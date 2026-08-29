@@ -3,6 +3,31 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] - 2026-08-29
+
+### Added
+
+- The incident and API-check reports gained a **Denied and dropped traffic**
+  section. It aggregates the `drop` severity global counters already collected
+  by `show counter global filter delta yes` over the whole capture, grouped by
+  PAN-OS counter aspect and name prefix into policy deny, DoS or zone
+  protection, forwarding, parse, resource exhaustion, and other drops, with the
+  total packets, the peak per-second rate, and the number of batches each
+  counter appeared in. A batch whose delta baseline was untrusted is excluded
+  from the totals and the exclusion is stated.
+- When packets were denied before session setup and a source IP is ranked
+  without an enriched session, the report now says so: that is the signature of
+  a UDP or GRE flood denied by a Security policy rule, which creates no session,
+  so PAN-OS can attribute the buffer pressure to a source IP only and
+  `show session id` has nothing to return. A **Denied packets** card was added
+  to the incident-state summary. Refs #74.
+
+### Changed
+
+- No firewall interaction changed. The section is derived from evidence already
+  present in the JSONL, so it costs no additional API call and no new command,
+  and existing captures render the new section when their report is regenerated.
+
 ## [0.9.1] - 2026-08-29
 
 ### Fixed

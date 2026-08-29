@@ -511,5 +511,181 @@ class CpuChartTests(unittest.TestCase):
         self.assertNotIn('<svg class="chart"', html)
         self.assertIn("No per-core CPU samples were recorded.", html)
 
+
+class DropCounterTests(unittest.TestCase):
+    """A flood denied by policy creates no session, so the report must name it."""
+
+    def _counter(
+        self,
+        name: str,
+        value: int,
+        rate: int,
+        aspect: str,
+        description: str,
+        severity: str = "drop",
+    ) -> dict:
+        return {
+            "name": name,
+            "value": value,
+            "rate": rate,
+            "severity": severity,
+            "category": "flow",
+            "aspect": aspect,
+            "description": description,
+        }
+
+    def _render(self, cycles: list[dict]) -> str:
+        records: list[dict] = [
+            {
+                "timestamp": "2026-08-27T10:00:00+00:00",
+                "run_id": "drop-run",
+                "event": "monitor_started",
+                "collector_version": "test",
+                "device": {"serial": "fixture", "model": "PA-fixture"},
+            }
+        ]
+        for batch, cycle in enumerate(cycles, 1):
+            record = {
+                "timestamp": f"2026-08-27T10:0{batch}:00+00:00",
+                "run_id": "drop-run",
+                "cycle": batch,
+                "elapsed_seconds": float(batch),
+                "percentages": {"packet_buffer_congestion": [61]},
+                "commands": {},
+            }
+            record.update(cycle)
+            records.append(record)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "drops.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            report = generate_html_report(capture, capture.with_suffix(".html"))
+            return report.read_text(encoding="utf-8")
+
+    def test_denied_flood_without_a_session_is_attributed_to_the_source_ip(self):
+        html = self._render(
+            [
+                {
+                    "candidate_entities": [
+                        {
+                            "rank": 1,
+                            "entity_type": "source_ip",
+                            "source_ip": "192.0.2.55",
+                            "drop_state": True,
+                            "evidence_sources": ["packet_buffer_protection"],
+                        }
+                    ],
+                    "global_counters_delta_status": "primed_interval",
+                    "global_counters_delta": {
+                        "elapsed_seconds": 5.0,
+                        "counters": [
+                            self._counter(
+                                "flow_policy_deny",
+                                418000,
+                                83600,
+                                "session",
+                                "Session setup: denied by policy",
+                            ),
+                            self._counter(
+                                "flow_dos_red_topology",
+                                1200,
+                                240,
+                                "dos",
+                                "Packets dropped by RED",
+                            ),
+                        ],
+                    },
+                }
+            ]
+        )
+
+        self.assertIn("Denied and dropped traffic", html)
+        self.assertIn("flow_policy_deny", html)
+        self.assertIn("Policy deny", html)
+        self.assertIn("DoS / zone protection", html)
+        self.assertIn('<p class="verdict verdict-isolated">', html)
+        self.assertIn("UDP or GRE flood denied by a", html)
+        self.assertIn("1 source IP(s) were ranked without an enriched session", html)
+        self.assertIn("Denied packets", html)
+        self.assertIn(">419200<", html)
+
+    def test_untrusted_baseline_batch_is_excluded_from_the_denied_total(self):
+        untrusted = {
+            "global_counters_delta_status": "baseline_untrusted",
+            "global_counters_delta": {
+                "counters": [
+                    self._counter(
+                        "flow_policy_deny",
+                        900000,
+                        1,
+                        "session",
+                        "Session setup: denied by policy",
+                    )
+                ]
+            },
+        }
+        primed = {
+            "global_counters_delta_status": "primed_interval",
+            "global_counters_delta": {
+                "counters": [
+                    self._counter(
+                        "flow_policy_deny",
+                        7,
+                        1,
+                        "session",
+                        "Session setup: denied by policy",
+                    )
+                ]
+            },
+        }
+        html = self._render([untrusted, primed])
+
+        self.assertIn("Counted batches: 1.", html)
+        self.assertIn("1 batch(es) excluded", html)
+        self.assertNotIn("900000", html.split("Batch details")[0])
+
+    def test_informational_counters_are_not_reported_as_drops(self):
+        html = self._render(
+            [
+                {
+                    "global_counters_delta_status": "primed_interval",
+                    "global_counters_delta": {
+                        "counters": [
+                            self._counter(
+                                "flow_tcp_non_syn",
+                                40,
+                                8,
+                                "session",
+                                "Non SYN TCP packets without session match",
+                                severity="info",
+                            ),
+                            self._counter(
+                                "flow_fwd_l3_mcast_drop",
+                                12,
+                                2,
+                                "forward",
+                                "Packets dropped: no route for multicast",
+                            ),
+                        ]
+                    },
+                }
+            ]
+        )
+
+        self.assertNotIn("flow_tcp_non_syn", html.split("Batch details")[0])
+        self.assertIn("flow_fwd_l3_mcast_drop", html)
+        self.assertIn("Forwarding", html)
+        self.assertIn('<p class="verdict verdict-collective">', html)
+        self.assertIn("No packet was denied by a Security policy rule", html)
+
+    def test_capture_without_counters_states_it_instead_of_an_empty_table(self):
+        html = self._render([{"commands": {}}])
+
+        self.assertIn("No drop counter was recorded in this capture.", html)
+        self.assertNotIn('<p class="verdict', html)
+
+
 if __name__ == "__main__":
     unittest.main()

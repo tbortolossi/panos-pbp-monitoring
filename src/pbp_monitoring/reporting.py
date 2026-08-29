@@ -1214,6 +1214,201 @@ def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
     )
 
 
+_MAX_RENDERED_DROP_COUNTERS = 30
+
+
+def _drop_counter_family(counter: dict[str, Any]) -> tuple[str, str]:
+    """Group a PAN-OS drop counter by its aspect and name prefix.
+
+    Classifying on the aspect and the name prefix rather than on a fixed list
+    of counter names keeps a counter that a future PAN-OS release renames or
+    adds inside the report instead of silently discarding it.
+    """
+    name = str(counter.get("name") or "")
+    aspect = str(counter.get("aspect") or "")
+    if name.startswith("flow_policy_"):
+        return "policy", "Policy deny"
+    if aspect == "dos" or name.startswith("flow_dos_"):
+        return "dos", "DoS / zone protection"
+    if aspect == "forward" or name.startswith("flow_fwd_"):
+        return "forward", "Forwarding"
+    if aspect == "parse":
+        return "parse", "Parse"
+    if aspect == "resource":
+        return "resource", "Resource exhaustion"
+    return "other", "Other drops"
+
+
+def _aggregate_drop_counters(
+    cycles: list[tuple[int, dict[str, Any]]],
+) -> dict[str, Any]:
+    """Sum the `drop` severity global counters observed across the capture.
+
+    A batch whose delta baseline is untrusted is excluded from the totals: its
+    sampling window is unknown, so its values would inflate the packet counts
+    presented as evidence.
+    """
+    aggregated: dict[str, dict[str, Any]] = {}
+    counted_batches = 0
+    untrusted_batches = 0
+    for _, record in cycles:
+        parsed = record.get("global_counters_delta")
+        if not isinstance(parsed, dict):
+            continue
+        counters = parsed.get("counters")
+        if not isinstance(counters, list):
+            continue
+        if str(record.get("global_counters_delta_status") or "") == "baseline_untrusted":
+            untrusted_batches += 1
+            continue
+        counted_batches += 1
+        for counter in counters:
+            if not isinstance(counter, dict):
+                continue
+            if str(counter.get("severity") or "").lower() != "drop":
+                continue
+            name = str(counter.get("name") or "").strip()
+            if not name:
+                continue
+            value = next(iter(_numbers(counter.get("value"))), None)
+            rate = next(iter(_numbers(counter.get("rate"))), None)
+            family_key, family_label = _drop_counter_family(counter)
+            item = aggregated.get(name)
+            if item is None:
+                item = aggregated[name] = {
+                    "name": name,
+                    "family_key": family_key,
+                    "family_label": family_label,
+                    "description": counter.get("description"),
+                    "total": 0.0,
+                    "peak_rate": None,
+                    "batches": 0,
+                }
+            if item["description"] in (None, "") and counter.get("description"):
+                item["description"] = counter.get("description")
+            item["batches"] += 1
+            if value is not None:
+                item["total"] += value
+            if rate is not None:
+                current_peak = item["peak_rate"]
+                item["peak_rate"] = (
+                    rate if current_peak is None else max(float(current_peak), rate)
+                )
+
+    items = sorted(
+        aggregated.values(),
+        key=lambda item: (-float(item["total"]), item["name"]),
+    )
+    family_totals: dict[str, float] = {}
+    for item in items:
+        family_totals[item["family_key"]] = (
+            family_totals.get(item["family_key"], 0.0) + float(item["total"])
+        )
+    return {
+        "items": items[:_MAX_RENDERED_DROP_COUNTERS],
+        "hidden_counters": max(0, len(items) - _MAX_RENDERED_DROP_COUNTERS),
+        "family_totals": family_totals,
+        "denied_total": family_totals.get("policy", 0.0) + family_totals.get("dos", 0.0),
+        "counted_batches": counted_batches,
+        "untrusted_batches": untrusted_batches,
+    }
+
+
+def _unenriched_source_ips(attribution: list[dict[str, Any]]) -> list[str]:
+    """List ranked source IPs that no session command could enrich."""
+    identifiers = []
+    for item in attribution:
+        if item.get("entity_type") == "session":
+            continue
+        summary = item.get("session_summary")
+        if isinstance(summary, dict) and summary.get("status") == "parsed":
+            continue
+        identifier = item.get("identifier")
+        if identifier not in (None, ""):
+            identifiers.append(str(identifier))
+    return identifiers
+
+
+def _render_drop_counters(
+    summary: dict[str, Any],
+    attribution: list[dict[str, Any]],
+) -> str:
+    items = summary["items"]
+    if not items:
+        return (
+            '<p class="muted">No drop counter was recorded in this capture. '
+            "Either the firewall dropped nothing during the observed batches, or "
+            "<code>show counter global filter delta yes</code> could not be "
+            "collected; the batch details below carry the exact response.</p>"
+        )
+
+    policy_total = summary["family_totals"].get("policy", 0.0)
+    dos_total = summary["family_totals"].get("dos", 0.0)
+    source_ips = _unenriched_source_ips(attribution)
+    if summary["denied_total"] > 0 and source_ips:
+        state = "isolated"
+        verdict = (
+            f"{_format_number(summary['denied_total'])} packets were dropped before "
+            f"session setup (policy deny {_format_number(policy_total)}, DoS or zone "
+            f"protection {_format_number(dos_total)}) while "
+            f"{len(source_ips)} source IP(s) were ranked without an enriched session. "
+            "That combination is consistent with a UDP or GRE flood denied by a "
+            "Security policy rule: denied traffic never creates a session, so PAN-OS "
+            "can attribute the buffer pressure to a source IP only and no "
+            "<code>show session id</code> can enrich it."
+        )
+    elif summary["denied_total"] > 0:
+        state = "mixed"
+        verdict = (
+            f"{_format_number(summary['denied_total'])} packets were dropped before "
+            f"session setup (policy deny {_format_number(policy_total)}, DoS or zone "
+            f"protection {_format_number(dos_total)}), and sessions were also ranked. "
+            "Both denied and permitted traffic contributed to the observed pressure."
+        )
+    else:
+        state = "collective"
+        verdict = (
+            "No packet was denied by a Security policy rule, by DoS protection, or by "
+            "zone protection during the counted batches. The drops below happened "
+            "after session setup or outside policy evaluation, so the offender "
+            "attribution table stays the primary evidence."
+        )
+
+    notes = [
+        f"Counted batches: {_format_number(summary['counted_batches'])}.",
+    ]
+    if summary["untrusted_batches"]:
+        notes.append(
+            f"{_format_number(summary['untrusted_batches'])} batch(es) excluded: "
+            "their delta baseline was untrusted, so the sampling window is unknown."
+        )
+    if summary["hidden_counters"]:
+        notes.append(
+            f"{_format_number(summary['hidden_counters'])} lower counter(s) not "
+            "listed; the batch details and the JSONL keep every counter."
+        )
+
+    rows = "".join(
+        "<tr>"
+        f'<td><code>{_escape(item["name"])}</code></td>'
+        f'<td>{_escape(item["family_label"])}</td>'
+        f'<td class="number">{_escape(_format_number(item["total"]))}</td>'
+        f'<td class="number">{_escape(_format_number(item["peak_rate"]))}</td>'
+        f'<td class="number">{_escape(item["batches"])}</td>'
+        f'<td class="wrap">{_escape(item.get("description") or "—")}</td>'
+        "</tr>"
+        for item in items
+    )
+    return (
+        f'<p class="verdict verdict-{state}">{verdict}</p>'
+        f'<p class="muted">{_escape(" ".join(notes))}</p>'
+        '<div class="table-wrap"><table><thead><tr>'
+        "<th>Counter</th><th>Family</th><th>Packets</th><th>Peak /s</th>"
+        "<th>Batches</th><th>PAN-OS description</th>"
+        f"</tr></thead><tbody>{rows}</tbody></table></div>"
+    )
+
+
 def _render_html(
     source: Path,
     records: list[tuple[int, dict[str, Any]]],
@@ -1229,6 +1424,8 @@ def _render_html(
     ]
     attribution = _aggregate_attribution(cycles)
     attribution_html = _render_attribution_table(attribution)
+    drop_counter_summary = _aggregate_drop_counters(cycles)
+    drop_counters_html = _render_drop_counters(drop_counter_summary, attribution)
     core_functions = next(
         (
             record["dp_core_functions"]
@@ -1422,6 +1619,9 @@ def _render_html(
             f'<strong>{_escape(low_free_limit_state)}</strong></article>',
             '<article class="card"><span class="card-label">PBP mode</span>'
             f'<strong>{_escape(", ".join(pbp_modes) or "—")}</strong></article>',
+            '<article class="card"><span class="card-label">Denied packets</span>'
+            f'<strong>{_escape(_format_number(drop_counter_summary["denied_total"]))}'
+            "</strong></article>",
         )
     )
     summary_groups = (
@@ -1650,6 +1850,10 @@ def _render_html(
     <section aria-labelledby="attribution-title">
       <h2 id="attribution-title">Offender attribution</h2>
       {attribution_html}
+    </section>
+    <section aria-labelledby="drop-counters-title">
+      <h2 id="drop-counters-title">Denied and dropped traffic</h2>
+      {drop_counters_html}
     </section>
     <section aria-labelledby="cpu-tracking-title">
       <h2 id="cpu-tracking-title">Dataplane CPU core tracking</h2>
