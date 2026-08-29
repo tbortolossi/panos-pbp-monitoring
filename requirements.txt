@@ -1,1 +1,1 @@
-# No third-party Python dependency.
+cryptography>=50.0.1,<51

@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
 keywords = ["pan-os", "packet-buffer-protection", "network-diagnostics", "syslog"]
-dependencies = ["cryptography>=43,<46"]
+dependencies = ["cryptography>=50.0.1,<51"]
 
 [project.urls]
 Homepage = "https://github.com/tbortolossi/panos-pbp-monitoring"

@@ -17,5 +17,6 @@ follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - HTML export index rendering remains compatible with the declared Python 3.10 minimum.
+- Require a non-vulnerable `cryptography` 50.0.1 release line.
 
 [0.4.1]: https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.4.1
