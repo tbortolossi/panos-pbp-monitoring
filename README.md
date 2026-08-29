@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring & Diagnostic Collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.11.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.11.0)
+[![Version](https://img.shields.io/badge/version-0.12.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.12.0)
 [![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
 
 PBP Monitoring is an event-driven, read-only diagnostic collector for PAN-OS
@@ -265,9 +265,17 @@ the collector logs a warning whenever it is disabled.
 
 ### 4. Configure PAN-OS Syslog forwarding
 
-Replace `<COLLECTOR_IP>` with the Linux Docker host address reachable from the
-firewall. The following PAN-OS 12.2 CLI hierarchy creates the UDP/BSD server
-profile:
+The **PAN-OS Syslog forwarding** section of the configuration page renders this
+whole block ready to paste, with the collector address already filled in from
+the address the browser reached the page on, the Syslog port, and the name of
+the log forwarding profile your security rules actually reference. Change any of
+the three and the commands follow; **Download** saves the same block as a text
+file for a change record. The page only produces text: the collector never
+writes to PAN-OS.
+
+The commands below are the same hierarchy, for reference. Replace
+`<COLLECTOR_IP>` with the Linux Docker host address reachable from the firewall.
+The following PAN-OS 12.2 CLI hierarchy creates the UDP/BSD server profile:
 
 ```text
 configure

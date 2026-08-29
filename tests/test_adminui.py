@@ -11,7 +11,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
-from pbp_monitoring.adminui import AdminController
+from pbp_monitoring.adminui import AdminController, syslog_commands
 from pbp_monitoring import __version__
 from pbp_monitoring.config_store import ConfigStore
 from pbp_monitoring.panos_keygen import SystemInfoError
@@ -415,6 +415,127 @@ class AdminUITests(unittest.TestCase):
                 self.assertTrue(store.list_targets()[0]["check_requested_at"])
                 self.assertIn("validation requested", page.lower())
                 self.assertIn("Validation queued", page)
+
+    def test_the_syslog_commands_use_the_address_the_admin_page_was_reached_on(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with signed_in_admin(Path(temporary_directory)) as (_opener, _base, _csrf, page):
+                self.assertIn("PAN-OS Syslog forwarding", page)
+                self.assertIn(
+                    "set shared log-settings syslog PBP-Docker server PBP-Docker server 127.0.0.1",
+                    page,
+                )
+                self.assertIn(
+                    "set shared log-settings syslog PBP-Docker server PBP-Docker port 514", page
+                )
+                self.assertIn("set shared log-settings system match-list PBP-Docker", page)
+                self.assertIn(
+                    "set shared log-settings profiles default match-list PBP-Docker log-type threat",
+                    page,
+                )
+                self.assertNotIn("&lt;COLLECTOR_IP&gt;", page)
+
+    def test_the_syslog_commands_follow_the_submitted_profile_address_and_port(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with signed_in_admin(Path(temporary_directory)) as (opener, base, _csrf, _page):
+                page = opener.open(
+                    base
+                    + "/admin?"
+                    + urlencode(
+                        {
+                            "collector_ip": "192.0.2.20",
+                            "syslog_port": "1514",
+                            "log_profile": "LFP-Corp",
+                        }
+                    )
+                ).read().decode()
+                self.assertIn(
+                    "set shared log-settings syslog PBP-Docker server PBP-Docker server 192.0.2.20",
+                    page,
+                )
+                self.assertIn(
+                    "set shared log-settings syslog PBP-Docker server PBP-Docker port 1514", page
+                )
+                self.assertIn(
+                    "set shared log-settings profiles LFP-Corp match-list PBP-Docker log-type threat",
+                    page,
+                )
+                self.assertIn(
+                    "set shared log-settings profiles LFP-Corp match-list PBP-Docker send-syslog"
+                    " [ PBP-Docker ]",
+                    page,
+                )
+                self.assertNotIn("profiles default match-list", page)
+
+    def test_an_unusable_syslog_value_falls_back_to_its_default_and_is_reported(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with signed_in_admin(Path(temporary_directory)) as (opener, base, _csrf, _page):
+                page = opener.open(
+                    base
+                    + "/admin?"
+                    + urlencode(
+                        {
+                            "collector_ip": "192.0.2.20; reboot",
+                            "syslog_port": "99999",
+                            "log_profile": 'default" or "1',
+                        }
+                    )
+                ).read().decode()
+                self.assertIn("ignored collector address", page)
+                self.assertIn("ignored Syslog port", page)
+                self.assertIn("ignored log forwarding profile", page)
+                self.assertIn("&lt;COLLECTOR_IP&gt;", page)
+                block = re.search(r"<pre>(.*?)</pre>", page, re.S).group(1)
+                self.assertNotIn("reboot", block)
+                self.assertIn(
+                    "set shared log-settings syslog PBP-Docker server PBP-Docker port 514", page
+                )
+                self.assertIn(
+                    "set shared log-settings profiles default match-list PBP-Docker log-type threat",
+                    page,
+                )
+
+    def test_the_syslog_commands_download_as_plain_text(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with signed_in_admin(Path(temporary_directory)) as (opener, base, _csrf, _page):
+                response = opener.open(
+                    base
+                    + "/admin/syslog-commands.txt?"
+                    + urlencode({"collector_ip": "192.0.2.20", "log_profile": "LFP-Corp"})
+                )
+                body = response.read().decode()
+                self.assertEqual(response.headers["Content-Type"], "text/plain; charset=utf-8")
+                self.assertIn("pbp-monitoring-syslog-forwarding.txt", response.headers["Content-Disposition"])
+                self.assertEqual(
+                    body, syslog_commands("192.0.2.20", "514", "LFP-Corp") + "\n"
+                )
+
+    def test_the_threat_match_list_extends_a_profile_without_replacing_it(self):
+        commands = syslog_commands("192.0.2.20", "514", "LFP-Corp")
+        self.assertIn(
+            'set shared log-settings profiles LFP-Corp match-list PBP-Docker filter'
+            ' "((threatid eq 8507) or (threatid eq 8508) or (threatid eq 8509))"',
+            commands,
+        )
+        self.assertIn('set shared log-settings system match-list PBP-Docker filter "All Logs"', commands)
+        self.assertNotIn("delete ", commands)
+        self.assertNotIn("clear ", commands)
+        for line in commands.splitlines():
+            self.assertRegex(
+                line,
+                r"^(#.*|configure|set .*|show .*|commit description \".*\"|)$",
+            )
+
+    def test_the_syslog_commands_require_an_authenticated_session(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with signed_in_admin(root) as (opener, base, csrf, _page):
+                opener.open(
+                    Request(base + "/admin/logout", data=urlencode({"csrf": csrf}).encode())
+                ).read()
+                page = opener.open(base + "/admin/syslog-commands.txt").read().decode()
+                self.assertNotIn("set shared log-settings", page)
+                self.assertIn("Administrator sign in", page)
+
 
     def test_the_configuration_page_reloads_only_while_a_validation_is_queued(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

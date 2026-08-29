@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.12.0] - 2026-08-29
+
+### Added
+
+- The configuration page gained a **PAN-OS Syslog forwarding** section that
+  renders the `set` commands to run on the firewall, so a newly added firewall
+  can be pointed at the collector without leaving the UI. The collector address
+  is pre-filled from the address the administrator reached the page on, the
+  Syslog port and the log forwarding profile name are editable, and the block
+  downloads as plain text. The Threat match list restricted to PBP IDs
+  8507-8509 is added to the profile you name, so a profile already applied to
+  every security rule keeps its existing destinations, and the System match list
+  carries both packet-buffer congestion alerts and ordinary System logs. An
+  unusable address, port, or profile name falls back to its default and is
+  reported instead of being rendered into a command. The page generates text
+  only: the collector still never writes to PAN-OS. Refs #82.
+
 ## [0.11.0] - 2026-08-29
 
 ### Added
