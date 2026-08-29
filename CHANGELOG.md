@@ -7,6 +7,10 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Two monitoring runs starting within the same wall-clock second no longer
+  merge into one capture: the run identifier gains a monotonic suffix when its
+  evidence directory already exists, so every incident keeps its own
+  unambiguous JSONL file and report.
 - A journal write failure (full disk, permissions) no longer prevents incident
   collection: the monitor starts even when the trigger cannot be journalled,
   the HTML report is generated even when the stop marker cannot be written,

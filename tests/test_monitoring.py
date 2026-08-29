@@ -32,6 +32,7 @@ from pbp_monitoring.orchestrator import (
     resource_monitor_command,
     resource_monitor_window_seconds,
     incident_capture_path,
+    unique_run_id,
     panos_csv_serial,
     select_session_lookups,
 )
@@ -1024,6 +1025,48 @@ class MonitorTests(unittest.TestCase):
             self.assertFalse(cycle["session_details"]["123"]["ok"])
             self.assertIn("session detail failed for 123", cycle["validation_errors"])
 
+
+
+class RunIdTests(unittest.TestCase):
+    """Two incidents in the same wall-clock second must not share a capture."""
+
+    def test_unique_run_id_suffixes_a_same_second_collision(self):
+        from datetime import datetime as real_datetime, timezone as real_timezone
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            frozen = real_datetime(2026, 8, 29, 10, 0, 0, tzinfo=real_timezone.utc)
+            with patch("pbp_monitoring.orchestrator.datetime") as mocked:
+                mocked.now.return_value = frozen
+                first = unique_run_id(output_dir)
+                incident_capture_path(output_dir, first).parent.mkdir(parents=True)
+                second = unique_run_id(output_dir)
+                incident_capture_path(output_dir, second).parent.mkdir(parents=True)
+                third = unique_run_id(output_dir)
+
+        self.assertEqual(first, "20260829T100000Z")
+        self.assertEqual(second, "20260829T100000Z-2")
+        self.assertEqual(third, "20260829T100000Z-3")
+
+    def test_back_to_back_monitors_get_distinct_captures(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            controller.trigger("PBP Packet Drop (8507)", "192.0.2.1:514")
+            first = controller.run_id
+            await asyncio.gather(controller.monitor_task, return_exceptions=True)
+            controller.trigger("PBP Packet Drop (8507)", "192.0.2.1:514")
+            second = controller.run_id
+            await asyncio.gather(controller.monitor_task, return_exceptions=True)
+            await controller.wait_for_reports()
+            return first, second
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            first, second = asyncio.run(scenario(make_config(output_dir)))
+
+            self.assertNotEqual(first, second)
+            self.assertTrue(incident_capture_path(output_dir, first).exists())
+            self.assertTrue(incident_capture_path(output_dir, second).exists())
 
 
 class PersistenceResilienceTests(unittest.TestCase):
