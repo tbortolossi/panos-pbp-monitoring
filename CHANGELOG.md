@@ -13,6 +13,10 @@ follows [Semantic Versioning](https://semver.org/).
 - Failed sign-in and setup attempts are throttled per source address (five
   failures per fifteen minutes), and concurrent password verifications are
   capped so a login flood cannot exhaust the CPU with key derivations.
+- The firewall form now warns that password-based key generation over an
+  unverified TLS connection (the compatibility default) exposes the PAN-OS
+  admin password to interception, and recommends the pre-generated-key method
+  or enabling verification first.
 - PAN-OS API responses are now read with an 8 MB ceiling and refused when they
   carry an XML document type declaration, closing memory-exhaustion paths from
   a misbehaving or intercepted endpoint (TLS verification defaults to disabled

@@ -310,6 +310,7 @@ class AdminUITests(unittest.TestCase):
                 self.assertNotIn("Management URL", page)
                 self.assertNotIn("Allowed Syslog source IP(s)", page)
                 self.assertIn('<select name="tls_verify">', page)
+                self.assertIn("can be intercepted on the management path", page)
 
     def test_saving_generates_a_key_and_reads_the_serial_from_the_firewall(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
