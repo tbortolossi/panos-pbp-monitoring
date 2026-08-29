@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring & Diagnostic Collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.15.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.15.0)
+[![Version](https://img.shields.io/badge/version-0.16.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.16.0)
 [![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
 
 PBP Monitoring is an event-driven, read-only diagnostic collector for PAN-OS
@@ -546,14 +546,31 @@ the summary separates capture facts, incident state, and peak utilization, and
 its peak metrics are grouped into packet buffers, packet descriptors, and
 system load. The lower-level event metadata is collapsed by default.
 
-The report opens with a **Probable cause** block: the peak buffer usage, the
-strongest offender with its flow and rate, the denied-traffic correlation, and
-the session-table verdict, composed into a few sentences ready for a TAC case.
+The report opens with an **At a glance** block that names the severity from
+the peak packet-buffer pressure against the PAN-OS PBP defaults (low below the
+50% alert level, elevated between alert and the 80% activate level, critical at
+or above it), lists the key figures (peak, duration, batches, triggers, top
+offender, denied packets, PBP state, stop reason), and carries the
+**Probable cause** sentences: the peak buffer usage, the strongest offender
+with its flow and rate, the denied-traffic correlation, and the session-table
+verdict, composed into a few sentences ready for a TAC case. The header shows
+formatted start and end times, the duration, and the stop reason in words with
+its slug underneath; a sticky navigation bar links every section, and each
+section starts with the question it answers. Peak cards and timeline cells turn
+amber above the alert level and red above the activate level, a metric the
+firewall never returned reads "Not collected" and is hidden from the timeline
+columns, batch summaries show their buffer reading without being opened, time
+columns show the clock time with the full timestamp on hover, and the per-core
+CPU tables fold away when no core came close to saturation.
 A **Top sources** table above the attribution ranking rolls ranked sessions up
 by source address — a scan or flood spread over hundreds of short sessions is
 attributed to the source that owns them — and a **Pressure over time** chart
 plots packet-buffer, descriptor, and session-table utilization batch by batch
-so the offender's first appearance can be aligned with the pressure curve.
+so the offender's first appearance can be aligned with the pressure curve. Its
+vertical axis fits the data (10, 25, 50, or 100%) so a lightly loaded firewall
+is not a flat line, the PBP alert and activate levels are drawn when they fit,
+the peak is labelled, and one triangle marks each syslog trigger received
+during the capture.
 
 The **Denied and dropped traffic** section aggregates the `drop` severity global
 counters returned by `show counter global filter delta yes` over the whole

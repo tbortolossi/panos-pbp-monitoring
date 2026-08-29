@@ -404,6 +404,19 @@ key must be backed up and restored together.
     logged and never delays or blocks collection. An empty URL disables the
     feature, and a non-HTTP(S) value is rejected at save time.
 
+47. The report is readable at a glance: it opens with a severity classified
+    from the peak packet-buffer pressure against the PAN-OS PBP defaults (low
+    below 50%, elevated from 50%, critical from 80%) and the key figures,
+    shows formatted times, the duration, and the stop reason in words, links
+    every section from a navigation bar, explains under each heading which
+    question the section answers, colours peak cards and timeline cells by
+    the same thresholds, distinguishes "Not collected" from zero and hides
+    never-returned metrics from the timeline, fits the pressure chart's axis
+    to the data with the PBP levels and each received trigger marked, and
+    folds the per-core CPU tables away when no core approached saturation.
+    None of this changes the JSONL, the commands, or the CSP: the report stays
+    a single static file with no script.
+
 ## 12. Possible enhancements
 
 - Native TCP/TLS Syslog reception.

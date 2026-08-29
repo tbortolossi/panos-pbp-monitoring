@@ -222,6 +222,125 @@ def _format_number(value: float | int | None) -> str:
     return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
+# PAN-OS packet buffer protection defaults: alert at 50 %, activate at 80 %.
+_PBP_ALERT_PERCENT = 50.0
+_PBP_ACTIVATE_PERCENT = 80.0
+
+_STOP_REASON_LABELS = {
+    "resources_recovered": "Resources recovered",
+    "maximum_duration": "Maximum duration reached",
+    "api_check_complete": "API check complete",
+    "monitor_stopped": "Monitor stopped",
+    "stopped": "Monitor stopped",
+}
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _human_timestamp(value: Any) -> str:
+    """Render an ISO timestamp as ``YYYY-MM-DD HH:MM:SS UTC`` for reading."""
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        return _display_text(value) if value not in (None, "") else "—"
+    zone = parsed.strftime("%z")
+    if parsed.tzinfo is None:
+        suffix = ""
+    elif zone in ("+0000", "-0000"):
+        suffix = " UTC"
+    else:
+        suffix = f" UTC{zone[:3]}:{zone[3:]}"
+    return parsed.strftime("%Y-%m-%d %H:%M:%S") + suffix
+
+
+def _clock_time(value: Any) -> str:
+    """Keep only the time of day; the full value stays available on hover."""
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        return _display_text(value) if value not in (None, "") else "—"
+    return parsed.strftime("%H:%M:%S")
+
+
+def _time_cell(value: Any) -> str:
+    """A clock-time ``<time>`` whose tooltip carries the full timestamp."""
+    if value in (None, ""):
+        return "—"
+    return (
+        f'<time datetime="{_escape(value)}" title="{_escape(value)}">'
+        f"{_escape(_clock_time(value))}</time>"
+    )
+
+
+def _human_duration(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "—"
+    total = float(seconds)
+    if total < 60:
+        return f"{_format_number(round(total, 2))} s"
+    minutes, remainder = divmod(int(round(total)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} min"
+    return f"{minutes} min {remainder:02d} s"
+
+
+def _stop_reason_label(reason: Any) -> str:
+    text = _display_text(reason)
+    return _STOP_REASON_LABELS.get(text, text.replace("_", " ").capitalize())
+
+
+def _level(value: float | int | None) -> str:
+    """Classify a utilization percentage against the PBP thresholds."""
+    if value is None:
+        return "none"
+    if float(value) >= _PBP_ACTIVATE_PERCENT:
+        return "bad"
+    if float(value) >= _PBP_ALERT_PERCENT:
+        return "warn"
+    return "ok"
+
+
+def _severity(peak: float | None) -> tuple[str, str, str]:
+    """Name the incident severity from the peak packet-buffer pressure."""
+    if peak is None:
+        return (
+            "unknown",
+            "Pressure unknown",
+            "No packet-buffer percentage was collected, so the pressure level "
+            "cannot be stated; read the batch details for the raw responses.",
+        )
+    if peak >= _PBP_ACTIVATE_PERCENT:
+        return (
+            "bad",
+            "Critical pressure",
+            f"Packet buffers peaked at {_format_number(peak)}%, at or above the "
+            f"{_format_number(_PBP_ACTIVATE_PERCENT)}% PBP activate level: the "
+            "firewall was discarding packets to protect itself.",
+        )
+    if peak >= _PBP_ALERT_PERCENT:
+        return (
+            "warn",
+            "Elevated pressure",
+            f"Packet buffers peaked at {_format_number(peak)}%, between the "
+            f"{_format_number(_PBP_ALERT_PERCENT)}% alert and the "
+            f"{_format_number(_PBP_ACTIVATE_PERCENT)}% activate levels: PAN-OS "
+            "raised alerts without discarding packets by itself.",
+        )
+    return (
+        "ok",
+        "Low pressure",
+        f"Packet buffers peaked at {_format_number(peak)}%, below the "
+        f"{_format_number(_PBP_ALERT_PERCENT)}% PBP alert level. If PBP still "
+        "engaged, its thresholds are set lower than the PAN-OS defaults.",
+    )
+
+
 def _resource_cpu_samples(record: dict[str, Any]) -> list[dict[str, Any]]:
     raw_samples = record.get("resource_monitor_cpu_cores")
     if not isinstance(raw_samples, list):
@@ -721,7 +840,7 @@ def _render_cpu_tracking(
         timeline_rows.append(
             "<tr>"
             f'<td class="number">{_escape(batch_number)}</td>'
-            f'<td>{_escape(timestamp)}</td>'
+            f'<td>{_time_cell(timestamp)}</td>'
             f'<td>{_escape(hottest)}</td>'
             f'<td class="number">{_escape(_format_number(peak))}</td>'
             f'<td class="number">{_escape(_format_number(average))}</td>'
@@ -756,7 +875,7 @@ def _render_cpu_tracking(
             f'<td class="number">{_escape(_format_number(peak))}</td>'
             f'<td class="number">{_escape(_format_number(maximum_values[-1]))}</td>'
             f'<td class="number">{_escape(sum(observation[4] for observation in observations))}</td>'
-            f'<td>Batch {_escape(peak_batch)}<br><span class="muted">{_escape(peak_time)}</span></td>'
+            f'<td>Batch {_escape(peak_batch)}<br><span class="muted">{_time_cell(peak_time)}</span></td>'
             "</tr>"
         )
 
@@ -1512,11 +1631,50 @@ _PRESSURE_SERIES = (
 )
 
 
-def _render_pressure_chart(cycles: list[tuple[int, dict[str, Any]]]) -> str:
+def _trigger_positions(
+    cycles: Sequence[tuple[int, dict[str, Any]]],
+    events: Sequence[tuple[int, dict[str, Any]]] | None,
+) -> list[float]:
+    """Place each received trigger on the batch axis, between its neighbours."""
+    batch_times = [_parse_timestamp(record.get("timestamp")) for _, record in cycles]
+    positions: list[float] = []
+    for _, record in events or ():
+        if str(record.get("event", "")).lower() != "trigger_received":
+            continue
+        moment = _parse_timestamp(record.get("timestamp"))
+        if moment is None:
+            continue
+        position: float | None = None
+        for index, batch_time in enumerate(batch_times):
+            if batch_time is None:
+                continue
+            if moment <= batch_time:
+                if index == 0:
+                    position = 0.0
+                else:
+                    previous = batch_times[index - 1]
+                    if previous is None or batch_time <= previous:
+                        position = float(index)
+                    else:
+                        fraction = (moment - previous) / (batch_time - previous)
+                        position = index - 1 + max(0.0, min(1.0, fraction))
+                break
+        if position is None:
+            position = float(len(batch_times) - 1)
+        positions.append(position)
+    return positions
+
+
+def _render_pressure_chart(
+    cycles: list[tuple[int, dict[str, Any]]],
+    events: list[tuple[int, dict[str, Any]]] | None = None,
+) -> str:
     """Chart the primary incident metrics per batch.
 
     The peak cards say how bad it got; this curve says when, so the operator
-    can align an offender's first appearance with the pressure itself.
+    can align an offender's first appearance with the pressure itself. The
+    vertical axis fits the data so a lightly loaded firewall is not a flat
+    line, and the PBP alert and activate levels are drawn when they fit.
     """
     if len(cycles) < 2:
         return ""
@@ -1532,26 +1690,53 @@ def _render_pressure_chart(cycles: list[tuple[int, dict[str, Any]]]) -> str:
                 series_points.setdefault(label, []).append((index, max(values)))
     if not series_points:
         return ""
+    highest = max(value for points in series_points.values() for _, value in points)
+    ceiling = next(
+        (candidate for candidate in (10, 25, 50, 100) if highest * 1.15 <= candidate),
+        100,
+    )
     left, right, top, bottom = 46, 18, 16, 34
     height = 250
     count = len(cycles)
     plot_width = _CHART_WIDTH - left - right
     step = plot_width / (count - 1)
 
-    def x_at(index: int) -> float:
+    def x_at(index: float) -> float:
         return left + index * step
 
     def y_at(value: float) -> float:
-        bounded = max(0.0, min(100.0, value))
-        return top + (100.0 - bounded) * (height - top - bottom) / 100.0
+        bounded = max(0.0, min(float(ceiling), value))
+        return top + (ceiling - bounded) * (height - top - bottom) / ceiling
 
     parts: list[str] = []
-    for gridline in (0, 25, 50, 75, 100):
+    gridstep = ceiling / 4
+    for level in range(5):
+        gridline = level * gridstep
         y = y_at(gridline)
         parts.append(
             f'<line x1="{left}" y1="{y:.1f}" x2="{_CHART_WIDTH - right}" y2="{y:.1f}" '
             'stroke="#e2e8f0" stroke-width="1"/>'
-            f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end" class="axis">{gridline}%</text>'
+            f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end" class="axis">'
+            f"{_format_number(gridline)}%</text>"
+        )
+    thresholds = [
+        (_PBP_ALERT_PERCENT, "alert", "#b45309"),
+        (_PBP_ACTIVATE_PERCENT, "activate", "#b42318"),
+    ]
+    threshold_legend: list[str] = []
+    for value, name, colour in thresholds:
+        if value > ceiling:
+            continue
+        y = y_at(value)
+        parts.append(
+            f'<line x1="{left}" y1="{y:.1f}" x2="{_CHART_WIDTH - right}" y2="{y:.1f}" '
+            f'stroke="{colour}" stroke-width="1" stroke-dasharray="6 4"/>'
+            f'<text x="{_CHART_WIDTH - right - 4}" y="{y - 4:.1f}" text-anchor="end" '
+            f'class="axis" fill="{colour}">PBP {name} {_format_number(value)}%</text>'
+        )
+        threshold_legend.append(
+            f'<span class="key"><i class="dashed" style="border-color:{colour}"></i>'
+            f"PBP {name} level</span>"
         )
     tick_stride = max(1, math.ceil(count / 12))
     for index in range(count):
@@ -1560,6 +1745,15 @@ def _render_pressure_chart(cycles: list[tuple[int, dict[str, Any]]]) -> str:
         parts.append(
             f'<text x="{x_at(index):.1f}" y="{height - 12}" text-anchor="middle" '
             f'class="axis">{index + 1}</text>'
+        )
+    trigger_positions = _trigger_positions(cycles, events)
+    for position in trigger_positions:
+        x = x_at(position)
+        parts.append(
+            f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{y_at(0):.1f}" '
+            'stroke="#d97706" stroke-width="1" stroke-opacity="0.7"/>'
+            f'<polygon points="{x - 4:.1f},{top} {x + 4:.1f},{top} {x:.1f},{top + 7}" '
+            'fill="#d97706"/>'
         )
     legend: list[str] = []
     for label, _, colour in _PRESSURE_SERIES:
@@ -1579,6 +1773,25 @@ def _render_pressure_chart(cycles: list[tuple[int, dict[str, Any]]]) -> str:
         legend.append(
             f'<span class="key"><i style="background:{colour}"></i>{_escape(label)}</span>'
         )
+    if trigger_positions:
+        legend.append(
+            '<span class="key"><i class="marker"></i>'
+            f"Trigger received ({len(trigger_positions)})</span>"
+        )
+    legend.extend(threshold_legend)
+    buffer_points = series_points.get(_PRESSURE_SERIES[0][0])
+    if buffer_points:
+        peak_index, peak_value = max(buffer_points, key=lambda point: point[1])
+        px, py = x_at(peak_index), y_at(peak_value)
+        anchor = "end" if peak_index > count / 2 else "start"
+        offset = -8 if anchor == "end" else 8
+        parts.append(
+            f'<circle cx="{px:.1f}" cy="{py:.1f}" r="4" fill="#fff" '
+            f'stroke="{_PRESSURE_SERIES[0][2]}" stroke-width="2"/>'
+            f'<text x="{px + offset:.1f}" y="{max(py - 8, top + 10):.1f}" '
+            f'text-anchor="{anchor}" class="axis peak-label">peak '
+            f"{_format_number(peak_value)}% · batch {peak_index + 1}</text>"
+        )
     title = "Buffer, descriptor, and session-table utilization per batch"
     return (
         f'<svg class="chart pressure-chart" viewBox="0 0 {_CHART_WIDTH} {height}" width="{_CHART_WIDTH}" '
@@ -1586,7 +1799,8 @@ def _render_pressure_chart(cycles: list[tuple[int, dict[str, Any]]]) -> str:
         f"<title>{_escape(title)}</title>{''.join(parts)}</svg>"
         f'<p class="chart-legend">{"".join(legend)}</p>'
         '<p class="muted chart-caption">Horizontal axis: batch number. Vertical axis: '
-        "window peak utilization.</p>"
+        f"window peak utilization, scaled to {_format_number(ceiling)}% to fit the data. "
+        "Each triangle marks a syslog trigger received during the capture.</p>"
     )
 
 
@@ -1667,10 +1881,10 @@ def _render_probable_cause(
     if not sentences:
         return ""
     return (
-        '<section aria-labelledby="probable-cause-title" class="probable-cause">'
-        '<h2 id="probable-cause-title">Probable cause</h2>'
+        '<div class="probable-cause">'
+        '<h3 id="probable-cause-title">Probable cause</h3>'
         + "".join(f"<p>{sentence}</p>" for sentence in sentences)
-        + "</section>"
+        + "</div>"
     )
 
 
@@ -1840,11 +2054,14 @@ def _render_drop_counters(
             "listed; the batch details and the JSONL keep every counter."
         )
 
+    largest = max((float(item["total"]) for item in items), default=0.0) or 1.0
     rows = "".join(
         "<tr>"
         f'<td><code>{_escape(item["name"])}</code></td>'
         f'<td>{_escape(item["family_label"])}</td>'
-        f'<td class="number">{_escape(_format_number(item["total"]))}</td>'
+        f'<td class="number bar-cell"><span class="bar" style="width:'
+        f'{max(2.0, min(100.0, float(item["total"]) / largest * 100.0)):.0f}%"></span>'
+        f'{_escape(_format_number(item["total"]))}</td>'
         f'<td class="number">{_escape(_format_number(item["peak_rate"]))}</td>'
         f'<td class="number">{_escape(item["batches"])}</td>'
         f'<td class="wrap">{_escape(item.get("description") or "—")}</td>'
@@ -2099,7 +2316,7 @@ def _render_html(
     probable_cause_html = _render_probable_cause(
         attribution, drop_counter_summary, session_series, cycles, events
     )
-    pressure_chart_html = _render_pressure_chart(cycles)
+    pressure_chart_html = _render_pressure_chart(cycles, events)
     session_table_html = _render_session_table(session_series)
     core_functions = next(
         (
@@ -2112,6 +2329,16 @@ def _render_html(
     )
     cpu_charts_html = _render_cpu_charts(cycles, core_functions)
     cpu_tracking_html = _render_cpu_tracking(cycles, core_functions)
+    cpu_needs_attention = any(
+        marker in cpu_charts_html for marker in ("verdict-isolated", "verdict-mixed")
+    )
+    if cpu_charts_html and not cpu_needs_attention:
+        cpu_tracking_html = (
+            '<details class="section-disclosure cpu-tables">'
+            "<summary><h3>Per-core tables</h3>"
+            '<span class="pill">no hot core · open for the detail</span></summary>'
+            f'<div class="section-body">{cpu_tracking_html}</div></details>'
+        )
     pbp_statuses = [
         record.get("pbp_status")
         for _, record in cycles
@@ -2161,8 +2388,8 @@ def _render_html(
         for _, record in records
         if record.get("timestamp") not in (None, "")
     ]
-    started_at = timestamps[0] if timestamps else "—"
-    ended_at = timestamps[-1] if timestamps else "—"
+    started_at = timestamps[0] if timestamps else None
+    ended_at = timestamps[-1] if timestamps else None
 
     elapsed_values = [
         value
@@ -2170,6 +2397,11 @@ def _render_html(
         for value in _numbers(record.get("elapsed_seconds"))
     ]
     duration = max(elapsed_values) if elapsed_values else None
+    if duration is None:
+        first_moment = _parse_timestamp(started_at)
+        last_moment = _parse_timestamp(ended_at)
+        if first_moment is not None and last_moment is not None:
+            duration = max(0.0, (last_moment - first_moment).total_seconds())
     unique_sessions = sorted(
         {session_id for _, record in cycles for session_id in _candidate_ids(record)}
     )
@@ -2194,6 +2426,12 @@ def _render_html(
     stop_reason = (
         stop_event.get("reason") or stop_event.get("event")
         if stop_event is not None
+        else None
+    )
+    stop_reason_html = (
+        f"{_escape(_stop_reason_label(stop_reason))}"
+        f'<br><span class="fact-detail">{_escape(stop_reason)}</span>'
+        if stop_reason
         else "Capture has no stop marker"
     )
     start_event = next(
@@ -2251,14 +2489,18 @@ def _render_html(
         if value is not None:
             bounded = max(0.0, min(100.0, value))
             meter = (
-                f'<meter min="0" max="100" value="{_escape(_format_number(bounded))}">'
+                f'<meter min="0" max="100" low="{_format_number(_PBP_ALERT_PERCENT)}" '
+                f'high="{_format_number(_PBP_ACTIVATE_PERCENT)}" optimum="0" '
+                f'value="{_escape(_format_number(bounded))}">'
                 f'{_escape(_format_number(value))}%</meter>'
             )
+            value_html = f"<strong>{_escape(_format_number(value))}%</strong>"
+        else:
+            value_html = '<strong class="not-collected">Not collected</strong>'
         metric_cards[key] = (
-            '<article class="card metric-card">'
+            f'<article class="card metric-card" data-level="{_level(value)}">'
             f'<span class="card-label">{_escape(card_labels[key])}</span>'
-            f'<strong>{_escape(_format_number(value))}{"%" if value is not None else ""}</strong>'
-            f"{meter}</article>"
+            f"{value_html}{meter}</article>"
         )
     metric_groups_html = "".join(
         '<div class="metric-family">'
@@ -2274,11 +2516,10 @@ def _render_html(
             '<article class="card"><span class="card-label">Batches</span>'
             f'<strong>{_escape(len(cycles))}</strong></article>',
             '<article class="card"><span class="card-label">Observed duration</span>'
-            f'<strong>{_escape(_format_number(duration))}'
-            f'{" s" if duration is not None else ""}</strong></article>',
+            f'<strong>{_escape(_human_duration(duration))}</strong></article>',
             '<article class="card"><span class="card-label">Unique sessions</span>'
             f'<strong>{_escape(len(unique_sessions))}</strong></article>',
-            '<article class="card"><span class="card-label">Ranked entities</span>'
+            '<article class="card"><span class="card-label">Ranked offenders</span>'
             f'<strong>{_escape(len(attribution))}</strong></article>',
             '<article class="card"><span class="card-label">Correlated triggers</span>'
             f'<strong>{_escape(len(trigger_events))}</strong></article>',
@@ -2308,9 +2549,17 @@ def _render_html(
         f'<div class="metric-families">{metric_groups_html}</div></div>'
     )
 
+    # Only chart the metrics the firewall actually returned: a column of dashes
+    # says nothing, and it pushes the useful ones off the screen.
+    timeline_metrics = [
+        (key, label) for key, label in _METRICS if metric_maxima[key] is not None
+    ] or list(_METRICS)
+    hidden_metrics = [
+        label for key, label in _METRICS if (key, label) not in timeline_metrics
+    ]
     timeline_rows: list[str] = []
     for batch_number, (_, record) in enumerate(cycles, 1):
-        metrics = [_metric_max(record, key) for key, _ in _METRICS]
+        metrics = [_metric_max(record, key) for key, _ in timeline_metrics]
         ids = _candidate_ids(record)
         id_text = ", ".join(ids) if ids else "—"
         clock = _firewall_clock(record) or "—"
@@ -2318,11 +2567,12 @@ def _render_html(
         timeline_rows.append(
             "<tr>"
             f'<td class="number">{_escape(batch_number)}</td>'
-            f'<td>{_escape(record.get("timestamp", "—"))}</td>'
+            f'<td>{_time_cell(record.get("timestamp"))}</td>'
             f'<td>{_escape(clock)}</td>'
             f'<td class="number">{_escape(_format_number(elapsed))}</td>'
             + "".join(
-                f'<td class="number">{_escape(_format_number(value))}</td>'
+                f'<td class="number" data-level="{_level(value)}">'
+                f"{_escape(_format_number(value))}</td>"
                 for value in metrics
             )
             + f'<td class="sessions">{_escape(id_text)}</td>'
@@ -2333,10 +2583,16 @@ def _render_html(
     if timeline_rows:
         timeline_body = "".join(timeline_rows)
     else:
-        column_count = len(_METRICS) + 6
+        column_count = len(timeline_metrics) + 6
         timeline_body = (
             f'<tr><td colspan="{column_count}" class="empty">No valid batch.</td></tr>'
         )
+    timeline_note = (
+        '<p class="muted">Columns never returned by the firewall are hidden: '
+        f"{_escape(', '.join(hidden_metrics))}.</p>"
+        if hidden_metrics and cycles
+        else ""
+    )
 
     cycle_details: list[str] = []
     for batch_number, (line_number, record) in enumerate(cycles, 1):
@@ -2351,10 +2607,35 @@ def _render_html(
             for key, label in _METRICS
             if _metric_max(record, key) is not None
         ) or "No recognized metric"
+        batch_buffer = next(
+            (
+                value
+                for key in ("packet_buffer_congestion", "resource_monitor_packet_buffer")
+                if (value := _metric_max(record, key)) is not None
+            ),
+            None,
+        )
+        batch_errors = _record_error_count(record)
+        glance_parts = [
+            f'<span class="glance-metric" data-level="{_level(batch_buffer)}">'
+            f"buffers {_escape(_format_number(batch_buffer))}"
+            f'{"%" if batch_buffer is not None else ""}</span>'
+            if batch_buffer is not None
+            else '<span class="glance-metric muted">no buffer reading</span>',
+            f'<span class="muted">{len(ids)} session{"s" if len(ids) != 1 else ""}</span>',
+        ]
+        if batch_errors:
+            glance_parts.append(
+                f'<span class="pill bad">{batch_errors} error'
+                f'{"s" if batch_errors != 1 else ""}</span>'
+            )
         cycle_details.append(
             '<details class="cycle">'
             f'<summary><span>Batch {_escape(batch_number)}</span>'
-            f'<time>{_escape(record.get("timestamp", "no timestamp"))}</time>'
+            f'{"".join(glance_parts)}'
+            f'<time datetime="{_escape(record.get("timestamp", ""))}" '
+            f'title="{_escape(record.get("timestamp", ""))}">'
+            f'{_escape(_clock_time(record.get("timestamp")) if record.get("timestamp") else "no timestamp")}</time>'
             f'<span class="pill">line {_escape(line_number)}</span></summary>'
             '<div class="cycle-body">'
             '<dl class="metadata">'
@@ -2381,7 +2662,9 @@ def _render_html(
         event_details.append(
             '<details class="cycle event">'
             f'<summary><span>{_escape(event_name)}</span>'
-            f'<time>{_escape(record.get("timestamp", "no timestamp"))}</time>'
+            f'<time datetime="{_escape(record.get("timestamp", ""))}" '
+            f'title="{_escape(record.get("timestamp", ""))}">'
+            f'{_escape(_clock_time(record.get("timestamp")) if record.get("timestamp") else "no timestamp")}</time>'
             f'<span class="pill">line {_escape(line_number)}</span></summary>'
             '<div class="cycle-body"><h3>Metadata</h3>'
             f'<pre class="raw">{_escape(metadata)}</pre>'
@@ -2396,8 +2679,66 @@ def _render_html(
     events_html = "".join(event_details) or '<p class="muted">No separate event.</p>'
 
     metric_headers = "".join(
-        f"<th>{_escape(label)} %</th>" for _, label in _METRICS
+        f"<th>{_escape(label)} %</th>" for _, label in timeline_metrics
     )
+
+    buffer_peak_values = [
+        value
+        for key in ("packet_buffer_congestion", "resource_monitor_packet_buffer")
+        if (value := metric_maxima.get(key)) is not None
+    ]
+    buffer_peak = max(buffer_peak_values) if buffer_peak_values else None
+    glance_html = ""
+    if cycles:
+        severity_state, severity_label, severity_text = _severity(buffer_peak)
+        top = attribution[0] if attribution else None
+        if top is not None:
+            top_kind = "session" if top.get("entity_type") == "session" else "source IP"
+            top_html = (
+                f"{_escape(top_kind)} <code>{_escape(top.get('identifier'))}</code>"
+            )
+        else:
+            top_html = '<span class="muted">none identified</span>'
+        facts = (
+            ("Peak packet buffer", f"{_escape(_format_number(buffer_peak))}"
+             f"{'%' if buffer_peak is not None else ''}"),
+            ("Observed duration", _escape(_human_duration(duration))),
+            ("Batches", _escape(len(cycles))),
+            ("Triggers received", _escape(len(trigger_events))),
+            ("Top offender", top_html),
+            ("Denied packets", _escape(_format_number(drop_counter_summary["denied_total"]))),
+            ("PBP engaged", _escape(pbp_active)),
+            ("Stop reason", _escape(_stop_reason_label(stop_reason)) if stop_reason else "No stop marker"),
+        )
+        facts_html = "".join(
+            f"<div><dt>{label}</dt><dd>{value}</dd></div>" for label, value in facts
+        )
+        glance_html = (
+            f'<section class="glance" data-level="{severity_state}" '
+            'aria-labelledby="glance-title">'
+            '<h2 id="glance-title">At a glance</h2>'
+            f'<p class="headline"><strong>{_escape(severity_label)}.</strong> '
+            f"{_escape(severity_text)}</p>"
+            f'<dl class="key-facts">{facts_html}</dl>'
+            f"{probable_cause_html}</section>"
+        )
+
+    nav_items = [
+        ("summary-title", "Summary"),
+        ("pressure-title", "Pressure"),
+        ("attribution-title", "Offenders"),
+        ("drop-counters-title", "Drops"),
+        ("session-table-title", "Sessions"),
+        ("cpu-tracking-title", "CPU"),
+        ("timeline-title", "Timeline"),
+        ("cycles-title", "Batches"),
+        ("events-title", "Events"),
+    ]
+    if glance_html:
+        nav_items.insert(0, ("glance-title", "At a glance"))
+    nav_html = '<nav class="toc" aria-label="Sections">' + "".join(
+        f'<a href="#{anchor}">{label}</a>' for anchor, label in nav_items
+    ) + "</nav>"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -2497,7 +2838,47 @@ def _render_html(
     pre.raw {{ overflow:auto; max-height:520px; margin:0; padding:12px; border-top:1px solid var(--line); background:#0f172a; color:#d9e5f5; font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }}
     pre.raw-error {{ color:#fecaca; }}
     footer {{ width:min(1180px,calc(100% - 32px)); margin:0 auto 30px; color:var(--muted); font-size:12px; overflow-wrap:anywhere; }}
-    @media print {{ body {{ background:#fff; }} header {{ background:#fff; color:#000; padding:16px 0; }} header p,.fact span {{ color:#444; }} main,footer {{ width:100%; }} .card,.table-wrap,details.cycle {{ box-shadow:none; break-inside:avoid; }} }}
+    .fact .fact-detail {{ display:inline; color:#a7f3d0; font-weight:500; font-size:12px; letter-spacing:0; text-transform:none; }}
+    .toc {{ position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; gap:4px 6px; padding:8px max(24px,calc((100vw - 1180px)/2)); background:#ffffffee; border-bottom:1px solid var(--line); backdrop-filter:blur(4px); }}
+    .toc a {{ padding:5px 11px; border-radius:999px; color:#0f3f4f; font-size:13px; font-weight:600; text-decoration:none; }}
+    .toc a:hover,.toc a:focus {{ background:#e0f2f1; }}
+    h2 {{ scroll-margin-top:56px; }}
+    .section-intro {{ margin:-8px 0 14px; color:var(--muted); }}
+    .glance {{ padding:18px 20px; border:1px solid var(--line); border-left:6px solid #64748b; border-radius:12px; background:#fff; }}
+    .glance[data-level="ok"] {{ border-left-color:#047857; }}
+    .glance[data-level="warn"] {{ border-left-color:#d97706; }}
+    .glance[data-level="bad"] {{ border-left-color:var(--danger); }}
+    .glance .headline {{ margin:0 0 14px; font-size:16px; }}
+    .glance .headline strong {{ font-size:18px; }}
+    .glance[data-level="ok"] .headline strong {{ color:#047857; }}
+    .glance[data-level="warn"] .headline strong {{ color:#b45309; }}
+    .glance[data-level="bad"] .headline strong {{ color:var(--danger); }}
+    .key-facts {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:0 0 6px; }}
+    .key-facts div {{ padding:9px 11px; border-radius:8px; background:var(--soft); }}
+    .key-facts dd {{ font-size:17px; font-weight:700; }}
+    .probable-cause {{ margin-top:14px; padding-top:10px; border-top:1px solid var(--line); }}
+    .probable-cause h3 {{ margin:0 0 6px; }}
+    .probable-cause p {{ margin:6px 0; }}
+    .not-collected {{ color:var(--muted); font-size:15px; font-weight:600; }}
+    .metric-card[data-level="none"] {{ background:#f8fafc; border-style:dashed; }}
+    .metric-card[data-level="warn"] {{ border-color:#f59e0b; background:#fffbeb; }}
+    .metric-card[data-level="bad"] {{ border-color:#f04438; background:#fef2f2; }}
+    .metric-card[data-level="bad"] strong {{ color:var(--danger); }}
+    .metric-card[data-level="warn"] strong {{ color:#b45309; }}
+    td[data-level="warn"] {{ background:#fff7e6; color:#92400e; font-weight:700; }}
+    td[data-level="bad"] {{ background:#fee4e2; color:var(--danger); font-weight:700; }}
+    .bar-cell {{ position:relative; min-width:120px; }}
+    .bar-cell .bar {{ position:absolute; left:6px; bottom:6px; height:4px; max-width:calc(100% - 12px); border-radius:2px; background:#94a3b8; }}
+    .glance-metric {{ padding:2px 8px; border-radius:6px; background:#ecfdf5; color:#047857; font-size:12px; font-weight:700; }}
+    .glance-metric[data-level="warn"] {{ background:#fffbeb; color:#b45309; }}
+    .glance-metric[data-level="bad"] {{ background:#fee4e2; color:var(--danger); }}
+    .glance-metric.muted {{ background:var(--soft); color:var(--muted); font-weight:500; }}
+    details.cycle>summary .pill.bad {{ margin-left:0; }}
+    details.cpu-tables {{ margin-top:14px; }}
+    details.cpu-tables>summary h3 {{ margin:0; }}
+    .chart text.peak-label {{ font-weight:700; fill:#0f172a; }}
+    .chart-legend i.marker {{ width:0; height:0; border:0; border-left:6px solid transparent; border-right:6px solid transparent; border-top:9px solid #d97706; border-radius:0; }}
+    @media print {{ body {{ background:#fff; }} header {{ background:#fff; color:#000; padding:16px 0; }} header p,.fact span,.fact-detail {{ color:#444; }} main,footer {{ width:100%; }} .toc {{ display:none; }} .card,.table-wrap,details.cycle,.glance {{ box-shadow:none; break-inside:avoid; }} }}
   </style>
 </head>
 <body>
@@ -2505,9 +2886,10 @@ def _render_html(
     <h1>{_escape(title)}</h1>
     <p>Static report derived from the JSONL capture. The JSONL file remains the original evidence.</p>
     <div class="facts">
-      <div class="fact"><span>Start</span><strong>{_escape(started_at)}</strong></div>
-      <div class="fact"><span>End</span><strong>{_escape(ended_at)}</strong></div>
-      <div class="fact"><span>Stop reason</span><strong>{_escape(stop_reason)}</strong></div>
+      <div class="fact"><span>Start</span><strong>{_escape(_human_timestamp(started_at))}</strong></div>
+      <div class="fact"><span>End</span><strong>{_escape(_human_timestamp(ended_at))}</strong></div>
+      <div class="fact"><span>Duration</span><strong>{_escape(_human_duration(duration))}</strong></div>
+      <div class="fact"><span>Stop reason</span><strong>{stop_reason_html}</strong></div>
       <div class="fact"><span>Target</span><strong>{_escape(target_name)}</strong></div>
       <div class="fact"><span>Device</span><strong>{_escape(device_name)}</strong></div>
       <div class="fact"><span>Model</span><strong>{_escape(device_model)}</strong></div>
@@ -2516,37 +2898,46 @@ def _render_html(
       <div class="fact"><span>Source</span><strong>{_escape(source.name)}</strong></div>
     </div>
   </header>
+  {nav_html}
   <main>
     {warning_html}
-    {probable_cause_html}
+    {glance_html}
     <section aria-labelledby="summary-title">
       <h2 id="summary-title">Summary</h2>
+      <p class="section-intro">How much was collected, what state PBP was in, and the highest value each resource reached. Cards turn amber above the {_escape(_format_number(_PBP_ALERT_PERCENT))}% alert level and red above the {_escape(_format_number(_PBP_ACTIVATE_PERCENT))}% activate level.</p>
       {summary_groups}
     </section>
     <section aria-labelledby="pressure-title">
       <h2 id="pressure-title">Pressure over time</h2>
+      <p class="section-intro">When the pressure rose and fell, batch by batch, and when the syslog triggers arrived relative to it.</p>
       {pressure_chart_html or '<p class="muted">At least two batches are required to draw the pressure curve.</p>'}
     </section>
     <section aria-labelledby="attribution-title">
       <h2 id="attribution-title">Offender attribution</h2>
+      <p class="section-intro">Which sessions and source addresses PAN-OS itself blamed for the buffer usage, with their flows and rates.</p>
       {attribution_html}
     </section>
     <section aria-labelledby="drop-counters-title">
       <h2 id="drop-counters-title">Denied and dropped traffic</h2>
+      <p class="section-intro">What the dataplane discarded, and whether it was denied before a session existed (a flood the policy blocks) or dropped afterwards.</p>
       {drop_counters_html}
     </section>
     {offender_logs_html}
     <section aria-labelledby="session-table-title">
       <h2 id="session-table-title">Session table</h2>
+      <p class="section-intro">Whether new sessions followed the load, or packets arrived without creating any.</p>
       {session_table_html}
     </section>
     <section aria-labelledby="cpu-tracking-title">
       <h2 id="cpu-tracking-title">Dataplane CPU core tracking</h2>
+      <p class="section-intro">Whether every core rose together (aggregate load) or one core ran hot alone (a single high-rate flow pinned to it).</p>
       {cpu_charts_html}
       {cpu_tracking_html}
     </section>
     <section aria-labelledby="timeline-title">
       <h2 id="timeline-title">Timeline</h2>
+      <p class="section-intro">One row per batch with every collected percentage. Hover a time for its full timestamp.</p>
+      {timeline_note}
       <div class="table-wrap timeline-wrap"><table class="timeline">
         <thead><tr><th>Batch</th><th>Collector time</th><th>Firewall time</th><th>Elapsed (s)</th>{metric_headers}<th>Sessions</th><th>Errors</th></tr></thead>
         <tbody>{timeline_body}</tbody>
@@ -2554,11 +2945,12 @@ def _render_html(
     </section>
     <section aria-labelledby="cycles-title">
       <h2 id="cycles-title">Batch details</h2>
+      <p class="section-intro">The raw evidence for TAC: every command response of every batch, exactly as the firewall returned it.</p>
       {details_html}
     </section>
-    <section aria-label="Events and metadata">
+    <section aria-labelledby="events-title">
       <details class="section-disclosure">
-        <summary><h2>Events and metadata</h2><span class="pill">{_escape(len(events))} records</span></summary>
+        <summary><h2 id="events-title">Events and metadata</h2><span class="pill">{_escape(len(events))} records</span></summary>
         <div class="section-body">{events_html}</div>
       </details>
     </section>

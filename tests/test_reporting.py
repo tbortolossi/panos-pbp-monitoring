@@ -1026,5 +1026,145 @@ class SessionTableTests(unittest.TestCase):
         self.assertIn("No session table snapshot was recorded in this capture.", html)
 
 
+class ReadabilityTests(unittest.TestCase):
+    """The report must answer the operator's first questions without scrolling."""
+
+    def _render(self, records: list[dict]) -> str:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "incident.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            report = generate_html_report(capture, capture.with_suffix(".html"))
+            return report.read_text(encoding="utf-8")
+
+    def _capture(self, peaks: list[float], triggers: int = 0) -> list[dict]:
+        records: list[dict] = [
+            {
+                "timestamp": "2026-08-29T14:14:55.600197+00:00",
+                "run_id": "glance-run",
+                "event": "monitor_started",
+                "device": {"model": "PA-fixture"},
+            }
+        ]
+        for index, peak in enumerate(peaks, 1):
+            records.append(
+                {
+                    "timestamp": f"2026-08-29T14:{15 + index:02d}:00+00:00",
+                    "run_id": "glance-run",
+                    "cycle": index,
+                    "elapsed_seconds": 60.0 * index,
+                    "percentages": {"packet_buffer_congestion": [peak]},
+                    "commands": {},
+                }
+            )
+        for number in range(triggers):
+            records.append(
+                {
+                    "timestamp": f"2026-08-29T14:16:{30 + number:02d}+00:00",
+                    "run_id": "glance-run",
+                    "event": "trigger_received",
+                    "message": "PBP alert",
+                }
+            )
+        records.append(
+            {
+                "timestamp": "2026-08-29T14:20:00+00:00",
+                "run_id": "glance-run",
+                "event": "monitor_stopped",
+                "reason": "maximum_duration",
+            }
+        )
+        return records
+
+    def test_low_pressure_is_named_below_the_alert_level(self):
+        html = self._render(self._capture([4.2, 4.46, 4.3]))
+
+        self.assertIn('<section class="glance" data-level="ok"', html)
+        self.assertIn("<strong>Low pressure.</strong>", html)
+        self.assertIn("peaked at 4.46%, below the 50% PBP alert level", html)
+        self.assertIn("Probable cause", html)
+
+    def test_elevated_and_critical_pressure_follow_the_pbp_thresholds(self):
+        elevated = self._render(self._capture([30.0, 65.0]))
+        critical = self._render(self._capture([30.0, 91.5]))
+
+        self.assertIn('data-level="warn"', elevated)
+        self.assertIn("<strong>Elevated pressure.</strong>", elevated)
+        self.assertIn('<section class="glance" data-level="bad"', critical)
+        self.assertIn("<strong>Critical pressure.</strong>", critical)
+        self.assertIn("at or above the 80% PBP activate level", critical)
+
+    def test_header_times_duration_and_stop_reason_are_human_readable(self):
+        html = self._render(self._capture([4.0, 4.1]))
+
+        self.assertIn("2026-08-29 14:14:55 UTC", html)
+        self.assertIn("2026-08-29 14:20:00 UTC", html)
+        self.assertIn("<strong>2 min 00 s</strong>", html)
+        self.assertIn("Maximum duration reached", html)
+        self.assertIn("maximum_duration", html)
+
+    def test_sections_are_reachable_from_a_navigation_bar(self):
+        html = self._render(self._capture([4.0, 4.1]))
+
+        self.assertIn('<nav class="toc"', html)
+        for anchor in (
+            "glance-title",
+            "summary-title",
+            "pressure-title",
+            "attribution-title",
+            "drop-counters-title",
+            "cpu-tracking-title",
+            "timeline-title",
+            "cycles-title",
+            "events-title",
+        ):
+            self.assertIn(f'href="#{anchor}"', html)
+            self.assertIn(f'id="{anchor}"', html)
+
+    def test_pressure_axis_fits_the_data_and_marks_received_triggers(self):
+        quiet = self._render(self._capture([4.0, 4.5, 4.2], triggers=2))
+        loud = self._render(self._capture([30.0, 85.0]))
+
+        self.assertIn("scaled to 10% to fit the data", quiet)
+        self.assertIn("Trigger received (2)", quiet)
+        self.assertIn("peak 4.5% · batch 2", quiet)
+        self.assertNotIn("PBP alert 50%", quiet)
+        self.assertIn("scaled to 100% to fit the data", loud)
+        self.assertIn("PBP alert 50%", loud)
+        self.assertIn("PBP activate 80%", loud)
+
+    def test_metrics_never_collected_are_hidden_from_the_timeline(self):
+        html = self._render(self._capture([4.0, 4.1]))
+
+        self.assertIn("Columns never returned by the firewall are hidden", html)
+        self.assertNotIn("<th>Descriptor ATOMIC %</th>", html)
+        self.assertIn("<th>PBP congestion %</th>", html)
+        self.assertIn("Not collected", html)
+
+    def test_batch_summaries_show_their_buffer_reading_and_clock_time(self):
+        html = self._render(self._capture([4.0, 87.0]))
+
+        self.assertIn('data-level="ok">buffers 4%</span>', html)
+        self.assertIn('data-level="bad">buffers 87%</span>', html)
+        self.assertIn('title="2026-08-29T14:17:00+00:00">14:17:00</time>', html)
+
+    def test_calm_cpu_tables_are_collapsed_but_kept(self):
+        records = self._capture([4.0, 4.1])
+        for record in records:
+            if "cycle" in record:
+                record["resource_monitor_cpu_cores"] = [
+                    {"dataplane": "dp0", "core_id": 1, "utilization": 3},
+                    {"dataplane": "dp0", "core_id": 2, "utilization": 2},
+                ]
+        html = self._render(records)
+
+        self.assertIn('<details class="section-disclosure cpu-tables">', html)
+        self.assertIn("no hot core", html)
+        self.assertIn("Per-core summary", html)
+        self.assertIn("CPU imbalance timeline", html)
+
+
 if __name__ == "__main__":
     unittest.main()

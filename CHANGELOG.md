@@ -3,6 +3,33 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.16.0] - 2026-08-29
+
+### Changed
+
+- The HTML report is readable at a glance. It opens with an **At a glance**
+  block: a severity named from the peak packet-buffer pressure against the
+  PAN-OS PBP defaults (low below the 50% alert level, elevated between alert
+  and the 80% activate level, critical at or above it), the key figures
+  (peak, duration, batches, triggers, top offender, denied packets, PBP
+  state, stop reason), and the existing probable-cause sentences.
+- The header shows formatted start and end times, the duration, and the stop
+  reason in words with its slug underneath. A sticky navigation bar links
+  every section, and each section starts with the question it answers.
+- Peak cards and timeline cells turn amber above the alert level and red
+  above the activate level. A metric the firewall never returned reads
+  "Not collected" instead of a dash and is hidden from the timeline columns.
+- The pressure chart's vertical axis fits the data (10, 25, 50, or 100%) so
+  a lightly loaded firewall is no longer a flat line; the PBP alert and
+  activate levels are drawn when they fit, the peak is labelled, and one
+  triangle marks each syslog trigger received during the capture.
+- Time columns show the clock time with the full timestamp on hover, batch
+  summaries show their buffer reading and session count without being
+  opened, the drop-counter table carries an inline share bar, and the
+  per-core CPU tables fold away when no core came close to saturation.
+- Nothing changes in the JSONL, the collected commands, or the CSP: the report
+  remains a single static file with no script and no external asset.
+
 ## [0.15.0] - 2026-08-29
 
 ### Added
