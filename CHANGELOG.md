@@ -7,6 +7,10 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Reception-journal compaction now trims by size as well as by record count.
+  When the newest 200 stored messages alone exceeded the 4 MB cap, every
+  subsequent datagram re-read, rewrote, and fsynced the whole journal on the
+  event loop, degrading UDP reception exactly under load.
 - Two monitoring runs starting within the same wall-clock second no longer
   merge into one capture: the run identifier gains a monotonic suffix when its
   evidence directory already exists, so every incident keeps its own
