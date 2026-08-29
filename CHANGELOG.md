@@ -13,6 +13,12 @@ follows [Semantic Versioning](https://semver.org/).
 - Failed sign-in and setup attempts are throttled per source address (five
   failures per fifteen minutes), and concurrent password verifications are
   capped so a login flood cannot exhaust the CPU with key derivations.
+- Monitoring-run starts are capped at 12 per firewall per rolling hour. UDP
+  Syslog is unauthenticated and the device serial is public in every PAN-OS
+  log, so a forged trigger stream could cycle collection runs indefinitely;
+  excess triggers are journalled as `trigger_rate_limited` and reinforcements
+  of an active run are never limited. The Syslog trust model is now documented
+  in the README and SECURITY policy.
 - The firewall form now warns that password-based key generation over an
   unverified TLS connection (the compatibility default) exposes the PAN-OS
   admin password to interception, and recommends the pre-generated-key method

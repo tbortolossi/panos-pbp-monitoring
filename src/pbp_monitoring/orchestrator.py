@@ -96,6 +96,12 @@ SYSLOG_REJECTIONS = {
 }
 SYSLOG_STATUS_RECORD_LIMIT = 200
 SYSLOG_STATUS_MAX_BYTES = 4 * 1024 * 1024
+# UDP Syslog is unauthenticated: the source and serial gates attribute a
+# message, they do not prove it. Cap how many monitoring runs a stream of
+# triggers can start per firewall so a forged flood cannot cycle collection
+# runs and grow the evidence volume without limit.
+RUN_START_LIMIT = 12
+RUN_START_WINDOW_SECONDS = 3600
 
 
 def utc_now() -> str:
@@ -2649,6 +2655,16 @@ class MonitorController:
         self.trigger_session_ids: set[int] = set()
         self.trigger_source_ips: set[str] = set()
         self.report_tasks: set[asyncio.Task[None]] = set()
+        self.run_starts: deque[float] = deque()
+
+    def _may_start_run(self) -> bool:
+        now = time.monotonic()
+        while self.run_starts and now - self.run_starts[0] > RUN_START_WINDOW_SECONDS:
+            self.run_starts.popleft()
+        if len(self.run_starts) >= RUN_START_LIMIT:
+            return False
+        self.run_starts.append(now)
+        return True
 
     def trigger(
         self,
@@ -2661,6 +2677,27 @@ class MonitorController:
         self.last_trigger_monotonic = time.monotonic()
         self.trigger_sequence += 1
         starts_monitor = self.monitor_task is None or self.monitor_task.done()
+        if starts_monitor and not self._may_start_run():
+            LOG.warning(
+                "Run-start rate limit reached for %s; trigger from %s journalled only",
+                self.cfg.target_name or self.cfg.panos_url,
+                peer,
+            )
+            try:
+                append_jsonl(
+                    self.cfg.output_dir / "syslog-triggers.jsonl",
+                    {
+                        "timestamp": utc_now(),
+                        "event": "trigger_rate_limited",
+                        "peer": peer,
+                        "transport_source_ip": transport_source_ip,
+                        "target_name": self.cfg.target_name,
+                        "metadata": extract_trigger_metadata(message),
+                    },
+                )
+            except Exception:
+                LOG.exception("Unable to journal a rate-limited trigger")
+            return
         if starts_monitor:
             self.run_id = unique_run_id(self.cfg.output_dir)
             self.trigger_session_ids.clear()
