@@ -31,6 +31,7 @@ from pbp_monitoring.orchestrator import (
     resource_monitor_command,
     resource_monitor_window_seconds,
     incident_capture_path,
+    panos_csv_serial,
     select_session_lookups,
 )
 
@@ -152,6 +153,124 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual([record["trigger"] for record in records], [False, True])
             self.assertEqual(records[1]["metadata"]["threat_id"], 8507)
             controller.trigger.assert_called_once()
+
+    def test_panos_positional_serial_is_extracted_from_a_syslog_line(self):
+        message = (
+            "PBP_SYSLOG_SOURCE=198.51.100.1 <11>Aug 29 15:53:29 lab-fw-01 "
+            "1,2026/08/29 15:53:24,012345678901,THREAT,flood,3074,"
+            "2026/08/29 15:53:29,,PBP Packet Drop(8507),,,,,"
+        )
+        metadata = extract_trigger_metadata(message)
+        self.assertEqual(metadata["device_serial"], "012345678901")
+        self.assertEqual(metadata["syslog_source_ip"], "198.51.100.1")
+
+    def test_a_line_that_is_not_a_panos_log_yields_no_serial(self):
+        self.assertIsNone(panos_csv_serial("a,b,c,d,e"))
+        self.assertIsNone(panos_csv_serial("ordinary system log"))
+
+    def _serial_router(self, output_dir, serials=("012345678901",)):
+        profiles = (
+            TargetProfile(
+                "PA-lab",
+                "https://fw.invalid",
+                "key",
+                serials=tuple(serials),
+                syslog_sources=("198.51.100.1",),
+            ),
+        )
+        cfg = make_config(output_dir, target_profiles=profiles)
+        router = MultiTargetRouter(cfg)
+        router.controllers["PA-lab"].trigger = Mock()
+        router._probe_target = AsyncMock()
+        return cfg, router
+
+    @staticmethod
+    def _panos_trigger(serial: str) -> bytes:
+        return (
+            "PBP_SYSLOG_SOURCE=198.51.100.1 <11>Aug 29 15:53:29 lab-fw-01 "
+            f"1,2026/08/29 15:53:24,{serial},THREAT,flood,3074,"
+            "2026/08/29 15:53:29,,PBP Packet Drop(8507),,,,,"
+        ).encode()
+
+    def test_registered_serial_from_the_declared_source_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            cfg, router = self._serial_router(output_dir)
+            protocol = SyslogProtocol(cfg, router)
+
+            protocol.datagram_received(
+                self._panos_trigger("012345678901"), ("192.0.2.3", 514)
+            )
+
+            router.controllers["PA-lab"].trigger.assert_called_once()
+            record = json.loads(
+                (output_dir / "syslog-received.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertNotIn("suppressed", record)
+            self.assertEqual(record["target_names"], ["PA-lab"])
+            self.assertEqual(record["metadata"]["device_serial"], "012345678901")
+
+    def test_foreign_serial_from_the_declared_source_starts_no_monitor(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            cfg, router = self._serial_router(output_dir)
+            protocol = SyslogProtocol(cfg, router)
+
+            protocol.datagram_received(
+                self._panos_trigger("099999999999"), ("192.0.2.3", 514)
+            )
+
+            router.controllers["PA-lab"].trigger.assert_not_called()
+            record = json.loads(
+                (output_dir / "syslog-received.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertEqual(record["suppressed"], "device_serial_not_registered")
+            self.assertNotIn("message", record)
+            self.assertFalse(
+                (output_dir / "targets" / "PA-lab" / "syslog-triggers.jsonl").exists()
+            )
+
+    def test_trigger_without_a_serial_is_refused_when_one_is_registered(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            cfg, router = self._serial_router(output_dir)
+            protocol = SyslogProtocol(cfg, router)
+
+            protocol.datagram_received(
+                b"PBP_SYSLOG_SOURCE=198.51.100.1 PBP Packet Drop(8507)",
+                ("192.0.2.3", 514),
+            )
+
+            router.controllers["PA-lab"].trigger.assert_not_called()
+            record = json.loads(
+                (output_dir / "syslog-received.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertEqual(record["suppressed"], "device_serial_missing")
+
+    def test_target_without_a_registered_serial_keeps_the_source_only_rule(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            cfg, router = self._serial_router(output_dir, serials=())
+            protocol = SyslogProtocol(cfg, router)
+
+            protocol.datagram_received(
+                b"PBP_SYSLOG_SOURCE=198.51.100.1 PBP Packet Drop(8507)",
+                ("192.0.2.3", 514),
+            )
+
+            router.controllers["PA-lab"].trigger.assert_called_once()
+            record = json.loads(
+                (output_dir / "syslog-received.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertNotIn("suppressed", record)
 
     def test_unregistered_sender_is_journalled_without_its_message(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -71,6 +71,28 @@ CLOCK_COMMAND = "<show><clock/></show>"
 
 DEVICE_IDENTITY_FIELDS = ("serial", "model", "software_version")
 SYSLOG_SOURCE_MARKER = "PBP_SYSLOG_SOURCE"
+# PAN-OS does not label the serial in a Syslog line, it positions it:
+# FUTURE_USE, receive time, serial, type, subtype. The log type is the anchor
+# that separates a real PAN-OS log from an arbitrary comma-separated string.
+PANOS_LOG_TYPE_FIELD = 3
+PANOS_SERIAL_FIELD = 2
+PANOS_LOG_TYPES = frozenset(
+    {
+        "TRAFFIC", "THREAT", "SYSTEM", "CONFIG", "HIP-MATCH", "CORRELATION",
+        "GLOBALPROTECT", "USERID", "IPTAG", "IP-TAG", "DECRYPTION", "SCTP",
+        "AUTHENTICATION", "GTP", "TUNNEL", "URL", "DATA", "WILDFIRE",
+    }
+)
+SERIAL_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# Why a Syslog emitter was refused. These slugs are persisted in the reception
+# journal, so keep them stable.
+SYSLOG_REJECTIONS = {
+    "source_not_registered": "source is not a declared Syslog source",
+    "device_serial_missing": "the message carries no device serial",
+    "device_serial_not_registered": (
+        "the device serial is not the one registered for this Syslog source"
+    ),
+}
 SYSLOG_STATUS_RECORD_LIMIT = 200
 SYSLOG_STATUS_MAX_BYTES = 4 * 1024 * 1024
 
@@ -2440,6 +2462,17 @@ def command_succeeded(record: Any) -> bool:
     return isinstance(record, dict) and record.get("ok") is True
 
 
+def panos_csv_serial(message: str) -> str | None:
+    """Return the serial PAN-OS positions in the third field of a Syslog line."""
+    fields = message.split(",")
+    if len(fields) <= PANOS_LOG_TYPE_FIELD:
+        return None
+    if fields[PANOS_LOG_TYPE_FIELD].strip().upper() not in PANOS_LOG_TYPES:
+        return None
+    serial = fields[PANOS_SERIAL_FIELD].strip()
+    return serial if SERIAL_PATTERN.fullmatch(serial) else None
+
+
 def extract_trigger_metadata(message: str) -> dict[str, Any]:
     """Extract only explicitly labelled forensic fields from a Syslog trigger."""
     metadata: dict[str, Any] = {}
@@ -2467,13 +2500,19 @@ def extract_trigger_metadata(message: str) -> dict[str, Any]:
     )
     if session_match:
         metadata["session_id"] = int(session_match.group(1))
-    serial_match = re.search(
-        r"(?i)\b(?:device[-_ ]?)?serial(?:[-_ ]?(?:number|no))?\s*[=:]\s*"
-        r"([A-Za-z0-9_-]+)",
-        message,
-    )
-    if serial_match:
-        metadata["device_serial"] = serial_match.group(1)
+    csv_serial = panos_csv_serial(message)
+    if csv_serial:
+        # The positional field is structural, so it is preferred over a labelled
+        # occurrence, which can appear anywhere inside a log payload.
+        metadata["device_serial"] = csv_serial
+    else:
+        serial_match = re.search(
+            r"(?i)\b(?:device[-_ ]?)?serial(?:[-_ ]?(?:number|no))?\s*[=:]\s*"
+            r"([A-Za-z0-9_-]+)",
+            message,
+        )
+        if serial_match:
+            metadata["device_serial"] = serial_match.group(1)
     syslog_source_match = re.search(
         rf"(?i)\b{SYSLOG_SOURCE_MARKER}=([0-9A-Fa-f:.]+)",
         message,
@@ -3045,17 +3084,41 @@ class MultiTargetRouter:
             return [serial_target]
         return list(candidates) if len(candidates) == 1 else []
 
-    def is_registered_source(
-        self, message: str, transport_source_ip: str | None
-    ) -> bool:
-        """Report whether the emitter is a declared Syslog source of a target.
+    def _rejection_reason(self, source: Any, serial: Any) -> str | None:
+        """Return why an emitter must be refused, or None when it is expected.
 
-        An allowlisted source that cannot yet be attributed to a single
-        firewall is still registered: its message stays evidence.
+        The Syslog source address is the first gate. The device serial captured
+        from the firewall when it was saved is the second: PAN-OS states it in
+        every log, so a message that does not carry that serial is not evidence
+        from that firewall, whatever address it appears to come from.
+
+        A target saved without a serial on record cannot be checked that way and
+        keeps the source-only rule, which is what it had before.
         """
+        if not isinstance(source, str) or source not in self.by_source:
+            return "source_not_registered"
+        registered = {
+            value.lower()
+            for name in self.by_source[source]
+            for value in self.profile_by_name[name].serials
+        }
+        if not registered:
+            return None
+        if not isinstance(serial, str) or not serial:
+            return "device_serial_missing"
+        if serial.lower() not in registered:
+            return "device_serial_not_registered"
+        return None
+
+    def rejection_reason(
+        self, message: str, transport_source_ip: str | None
+    ) -> str | None:
+        """Return why this message must not be attributed, or None to accept."""
         metadata = extract_trigger_metadata(message)
-        source = metadata.get("syslog_source_ip") or transport_source_ip
-        return isinstance(source, str) and source in self.by_source
+        return self._rejection_reason(
+            metadata.get("syslog_source_ip") or transport_source_ip,
+            metadata.get("device_serial"),
+        )
 
     def _dispatch(
         self,
@@ -3093,24 +3156,22 @@ class MultiTargetRouter:
         metadata = extract_trigger_metadata(message)
         serial = metadata.get("device_serial")
         source = metadata.get("syslog_source_ip") or transport_source_ip
-        candidate_names = (
-            self.by_source.get(source, []) if isinstance(source, str) else []
-        )
-        if not candidate_names:
-            self._reject(source if isinstance(source, str) else None, peer, "source not allowlisted")
+        reason = self._rejection_reason(source, serial)
+        if reason is not None:
+            self._reject(
+                source if isinstance(source, str) else None,
+                peer,
+                SYSLOG_REJECTIONS[reason],
+            )
             return
+        candidate_names = self.by_source[source]
+        # The gate above already proved a present serial belongs to one of the
+        # candidates, so this lookup can only select an allowlisted target.
         serial_target = (
             self.by_serial.get(str(serial).lower())
             if isinstance(serial, str)
             else None
         )
-        if serial_target is not None and serial_target not in candidate_names:
-            self._reject(
-                source if isinstance(source, str) else None,
-                peer,
-                "device serial does not match the allowlisted source",
-            )
-            return
         if serial_target is not None:
             target_name = serial_target
             route_method = "device_serial_and_syslog_source"
@@ -3345,14 +3406,14 @@ class ManagedRouter:
             else []
         )
 
-    def is_registered_source(
+    def rejection_reason(
         self, message: str, transport_source_ip: str | None
-    ) -> bool:
+    ) -> str | None:
         self._reload_if_needed()
         return (
-            self.router.is_registered_source(message, transport_source_ip)
+            self.router.rejection_reason(message, transport_source_ip)
             if self.router is not None
-            else False
+            else "source_not_registered"
         )
 
     def trigger(
@@ -3402,20 +3463,20 @@ class SyslogProtocol(asyncio.DatagramProtocol):
             "trigger": is_trigger,
             "target_names": target_names,
         }
-        checker = getattr(type(self.controller), "is_registered_source", None)
-        registered = (
-            checker(self.controller, message, addr[0]) if callable(checker) else True
+        checker = getattr(type(self.controller), "rejection_reason", None)
+        reason = (
+            checker(self.controller, message, addr[0]) if callable(checker) else None
         )
-        if registered:
+        if reason is None:
             record["metadata"] = metadata
             record["message"] = message
             return record
-        # A host nobody declared must stay visible enough to be registered, but
-        # its text is never persisted. Only the source address the gateway
+        # A sender nobody declared must stay visible enough to be registered,
+        # but its text is never persisted. Only the source address the gateway
         # observed survives, and it is already validated as an IP address.
         source = metadata.get("syslog_source_ip")
         record["metadata"] = {"syslog_source_ip": source} if source else {}
-        record["suppressed"] = "source_not_registered"
+        record["suppressed"] = reason
         return record
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
