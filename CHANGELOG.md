@@ -3,6 +3,16 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.15.0] - Unreleased
+
+### Fixed
+
+- The firewall check loop reloads the configuration before resolving
+  connection profiles. A firewall saved after daemon startup is now checked
+  without waiting for an unrelated Syslog datagram, and an edited firewall is
+  checked at its new address with its new credentials instead of the stale
+  in-memory profile.
+
 ## [0.14.1] - 2026-08-29
 
 ### Fixed
