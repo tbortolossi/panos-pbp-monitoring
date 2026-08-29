@@ -43,8 +43,10 @@ follows [Semantic Versioning](https://semver.org/).
   candidate session list stayed empty, no `show session id` enrichment ran, and
   the report showed an empty attribution table with `—` in the Timeline
   `Sessions` column even though the firewall had reported entries in
-  `Drop State: Yes`. Existing captures recover their offenders when their report
-  is regenerated. Refs #76.
+  `Drop State: Yes`. Only captures collected after this fix carry offenders: the
+  report renders the ranking persisted in the JSONL and does not re-parse the raw
+  command output, so regenerating the report of an older capture changes nothing.
+  Refs #76.
 
 ### Changed
 
