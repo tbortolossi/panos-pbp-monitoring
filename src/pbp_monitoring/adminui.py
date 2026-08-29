@@ -546,7 +546,10 @@ with <code>show system info</code>: it validates the credentials and reads the d
 {stored_panel}<div class="panel" id="panel-credentials"><div class="grid">
 <div><label>API username</label><input name="username" autocomplete="off"></div>
 <div><label>API password (never stored)</label><input type="password" name="password" autocomplete="new-password"></div>
-</div><p class="muted">The credentials generate an API key by HTTPS POST; only the key is stored.</p></div>
+</div><p class="muted">The credentials generate an API key by HTTPS POST; only the key is stored.</p>
+<p class="notice error">With <strong>TLS verify: No</strong>, this password travels over an unverified
+connection and can be intercepted on the management path. Prefer the API key method with a key
+generated on the firewall CLI, or enable TLS verification first.</p></div>
 <div class="panel" id="panel-key"><div class="grid">
 <div><label>API key</label><input type="password" name="api_key" autocomplete="off"></div>
 </div></div></fieldset>
