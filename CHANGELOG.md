@@ -7,6 +7,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The HTML report opens with a **Probable cause** block composing the
+  verdicts that were previously scattered (peak buffer usage, strongest
+  offender with its flow, denied-traffic correlation, session-table
+  behavior) into a few sentences an engineer can paste into a TAC case.
+- A **Top sources** rollup above the attribution table groups ranked
+  sessions by their source address, so a scan or flood spread over many
+  short sessions is attributed to the source that owns them (session count,
+  RED state, max PBP contribution, aggregate peak rate, applications,
+  zones, distinct destinations).
+- A **Pressure over time** chart plots packet-buffer, descriptor, and
+  session-table utilization per batch, so the operator can align an
+  offender's first appearance with the pressure curve.
 - Unenriched offender sources now get flow detail from the firewall's own
   traffic log. When a ranked source IP had no session to inspect (flood
   denied before session setup, RED-blocked source), the collector runs one

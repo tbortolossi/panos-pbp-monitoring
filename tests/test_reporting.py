@@ -203,6 +203,88 @@ class ReportingTests(unittest.TestCase):
             if os.name == "posix":
                 self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o600)
 
+    def test_top_sources_pressure_curve_and_probable_cause_are_rendered(self):
+        def cycle(number: int) -> dict:
+            return {
+                "timestamp": f"2026-08-29T10:0{number}:00+00:00",
+                "run_id": "fixture-run",
+                "cycle": number,
+                "elapsed_seconds": float(number),
+                "percentages": {
+                    "packet_buffer_congestion": [60 + number],
+                    "resource_monitor_session": [30],
+                },
+                "candidate_entities": [
+                    {
+                        "entity_type": "session",
+                        "session_id": 101,
+                        "drop_state": True,
+                        "pbp_percentage_total": 41.0,
+                        "rank": 1,
+                        "evidence_sources": ["packet_buffer_protection"],
+                        "zones": ["outside"],
+                    },
+                    {
+                        "entity_type": "session",
+                        "session_id": 102,
+                        "pbp_percentage_total": 12.0,
+                        "rank": 2,
+                        "evidence_sources": ["packet_buffer_protection"],
+                        "zones": ["outside"],
+                    },
+                ],
+                "session_summaries": {
+                    "101": {
+                        "status": "parsed",
+                        "application": "quic",
+                        "rule": "allow-out",
+                        "c2s": {
+                            "source_ip": "203.0.113.7",
+                            "destination_ip": "198.51.100.20",
+                            "source_port": 1111,
+                            "destination_port": 443,
+                            "protocol": 17,
+                        },
+                    },
+                    "102": {
+                        "status": "parsed",
+                        "application": "quic",
+                        "rule": "allow-out",
+                        "c2s": {
+                            "source_ip": "203.0.113.7",
+                            "destination_ip": "198.51.100.21",
+                            "source_port": 2222,
+                            "destination_port": 443,
+                            "protocol": 17,
+                        },
+                    },
+                },
+                "session_rates": {
+                    "101": {"status": "derived", "bits_per_second_total": 8_000_000},
+                    "102": {"status": "derived", "bits_per_second_total": 4_000_000},
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "incident.jsonl"
+            self._write_records(capture, [cycle(1), cycle(2)])
+
+            rendered = generate_html_report(capture).read_text(encoding="utf-8")
+
+            self.assertIn("Top sources", rendered)
+            self.assertIn("<code>203.0.113.7</code></td><td>2</td>", rendered)
+            self.assertIn("Probable cause", rendered)
+            self.assertIn(
+                "The strongest evidence points to session <code>101</code>",
+                rendered,
+            )
+            self.assertIn("Pressure over time", rendered)
+            self.assertIn("Packet buffer</span>", rendered)
+            self.assertIn(
+                "Buffer, descriptor, and session-table utilization per batch",
+                rendered,
+            )
+
     def test_offender_traffic_logs_render_their_recovered_flows(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             capture = Path(temporary_directory) / "incident.jsonl"

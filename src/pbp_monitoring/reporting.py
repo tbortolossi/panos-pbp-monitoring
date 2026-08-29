@@ -1329,6 +1329,329 @@ def _unenriched_source_ips(attribution: list[dict[str, Any]]) -> list[str]:
     return identifiers
 
 
+def _drop_counter_verdict(
+    summary: dict[str, Any],
+    attribution: list[dict[str, Any]],
+) -> tuple[str, str]:
+    """Classify the denied-traffic evidence and word its verdict."""
+    policy_total = summary["family_totals"].get("policy", 0.0)
+    dos_total = summary["family_totals"].get("dos", 0.0)
+    source_ips = _unenriched_source_ips(attribution)
+    if summary["denied_total"] > 0 and source_ips:
+        return (
+            "isolated",
+            f"{_format_number(summary['denied_total'])} packets were dropped before "
+            f"session setup (policy deny {_format_number(policy_total)}, DoS or zone "
+            f"protection {_format_number(dos_total)}) while "
+            f"{len(source_ips)} source IP(s) were ranked without an enriched session. "
+            "That combination is consistent with a UDP or GRE flood denied by a "
+            "Security policy rule: denied traffic never creates a session, so PAN-OS "
+            "can attribute the buffer pressure to a source IP only and no "
+            "<code>show session id</code> can enrich it.",
+        )
+    if summary["denied_total"] > 0:
+        return (
+            "mixed",
+            f"{_format_number(summary['denied_total'])} packets were dropped before "
+            f"session setup (policy deny {_format_number(policy_total)}, DoS or zone "
+            f"protection {_format_number(dos_total)}), and sessions were also ranked. "
+            "Both denied and permitted traffic contributed to the observed pressure.",
+        )
+    return (
+        "collective",
+        "No packet was denied by a Security policy rule, by DoS protection, or by "
+        "zone protection during the counted batches. The drops below happened "
+        "after session setup or outside policy evaluation, so the offender "
+        "attribution table stays the primary evidence.",
+    )
+
+
+def _aggregate_top_sources(attribution: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Roll ranked entities up by source IP.
+
+    A scan or a flood produces many short sessions that are each ranked
+    separately; this view states which source owns them. Session entities are
+    grouped by their enriched c2s source address, source-IP entities by their
+    identifier.
+    """
+    groups: dict[str, dict[str, Any]] = {}
+
+    def ensure(source: str) -> dict[str, Any]:
+        return groups.setdefault(
+            source,
+            {
+                "source_ip": source,
+                "sessions": 0,
+                "unenriched": False,
+                "drop_state": False,
+                "pbp_percentage": None,
+                "peak_bits_per_second_total": 0.0,
+                "applications": set(),
+                "zones": set(),
+                "destinations": set(),
+                "first_seen": None,
+                "last_seen": None,
+            },
+        )
+
+    for item in attribution:
+        if item.get("entity_type") == "session":
+            summary = item.get("session_summary")
+            flow = summary.get("c2s") if isinstance(summary, dict) else None
+            source = flow.get("source_ip") if isinstance(flow, dict) else None
+            if not source:
+                continue
+            group = ensure(str(source))
+            group["sessions"] += 1
+            application = summary.get("application")
+            if application:
+                group["applications"].add(str(application))
+            destination = flow.get("destination_ip")
+            if destination:
+                group["destinations"].add(str(destination))
+        else:
+            identifier = item.get("identifier")
+            if not identifier:
+                continue
+            group = ensure(str(identifier))
+            group["unenriched"] = True
+        group["drop_state"] = group["drop_state"] or bool(item.get("drop_state"))
+        pbp = item.get("pbp_percentage")
+        if isinstance(pbp, (int, float)):
+            current = group["pbp_percentage"]
+            group["pbp_percentage"] = (
+                float(pbp) if current is None else max(float(current), float(pbp))
+            )
+        peak = item.get("peak_bits_per_second_total")
+        if isinstance(peak, (int, float)):
+            group["peak_bits_per_second_total"] += float(peak)
+        zones = item.get("zones")
+        if isinstance(zones, (list, tuple, set)):
+            group["zones"].update(str(zone) for zone in zones if zone)
+        for boundary, pick in (("first_seen", min), ("last_seen", max)):
+            value = item.get(boundary)
+            if value in (None, ""):
+                continue
+            current = group[boundary]
+            group[boundary] = (
+                str(value) if current is None else pick(str(current), str(value))
+            )
+
+    rollup = sorted(
+        groups.values(),
+        key=lambda group: (
+            0 if group["drop_state"] else 1,
+            -(group["pbp_percentage"] or 0.0),
+            -group["sessions"],
+        ),
+    )
+    # The rollup only earns its place when it actually aggregates: several
+    # sources, or one source owning several sessions.
+    if len(rollup) <= 1 and all(group["sessions"] <= 1 for group in rollup):
+        return []
+    return rollup
+
+
+def _render_top_sources(rollup: list[dict[str, Any]]) -> str:
+    if not rollup:
+        return ""
+    rows = []
+    for group in rollup:
+        rate = group["peak_bits_per_second_total"]
+        rate_text = (
+            _format_number(rate / 1_000_000.0) if rate else "—"
+        )
+        flows = group["sessions"]
+        if group["unenriched"]:
+            flows_text = f"{flows} + denied traffic" if flows else "denied traffic only"
+        else:
+            flows_text = str(flows)
+        rows.append(
+            "<tr>"
+            f'<td><code>{_escape(group["source_ip"])}</code></td>'
+            f'<td>{_escape(flows_text)}</td>'
+            f'<td>{_escape("Yes" if group["drop_state"] else "No")}</td>'
+            f'<td class="number">{_escape(_format_number(group["pbp_percentage"]))}</td>'
+            f'<td class="number">{_escape(rate_text)}</td>'
+            f'<td class="wrap">{_escape(", ".join(sorted(group["applications"])) or "—")}</td>'
+            f'<td class="wrap">{_escape(", ".join(sorted(group["zones"])) or "—")}</td>'
+            f'<td class="number">{_escape(len(group["destinations"]) or "—")}</td>'
+            f'<td>{_escape(group["first_seen"] or "—")}<br>{_escape(group["last_seen"] or "—")}</td>'
+            "</tr>"
+        )
+    return (
+        "<h3>Top sources</h3>"
+        '<p class="muted">Ranked entities rolled up by source address: a scan or a '
+        "flood spreads over many short sessions, and this view states which source "
+        "owns them.</p>"
+        '<div class="table-wrap"><table><thead><tr>'
+        "<th>Source</th><th>Sessions</th><th>RED drop</th><th>Max PBP %</th>"
+        "<th>Aggregate peak Mbit/s</th><th>Applications</th><th>Zones</th>"
+        "<th>Distinct destinations</th><th>First / last seen</th>"
+        f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+_PRESSURE_SERIES = (
+    (
+        "Packet buffer",
+        ("packet_buffer_congestion", "resource_monitor_packet_buffer"),
+        "#155e75",
+    ),
+    (
+        "Packet descriptor",
+        (
+            "descriptor_atomic",
+            "descriptor_total",
+            "resource_monitor_packet_descriptor",
+            "resource_monitor_packet_descriptor_on_chip",
+        ),
+        "#b42318",
+    ),
+    ("Session table", ("resource_monitor_session",), "#0f766e"),
+)
+
+
+def _render_pressure_chart(cycles: list[tuple[int, dict[str, Any]]]) -> str:
+    """Chart the primary incident metrics per batch.
+
+    The peak cards say how bad it got; this curve says when, so the operator
+    can align an offender's first appearance with the pressure itself.
+    """
+    if len(cycles) < 2:
+        return ""
+    series_points: dict[str, list[tuple[int, float]]] = {}
+    for index, (_, record) in enumerate(cycles):
+        for label, keys, _ in _PRESSURE_SERIES:
+            values = [
+                value
+                for key in keys
+                if (value := _metric_max(record, key)) is not None
+            ]
+            if values:
+                series_points.setdefault(label, []).append((index, max(values)))
+    if not series_points:
+        return ""
+    left, right, top, bottom = 46, 18, 16, 34
+    height = 250
+    count = len(cycles)
+    plot_width = _CHART_WIDTH - left - right
+    step = plot_width / (count - 1)
+
+    def x_at(index: int) -> float:
+        return left + index * step
+
+    def y_at(value: float) -> float:
+        bounded = max(0.0, min(100.0, value))
+        return top + (100.0 - bounded) * (height - top - bottom) / 100.0
+
+    parts: list[str] = []
+    for gridline in (0, 25, 50, 75, 100):
+        y = y_at(gridline)
+        parts.append(
+            f'<line x1="{left}" y1="{y:.1f}" x2="{_CHART_WIDTH - right}" y2="{y:.1f}" '
+            'stroke="#e2e8f0" stroke-width="1"/>'
+            f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end" class="axis">{gridline}%</text>'
+        )
+    tick_stride = max(1, math.ceil(count / 12))
+    for index in range(count):
+        if index % tick_stride and index != count - 1:
+            continue
+        parts.append(
+            f'<text x="{x_at(index):.1f}" y="{height - 12}" text-anchor="middle" '
+            f'class="axis">{index + 1}</text>'
+        )
+    legend: list[str] = []
+    for label, _, colour in _PRESSURE_SERIES:
+        points = series_points.get(label)
+        if not points:
+            continue
+        joined = " ".join(f"{x_at(i):.1f},{y_at(v):.1f}" for i, v in points)
+        if len(points) == 1:
+            index, value = points[0]
+            parts.append(
+                f'<circle cx="{x_at(index):.1f}" cy="{y_at(value):.1f}" r="3" fill="{colour}"/>'
+            )
+        else:
+            parts.append(
+                f'<polyline points="{joined}" fill="none" stroke="{colour}" stroke-width="2"/>'
+            )
+        legend.append(
+            f'<span class="key"><i style="background:{colour}"></i>{_escape(label)}</span>'
+        )
+    title = "Buffer, descriptor, and session-table utilization per batch"
+    return (
+        f'<svg class="chart pressure-chart" viewBox="0 0 {_CHART_WIDTH} {height}" width="{_CHART_WIDTH}" '
+        f'height="{height}" role="img" aria-label="{_escape(title)}">'
+        f"<title>{_escape(title)}</title>{''.join(parts)}</svg>"
+        f'<p class="chart-legend">{"".join(legend)}</p>'
+        '<p class="muted chart-caption">Horizontal axis: batch number. Vertical axis: '
+        "window peak utilization.</p>"
+    )
+
+
+def _render_probable_cause(
+    attribution: list[dict[str, Any]],
+    drop_counter_summary: dict[str, Any],
+    session_series: list[dict[str, Any]],
+    cycles: list[tuple[int, dict[str, Any]]],
+) -> str:
+    """Compose the scattered verdicts into a few sentences an engineer can paste."""
+    if not cycles:
+        return ""
+    sentences: list[str] = []
+    buffer_values = [
+        value
+        for _, record in cycles
+        for key in ("packet_buffer_congestion", "resource_monitor_packet_buffer")
+        if (value := _metric_max(record, key)) is not None
+    ]
+    if buffer_values:
+        sentences.append(
+            f"Packet buffer usage peaked at {_format_number(max(buffer_values))}% "
+            f"over {len(cycles)} collected batches."
+        )
+    top = attribution[0] if attribution else None
+    if top is not None:
+        tuple_text, context = _flow_description(top)
+        entity_label = (
+            f"session <code>{_escape(top.get('identifier'))}</code>"
+            if top.get("entity_type") == "session"
+            else f"source IP <code>{_escape(top.get('identifier'))}</code>"
+        )
+        detail = ""
+        if tuple_text != "—":
+            detail = f" ({_escape(tuple_text)}"
+            if context != "—":
+                detail += f", {_escape(context)}"
+            detail += ")"
+        drop_text = (
+            ", which reached the RED drop state" if top.get("drop_state") else ""
+        )
+        peak_rate = top.get("peak_bits_per_second_total")
+        rate_text = (
+            f" and peaked at {_format_number(float(peak_rate) / 1_000_000.0)} Mbit/s"
+            if isinstance(peak_rate, (int, float))
+            else ""
+        )
+        sentences.append(
+            f"The strongest evidence points to {entity_label}{detail}"
+            f"{drop_text}{rate_text}."
+        )
+    if drop_counter_summary.get("items"):
+        sentences.append(_drop_counter_verdict(drop_counter_summary, attribution)[1])
+    if session_series:
+        sentences.append(_session_verdict(session_series)[1])
+    if not sentences:
+        return ""
+    return (
+        '<section aria-labelledby="probable-cause-title" class="probable-cause">'
+        '<h2 id="probable-cause-title">Probable cause</h2>'
+        + "".join(f"<p>{sentence}</p>" for sentence in sentences)
+        + "</section>"
+    )
+
+
 def _render_offender_traffic_logs(events: list[tuple[int, dict[str, Any]]]) -> str:
     """Render the traffic-log flows recovered for unenriched offender sources."""
     record = next(
@@ -1409,37 +1732,7 @@ def _render_drop_counters(
             "collected; the batch details below carry the exact response.</p>"
         )
 
-    policy_total = summary["family_totals"].get("policy", 0.0)
-    dos_total = summary["family_totals"].get("dos", 0.0)
-    source_ips = _unenriched_source_ips(attribution)
-    if summary["denied_total"] > 0 and source_ips:
-        state = "isolated"
-        verdict = (
-            f"{_format_number(summary['denied_total'])} packets were dropped before "
-            f"session setup (policy deny {_format_number(policy_total)}, DoS or zone "
-            f"protection {_format_number(dos_total)}) while "
-            f"{len(source_ips)} source IP(s) were ranked without an enriched session. "
-            "That combination is consistent with a UDP or GRE flood denied by a "
-            "Security policy rule: denied traffic never creates a session, so PAN-OS "
-            "can attribute the buffer pressure to a source IP only and no "
-            "<code>show session id</code> can enrich it."
-        )
-    elif summary["denied_total"] > 0:
-        state = "mixed"
-        verdict = (
-            f"{_format_number(summary['denied_total'])} packets were dropped before "
-            f"session setup (policy deny {_format_number(policy_total)}, DoS or zone "
-            f"protection {_format_number(dos_total)}), and sessions were also ranked. "
-            "Both denied and permitted traffic contributed to the observed pressure."
-        )
-    else:
-        state = "collective"
-        verdict = (
-            "No packet was denied by a Security policy rule, by DoS protection, or by "
-            "zone protection during the counted batches. The drops below happened "
-            "after session setup or outside policy evaluation, so the offender "
-            "attribution table stays the primary evidence."
-        )
+    state, verdict = _drop_counter_verdict(summary, attribution)
 
     notes = [
         f"Counted batches: {_format_number(summary['counted_batches'])}.",
@@ -1702,11 +1995,17 @@ def _render_html(
         if str(record.get("event", "")).lower() == "trigger_received"
     ]
     attribution = _aggregate_attribution(cycles)
-    attribution_html = _render_attribution_table(attribution)
+    attribution_html = _render_top_sources(
+        _aggregate_top_sources(attribution)
+    ) + _render_attribution_table(attribution)
     drop_counter_summary = _aggregate_drop_counters(cycles)
     drop_counters_html = _render_drop_counters(drop_counter_summary, attribution)
     offender_logs_html = _render_offender_traffic_logs(events)
     session_series = _session_series(cycles)
+    probable_cause_html = _render_probable_cause(
+        attribution, drop_counter_summary, session_series, cycles
+    )
+    pressure_chart_html = _render_pressure_chart(cycles)
     session_table_html = _render_session_table(session_series)
     core_functions = next(
         (
@@ -2125,9 +2424,14 @@ def _render_html(
   </header>
   <main>
     {warning_html}
+    {probable_cause_html}
     <section aria-labelledby="summary-title">
       <h2 id="summary-title">Summary</h2>
       {summary_groups}
+    </section>
+    <section aria-labelledby="pressure-title">
+      <h2 id="pressure-title">Pressure over time</h2>
+      {pressure_chart_html or '<p class="muted">At least two batches are required to draw the pressure curve.</p>'}
     </section>
     <section aria-labelledby="attribution-title">
       <h2 id="attribution-title">Offender attribution</h2>
