@@ -35,7 +35,34 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "generate_html_report": "true",
     "generate_text_export": "true",
     "syslog_fresh_seconds": "300",
+    "target_check_hours": "24",
 }
+
+
+def dp_core_identity(device_identity: dict[str, str] | None) -> str | None:
+    """Return the model and PAN-OS release a core map was captured on.
+
+    Function groups are assigned per platform and per release, so a map is only
+    trustworthy while both still match.
+    """
+    identity = device_identity or {}
+    model = str(identity.get("model") or "").strip()
+    version = str(identity.get("software_version") or "").strip()
+    if not model or not version:
+        return None
+    return f"{model}|{version}"
+
+
+def _decode_core_functions(payload: Any) -> tuple[dict[str, Any], ...]:
+    if not payload:
+        return ()
+    try:
+        entries = json.loads(str(payload))
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(entries, list):
+        return ()
+    return tuple(entry for entry in entries if isinstance(entry, dict))
 
 
 def _utc_now() -> str:
@@ -53,6 +80,16 @@ class StoredTarget:
     syslog_sources: tuple[str, ...]
     tls_verify: str
     enabled: bool
+    hostname: str | None = None
+    model: str | None = None
+    sw_version: str | None = None
+    dp_core_functions: tuple[dict[str, Any], ...] = ()
+    dp_core_functions_identity: str | None = None
+    last_check_at: str | None = None
+    last_check_kind: str | None = None
+    last_check_status: str | None = None
+    last_check_detail: str | None = None
+    check_requested_at: str | None = None
 
 
 class ConfigStore:
@@ -91,6 +128,16 @@ class ConfigStore:
                     syslog_sources_json TEXT NOT NULL,
                     tls_verify TEXT NOT NULL DEFAULT 'false',
                     enabled INTEGER NOT NULL DEFAULT 1,
+                    hostname TEXT,
+                    model TEXT,
+                    sw_version TEXT,
+                    dp_core_functions_json TEXT,
+                    dp_core_functions_identity TEXT,
+                    last_check_at TEXT,
+                    last_check_kind TEXT,
+                    last_check_status TEXT,
+                    last_check_detail TEXT,
+                    check_requested_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -118,6 +165,20 @@ class ConfigStore:
                 connection.execute(
                     "UPDATE targets SET tls_verify=?", (legacy_value,)
                 )
+            for column in (
+                "hostname",
+                "model",
+                "sw_version",
+                "dp_core_functions_json",
+                "dp_core_functions_identity",
+                "last_check_at",
+                "last_check_kind",
+                "last_check_status",
+                "last_check_detail",
+                "check_requested_at",
+            ):
+                if column not in columns:
+                    connection.execute(f"ALTER TABLE targets ADD COLUMN {column} TEXT")
             connection.execute("DELETE FROM settings WHERE key='tls_verify'")
             now = _utc_now()
             connection.executemany(
@@ -128,8 +189,8 @@ class ConfigStore:
                 "INSERT OR IGNORE INTO meta(key,value) VALUES('revision','1')"
             )
             connection.execute(
-                """INSERT INTO meta(key,value) VALUES('schema_version','2')
-                   ON CONFLICT(key) DO UPDATE SET value='2'"""
+                """INSERT INTO meta(key,value) VALUES('schema_version','5')
+                   ON CONFLICT(key) DO UPDATE SET value='5'"""
             )
         self._chmod_private(self.path)
 
@@ -237,6 +298,11 @@ class ConfigStore:
         fresh = float(merged["syslog_fresh_seconds"])
         if not (fresh > 0 and fresh < float("inf")):
             raise ValueError("syslog_fresh_seconds must be a positive finite number")
+        check_hours = float(merged["target_check_hours"])
+        if not (0 <= check_hours <= 8760):
+            raise ValueError(
+                "target_check_hours must be between 0 (disabled) and 8760"
+            )
         for key in ("generate_html_report", "generate_text_export"):
             if merged[key].lower() not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
                 raise ValueError(f"{key} must be true or false")
@@ -275,13 +341,21 @@ class ConfigStore:
         name: str,
         panos_url: str,
         api_key: str | None,
-        target_serial: str | None,
+        target_serial: str | None = None,
         serials: list[str] | tuple[str, ...],
         syslog_sources: list[str] | tuple[str, ...],
         tls_verify: str = "false",
         enabled: bool = True,
+        device_identity: dict[str, str] | None = None,
+        dp_core_functions: list[dict[str, Any]] | None = None,
         target_id: int | None = None,
     ) -> int:
+        """Persist a firewall; `device_identity` carries `show system info` fields.
+
+        `dp_core_functions` is the static core-to-function-group map read once
+        from the firewall. It is stored with the identity it was captured on so
+        a PAN-OS upgrade can invalidate it. `None` keeps the stored copy.
+        """
         name = name.strip()
         if not TARGET_NAME.fullmatch(name):
             raise ValueError("target name must contain only letters, digits, dot, dash or underscore")
@@ -291,6 +365,17 @@ class ConfigStore:
             dict.fromkeys(str(value).strip() for value in serials if str(value).strip())
         )
         target_serial = str(target_serial or "").strip() or None
+        identity = device_identity or {}
+        device = tuple(
+            str(identity.get(field) or "").strip() or None
+            for field in ("hostname", "model", "software_version")
+        )
+        core_map: tuple[str | None, str | None] | None = None
+        if dp_core_functions is not None:
+            core_map = (
+                json.dumps(list(dp_core_functions)) if dp_core_functions else None,
+                dp_core_identity(identity) if dp_core_functions else None,
+            )
         tls_verify = str(tls_verify).strip() or "false"
         if tls_verify.lower() in {"0", "no", "off"}:
             tls_verify = "false"
@@ -318,37 +403,129 @@ class ConfigStore:
                 cursor = connection.execute(
                     """INSERT INTO targets
                        (name,panos_url,api_key_ciphertext,target_serial,serials_json,
-                        syslog_sources_json,tls_verify,enabled,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        syslog_sources_json,tls_verify,enabled,hostname,model,sw_version,
+                        dp_core_functions_json,dp_core_functions_identity,
+                        created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         name, panos_url, ciphertext, target_serial,
                         json.dumps(normalized_serials), json.dumps(normalized_sources),
-                        tls_verify, int(enabled), now, now,
+                        tls_verify, int(enabled), *device, *(core_map or (None, None)),
+                        now, now,
                     ),
                 )
                 result = int(cursor.lastrowid)
             else:
                 row = connection.execute(
-                    "SELECT api_key_ciphertext FROM targets WHERE id=?", (target_id,)
+                    """SELECT api_key_ciphertext,hostname,model,sw_version,
+                              dp_core_functions_json,dp_core_functions_identity
+                       FROM targets WHERE id=?""",
+                    (target_id,),
                 ).fetchone()
                 if row is None:
                     raise ValueError("firewall no longer exists")
                 ciphertext = str(row["api_key_ciphertext"])
                 if api_key and api_key.strip():
                     ciphertext = self._fernet().encrypt(api_key.strip().encode()).decode()
+                if not device_identity:
+                    device = (row["hostname"], row["model"], row["sw_version"])
+                if core_map is None:
+                    core_map = (
+                        row["dp_core_functions_json"],
+                        row["dp_core_functions_identity"],
+                    )
                 connection.execute(
                     """UPDATE targets SET name=?,panos_url=?,api_key_ciphertext=?,
-                       target_serial=?,serials_json=?,syslog_sources_json=?,tls_verify=?,enabled=?,updated_at=?
+                       target_serial=?,serials_json=?,syslog_sources_json=?,tls_verify=?,enabled=?,
+                       hostname=?,model=?,sw_version=?,
+                       dp_core_functions_json=?,dp_core_functions_identity=?,updated_at=?
                        WHERE id=?""",
                     (
                         name, panos_url, ciphertext, target_serial,
                         json.dumps(normalized_serials), json.dumps(normalized_sources),
-                        tls_verify, int(enabled), now, target_id,
+                        tls_verify, int(enabled), *device, *core_map, now, target_id,
                     ),
                 )
                 result = target_id
             self._bump_revision(connection)
         return result
+
+    def request_target_check(self, target_id: int) -> None:
+        """Queue a full validation for one firewall.
+
+        The Web UI mounts the evidence volume read-only and the collector
+        exposes no port, so the shared database carries the request instead.
+        """
+        with self._connect() as connection:
+            updated = connection.execute(
+                "UPDATE targets SET check_requested_at=? WHERE id=?",
+                (_utc_now(), target_id),
+            ).rowcount
+        if not updated:
+            raise ValueError("firewall no longer exists")
+
+    def record_target_check(
+        self,
+        target_id: int,
+        *,
+        kind: str,
+        status: str,
+        detail: str | None = None,
+        clear_request: bool = False,
+    ) -> None:
+        """Store the outcome of a check without disturbing the running config."""
+        with self._connect() as connection:
+            if clear_request:
+                connection.execute(
+                    """UPDATE targets SET last_check_at=?,last_check_kind=?,
+                       last_check_status=?,last_check_detail=?,check_requested_at=NULL
+                       WHERE id=?""",
+                    (_utc_now(), kind, status, detail, target_id),
+                )
+            else:
+                connection.execute(
+                    """UPDATE targets SET last_check_at=?,last_check_kind=?,
+                       last_check_status=?,last_check_detail=? WHERE id=?""",
+                    (_utc_now(), kind, status, detail, target_id),
+                )
+
+    def refresh_target_device(
+        self,
+        target_id: int,
+        *,
+        device_identity: dict[str, str],
+        dp_core_functions: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Update the identity and core map a check found to have changed."""
+        device = tuple(
+            str(device_identity.get(field) or "").strip() or None
+            for field in ("hostname", "model", "software_version")
+        )
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT dp_core_functions_json,dp_core_functions_identity
+                   FROM targets WHERE id=?""",
+                (target_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("firewall no longer exists")
+            if dp_core_functions is None:
+                core_map = (
+                    row["dp_core_functions_json"],
+                    row["dp_core_functions_identity"],
+                )
+            else:
+                core_map = (
+                    json.dumps(list(dp_core_functions)) if dp_core_functions else None,
+                    dp_core_identity(device_identity) if dp_core_functions else None,
+                )
+            connection.execute(
+                """UPDATE targets SET hostname=?,model=?,sw_version=?,
+                   dp_core_functions_json=?,dp_core_functions_identity=?,updated_at=?
+                   WHERE id=?""",
+                (*device, *core_map, _utc_now(), target_id),
+            )
+            self._bump_revision(connection)
 
     def delete_target(self, target_id: int) -> None:
         with self._connect() as connection:
@@ -370,6 +547,18 @@ class ConfigStore:
                 "syslog_sources": tuple(json.loads(row["syslog_sources_json"])),
                 "tls_verify": str(row["tls_verify"]),
                 "enabled": bool(row["enabled"]),
+                "hostname": row["hostname"],
+                "model": row["model"],
+                "sw_version": row["sw_version"],
+                "dp_core_functions": _decode_core_functions(
+                    row["dp_core_functions_json"]
+                ),
+                "dp_core_functions_identity": row["dp_core_functions_identity"],
+                "last_check_at": row["last_check_at"],
+                "last_check_kind": row["last_check_kind"],
+                "last_check_status": row["last_check_status"],
+                "last_check_detail": row["last_check_detail"],
+                "check_requested_at": row["check_requested_at"],
             }
             if include_secrets:
                 try:

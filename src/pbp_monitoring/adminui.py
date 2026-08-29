@@ -16,8 +16,15 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
-from .config_store import ConfigStore, DEFAULT_SETTINGS
-from .panos_keygen import generate_api_key, make_ssl_context, normalize_firewall_url
+from .config_store import ConfigStore, DEFAULT_SETTINGS, TARGET_NAME
+from .panos_keygen import (
+    PanOSAdminError,
+    fetch_dp_core_functions,
+    fetch_system_info,
+    generate_api_key,
+    make_ssl_context,
+    normalize_firewall_url,
+)
 
 
 SESSION_SECONDS = 8 * 60 * 60
@@ -38,6 +45,14 @@ header a{{color:white}}main{{width:min(1080px,calc(100% - 28px));margin:22px aut
 h1,h2{{margin-top:0}}label{{display:block;margin:11px 0 4px;font-weight:650}}input,select{{width:100%;padding:9px 10px;border:1px solid #bdc9d8;border-radius:8px;background:white}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 14px}}button,.button{{display:inline-block;margin-top:14px;padding:9px 14px;border:0;border-radius:8px;background:var(--accent);color:white;font-weight:700;text-decoration:none;cursor:pointer}}
 button.danger{{background:var(--bad)}}.muted{{color:var(--muted)}}.notice{{padding:10px 12px;border-radius:8px;background:#e0f2fe;color:#075985}}.error{{background:#fee2e2;color:#991b1b}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}code{{overflow-wrap:anywhere}}form.inline{{display:inline}}form.inline button{{margin:0}}nav{{display:flex;gap:16px;align-items:center}}nav .version{{margin-left:auto;color:#d9f4f2}}.action-row{{display:flex;align-items:center;gap:7px}}.action-row .button,.action-row button{{display:inline-flex;align-items:center;justify-content:center;width:72px;height:34px;margin:0;padding:6px 9px}}
+.form-actions{{display:flex;align-items:center;gap:10px;margin-top:18px}}.form-actions button,.form-actions .button{{display:inline-flex;align-items:center;height:38px;margin:0}}
+.button.secondary{{background:white;color:var(--ink);border:1px solid #bdc9d8}}
+fieldset.auth{{margin:16px 0 0;padding:4px 14px 14px;border:1px solid var(--line);border-radius:10px}}
+fieldset.auth>legend{{padding:0 6px;font-weight:650}}
+fieldset.auth>input[type=radio]{{width:auto;margin:0 6px 0 0;vertical-align:middle;accent-color:var(--accent)}}
+fieldset.auth>label{{display:inline-block;margin:6px 20px 6px 0;font-weight:500}}
+fieldset.auth>.panel{{display:none;margin-top:2px}}fieldset.auth>.panel .muted{{margin:8px 0 0}}
+#auth-stored:checked~#panel-stored,#auth-credentials:checked~#panel-credentials,#auth-key:checked~#panel-key{{display:block}}
 </style></head><body><header><nav><strong>PBP Monitoring Admin</strong><a href="/">Dashboard</a><a href="/admin">Configuration</a><span class="version">v{_e(__version__)}</span></nav></header><main>{body}</main></body></html>"""
 
 
@@ -161,12 +176,17 @@ class AdminController:
         for target in targets:
             rows.append(
                 "<tr>"
-                f"<td><strong>{_e(target['name'])}</strong></td><td><code>{_e(target['panos_url'])}</code></td>"
-                f"<td>{_e(', '.join(target['syslog_sources']))}</td><td>{'Enabled' if target['enabled'] else 'Disabled'}</td>"
+                f"<td><strong>{_e(target['name'])}</strong></td>"
+                f"<td>{_e(target['hostname'] or '-')}<div class=\"muted\">{_e(self._device_summary(target))}</div></td>"
+                f"<td><code>{_e(self._firewall_ip(target))}</code></td>"
+                f"<td><code>{_e(', '.join(target['serials']) or '-')}</code></td>"
+                f"<td>{'Enabled' if target['enabled'] else 'Disabled'}</td>"
+                f"<td>{self._check_summary(target)}</td>"
                 f"<td><div class=\"action-row\"><a class=\"button\" href=\"/admin?edit={target['target_id']}\">Edit</a>"
+                f"<form class=\"inline\" method=\"post\" action=\"/admin/target/check\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><input type=\"hidden\" name=\"target_id\" value=\"{target['target_id']}\"><button class=\"secondary\" type=\"submit\">Test</button></form>"
                 f"<form class=\"inline\" method=\"post\" action=\"/admin/target/delete\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><input type=\"hidden\" name=\"target_id\" value=\"{target['target_id']}\"><button class=\"danger\" type=\"submit\">Delete</button></form></div></td></tr>"
             )
-        target_rows = "".join(rows) or '<tr><td colspan="5" class="muted">No firewall configured yet.</td></tr>'
+        target_rows = "".join(rows) or '<tr><td colspan="7" class="muted">No firewall configured yet.</td></tr>'
         edit_target = next((target for target in targets if target["target_id"] == edit_id), None)
         recovery = ""
         if not self.store.recovery_key_acknowledged():
@@ -187,26 +207,166 @@ class AdminController:
 <div><label>New password (8 characters minimum)</label><input type="password" name="new_password" autocomplete="new-password" minlength="8" required></div>
 <div><label>Confirm new password</label><input type="password" name="confirm_password" autocomplete="new-password" minlength="8" required></div>
 </div><button type="submit">Change password</button></form></section>
-<section class="card"><h2>Firewalls</h2><table><thead><tr><th>Name</th><th>Management URL</th><th>Allowed Syslog sources</th><th>State</th><th>Actions</th></tr></thead><tbody>{target_rows}</tbody></table></section>
+<section class="card"><h2>Firewalls</h2><table><thead><tr><th>Name</th><th>Device</th><th>Firewall IP</th><th>Serial</th><th>State</th><th>Last check</th><th>Actions</th></tr></thead><tbody>{target_rows}</tbody></table></section>
 {self._target_form(csrf, edit_target)}
 <section class="card"><h2>Collector settings</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
 {''.join(f'<div><label>{_e(key.replace("_", " ").title())}</label><input name="{_e(key)}" value="{_e(value)}" required></div>' for key, value in settings.items())}
 </div><button type="submit">Save settings</button></form></section>""")
 
+    @staticmethod
+    def _check_summary(target: dict[str, Any]) -> str:
+        """Render the outcome of the last automatic or requested firewall check."""
+        if target.get("check_requested_at"):
+            return '<span class="muted">Validation queued</span>'
+        checked_at = target.get("last_check_at")
+        if not checked_at:
+            return '<span class="muted">Never checked</span>'
+        status = str(target.get("last_check_status") or "")
+        kind = str(target.get("last_check_kind") or "check")
+        label = "Passed" if status == "ok" else "Failed"
+        colour = "#047857" if status == "ok" else "var(--bad)"
+        detail = str(target.get("last_check_detail") or "")
+        return (
+            f'<strong style="color:{colour}">{_e(label)}</strong>'
+            f'<div class="muted">{_e(kind)} &middot; {_e(str(checked_at)[:19])}Z</div>'
+            + (f'<div class="muted">{_e(detail)}</div>' if detail else "")
+        )
+
+    @staticmethod
+    def _device_summary(target: dict[str, Any]) -> str:
+        model, version = target.get("model"), target.get("sw_version")
+        return " · ".join(
+            part for part in (model, f"PAN-OS {version}" if version else "") if part
+        )
+
+    @staticmethod
+    def _firewall_ip(target: dict[str, Any]) -> str:
+        return urlsplit(str(target.get("panos_url") or "")).hostname or ""
+
     def _target_form(self, csrf: str, target: dict[str, Any] | None = None) -> str:
         target = target or {}
         editing = bool(target)
+        address = self._firewall_ip(target)
+        tls = str(target.get("tls_verify") or "false")
+        custom_tls = (
+            f'<option value="{_e(tls)}" selected>CA bundle: {_e(tls)}</option>'
+            if tls not in {"true", "false"}
+            else ""
+        )
+        stored_choice = (
+            '<input type="radio" id="auth-stored" name="auth_method" value="stored" checked>'
+            '<label for="auth-stored">Keep the stored API key</label>'
+            if editing
+            else ""
+        )
+        stored_panel = (
+            '<div class="panel" id="panel-stored"><p class="muted">The encrypted API key already '
+            "stored for this firewall is reused and revalidated.</p></div>"
+            if editing
+            else ""
+        )
+        extra_sources = [
+            source for source in target.get("syslog_sources", ()) if source != address
+        ]
+        notes = []
+        if target.get("serials") or target.get("hostname"):
+            identity = " · ".join(
+                part
+                for part in (
+                    target.get("hostname"),
+                    self._device_summary(target),
+                    ", ".join(target.get("serials", ())),
+                )
+                if part
+            )
+            notes.append(f"Read from the firewall: <code>{_e(identity)}</code>.")
+        if extra_sources:
+            notes.append(
+                "Additional allowed Syslog sources configured outside this form are preserved: "
+                f"<code>{_e(', '.join(extra_sources))}</code>."
+            )
+        note_html = f'<p class="muted">{" ".join(notes)}</p>' if notes else ""
         return f"""<section class="card"><h2>{'Edit firewall' if editing else 'Add a firewall'}</h2>
-<p class="muted">Leave API key blank to retain the existing key. Alternatively provide temporary credentials to generate a key; the password is never stored.</p>
-<form method="post" action="/admin/target/save"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
-<input type="hidden" name="target_id" value="{_e(target.get('target_id'))}">
-<div><label>Name</label><input name="name" value="{_e(target.get('name'))}" required></div><div><label>Management URL</label><input name="panos_url" value="{_e(target.get('panos_url'))}" placeholder="https://192.0.2.10" required></div>
-<div><label>API key</label><input type="password" name="api_key" autocomplete="off"></div><div><label>API username (optional key generation)</label><input name="username" autocomplete="off"></div>
+<p class="muted">The firewall IP is both the API management address and the allowed Syslog source. Saving contacts the firewall
+with <code>show system info</code>: it validates the credentials and reads the device serial, so the firewall must be reachable.</p>
+<form method="post" action="/admin/target/save"><input type="hidden" name="csrf" value="{csrf}">
+<input type="hidden" name="target_id" value="{_e(target.get('target_id'))}"><div class="grid">
+<div><label>Name</label><input name="name" value="{_e(target.get('name'))}" placeholder="firewall hostname"><span class="muted">Optional. Left blank, the PAN-OS hostname is used.</span></div>
+<div><label>Firewall IP</label><input name="firewall_ip" value="{_e(address)}" placeholder="192.0.2.10" required></div>
+<div><label>TLS verify</label><select name="tls_verify">{custom_tls}<option value="true" {'selected' if tls == 'true' else ''}>Yes</option><option value="false" {'selected' if tls != 'true' and not custom_tls else ''}>No</option></select><span class="muted">Per-firewall setting. New firewalls default to No.</span></div>
+<div><label>Enabled</label><select name="enabled"><option value="true" {'selected' if target.get('enabled', True) else ''}>Yes</option><option value="false" {'selected' if target and not target.get('enabled') else ''}>No</option></select></div>
+</div>
+<fieldset class="auth"><legend>Authentication method</legend>{stored_choice}
+<input type="radio" id="auth-credentials" name="auth_method" value="credentials" {'' if editing else 'checked'}><label for="auth-credentials">Username and password</label>
+<input type="radio" id="auth-key" name="auth_method" value="api_key"><label for="auth-key">API key</label>
+{stored_panel}<div class="panel" id="panel-credentials"><div class="grid">
+<div><label>API username</label><input name="username" autocomplete="off"></div>
 <div><label>API password (never stored)</label><input type="password" name="password" autocomplete="new-password"></div>
-<div><label>Device serial(s), comma separated</label><input name="serials" value="{_e(', '.join(target.get('serials', ())))}"></div><div><label>Panorama target serial</label><input name="target_serial" value="{_e(target.get('target_serial'))}"></div>
-<div><label>TLS verify</label><input name="tls_verify" value="{_e(target.get('tls_verify', 'false'))}" placeholder="false, true, or /certs/ca.pem" required><span class="muted">Per-firewall setting. New firewalls default to disabled.</span></div>
-<div><label>Allowed Syslog source IP(s), comma separated</label><input name="syslog_sources" value="{_e(', '.join(target.get('syslog_sources', ())))}" required></div><div><label>Enabled</label><select name="enabled"><option value="true" {'selected' if target.get('enabled', True) else ''}>Yes</option><option value="false" {'selected' if target and not target.get('enabled') else ''}>No</option></select></div>
-</div><button type="submit">Save firewall</button>{'<a class="button" href="/admin">Cancel</a>' if editing else ''}</form></section>"""
+</div><p class="muted">The credentials generate an API key by HTTPS POST; only the key is stored.</p></div>
+<div class="panel" id="panel-key"><div class="grid">
+<div><label>API key</label><input type="password" name="api_key" autocomplete="off"></div>
+</div></div></fieldset>
+{note_html}<div class="form-actions"><button type="submit">Save firewall</button>{'<a class="button secondary" href="/admin">Cancel</a>' if editing else ''}</div></form></section>"""
+
+    @staticmethod
+    def _resolved_name(value: str, identity: dict[str, str], existing: Any) -> str:
+        name = str(value).strip()
+        if name:
+            return name
+        hostname = str(identity.get("hostname") or "").strip()
+        if TARGET_NAME.fullmatch(hostname):
+            return hostname
+        if existing is not None:
+            return existing.name
+        raise ValueError(
+            "enter a name: the PAN-OS hostname is empty or contains unsupported characters"
+        )
+
+    @staticmethod
+    def _validated_firewall_ip(value: str) -> str:
+        try:
+            return str(ipaddress.ip_address(str(value).strip()))
+        except ValueError as exc:
+            raise ValueError(
+                "the firewall IP must be an IPv4 or IPv6 address; it is also the allowed Syslog source"
+            ) from exc
+
+    @staticmethod
+    def _validated_tls_verify(value: str, existing: Any) -> str:
+        value = str(value).strip() or "false"
+        if value in {"true", "false"}:
+            return value
+        if existing is not None and value == existing.tls_verify:
+            return value
+        raise ValueError("TLS verify must be Yes or No")
+
+    def _resolved_api_key(
+        self,
+        form: dict[str, str],
+        *,
+        panos_url: str,
+        ssl_context: Any,
+        timeout: float,
+        existing: Any,
+    ) -> str:
+        method = form.get("auth_method", "credentials")
+        if method == "stored":
+            if existing is None:
+                raise ValueError("a new firewall has no stored API key to reuse")
+            return existing.api_key
+        if method == "api_key":
+            api_key = form.get("api_key", "").strip()
+            if not api_key:
+                raise ValueError("an API key is required for this authentication method")
+            return api_key
+        if method != "credentials":
+            raise ValueError("invalid authentication method")
+        username, password = form.get("username", "").strip(), form.get("password", "")
+        if not username or not password:
+            raise ValueError("both API username and password are required to generate a key")
+        return generate_api_key(
+            panos_url, username, password, ssl_context=ssl_context, timeout=timeout
+        )
 
     def handle(self, handler: Any, path: str) -> bool:
         if not path.startswith("/admin"):
@@ -289,38 +449,98 @@ class AdminController:
                     "/admin",
                     f"PBPADMIN=; Path=/admin; Max-Age=0; HttpOnly; SameSite=Strict{secure}",
                 )
+            elif path == "/admin/target/check":
+                self.store.request_target_check(int(form["target_id"]))
+                self._send(
+                    handler,
+                    self._dashboard(
+                        csrf,
+                        "Full read-only validation requested. The collector runs it "
+                        "within a few seconds, and the result appears in this list.",
+                    ),
+                )
             elif path == "/admin/target/delete":
                 self.store.delete_target(int(form["target_id"]))
                 self._send(handler, self._dashboard(csrf, "Firewall deleted."))
             elif path == "/admin/target/save":
-                api_key = form.get("api_key", "").strip() or None
-                username, password = form.get("username", "").strip(), form.get("password", "")
-                if username or password:
-                    if not username or not password:
-                        raise ValueError("both API username and password are required for key generation")
-                    settings = self.store.get_settings()
-                    tls = form.get("tls_verify", "false").strip() or "false"
-                    context = make_ssl_context(
-                        insecure=tls.lower() in {"false", "0", "no", "off"},
-                        ca_bundle=None if tls.lower() in {"true", "1", "yes", "on", "false", "0", "no", "off"} else tls,
-                    )
-                    api_key = generate_api_key(
-                        normalize_firewall_url(form["panos_url"]), username, password,
-                        ssl_context=context, timeout=float(settings["request_timeout"]),
-                    )
                 target_id = int(form["target_id"]) if form.get("target_id", "").strip() else None
-                self.store.save_target(
-                    target_id=target_id, name=form["name"], panos_url=form["panos_url"], api_key=api_key,
-                    target_serial=form.get("target_serial"),
-                    serials=[value.strip() for value in form.get("serials", "").split(",")],
-                    syslog_sources=[value.strip() for value in form.get("syslog_sources", "").split(",")],
-                    tls_verify=form.get("tls_verify", "false"),
-                    enabled=form.get("enabled") == "true",
+                existing = None
+                if target_id is not None:
+                    existing = next(
+                        (
+                            item
+                            for item in self.store.list_targets(include_secrets=True)
+                            if item.target_id == target_id
+                        ),
+                        None,
+                    )
+                    if existing is None:
+                        raise ValueError("firewall no longer exists")
+                firewall_ip = self._validated_firewall_ip(form.get("firewall_ip", ""))
+                panos_url = normalize_firewall_url(firewall_ip)
+                tls = self._validated_tls_verify(form.get("tls_verify", "false"), existing)
+                timeout = float(self.store.get_settings()["request_timeout"])
+                context = make_ssl_context(
+                    insecure=tls == "false", ca_bundle=None if tls == "true" else tls
                 )
-                self._send(handler, self._dashboard(csrf, "Firewall saved. The API password was not stored."))
+                api_key = self._resolved_api_key(
+                    form,
+                    panos_url=panos_url,
+                    ssl_context=context,
+                    timeout=timeout,
+                    existing=existing,
+                )
+                identity = fetch_system_info(
+                    panos_url, api_key, ssl_context=context, timeout=timeout
+                )
+                core_functions = fetch_dp_core_functions(
+                    panos_url, api_key, ssl_context=context, timeout=timeout
+                )
+                replaced = {firewall_ip}
+                if existing is not None:
+                    replaced.add(urlsplit(existing.panos_url).hostname or "")
+                preserved_sources = [
+                    source
+                    for source in (existing.syslog_sources if existing else ())
+                    if source not in replaced
+                ]
+                self.store.save_target(
+                    target_id=target_id,
+                    name=self._resolved_name(form.get("name", ""), identity, existing),
+                    panos_url=panos_url, api_key=api_key,
+                    target_serial=existing.target_serial if existing else None,
+                    serials=[identity["serial"]],
+                    syslog_sources=[firewall_ip, *preserved_sources],
+                    tls_verify=tls,
+                    enabled=form.get("enabled") == "true",
+                    device_identity=identity,
+                    dp_core_functions=core_functions,
+                )
+                summary = " ".join(
+                    part
+                    for part in (
+                        identity.get("hostname"),
+                        identity.get("model"),
+                        f"serial {identity['serial']}",
+                        f"PAN-OS {identity['software_version']}"
+                        if identity.get("software_version")
+                        else "",
+                        f"{len(core_functions)} dataplane cores mapped"
+                        if core_functions
+                        else "dataplane core map unavailable",
+                    )
+                    if part
+                )
+                self._send(
+                    handler,
+                    self._dashboard(
+                        csrf,
+                        f"Firewall saved and API key validated: {summary}. The API password was not stored.",
+                    ),
+                )
             else:
                 handler.send_error(404)
             return True
-        except (KeyError, ValueError, OSError, ssl.SSLError, sqlite3.Error) as exc:
+        except (KeyError, ValueError, OSError, ssl.SSLError, sqlite3.Error, PanOSAdminError) as exc:
             self._send(handler, _layout("Configuration error", f'<section class="card"><h1>Configuration not saved</h1><p class="notice error">{_e(exc)}</p><p><a href="/admin">Return to configuration</a></p></section>'), 400)
             return True

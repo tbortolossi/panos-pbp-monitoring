@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring & Diagnostic Collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.4.1-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.4.1)
+[![Version](https://img.shields.io/badge/version-0.9.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.9.0)
 [![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
 
 PBP Monitoring is an event-driven, read-only diagnostic collector for PAN-OS
@@ -31,7 +31,9 @@ Runtime configuration is stored in the named Docker volume
 The dashboard provides:
 
 - global Syslog reception freshness;
-- independent reception freshness for every configured firewall;
+- one card per configured firewall carrying its three live signals: Syslog
+  reception freshness, the outcome of the last read-only API check, and whether a
+  monitoring run is in progress on that firewall;
 - the 20 latest received logs;
 - active and completed runs, including their UTC start time;
 - links to HTML reports, JSONL evidence, and TXT batch exports;
@@ -59,7 +61,10 @@ debug dataplane pool statistics
 show counter global filter delta yes
 ```
 
-`show system info` runs once at incident startup. Candidate sessions are
+`show system info` runs once at incident startup to identify the device.
+`show statistics`, which returns the function groups assigned to each dataplane
+core, runs when a firewall is saved in the admin UI rather than during an
+incident. Candidate sessions are
 enriched with `show session id <session-id>`. Consecutive cumulative byte
 counters are sampled to derive c2s, s2c, and total bit rates without scanning
 the complete session table.
@@ -186,33 +191,71 @@ In **Admin > Firewalls**, enter:
 
 | Field | Description |
 |---|---|
-| Name | Stable local identifier, for example `PA-440` |
-| Management URL | HTTPS-only API endpoint, for example `https://10.0.0.253` |
-| API key | Existing PAN-OS API key; leave blank only when editing an existing entry |
-| API username/password | Optional temporary credentials used to generate the API key |
-| Device serials | Serial numbers that may identify this target in Syslog |
-| Panorama target serial | Optional `target` value for Panorama operation mode |
-| TLS verify | Per-firewall `false`, `true`, or CA bundle path; defaults to `false` |
-| Allowed Syslog sources | One or more source IPs permitted to trigger this target |
+| Name | Stable local identifier, for example `PA-440`. Left blank, the PAN-OS hostname read from the firewall is used |
+| Firewall IP | The firewall address, for example `192.0.2.10`. It is used both as the HTTPS API endpoint and as the allowed Syslog source |
+| Authentication method | How the API key is obtained: username and password, an existing API key, or the stored key when editing |
+| API key | Used by the *Existing API key* method |
+| API username / API password | Used by the *Username and password* method; the password is never stored |
+| TLS verify | Yes or No, per firewall; new firewalls default to No |
 | Enabled | Whether the target participates in routing and collection |
 
-The management URL and allowed Syslog source are intentionally separate. With
-a PAN-OS service route, NAT, or relay, the source sending Syslog may not be the
-management interface.
+Saving contacts the firewall once with `show system info`. That single read-only
+call validates the API key and returns the device serial, hostname, model, and
+PAN-OS version. All four are stored: the serial is what attributes an HA or
+multi-firewall Syslog message to this target, and the hostname, model, and
+version are shown in the **Device** column of the firewall list, so none of them
+is typed by hand. The firewall must be reachable when the entry is saved: an
+unreachable address, an untrusted certificate, or a rejected key is reported and
+nothing is written.
+
+### Keeping a saved firewall verified
+
+A firewall is otherwise only contacted when an incident starts, so a revoked API
+key, an address moved behind a new filter, or a deleted API administrator would
+be discovered during an incident, exactly when evidence is being lost. The
+collector therefore runs a small read-only check per enabled firewall every
+`target_check_hours`, 24 by default, and 0 disables it:
+
+- `show system info` for reachability, API key validity, and release drift;
+- `show statistics` only when the stored dataplane core map is missing or was
+  captured on a different model or PAN-OS release, refreshing it in place.
+
+A firewall in steady state therefore costs one API call a day, and no capture
+file is written. A firewall with an active incident is never checked: it is
+already polled every few seconds while under packet-buffer pressure, and the
+check must not compete with the diagnostic batches.
+
+Each firewall card on the dashboard states the result of that check beside its
+Syslog freshness, and turns amber while a monitoring run is in progress on that
+firewall. The run state is read from the run files the collector already writes;
+nothing polls the firewall to determine it.
+
+The **Test** button beside each firewall runs the full read-only validation for
+that firewall instead: every collection command and every parser, writing a
+capture and an HTML report the dashboard already serves. The Web service mounts
+the evidence volume read-only by design and the collector exposes no port, so
+the button records the request in the shared configuration database and the
+collector runs it on its next tick, a few seconds later. The **Last check**
+column reports when either check last ran, whether it passed, and a short reason
+when it did not.
+
+Because HTTPS uses port 443 and Syslog uses port 514, one address covers both.
+When an earlier configuration allowed additional Syslog sources for a target,
+for example a PAN-OS service-route address, they are preserved on save and
+listed under the form.
 
 When temporary credentials are supplied, the Web service sends them by HTTPS
 POST to PAN-OS key generation. They are never placed in the URL and the username
 and password are not stored. The resulting API key is encrypted immediately.
 
 Use a dedicated least-privilege XML API administrator. Prefer a management
-certificate signed by an internal CA. Copy its PEM bundle into `certs/` and set
-**TLS verify** to its container path, for example:
+certificate signed by an internal CA: copy its PEM bundle into `certs/` and set
+**TLS verify** to *Yes*, with the container path of the bundle installed as the
+system trust store. A per-firewall CA bundle path imported from a legacy
+`targets.json`, for example `/certs/company-ca.pem`, is preserved and offered as
+an extra choice in the list for that firewall.
 
-```text
-/certs/company-ca.pem
-```
-
-New firewalls default to `false` for compatibility with self-signed management
+New firewalls default to *No* for compatibility with self-signed management
 certificates. Enable verification for production firewalls whenever possible;
 the collector logs a warning whenever it is disabled.
 
@@ -263,8 +306,9 @@ Commit only after reviewing the candidate configuration:
 commit description "Forward PBP System and Threat logs to the diagnostic collector"
 ```
 
-If a service route is configured for Syslog, add its source address—not an
-assumed management address—to **Allowed Syslog sources** in the admin page.
+A firewall must send Syslog from the same address configured as **Firewall IP**.
+If a service route makes it send from a different source, the collector logs
+`source not allowlisted` for that address.
 
 ### 5. Restrict the Linux host firewall
 
@@ -361,6 +405,7 @@ published:
 | Generate HTML report | `true` | Build the standalone incident report |
 | Generate text export | `true` | Write startup and batch TXT files |
 | Syslog fresh seconds | `300` | Green/red dashboard freshness window |
+| Target check hours | `24` | Interval of the read-only firewall check; `0` disables it |
 
 Configuration changes are loaded at the next received datagram. When an
 incident is active, the new revision is deliberately deferred until the run
@@ -392,7 +437,9 @@ Each incident contains:
 
 - `incident.jsonl`: authoritative structured and exact raw evidence;
 - `report.html`: standalone human report with the JSONL SHA-256 digest;
-- `raw/startup.txt`: startup commands and raw HTTP/XML response;
+- `raw/startup.txt`: startup commands and raw HTTP/XML response, plus the
+  dataplane core-to-function-group map and where it came from, so an exported run
+  explains its own CPU charts;
 - `raw/batch-NNNN.txt`: human-readable export for every batch.
 
 The dashboard's **ZIP support** action downloads the complete run as one
@@ -426,11 +473,50 @@ returned per-core average and maximum is preserved, together with the latest
 value, window average, window peak, hot-point count, and sample count. Adjacent
 windows intentionally overlap and must not be summed as unique seconds.
 
-The HTML report summarizes every core across the run and shows a batch timeline
-with the hottest core, window average, maxâ€“min spread, and a high-imbalance
-signal. This signal corroborates possible flow-hash concentration; it does not
-prove that one session alone is responsible, so it must be read alongside
-session rates, PBP offenders, and ingress backlogs.
+The HTML report draws one section per dataplane, so a chassis with several
+dataplanes produces one set of charts per DP. Each section states whether the
+load rose on every comparable core or on only a few of them, then shows a
+heatmap of core by batch, which stays readable at 64 cores, and a line chart of
+the hottest cores against the median of their peers. Both are inline SVG: the
+report stays a single self-contained file with no script and no external asset.
+The per-core summary table and the batch imbalance timeline remain underneath as
+the detailed evidence.
+
+The distinction the charts are built for is the one that matters
+operationally. Every comparable core rising together is aggregate load. One core
+saturated while its peers stay cold is flow-hash concentration, which is what a
+single very high-rate session looks like from the dataplane. This corroborates
+possible flow-hash concentration; it does not prove that one session alone is
+responsible, so it must be read alongside session rates, PBP offenders, and
+ingress backlogs.
+
+Dataplane cores are not interchangeable, so the comparison is restricted to
+cores that actually forward traffic. Cores are labelled by what distinguishes
+them from their peers, such as `flow_mgmt`, `flow_ctrl`, or `pan_timer`, and
+only cores carrying `flow_fastpath` are compared: a timer core sitting
+permanently at 0% is not a sign of imbalance.
+
+That map comes from `show statistics`, which PAN-OS answers with one entry per
+core. Because the assignment is fixed for a platform and PAN-OS release, the
+command runs **once per firewall**, when the firewall is saved in the admin UI,
+next to the `show system info` call that already validates the API key. The
+result is stored with the firewall and the release it was captured on, so an
+incident spends no API call on a firewall that is already under pressure. The
+save confirmation reports how many cores were mapped.
+
+A PAN-OS upgrade can reassign function groups, so a stored map is only trusted
+while the model and PAN-OS version still match what the incident reads from
+`show system info`. On a mismatch the collector reads the map again for that
+incident and logs that the firewall should be saved again to refresh the stored
+copy. Each `monitor_started` record carries the map it used and a
+`dp_core_functions_source` field naming where it came from, `configuration` or
+`firewall`, so incident evidence stays self-contained. `--check-api` always
+calls the command, because its purpose is to prove that the configured API
+administrator can run everything the collector needs.
+
+A firewall that cannot answer the command is still saved normally. The incident
+records a `dataplane core function groups could not be read` warning, and the
+charts still render with cores labelled by number.
 
 Copy one incident to the Linux host without modifying the volume:
 
@@ -482,8 +568,8 @@ docker compose up -d
 docker compose ps
 ```
 
-After an update, verify the dashboard, the global/per-firewall freshness cards,
-and a read-only API check. Do not use `docker compose down -v`; `-v` deletes both
+After an update, verify the dashboard, the per-firewall cards, and a read-only
+API check. Do not use `docker compose down -v`; `-v` deletes both
 persistent volumes.
 
 ## Migrating an older file-based installation
@@ -522,7 +608,7 @@ transport.
 The collector receives logs but cannot attribute a recent one to that target.
 Check:
 
-- the target's **Allowed Syslog sources**;
+- the target's **Firewall IP**, which is also its allowed Syslog source;
 - the observed source in the latest-log table;
 - PAN-OS service-route selection;
 - device serial configuration;
@@ -536,8 +622,9 @@ firewall or trusted relay. Never broadly allowlist arbitrary client networks.
 ### PAN-OS API failure
 
 Run the read-only API check and review its generated report. Confirm HTTPS
-reachability, certificate trust, key validity, least-privilege permissions,
-Panorama target serial, and the target's enabled state.
+reachability, certificate trust, key validity, least-privilege permissions, and
+the target's enabled state. Re-saving the firewall in the admin page repeats the
+`show system info` validation immediately.
 
 ### Admin page is not reachable remotely
 
@@ -598,7 +685,7 @@ pbp-web
 pbp-config
 ```
 
-`PRD.md` defines product behavior and acceptance criteria. `AGENTS.md` defines
+`PRD.md` defines product behavior and acceptance criteria. `CLAUDE.md` defines
 the repository safety constraints. `CONTRIBUTING.md` and `SECURITY.md` describe
 change validation and confidential vulnerability reporting.
 

@@ -362,9 +362,10 @@ def render_text_export_index(
         filename = str(item.get("name", ""))
         file_url = quote(filename, safe="")
         size_kib = float(item.get("size_bytes", 0)) / 1024
+        batch_label = "Startup" if filename == "startup.txt" else f"Batch {item.get('batch')}"
         rows.append(
             "<tr>"
-            f"<td><strong>{_escape('Startup' if filename == 'startup.txt' else f'Batch {item.get("batch")}')}</strong><code>{_escape(filename)}</code></td>"
+            f"<td><strong>{_escape(batch_label)}</strong><code>{_escape(filename)}</code></td>"
             f"<td>{_escape(_display_utc(item.get('collector_time')))}</td>"
             f"<td>{_escape(item.get('firewall_time'))}</td>"
             f"<td class=\"number\">{_escape(item.get('duration_seconds'))}</td>"
@@ -473,6 +474,14 @@ def collect_dashboard_state(
             last = matching[-1] if matching else None
             last_time = _parse_time(last.get("timestamp")) if last else None
             target_age = max(0.0, (current - last_time).total_seconds()) if last_time else None
+            active_run = next(
+                (
+                    run["run_id"]
+                    for run in runs
+                    if run["target"] == target["name"] and run["status"] == "active"
+                ),
+                None,
+            )
             firewall_statuses.append(
                 {
                     "name": target["name"],
@@ -480,6 +489,12 @@ def collect_dashboard_state(
                     "healthy": bool(target["enabled"] and target_age is not None and target_age <= freshness_seconds),
                     "last_received_at": last.get("timestamp") if last else None,
                     "age_seconds": target_age,
+                    "active_run": active_run,
+                    "last_check_at": target.get("last_check_at"),
+                    "last_check_kind": target.get("last_check_kind"),
+                    "last_check_status": target.get("last_check_status"),
+                    "last_check_detail": target.get("last_check_detail"),
+                    "check_requested_at": target.get("check_requested_at"),
                 }
             )
     return {
@@ -490,6 +505,21 @@ def collect_dashboard_state(
         "runs": runs[:run_limit],
         "firewalls": firewall_statuses,
     }
+
+
+def _check_line(firewall: dict[str, Any]) -> str:
+    """Summarize the last read-only firewall check for the dashboard card."""
+    if firewall.get("check_requested_at"):
+        return "API check: validation queued"
+    checked_at = firewall.get("last_check_at")
+    if not checked_at:
+        return "API check: never run"
+    status = str(firewall.get("last_check_status") or "")
+    kind = str(firewall.get("last_check_kind") or "check")
+    label = "passed" if status == "ok" else "FAILED"
+    detail = str(firewall.get("last_check_detail") or "")
+    line = f"API check: {kind} {label} at {_display_utc(checked_at)}"
+    return f"{line} - {detail}" if detail else line
 
 
 def render_dashboard(state: dict[str, Any], refresh_seconds: int = 5) -> str:
@@ -554,15 +584,32 @@ def render_dashboard(state: dict[str, Any], refresh_seconds: int = 5) -> str:
     firewall_cards: list[str] = []
     for firewall in state.get("firewalls", []):
         firewall_age = firewall.get("age_seconds")
-        detail = (
-            f"Last log {_display_utc(firewall.get('last_received_at'))} ({int(firewall_age)} seconds ago)"
+        syslog_line = (
+            f"Syslog: last log {_display_utc(firewall.get('last_received_at'))}"
+            f" ({int(firewall_age)} seconds ago)"
             if isinstance(firewall_age, (int, float))
-            else "No attributed log received"
+            else "Syslog: no attributed log received"
+        )
+        active_run = firewall.get("active_run")
+        check_line = _check_line(firewall)
+        if active_run:
+            state_class, headline = "busy", "monitoring run in progress"
+        elif not firewall.get("healthy") or firewall.get("last_check_status") == "failed":
+            state_class, headline = "bad", "needs attention"
+        else:
+            state_class, headline = "ok", "healthy"
+        run_line = (
+            f"Incident: run {active_run} in progress"
+            if active_run
+            else "Incident: no run in progress"
         )
         firewall_cards.append(
-            f'<div class="status {"ok" if firewall.get("healthy") else "bad"}"><span class="dot"></span><div>'
-            f'<strong>{_escape(firewall.get("name"))}: {"receiving logs" if firewall.get("healthy") else "logs missing or stale"}</strong>'
-            f'<span>{_escape(detail)}</span></div></div>'
+            f'<div class="status {state_class}"><span class="dot"></span><div>'
+            f'<strong>{_escape(firewall.get("name"))}: {_escape(headline)}</strong>'
+            f'<span>{_escape(syslog_line)}</span>'
+            f'<span>{_escape(check_line)}</span>'
+            f'<span>{_escape(run_line)}</span>'
+            "</div></div>"
         )
 
     return f"""<!doctype html>
@@ -570,13 +617,14 @@ def render_dashboard(state: dict[str, Any], refresh_seconds: int = 5) -> str:
 <meta http-equiv="refresh" content="{max(2, int(refresh_seconds))}">
 <meta name="referrer" content="no-referrer"><title>PBP Monitoring</title>
 <style>
-:root{{--ink:#172033;--muted:#64748b;--line:#dbe3ee;--soft:#f4f7fb;--ok:#15803d;--bad:#b42318;--accent:#155e75}}
+:root{{--ink:#172033;--muted:#64748b;--line:#dbe3ee;--soft:#f4f7fb;--ok:#15803d;--bad:#b42318;--busy:#b45309;--accent:#155e75}}
 *{{box-sizing:border-box}}body{{margin:0;background:var(--soft);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}}
 header{{padding:28px max(20px,calc((100vw - 1280px)/2));color:#fff;background:linear-gradient(125deg,#0f172a,#155e75)}}
 h1{{margin:0;font-size:clamp(25px,4vw,40px)}}header p{{margin:5px 0 0;color:#d9f4f2}}main{{width:min(1280px,calc(100% - 28px));margin:22px auto 42px}}
-.status{{display:flex;align-items:center;gap:13px;padding:16px 18px;border:1px solid var(--line);border-radius:12px;background:#fff}}
+.status{{display:flex;align-items:flex-start;gap:13px;padding:16px 18px;border:1px solid var(--line);border-radius:12px;background:#fff}}
 .status-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-top:12px}}
-.dot{{width:18px;height:18px;border-radius:50%;background:var(--bad);box-shadow:0 0 0 5px #fee2e2}}.status.ok .dot{{background:var(--ok);box-shadow:0 0 0 5px #dcfce7}}
+.dot{{flex:0 0 auto;width:18px;height:18px;border-radius:50%;background:var(--bad);box-shadow:0 0 0 5px #fee2e2}}.status.ok .dot{{background:var(--ok);box-shadow:0 0 0 5px #dcfce7}}
+.status.busy .dot{{background:var(--busy);box-shadow:0 0 0 5px #fef3c7}}.status .dot{{margin-top:3px}}.status>div{{min-width:0}}.status span{{display:block}}
 .status strong{{display:block;font-size:17px}}.muted,.status span{{color:var(--muted)}}section{{margin-top:24px}}h2{{margin:0 0 12px}}
 .table-wrap{{overflow:auto;max-height:55vh;border:1px solid var(--line);border-radius:12px;background:#fff;scrollbar-gutter:stable}}table{{width:100%;border-collapse:collapse;white-space:nowrap}}
 th,td{{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}th{{position:sticky;top:0;background:#eef3f8;font-size:12px;text-transform:uppercase}}

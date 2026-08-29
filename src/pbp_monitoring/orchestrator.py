@@ -31,7 +31,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from . import __version__
-from .config_store import ConfigStore, StoredTarget
+from .config_store import ConfigStore, StoredTarget, dp_core_identity
 from .text_export import write_record_text_export
 
 
@@ -65,6 +65,7 @@ OP_COMMANDS = {
 }
 
 SYSTEM_INFO_COMMAND = "<show><system><info/></system></show>"
+DP_CORE_FUNCTIONS_COMMAND = "<show><statistics/></show>"
 CLOCK_COMMAND = "<show><clock/></show>"
 
 DEVICE_IDENTITY_FIELDS = ("serial", "model", "software_version")
@@ -144,6 +145,8 @@ class TargetProfile:
     serials: tuple[str, ...] = ()
     syslog_sources: tuple[str, ...] = ()
     tls_verify: bool | str = False
+    dp_core_functions: tuple[dict[str, Any], ...] = ()
+    dp_core_functions_identity: str | None = None
 
 
 def load_target_profiles(path: Path) -> tuple[TargetProfile, ...]:
@@ -287,6 +290,8 @@ class Config:
     target_name: str | None = None
     target_profiles: tuple[TargetProfile, ...] = ()
     config_revision: int | None = None
+    dp_core_functions: tuple[dict[str, Any], ...] = ()
+    dp_core_functions_identity: str | None = None
 
     def __post_init__(self) -> None:
         numeric_rules = (
@@ -409,6 +414,8 @@ class Config:
                     serials=item.serials,
                     syslog_sources=item.syslog_sources,
                     tls_verify=_parse_tls_verify(item.tls_verify),
+                    dp_core_functions=item.dp_core_functions,
+                    dp_core_functions_identity=item.dp_core_functions_identity,
                 )
             )
         primary = profiles[0] if profiles else None
@@ -417,6 +424,10 @@ class Config:
             api_key=primary.api_key if primary else "",
             target_serial=primary.target_serial if primary else None,
             tls_verify=primary.tls_verify if primary else False,
+            dp_core_functions=primary.dp_core_functions if primary else (),
+            dp_core_functions_identity=(
+                primary.dp_core_functions_identity if primary else None
+            ),
             syslog_host=os.getenv("SYSLOG_HOST", "0.0.0.0"),
             syslog_port=int(os.getenv("SYSLOG_PORT", "5514")),
             poll_seconds=float(values["poll_seconds"]),
@@ -444,6 +455,8 @@ class Config:
             output_dir=self.output_dir / "targets" / profile.name,
             target_name=profile.name,
             target_profiles=(),
+            dp_core_functions=profile.dp_core_functions,
+            dp_core_functions_identity=profile.dp_core_functions_identity,
         )
 
 
@@ -688,6 +701,59 @@ def extract_pbp_offenders(output: str) -> list[dict[str, Any]]:
     return offenders
 
 
+def _panos_flag(value: str | None) -> bool | None:
+    """Interpret the boolean-like element text used by operational XML."""
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"true", "yes", "1"}:
+        return True
+    if normalized in {"false", "no", "0"}:
+        return False
+    return None
+
+
+def _structured_pbp_state(output: str) -> dict[str, Any]:
+    """Read PBP mode and activation flags from the structured XML form.
+
+    A chassis reports one element per dataplane, so a single dataplane in
+    mitigation is enough to consider the firewall affected.
+    """
+    try:
+        root = ET.fromstring(output)
+    except ET.ParseError:
+        return {}
+    enabled: list[bool] = []
+    running: list[bool] = []
+    monitor_only: list[bool] = []
+    modes: list[str] = []
+    for element in root.iter():
+        if not _local_tag(element).endswith("packet-buffer-protection"):
+            continue
+        for name, sink in (
+            ("is-module-enabled", enabled),
+            ("is-running", running),
+            ("is-monitor-only", monitor_only),
+        ):
+            flag = _panos_flag(_child_text(element, name))
+            if flag is not None:
+                sink.append(flag)
+        if _panos_flag(_child_text(element, "use-latency")):
+            modes.append("latency")
+        elif _panos_flag(_child_text(element, "use-buffer")):
+            modes.append("packet_buffer")
+    state: dict[str, Any] = {}
+    if enabled:
+        state["enabled"] = any(enabled)
+    if running:
+        state["active"] = any(running)
+    if monitor_only:
+        state["monitor_only"] = any(monitor_only)
+    if modes:
+        state["mode"] = "latency" if "latency" in modes else "packet_buffer"
+    return state
+
+
 def extract_pbp_status(
     output: str,
     offenders: list[dict[str, Any]] | None = None,
@@ -729,7 +795,7 @@ def extract_pbp_status(
             None,
         )
     )
-    return {
+    status: dict[str, Any] = {
         "enabled": enabled,
         "active": active,
         "mode": mode,
@@ -739,6 +805,9 @@ def extract_pbp_status(
         "congestion_percentage": max(congestion_values) if congestion_values else None,
         "drop_probability_percentage": drop_probability,
     }
+    # The structured form is authoritative when the release returns it.
+    status.update(_structured_pbp_state(output))
+    return status
 
 
 def extract_ingress_backlogs(output: str) -> dict[str, list[dict[str, Any]]]:
@@ -1496,6 +1565,76 @@ def _structured_ingress_percentages(output: str, tag: str) -> list[float]:
     return values
 
 
+FASTPATH_FUNCTION = "flow_fastpath"
+TASK_LINE = re.compile(
+    r"^\s*task\s+(?P<core>\d+)\s*\(\s*pid\s*:\s*(?P<pid>\d+)\s*\)\s*(?P<modules>.*)$",
+    re.I,
+)
+
+
+def extract_dp_core_functions(statistics: str) -> list[dict[str, Any]]:
+    """Return the static core-to-function-group map for every dataplane.
+
+    PAN-OS assigns each dataplane core a fixed set of function groups, so cores
+    are not interchangeable and a quiet core is not necessarily an idle one.
+    The map is constant for a platform and PAN-OS release, which is why it is
+    collected once per incident rather than on every poll.
+    """
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(dataplane: str, core_id: str, functions: list[str]) -> None:
+        identity = (dataplane, core_id)
+        if identity in seen or not functions:
+            return
+        seen.add(identity)
+        entries.append(
+            {
+                "dataplane": dataplane,
+                "core_id": core_id,
+                "functions": functions,
+                "forwards_traffic": FASTPATH_FUNCTION in functions,
+            }
+        )
+
+    try:
+        root = ET.fromstring(statistics)
+    except ET.ParseError:
+        root = None
+
+    if root is not None:
+        for element in root.iter():
+            if _local_tag(element) != "entry":
+                continue
+            dataplane = _child_text(element, "dp")
+            if not dataplane:
+                continue
+            for core in element.iter():
+                if _local_tag(core) != "entry" or core is element:
+                    continue
+                core_id = _child_text(core, "id")
+                if core_id is None:
+                    continue
+                functions = [
+                    member.text.strip()
+                    for module in core
+                    if _local_tag(module) == "modules"
+                    for member in module
+                    if _local_tag(member) == "member" and member.text
+                ]
+                add(dataplane.strip().lower(), core_id, functions)
+        if entries:
+            return entries
+
+    for line in panos_result_text(statistics).splitlines():
+        match = TASK_LINE.match(line)
+        if not match:
+            continue
+        functions = match.group("modules").split()
+        add("dp0", match.group("core"), functions)
+    return entries
+
+
 def extract_resource_cpu_cores(resource_monitor: str) -> list[dict[str, Any]]:
     """Return per-core CPU series and summaries from the per-second view."""
     samples: list[dict[str, Any]] = []
@@ -2243,6 +2382,37 @@ class MonitorController:
     def _redact_secret(self, value: str) -> str:
         return value.replace(self.cfg.api_key, "<redacted>") if self.cfg.api_key else value
 
+    async def _resolve_core_functions(
+        self,
+        device: dict[str, str],
+        *,
+        force: bool = False,
+    ) -> tuple[list[dict[str, Any]], str, dict[str, Any] | None]:
+        """Return the dataplane core map, calling the firewall only when needed.
+
+        The map is captured once when the firewall is saved, so an incident
+        normally reuses it and spends no API call on a firewall that is already
+        under pressure. A PAN-OS upgrade can reassign function groups, so a
+        stored map is only trusted while the model and release still match.
+        """
+        running = dp_core_identity(device)
+        stored = [dict(entry) for entry in self.cfg.dp_core_functions]
+        if not force and stored and running and self.cfg.dp_core_functions_identity == running:
+            return stored, "configuration", None
+        if stored and not force:
+            LOG.warning(
+                "Stored dataplane core map for %s was captured on %s but the "
+                "firewall reports %s; reading it again and save the firewall to "
+                "refresh the stored copy",
+                self.cfg.target_name or self.cfg.panos_url,
+                self.cfg.dp_core_functions_identity or "an unknown release",
+                running or "an unknown release",
+            )
+        _, payload = await self._collect_command(
+            "dp_core_functions", DP_CORE_FUNCTIONS_COMMAND
+        )
+        return extract_dp_core_functions(command_result(payload)), "firewall", payload
+
     async def _collect_command(
         self,
         name: str,
@@ -2390,6 +2560,16 @@ class MonitorController:
                     _, global_counter_baseline = global_counter_primer_task.result()
                     device = extract_system_info(command_result(system_info))
                     identity_warnings = device_identity_warnings(device)
+                    (
+                        core_functions,
+                        core_functions_source,
+                        dp_core_functions,
+                    ) = await self._resolve_core_functions(device)
+                    startup_warnings = list(identity_warnings)
+                    if not core_functions:
+                        startup_warnings.append(
+                            "dataplane core function groups could not be read"
+                        )
                     startup_record = {
                         "timestamp": started_at,
                         "collector_version": __version__,
@@ -2398,9 +2578,16 @@ class MonitorController:
                         "target_name": self.cfg.target_name,
                         "device": device,
                         "identity_complete": not identity_warnings,
-                        "parse_warnings": identity_warnings,
+                        "parse_warnings": startup_warnings,
+                        "dp_core_functions": core_functions,
+                        "dp_core_functions_source": core_functions_source,
                         "commands": {
                             "system_info": system_info,
+                            **(
+                                {"dp_core_functions": dp_core_functions}
+                                if dp_core_functions is not None
+                                else {}
+                            ),
                             "global_counters_baseline": global_counter_baseline,
                         },
                     }
@@ -2837,6 +3024,18 @@ class MultiTargetRouter:
             return_exceptions=True,
         )
 
+    def is_target_busy(self, name: str) -> bool:
+        """Report whether one firewall is currently being polled for an incident."""
+        if self.pending:
+            # A routing probe is in flight and may poll any candidate firewall.
+            return True
+        controller = self.controllers.get(name)
+        return bool(
+            controller is not None
+            and controller.monitor_task is not None
+            and not controller.monitor_task.done()
+        )
+
     def is_busy(self) -> bool:
         return bool(self.pending) or any(
             controller.monitor_task is not None
@@ -2978,6 +3177,12 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
     _, global_counter_baseline = global_counter_primer_task.result()
     device = extract_system_info(command_result(system_info))
     identity_warnings = device_identity_warnings(device)
+    core_functions, core_functions_source, dp_core_functions = (
+        await controller._resolve_core_functions(device, force=True)
+    )
+    startup_warnings = list(identity_warnings)
+    if not core_functions:
+        startup_warnings.append("dataplane core function groups could not be read")
     startup_record = {
         "timestamp": started_at,
         "collector_version": __version__,
@@ -2987,9 +3192,12 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
         "target_name": cfg.target_name,
         "device": device,
         "identity_complete": not identity_warnings,
-        "parse_warnings": identity_warnings,
+        "parse_warnings": startup_warnings,
+        "dp_core_functions": core_functions,
+        "dp_core_functions_source": core_functions_source,
         "commands": {
             "system_info": system_info,
+            "dp_core_functions": dp_core_functions,
             "global_counters_baseline": global_counter_baseline,
         },
     }
@@ -3114,13 +3322,193 @@ async def run_configured_api_checks(cfg: Config) -> list[tuple[Path, bool]]:
     return list(await asyncio.gather(*(run_api_check(item) for item in target_configs)))
 
 
+CHECK_TICK_SECONDS = 10.0
+
+
+def _check_detail(device: dict[str, str], core_count: int, refreshed: bool) -> str:
+    parts = [
+        f"PAN-OS {device.get('software_version') or 'unknown'}",
+        f"{core_count} dataplane cores mapped" if core_count else "core map unavailable",
+    ]
+    if refreshed:
+        parts.append("stored identity refreshed")
+    return "; ".join(parts)
+
+
+async def run_target_keepalive(cfg: Config, store: ConfigStore, target: StoredTarget) -> bool:
+    """Confirm one firewall is reachable and its stored identity still current.
+
+    Read-only and deliberately small: `show system info` every time, and
+    `show statistics` only when the stored core map is missing or was captured
+    on a different model or PAN-OS release. A firewall in steady state costs one
+    API call a day.
+    """
+    controller = MonitorController(cfg, PanOSClient(cfg))
+    _, system_info = await controller._collect_command("system_info", SYSTEM_INFO_COMMAND)
+    if not command_succeeded(system_info):
+        store.record_target_check(
+            target.target_id,
+            kind="keepalive",
+            status="failed",
+            detail=str(system_info.get("error") or "show system info failed"),
+        )
+        LOG.warning(
+            "Keepalive failed for %s: %s", target.name, system_info.get("error")
+        )
+        return False
+
+    device = extract_system_info(command_result(system_info))
+    running = dp_core_identity(device)
+    stale = not target.dp_core_functions or target.dp_core_functions_identity != running
+    core_functions: list[dict[str, Any]] | None = None
+    if stale:
+        core_functions, _, _ = await controller._resolve_core_functions(
+            device, force=True
+        )
+
+    identity_changed = (
+        (target.model or None) != (device.get("model") or None)
+        or (target.sw_version or None) != (device.get("software_version") or None)
+    )
+    if identity_changed or core_functions is not None:
+        store.refresh_target_device(
+            target.target_id,
+            device_identity=device,
+            dp_core_functions=core_functions,
+        )
+    if identity_changed:
+        LOG.info(
+            "Keepalive refreshed %s: model %s, PAN-OS %s",
+            target.name,
+            device.get("model") or "unknown",
+            device.get("software_version") or "unknown",
+        )
+    count = (
+        len(core_functions)
+        if core_functions is not None
+        else len(target.dp_core_functions)
+    )
+    store.record_target_check(
+        target.target_id,
+        kind="keepalive",
+        status="ok",
+        detail=_check_detail(device, count, identity_changed or core_functions is not None),
+    )
+    return True
+
+
+async def run_target_validation(cfg: Config, store: ConfigStore, target: StoredTarget) -> bool:
+    """Run the full read-only validation batch for one firewall on request."""
+    try:
+        capture, ok = await run_api_check(cfg)
+    except Exception as exc:  # a failed validation must not stop the listener
+        LOG.exception("Validation failed for %s", target.name)
+        store.record_target_check(
+            target.target_id,
+            kind="validation",
+            status="failed",
+            detail=f"{type(exc).__name__}: {exc}",
+            clear_request=True,
+        )
+        return False
+    store.record_target_check(
+        target.target_id,
+        kind="validation",
+        status="ok" if ok else "failed",
+        detail=f"run {capture.parent.name}",
+        clear_request=True,
+    )
+    LOG.info(
+        "Validation for %s finished as %s (%s)",
+        target.name,
+        "success" if ok else "failure",
+        capture.parent.name,
+    )
+    return ok
+
+
+def _check_is_due(last_check_at: str | None, interval_hours: float, now: datetime) -> bool:
+    if interval_hours <= 0:
+        return False
+    if not last_check_at:
+        return True
+    try:
+        previous = datetime.fromisoformat(str(last_check_at))
+    except ValueError:
+        return True
+    if previous.tzinfo is None:
+        previous = previous.replace(tzinfo=timezone.utc)
+    return (now - previous).total_seconds() >= interval_hours * 3600
+
+
+async def run_target_checks_once(router: "ManagedRouter") -> int:
+    """Run every due keepalive and every requested validation, one firewall at a time.
+
+    A firewall with an active incident is skipped: it is already being polled
+    every few seconds while under packet-buffer pressure, and a check must never
+    compete with the diagnostic batches.
+    """
+    store = router.store
+    try:
+        targets = [
+            target
+            for target in store.list_targets(include_secrets=True)
+            if isinstance(target, StoredTarget) and target.enabled
+        ]
+        interval_hours = float(store.get_settings()["target_check_hours"])
+    except (OSError, ValueError, KeyError):
+        LOG.exception("Unable to read the firewall check schedule")
+        return 0
+
+    now = datetime.now(timezone.utc)
+    performed = 0
+    for target in targets:
+        if router.router is not None and router.router.is_target_busy(target.name):
+            continue
+        profile = next(
+            (
+                item
+                for item in router.cfg.target_profiles
+                if item.name == target.name
+            ),
+            None,
+        )
+        if profile is None:
+            continue
+        target_cfg = router.cfg.for_target(profile)
+        try:
+            if target.check_requested_at:
+                await run_target_validation(target_cfg, store, target)
+            elif _check_is_due(target.last_check_at, interval_hours, now):
+                await run_target_keepalive(target_cfg, store, target)
+            else:
+                continue
+        except Exception:  # one firewall must not stop the others
+            LOG.exception("Firewall check failed for %s", target.name)
+        performed += 1
+    return performed
+
+
+async def run_target_check_loop(router: "ManagedRouter") -> None:
+    while True:
+        await asyncio.sleep(CHECK_TICK_SECONDS)
+        try:
+            await run_target_checks_once(router)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # the listener must survive any check failure
+            LOG.exception("Firewall check cycle failed")
+
+
 async def run_daemon(cfg: Config) -> None:
     cfg.output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     controller: MonitorController | MultiTargetRouter | ManagedRouter
+    check_task: asyncio.Task[None] | None = None
     config_db = os.getenv("PBP_CONFIG_DB", "").strip()
     if config_db:
         controller = ManagedRouter(cfg, ConfigStore(Path(config_db)))
         LOG.info("Managed configuration enabled at revision %s", cfg.config_revision)
+        check_task = asyncio.create_task(run_target_check_loop(controller))
     elif cfg.target_profiles:
         controller = MultiTargetRouter(cfg)
         LOG.info(
@@ -3146,6 +3534,9 @@ async def run_daemon(cfg: Config) -> None:
         await stop.wait()
     finally:
         transport.close()
+        if check_task is not None:
+            check_task.cancel()
+            await asyncio.gather(check_task, return_exceptions=True)
         if isinstance(controller, (MultiTargetRouter, ManagedRouter)):
             await controller.close()
         else:

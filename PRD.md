@@ -32,9 +32,11 @@ aggregated and do not always describe the original flow.
 - Produce one human-readable raw TXT export per collection batch.
 - Expose local, read-only reception and incident status without querying or
   changing the firewall.
-- Configure collector behavior, monitored firewalls, API credentials, and
-  allowed Syslog sources through an authenticated HTTPS admin page reachable
-  remotely on a protected management network.
+- Configure collector behavior, monitored firewalls, and API credentials
+  through an authenticated HTTPS admin page reachable remotely on a protected
+  management network. One firewall IP declares both the API endpoint and the
+  allowed Syslog source, and the device serial is read from the firewall rather
+  than typed.
 - Operate directly against a firewall or through Panorama.
 - Route an HA or multi-firewall trigger to the emitting device without assuming
   which member is active.
@@ -71,9 +73,22 @@ than create a concurrent one.
    candidate set and device serial may select within it. A source shared by
    several targets is probed read-only across those candidates and ambiguous
    results safely fan out only within that allowlist.
-3. At startup, the monitor runs `show system info` once without delaying the
-   first diagnostic batch.
-4. At incident startup, the monitor primes the global-counter delta baseline
+3. Each enabled firewall is verified read-only every `target_check_hours`, 24 by
+   default and 0 to disable: `show system info` for reachability, API key
+   validity and release drift, and `show statistics` only when the stored core
+   map is missing or was captured on a different model or release. No capture is
+   written, and a firewall with an active incident is skipped. An administrator
+   can request the full validation batch for one firewall from the admin UI; the
+   request travels through the configuration database because the Web service
+   mounts the evidence volume read-only and the collector exposes no port.
+4. At startup, the monitor runs `show system info` once without delaying the
+   first diagnostic batch. The dataplane core-to-function-group map returned by
+   `show statistics` is captured once per firewall, when the firewall is saved,
+   and stored with the model and PAN-OS release it was captured on. An incident
+   reuses it and spends no API call unless that identity no longer matches, in
+   which case it is read again for that incident. A firewall that cannot answer
+   the command records a parse warning and keeps collecting.
+5. At incident startup, the monitor primes the global-counter delta baseline
    separately. At the start of each batch, it starts `show clock`, then collects
    the following commands in parallel every five seconds without waiting for
    the clock request to time out:
@@ -82,141 +97,48 @@ than create a concurrent one.
    - `show running resource-monitor`;
    - `debug dataplane pool statistics`;
    - `show counter global filter delta yes`.
-5. The PBP table is structured without losing rows or directions: session or
+6. The PBP table is structured without losing rows or directions: session or
    source-IP type, zone, rank, samples, percentage, `Drop State`, packets, and
    time until discard. `ingress-backlogs` separately preserves slot/DP,
    ATOMIC/TOTAL, groups, counts, and flow details.
-6. Entities are ranked by RED evidence, contribution, and corroboration. The
+7. Entities are ranked by RED evidence, contribution, and corroboration. The
    collector immediately calls `show session id <id>` for priority sessions,
    including an ID explicitly supplied by the trigger, with bounded concurrency,
    fair selection, and retry delays. Repeated snapshots derive c2s, s2c, and
    total bit rates while detecting reset counters and reused session IDs. A
    source IP alone remains valid attribution evidence but does not cause a
    session command.
-7. The complete cycle, raw XML API responses, and partial errors are written to
+8. The complete cycle, raw XML API responses, and partial errors are written to
    a JSONL file.
-8. The monitor stops after N consecutive complete measurements below the
+9. The monitor stops after N consecutive complete measurements below the
    recovery threshold, after the configurable time-to-live since the last
    matching alert, or after the maximum duration. A new trigger resets the
    recovery sequence and the alert inactivity timer.
-9. After the stop marker is written, a standalone HTML report is generated in
+10. After the stop marker is written, a standalone HTML report is generated in
    the background from the JSONL file.
-10. Each completed batch also writes an atomic TXT view of its command and
+11. Each completed batch also writes an atomic TXT view of its command and
     session outputs. A Web UI displays bounded Syslog reception status and
     read-only artifact links; its authenticated admin area writes only to the
     separate configuration store.
+12. Saving a firewall in the admin area performs at most two outbound calls: an
+    optional HTTPS key generation from temporary credentials, then one
+    read-only `show system info`. The second call validates the API key and
+    supplies the stored device serial, hostname, model, and PAN-OS version. Neither call changes firewall state, and
+    a failure of either leaves the configuration unchanged.
 
 ## 7. Functional requirements
 
-- **FR-01** — Listen on a configurable, unprivileged UDP Syslog port.
-- **FR-02** — Match the four fixed PBP trigger signatures case-insensitively.
-- **FR-03** — Query operational commands through XML API `type=op`.
-- **FR-04** — Send the key in the `X-PAN-KEY` header.
-- **FR-05** — Support per-target `target_serial` for Panorama.
-- **FR-06** — Preserve every raw output, including partial errors.
-- **FR-07** — Extract IDs without mistaking an IPv4 address for an ID.
-- **FR-08** — Enrich no more than the configured number of sessions per cycle.
-- **FR-09** — Prevent concurrent monitors.
-- **FR-10** — Enforce a mandatory maximum duration.
-- **FR-11** — Create a separate Syslog trigger journal.
-- **FR-12** — Shut down cleanly on SIGINT and SIGTERM.
-- **FR-13** — Capture `show system info` once at incident startup.
-- **FR-14** — Start `show clock` before the diagnostics in every batch.
-- **FR-15** — Count a recovery measurement only when the required packet-buffer
-  and packet-descriptor metrics were extracted.
-- **FR-16** — Generate a standalone HTML report that can be rebuilt from JSONL.
-- **FR-17** — Provide a single-batch API validation mode without a Syslog
-  trigger, restricted to the read-only command allowlist.
-- **FR-18** — Correlate each trigger with the `run_id` and preserve its order,
-  reinforcement status, and explicitly labeled metadata.
-- **FR-19** — Rank session/IP candidates using PAN-OS evidence and prioritize
-  new offenders ahead of retries within the batch limit.
-- **FR-20** — Normalize the 5-tuple, zones, application, rule, state, interfaces,
-  and available counters from `show session id` while preserving the complete
-  raw response.
-- **FR-21** — Persist every incident in its own directory with its JSONL source
-  and derived HTML report.
-- **FR-22** — Provide a Docker Compose deployment accepting Syslog over TCP and
-  UDP on port 514 through a non-privileged Syslog gateway.
-- **FR-23** — Stop an active monitor after a configurable period without a
-  matching alert, while retaining a separate absolute maximum duration.
-- **FR-24** — Preserve and normalize dataplane pool availability, including
-  packet-buffer used/free percentages and the low-free limit state.
-- **FR-25** — Preserve global counter deltas and normalize flow-category rows.
-- **FR-26** — Load a private, gitignored target inventory for standalone and
-  multi-firewall modes. A target IP may derive both its HTTPS API URL and
-  allowed Syslog source; explicit URL/source overrides and named environment
-  variables remain available for advanced topologies.
-- **FR-27** — Preserve the original sender through the Syslog gateway and route
-  by device serial before Syslog source IP.
-- **FR-28** — Probe unresolved targets concurrently without duplicating probes
-  for concurrent triggers from the same unresolved sender.
-- **FR-29** — Maintain independent incident state, deduplication, TTL, recovery,
-  evidence directories, and reports for every selected target.
-- **FR-30** — Route a one-entry standalone inventory directly without an
-  unnecessary discovery probe.
-- **FR-31** — Require every target to resolve at least one normalized Syslog
-  source IP, derived from `ip` or declared explicitly, and reject unmatched
-  sources or serial/source identity conflicts before any API collection starts.
-- **FR-32** — Re-sample only bounded PBP/ingress candidate sessions and derive
-  directional and total throughput from cumulative byte-counter deltas.
-- **FR-33** — Prime the global-counter baseline before the first recorded delta,
-  preserve that raw baseline, and expose warn/error/drop rows separately without
-  discarding informational raw evidence.
-- **FR-34** — Write private `startup.txt` and `batch-NNNN.txt` files beside each
-  incident without replacing JSONL as the source of truth, and support rebuilding
-  those files from an existing capture.
-- **FR-35** — Maintain a bounded reception-status journal for matching and
-  non-matching Syslog messages so transport freshness is observable.
-- **FR-36** — Provide a Web service with a health endpoint, the 20 latest
-  received logs, recent run state, and read-only artifact links. It has no
-  writable evidence access; credential access is restricted to authenticated
-  configuration operations.
-- **FR-37** — Keep wide timeline columns reachable through a bounded two-axis
-  scrolling region with sticky headers and batch identifiers.
-- **FR-38** — Persist runtime settings and the target inventory in SQLite so a
-  normal Compose deployment requires neither `.env` nor `targets.json`.
-- **FR-39** — Encrypt PAN-OS API keys with an authenticated installation-specific
-  master key generated at first startup and persisted independently of images.
-  Deliver that key to an authenticated administrator until explicit backup
-  acknowledgement, then stop rendering it in the UI.
-- **FR-40** — Protect remotely available Web administration with HTTPS, a salted
-  password derivation, authenticated sessions, CSRF tokens, and management-network
-  access controls. Permit remote initial password setup and authenticated password
-  changes; a change invalidates existing administrator sessions.
-- **FR-41** — Generate a PAN-OS API key from temporary credentials in the admin
-  page without storing the username or password or putting either in the URL.
-- **FR-42** — Show global Syslog freshness and independent freshness for every
-  configured firewall. Unattributable logs may update only the global state.
-- **FR-43** — Reload valid configuration revisions between incidents. A change
-  received during a run must be deferred until that run completes.
+The numbered functional requirements are tracked as GitHub issues, which are the
+living list: <https://github.com/tbortolossi/panos-pbp-monitoring/issues?q=label%3Arequirement>
 
-- **FR-44** — Show extracted command results and non-empty errors immediately in
-  HTML reports while keeping the exact raw API response in a nested disclosure
-  collapsed by default.
-- **FR-45** — Query a per-second resource-monitor window covering the configured
-  poll interval plus a two-second margin, bounded to 60 seconds. Preserve every
-  returned per-core average and maximum, summarize the overlapping windows over
-  the run, and expose CPU imbalance as corroborating evidence rather than
-  deterministic offender attribution.
-- **FR-46** — Download a complete run as a compressed support archive containing
-  its evidence, run-correlated trigger logs, retained target-attributed Syslog
-  received during the run, and a versioned SHA-256 manifest without persisting
-  a duplicate.
-- **FR-47** — Offer an authenticated CSV download of the installation recovery
-  key until backup acknowledgement, then stop serving it.
-- **FR-48** — Store TLS verification independently for each firewall. New
-  firewalls default to disabled verification; existing global values migrate to
-  their current targets.
-- **FR-49** — Identify the application version in the UI, captures, reports, and
-  support archives.
-- **FR-50** — Always serve the dashboard and administration over TLS. Use an
-  explicit certificate/key pair when configured; otherwise create a persistent,
-  installation-specific self-signed certificate with configurable DNS/IP subject
-  alternative names without requiring `.env`.
-- **FR-51** — Publish a separate HTTP listener that serves no application data
-  and redirects every valid request to the same host on the configured public
-  HTTPS port. Reject malformed Host headers instead of reflecting them.
+Each requirement carries the `requirement` label; `implemented` marks those
+delivered in a release. FR-01 to FR-51 were imported at public launch and cover
+release v0.4.1. New requirements are opened there, not added to this document.
+
+This section is kept as a stable anchor so existing issue links resolve. The
+sections around it stay authoritative: section 6 defines the functional flow,
+section 8 the non-functional requirements, section 9 the produced data, and
+section 11 the acceptance criteria a release is validated against.
 
 ## 8. Non-functional requirements
 
@@ -250,20 +172,25 @@ trigger is copied into the incident as an event. Each incident creates
 firewall clock, ranked candidate entities, PBP rows, ingress details, normalized
 session snapshots and rates, dataplane pool headroom, global/flow/significant
 counter views, parsing status, and raw XML command responses. A
-`monitor_started` record preserves the identity returned by `show system info`,
-and a `monitor_stopped` record gives the stop reason. Multi-target mode roots
+`monitor_started` record preserves the identity returned by `show system info`
+and the `dp_core_functions` core-to-function-group map with the
+`dp_core_functions_source` field naming where that map came from, and a
+`monitor_stopped` record gives the stop reason. Multi-target mode roots
 these files below `targets/<target-name>/` and adds `syslog-routing.jsonl` for
 probe and routing evidence.
 
 `incidents/<run_id>/report.html` is a derived view containing a summary, timeline,
-offender ranking, partial errors, and all collapsible raw outputs. It contains
+offender ranking, per-dataplane CPU core charts, partial errors, and all
+collapsible raw outputs. It contains
 the JSONL SHA-256 digest; JSONL remains the source of truth. Validation mode
 similarly produces `api-checks/<run_id>/api-check.jsonl` and
 `api-checks/<run_id>/report.html`.
 
 `incidents/<run_id>/raw/startup.txt` and `raw/batch-NNNN.txt` provide readable
 command-by-command exports, including result, error, exact raw XML response, and
-session lookups. `syslog-received.jsonl` is a compacted status journal for the
+session lookups. The startup export also states the dataplane
+core-to-function-group map and its source, which an incident reusing the stored
+map does not carry as a command payload. `syslog-received.jsonl` is a compacted status journal for the
 dashboard, not a replacement for incident evidence.
 The Web UI streams a ZIP support export containing these run artifacts and a
 versioned checksum manifest.
@@ -308,56 +235,78 @@ key must be backed up and restored together.
 10. Three complete measurements below the default threshold stop collection;
     an error or unrecognized format does not count as a low measurement.
 11. The maximum duration stops an incident that never recovers.
-12. `show system info` runs once and `show clock` once per batch.
-13. The HTML report escapes hostile output and does not modify the JSONL file.
-14. Unit tests and Python compilation succeed.
-15. The service starts without root privileges after documented installation.
-16. A serial-labelled trigger routes only to its configured target.
-17. The Syslog gateway preserves the original sender address for source routing.
-18. Concurrent triggers from one shared allowlisted source cause one parallel probe,
+12. `show system info` runs once per incident and `show clock` once per batch.
+13. A firewall unchanged since its last check costs one API call per check
+    interval, a firewall with an active incident is not checked at all, and a
+    failed check is recorded and visible without interrupting Syslog reception.
+14. Each dashboard firewall card states Syslog freshness, the outcome of the last
+    read-only check, and whether a monitoring run is in progress on that
+    firewall. The run state is derived from the run files already written; no
+    additional firewall call is made to determine it.
+    `show statistics` runs once per firewall at save time, is not called during
+    an incident whose stored map still matches the running release, and is
+    always called by `--check-api`.
+15. The report charts each dataplane separately and states whether the load rose
+    on every comparable core or on a few of them. Only cores carrying
+    `flow_fastpath` are compared, because PAN-OS assigns some cores to
+    management, control, or timer duties that make them permanently busier or
+    quieter than their peers.
+16. The HTML report escapes hostile output and does not modify the JSONL file.
+17. Unit tests and Python compilation succeed.
+18. The service starts without root privileges after documented installation.
+19. A serial-labelled trigger routes only to its configured target.
+20. The Syslog gateway preserves the original sender address for source routing.
+21. Concurrent triggers from one shared allowlisted source cause one parallel probe,
     then reinforce the selected target incident.
-19. An affected member discovered by probe is selected without polling a healthy
+22. An affected member discovered by probe is selected without polling a healthy
     member for the full incident; an ambiguous probe fans out without losing the
     trigger.
-20. `--check-api` validates every configured target and returns failure if any
+23. `--check-api` validates every configured target and returns failure if any
     target validation fails.
-21. A matching trigger from an unlisted source, or with a serial inconsistent
+24. A matching trigger from an unlisted source, or with a serial inconsistent
     with that source's candidates, causes no API call and starts no monitor.
-22. Two valid snapshots of one candidate session produce c2s, s2c, and total
+25. Two valid snapshots of one candidate session produce c2s, s2c, and total
     throughput; a counter decrease or changed start time produces no false rate.
-23. The global-counter primer is preserved separately and the first recorded
+26. The global-counter primer is preserved separately and the first recorded
     cycle identifies whether its delta interval was successfully primed.
-24. Every startup and batch can be opened as a standalone TXT file containing
+27. Every startup and batch can be opened as a standalone TXT file containing
     its command results, raw responses, errors, and session details.
-25. Both ordinary and triggering Syslog datagrams update the bounded reception
+28. Both ordinary and triggering Syslog datagrams update the bounded reception
     journal without causing ordinary messages to start a monitor.
-26. The Web UI reports fresh/stale Syslog state, recent runs, and only serves
+29. The Web UI reports fresh/stale Syslog state, recent runs, and only serves
     artifacts contained below a validated incident directory.
-27. Every timeline column remains reachable on a narrower display.
-28. The stack starts in setup mode without `.env` or `targets.json`, and the
+30. Every timeline column remains reachable on a narrower display.
+31. The stack starts in setup mode without `.env` or `targets.json`, and the
     collector begins routing after an administrator adds an enabled target.
-29. Plaintext API keys and admin passwords do not occur in SQLite, logs, HTML,
+32. Plaintext API keys and admin passwords do not occur in SQLite, logs, HTML,
     or exception messages.
-30. Global reception may be green while a configured firewall with no recent
+33. Global reception may be green while a configured firewall with no recent
     attributable log is independently red.
-31. The first authenticated administrator can retrieve the installation
+34. The first authenticated administrator can retrieve the installation
     recovery key and acknowledge its secure backup; subsequent pages no longer
     render the key.
-32. A support ZIP contains the complete run and a manifest with application
+35. A support ZIP contains the complete run and a manifest with application
     version, sizes, valid SHA-256 hashes, run triggers, and retained Syslog
     messages attributed to that target during the run.
-33. TLS verification can differ between two firewalls and defaults to disabled
+36. TLS verification can differ between two firewalls and defaults to disabled
     for a newly created firewall.
-34. An eight-character administrator password is accepted and a shorter one is
+37. An eight-character administrator password is accepted and a shorter one is
     rejected.
-35. A default installation requires no `.env`, publishes remote HTTPS, creates
+38. A default installation requires no `.env`, publishes remote HTTPS, creates
     one persistent matching self-signed certificate/key pair, and permits remote
     initial administrator setup. Requested IP/DNS SANs survive rebuilds.
-36. An authenticated password change requires the current password, accepts a
+39. An authenticated password change requires the current password, accepts a
     new password of at least eight characters, and invalidates all sessions.
-37. `http://<host>/path` returns a permanent redirect to
+40. `http://<host>/path` returns a permanent redirect to
     `https://<host>:8088/path`; malformed Host headers are rejected and the HTTP
     listener exposes no dashboard or administrative content.
+41. Saving a firewall stores the serial, hostname, model, and PAN-OS version
+    returned by `show system info`, and its single IP as both API endpoint and
+    allowed Syslog source. A name left blank takes the PAN-OS hostname, and a
+    later save without a refreshed identity keeps the stored one. A rejected key,
+    an unreachable address, or a missing serial reports an error and writes
+    nothing. Additional Syslog sources imported from a legacy configuration are
+    preserved across an edit.
 
 ## 12. Possible enhancements
 
