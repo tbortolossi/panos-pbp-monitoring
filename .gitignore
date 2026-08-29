@@ -1,4 +1,5 @@
 # Local configuration and secrets
+CLAUDE.local.md
 .env
 .env.*
 !.env.example

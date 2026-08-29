@@ -53,6 +53,9 @@ class StoredTarget:
     syslog_sources: tuple[str, ...]
     tls_verify: str
     enabled: bool
+    hostname: str | None = None
+    model: str | None = None
+    sw_version: str | None = None
 
 
 class ConfigStore:
@@ -91,6 +94,9 @@ class ConfigStore:
                     syslog_sources_json TEXT NOT NULL,
                     tls_verify TEXT NOT NULL DEFAULT 'false',
                     enabled INTEGER NOT NULL DEFAULT 1,
+                    hostname TEXT,
+                    model TEXT,
+                    sw_version TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -118,6 +124,9 @@ class ConfigStore:
                 connection.execute(
                     "UPDATE targets SET tls_verify=?", (legacy_value,)
                 )
+            for column in ("hostname", "model", "sw_version"):
+                if column not in columns:
+                    connection.execute(f"ALTER TABLE targets ADD COLUMN {column} TEXT")
             connection.execute("DELETE FROM settings WHERE key='tls_verify'")
             now = _utc_now()
             connection.executemany(
@@ -128,8 +137,8 @@ class ConfigStore:
                 "INSERT OR IGNORE INTO meta(key,value) VALUES('revision','1')"
             )
             connection.execute(
-                """INSERT INTO meta(key,value) VALUES('schema_version','2')
-                   ON CONFLICT(key) DO UPDATE SET value='2'"""
+                """INSERT INTO meta(key,value) VALUES('schema_version','3')
+                   ON CONFLICT(key) DO UPDATE SET value='3'"""
             )
         self._chmod_private(self.path)
 
@@ -275,13 +284,15 @@ class ConfigStore:
         name: str,
         panos_url: str,
         api_key: str | None,
-        target_serial: str | None,
+        target_serial: str | None = None,
         serials: list[str] | tuple[str, ...],
         syslog_sources: list[str] | tuple[str, ...],
         tls_verify: str = "false",
         enabled: bool = True,
+        device_identity: dict[str, str] | None = None,
         target_id: int | None = None,
     ) -> int:
+        """Persist a firewall; `device_identity` carries `show system info` fields."""
         name = name.strip()
         if not TARGET_NAME.fullmatch(name):
             raise ValueError("target name must contain only letters, digits, dot, dash or underscore")
@@ -291,6 +302,11 @@ class ConfigStore:
             dict.fromkeys(str(value).strip() for value in serials if str(value).strip())
         )
         target_serial = str(target_serial or "").strip() or None
+        identity = device_identity or {}
+        device = tuple(
+            str(identity.get(field) or "").strip() or None
+            for field in ("hostname", "model", "software_version")
+        )
         tls_verify = str(tls_verify).strip() or "false"
         if tls_verify.lower() in {"0", "no", "off"}:
             tls_verify = "false"
@@ -318,32 +334,37 @@ class ConfigStore:
                 cursor = connection.execute(
                     """INSERT INTO targets
                        (name,panos_url,api_key_ciphertext,target_serial,serials_json,
-                        syslog_sources_json,tls_verify,enabled,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        syslog_sources_json,tls_verify,enabled,hostname,model,sw_version,
+                        created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         name, panos_url, ciphertext, target_serial,
                         json.dumps(normalized_serials), json.dumps(normalized_sources),
-                        tls_verify, int(enabled), now, now,
+                        tls_verify, int(enabled), *device, now, now,
                     ),
                 )
                 result = int(cursor.lastrowid)
             else:
                 row = connection.execute(
-                    "SELECT api_key_ciphertext FROM targets WHERE id=?", (target_id,)
+                    "SELECT api_key_ciphertext,hostname,model,sw_version FROM targets WHERE id=?",
+                    (target_id,),
                 ).fetchone()
                 if row is None:
                     raise ValueError("firewall no longer exists")
                 ciphertext = str(row["api_key_ciphertext"])
                 if api_key and api_key.strip():
                     ciphertext = self._fernet().encrypt(api_key.strip().encode()).decode()
+                if not device_identity:
+                    device = (row["hostname"], row["model"], row["sw_version"])
                 connection.execute(
                     """UPDATE targets SET name=?,panos_url=?,api_key_ciphertext=?,
-                       target_serial=?,serials_json=?,syslog_sources_json=?,tls_verify=?,enabled=?,updated_at=?
+                       target_serial=?,serials_json=?,syslog_sources_json=?,tls_verify=?,enabled=?,
+                       hostname=?,model=?,sw_version=?,updated_at=?
                        WHERE id=?""",
                     (
                         name, panos_url, ciphertext, target_serial,
                         json.dumps(normalized_serials), json.dumps(normalized_sources),
-                        tls_verify, int(enabled), now, target_id,
+                        tls_verify, int(enabled), *device, now, target_id,
                     ),
                 )
                 result = target_id
@@ -370,6 +391,9 @@ class ConfigStore:
                 "syslog_sources": tuple(json.loads(row["syslog_sources_json"])),
                 "tls_verify": str(row["tls_verify"]),
                 "enabled": bool(row["enabled"]),
+                "hostname": row["hostname"],
+                "model": row["model"],
+                "sw_version": row["sw_version"],
             }
             if include_secrets:
                 try:

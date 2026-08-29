@@ -145,7 +145,7 @@ class ReportingTests(unittest.TestCase):
 
             self.assertIn("Summary", rendered)
             self.assertIn("Collector version", rendered)
-            self.assertIn("PBP Monitoring v0.4.1", rendered)
+            self.assertIn("PBP Monitoring v0.5.0", rendered)
             self.assertIn("ha-a&lt;&amp;&gt;", rendered)
             self.assertIn("Timeline", rendered)
             self.assertIn('class="table-wrap timeline-wrap"', rendered)
