@@ -127,7 +127,16 @@ installation-specific self-signed certificate and private key in the persistent
 configuration volume. Remote administration, including initial password setup
 and authenticated password changes, is enabled without a `.env` file. Restrict
 TCP 80 and 8088 to the trusted management network with the host firewall or an
-upstream ACL; the first administrator setup is intentionally reachable remotely.
+upstream ACL; the first administrator setup is reachable remotely but requires
+the one-time setup code printed in the webui container log, so the collector
+cannot be claimed by whoever reaches the port first:
+
+```bash
+docker compose logs webui | grep "setup code"
+```
+
+Failed sign-in and setup attempts are throttled per source address: after five
+failures within fifteen minutes, that address must wait before trying again.
 
 Opening `http://<docker-host>` returns an HTTP 308 redirect to
 `https://<docker-host>:8088`. The HTTP listener never serves the dashboard,

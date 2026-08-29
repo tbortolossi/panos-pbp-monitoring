@@ -11,7 +11,9 @@ import re
 import secrets
 import sqlite3
 import ssl
+import threading
 import time
+from collections import deque
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,10 @@ from .panos_keygen import (
 LOG = logging.getLogger("pbp-adminui")
 
 SESSION_SECONDS = 8 * 60 * 60
+AUTH_ATTEMPT_LIMIT = 5
+AUTH_ATTEMPT_WINDOW_SECONDS = 15 * 60
+AUTH_SOURCE_LIMIT = 1024
+VERIFY_CONCURRENCY = 4
 PENDING_CHECK_REFRESH_SECONDS = 5
 
 # PAN-OS Syslog forwarding helper. The collector never writes to the firewall:
@@ -139,6 +145,56 @@ class AdminController:
         self.sessions: dict[str, tuple[float, str]] = {}
         self.setup_token = secrets.token_urlsafe(32)
         self.login_token = secrets.token_urlsafe(32)
+        self.auth_failures: dict[str, deque[float]] = {}
+        self.verify_slots = threading.BoundedSemaphore(VERIFY_CONCURRENCY)
+        self.setup_code: str | None = None
+        if not self.store.has_admin_password():
+            # A freshly deployed collector must not be claimable by whoever
+            # reaches the port first. The code is only visible to someone who
+            # can already read the container logs on the host.
+            self.setup_code = secrets.token_urlsafe(12)
+            LOG.warning(
+                "Initial administrator setup requires the one-time setup code: %s",
+                self.setup_code,
+            )
+
+    def _throttled(self, source: str) -> bool:
+        """Report whether this source exhausted its authentication attempts."""
+        now = time.monotonic()
+        failures = self.auth_failures.get(source)
+        if failures is None:
+            return False
+        while failures and now - failures[0] > AUTH_ATTEMPT_WINDOW_SECONDS:
+            failures.popleft()
+        if not failures:
+            del self.auth_failures[source]
+            return False
+        return len(failures) >= AUTH_ATTEMPT_LIMIT
+
+    def _record_auth_failure(self, source: str) -> None:
+        now = time.monotonic()
+        for known in list(self.auth_failures):
+            entries = self.auth_failures[known]
+            while entries and now - entries[0] > AUTH_ATTEMPT_WINDOW_SECONDS:
+                entries.popleft()
+            if not entries:
+                del self.auth_failures[known]
+        if len(self.auth_failures) >= AUTH_SOURCE_LIMIT and source not in self.auth_failures:
+            # Bounded memory: beyond this many concurrently throttled sources
+            # the service is under attack anyway; drop the oldest entry.
+            self.auth_failures.pop(next(iter(self.auth_failures)))
+        self.auth_failures.setdefault(source, deque()).append(now)
+
+    def _throttle_page(self, handler: Any) -> None:
+        self._send(
+            handler,
+            _layout(
+                "Too many attempts",
+                '<section class="card"><h1>Too many failed attempts</h1>'
+                "<p>Authentication from your address is paused. Try again in a few minutes.</p></section>",
+            ),
+            429,
+        )
 
     def _is_loopback(self, handler: Any) -> bool:
         if self.allow_remote or self.trust_loopback_proxy:
@@ -242,7 +298,11 @@ class AdminController:
         notice = f'<p class="notice error">{_e(message)}</p>' if message else ""
         return _layout("Initial setup", f"""<section class="card"><h1>Secure initial setup</h1>{notice}
 <p>Create the local administrator password. It is stored as a salted PBKDF2 hash and cannot be recovered.</p>
+<p class="muted">The one-time setup code is printed in the webui container log at startup:
+<code>docker compose logs webui | grep "setup code"</code>. It proves you operate the host, so the
+collector cannot be claimed by whoever reaches this port first.</p>
 <form method="post" action="/admin/setup"><input type="hidden" name="csrf" value="{self.setup_token}">
+<label>Setup code (from the container log)</label><input type="text" name="setup_code" autocomplete="off" required>
 <label>Password (8 characters minimum)</label><input type="password" name="password" autocomplete="new-password" minlength="8" required>
 <label>Confirm password</label><input type="password" name="confirm" autocomplete="new-password" minlength="8" required>
 <button type="submit">Create administrator</button></form></section>""")
@@ -561,13 +621,30 @@ with <code>show system info</code>: it validates the credentials and reads the d
         try:
             if not self.store.has_admin_password():
                 if handler.command == "POST" and path == "/admin/setup":
+                    source = handler.client_address[0]
+                    if self._throttled(source):
+                        self._throttle_page(handler)
+                        return True
                     form = self._form(handler)
                     if not secrets.compare_digest(form.get("csrf", ""), self.setup_token):
                         raise ValueError("invalid setup token")
+                    if not secrets.compare_digest(
+                        form.get("setup_code", ""), self.setup_code or ""
+                    ):
+                        self._record_auth_failure(source)
+                        self._send(
+                            handler,
+                            self._setup_page(
+                                "Invalid setup code. Read it in the webui container log."
+                            ),
+                            403,
+                        )
+                        return True
                     if form.get("password") != form.get("confirm"):
                         raise ValueError("password confirmation does not match")
                     self.store.set_admin_password(form.get("password", ""))
                     self.setup_token = secrets.token_urlsafe(32)
+                    self.setup_code = None
                     self._redirect(handler, "/admin")
                 else:
                     self._send(handler, self._setup_page())
@@ -575,8 +652,28 @@ with <code>show system info</code>: it validates the credentials and reads the d
             session = self._session(handler)
             if session is None:
                 if handler.command == "POST" and path == "/admin/login":
+                    source = handler.client_address[0]
+                    if self._throttled(source):
+                        self._throttle_page(handler)
+                        return True
                     form = self._form(handler)
-                    if not secrets.compare_digest(form.get("csrf", ""), self.login_token) or not self.store.verify_admin_password(form.get("password", "")):
+                    if not self.verify_slots.acquire(blocking=False):
+                        # Password hashing is deliberately expensive; refuse to
+                        # stack unlimited concurrent derivations.
+                        self._send(
+                            handler,
+                            self._login_page("The server is busy. Try again."),
+                            503,
+                        )
+                        return True
+                    try:
+                        accepted = secrets.compare_digest(
+                            form.get("csrf", ""), self.login_token
+                        ) and self.store.verify_admin_password(form.get("password", ""))
+                    finally:
+                        self.verify_slots.release()
+                    if not accepted:
+                        self._record_auth_failure(source)
                         self._send(handler, self._login_page("Invalid password."), 401)
                     else:
                         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)

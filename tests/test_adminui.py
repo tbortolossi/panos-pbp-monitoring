@@ -1,5 +1,6 @@
 import contextlib
 import http.cookiejar
+import logging
 import re
 import tempfile
 import threading
@@ -41,12 +42,37 @@ CORE_FUNCTIONS = [
 ]
 
 
+class SetupCodeCatcher(logging.Handler):
+    """Capture the one-time setup code the controller logs at startup."""
+
+    def __init__(self):
+        super().__init__()
+        self.code = None
+
+    def emit(self, record):
+        match = re.search(r"setup code: (\S+)", record.getMessage())
+        if match:
+            self.code = match.group(1)
+
+
+@contextlib.contextmanager
+def capture_setup_code():
+    catcher = SetupCodeCatcher()
+    logger = logging.getLogger("pbp-adminui")
+    logger.addHandler(catcher)
+    try:
+        yield catcher
+    finally:
+        logger.removeHandler(catcher)
+
+
 @contextlib.contextmanager
 def signed_in_admin(root: Path):
     """Start the admin server, complete setup, and sign in."""
-    server = ThreadingHTTPServer(
-        ("127.0.0.1", 0), handler_factory(root / "data", 300, root / "config" / "config.db")
-    )
+    with capture_setup_code() as catcher:
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), handler_factory(root / "data", 300, root / "config" / "config.db")
+        )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -58,7 +84,12 @@ def signed_in_admin(root: Path):
             Request(
                 base + "/admin/setup",
                 data=urlencode(
-                    {"csrf": csrf, "password": "long-test-password", "confirm": "long-test-password"}
+                    {
+                        "csrf": csrf,
+                        "setup_code": catcher.code,
+                        "password": "long-test-password",
+                        "confirm": "long-test-password",
+                    }
                 ).encode(),
             )
         ).read().decode()
@@ -80,10 +111,11 @@ class AdminUITests(unittest.TestCase):
     def test_initial_password_login_and_authenticated_configuration_page(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            server = ThreadingHTTPServer(
-                ("127.0.0.1", 0),
-                handler_factory(root / "data", 300, root / "config" / "config.db"),
-            )
+            with capture_setup_code() as catcher:
+                server = ThreadingHTTPServer(
+                    ("127.0.0.1", 0),
+                    handler_factory(root / "data", 300, root / "config" / "config.db"),
+                )
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -94,6 +126,7 @@ class AdminUITests(unittest.TestCase):
                 setup_body = urlencode(
                     {
                         "csrf": setup_csrf,
+                        "setup_code": catcher.code,
                         "password": "long-test-password",
                         "confirm": "long-test-password",
                     }
@@ -146,6 +179,115 @@ class AdminUITests(unittest.TestCase):
                 store = ConfigStore(root / "config" / "config.db")
                 self.assertFalse(store.verify_admin_password("long-test-password"))
                 self.assertTrue(store.verify_admin_password("new-test-password"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_setup_rejects_a_wrong_code_and_accepts_the_logged_one(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with capture_setup_code() as catcher:
+                server = ThreadingHTTPServer(
+                    ("127.0.0.1", 0),
+                    handler_factory(root / "data", 300, root / "config" / "config.db"),
+                )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                setup = opener.open(base + "/admin").read().decode()
+                self.assertIn("setup code", setup)
+                csrf = re.search(r'name="csrf" value="([^"]+)"', setup).group(1)
+                with self.assertRaises(HTTPError) as context:
+                    opener.open(
+                        Request(
+                            base + "/admin/setup",
+                            data=urlencode(
+                                {
+                                    "csrf": csrf,
+                                    "setup_code": "wrong-code",
+                                    "password": "long-test-password",
+                                    "confirm": "long-test-password",
+                                }
+                            ).encode(),
+                        )
+                    )
+                self.assertEqual(context.exception.code, 403)
+                store = ConfigStore(root / "config" / "config.db")
+                self.assertFalse(store.has_admin_password())
+                accepted = opener.open(
+                    Request(
+                        base + "/admin/setup",
+                        data=urlencode(
+                            {
+                                "csrf": csrf,
+                                "setup_code": catcher.code,
+                                "password": "long-test-password",
+                                "confirm": "long-test-password",
+                            }
+                        ).encode(),
+                    )
+                ).read().decode()
+                self.assertIn("Administrator sign in", accepted)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_repeated_login_failures_throttle_the_source(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with capture_setup_code() as catcher:
+                server = ThreadingHTTPServer(
+                    ("127.0.0.1", 0),
+                    handler_factory(root / "data", 300, root / "config" / "config.db"),
+                )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                setup = opener.open(base + "/admin").read().decode()
+                csrf = re.search(r'name="csrf" value="([^"]+)"', setup).group(1)
+                login = opener.open(
+                    Request(
+                        base + "/admin/setup",
+                        data=urlencode(
+                            {
+                                "csrf": csrf,
+                                "setup_code": catcher.code,
+                                "password": "long-test-password",
+                                "confirm": "long-test-password",
+                            }
+                        ).encode(),
+                    )
+                ).read().decode()
+                login_csrf = re.search(r'name="csrf" value="([^"]+)"', login).group(1)
+                for _ in range(5):
+                    with self.assertRaises(HTTPError) as context:
+                        opener.open(
+                            Request(
+                                base + "/admin/login",
+                                data=urlencode(
+                                    {"csrf": login_csrf, "password": "wrong-password"}
+                                ).encode(),
+                            )
+                        )
+                    self.assertEqual(context.exception.code, 401)
+                # The sixth attempt is refused before verification, even with
+                # the correct password.
+                with self.assertRaises(HTTPError) as context:
+                    opener.open(
+                        Request(
+                            base + "/admin/login",
+                            data=urlencode(
+                                {"csrf": login_csrf, "password": "long-test-password"}
+                            ).encode(),
+                        )
+                    )
+                self.assertEqual(context.exception.code, 429)
             finally:
                 server.shutdown()
                 server.server_close()

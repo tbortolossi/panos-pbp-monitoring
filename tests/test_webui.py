@@ -2,6 +2,7 @@ import hashlib
 import http.cookiejar
 import io
 import json
+import logging
 import re
 import tempfile
 import threading
@@ -39,21 +40,38 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
+class _SetupCodeCatcher(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.code = None
+
+    def emit(self, record):
+        match = re.search(r"setup code: (\S+)", record.getMessage())
+        if match:
+            self.code = match.group(1)
+
+
 class ArtifactAuthenticationTests(unittest.TestCase):
     """Incident evidence must be gated by the administrator session."""
 
     def _server(self, root: Path):
-        server = ThreadingHTTPServer(
-            ("127.0.0.1", 0),
-            handler_factory(root / "data", 300, root / "config" / "config.db"),
-        )
+        catcher = _SetupCodeCatcher()
+        logger = logging.getLogger("pbp-adminui")
+        logger.addHandler(catcher)
+        try:
+            server = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                handler_factory(root / "data", 300, root / "config" / "config.db"),
+            )
+        finally:
+            logger.removeHandler(catcher)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        return server, thread
+        return server, thread, catcher.code
 
     def test_unauthenticated_requests_are_redirected_to_the_admin_area(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            server, thread = self._server(Path(temporary_directory))
+            server, thread, _ = self._server(Path(temporary_directory))
             base = f"http://127.0.0.1:{server.server_port}"
             opener = build_opener(_NoRedirect())
             try:
@@ -82,7 +100,7 @@ class ArtifactAuthenticationTests(unittest.TestCase):
             run_dir = root / "data" / "targets" / "fw-a" / "incidents" / "run-1"
             run_dir.mkdir(parents=True)
             (run_dir / "report.html").write_text("fixture report", encoding="utf-8")
-            server, thread = self._server(root)
+            server, thread, setup_code = self._server(root)
             base = f"http://127.0.0.1:{server.server_port}"
             opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
             try:
@@ -94,6 +112,7 @@ class ArtifactAuthenticationTests(unittest.TestCase):
                         data=urlencode(
                             {
                                 "csrf": csrf,
+                                "setup_code": setup_code,
                                 "password": "long-test-password",
                                 "confirm": "long-test-password",
                             }
