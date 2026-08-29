@@ -14,4 +14,8 @@ follows [Semantic Versioning](https://semver.org/).
 - Docker Compose deployment with an HTTPS dashboard and authenticated administration.
 - Encrypted target credentials, per-firewall TLS policy, and persistent configuration.
 
+### Fixed
+
+- HTML export index rendering remains compatible with the declared Python 3.10 minimum.
+
 [0.4.1]: https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.4.1

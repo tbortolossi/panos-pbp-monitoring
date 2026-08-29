@@ -362,9 +362,10 @@ def render_text_export_index(
         filename = str(item.get("name", ""))
         file_url = quote(filename, safe="")
         size_kib = float(item.get("size_bytes", 0)) / 1024
+        batch_label = "Startup" if filename == "startup.txt" else f"Batch {item.get('batch')}"
         rows.append(
             "<tr>"
-            f"<td><strong>{_escape('Startup' if filename == 'startup.txt' else f'Batch {item.get("batch")}')}</strong><code>{_escape(filename)}</code></td>"
+            f"<td><strong>{_escape(batch_label)}</strong><code>{_escape(filename)}</code></td>"
             f"<td>{_escape(_display_utc(item.get('collector_time')))}</td>"
             f"<td>{_escape(item.get('firewall_time'))}</td>"
             f"<td class=\"number\">{_escape(item.get('duration_seconds'))}</td>"
