@@ -131,8 +131,11 @@ than create a concurrent one.
    the background from the JSONL file.
 11. Each completed batch also writes an atomic TXT view of its command and
     session outputs. A Web UI displays bounded Syslog reception status and
-    read-only artifact links; its authenticated admin area writes only to the
-    separate configuration store.
+    read-only artifact links. The dashboard and every artifact route require
+    the administrator session: incident evidence carries device serials,
+    addresses, and raw command output, so it is protected by the same
+    authentication as the configuration and fails closed. The admin area
+    writes only to the separate configuration store.
 12. The admin area renders the PAN-OS Syslog forwarding commands for the
     operator to review and run themselves, pre-filled with the address the
     administrator reached the page on, an editable Syslog port, and an editable

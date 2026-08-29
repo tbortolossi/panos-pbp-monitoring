@@ -1,6 +1,8 @@
 import hashlib
+import http.cookiejar
 import io
 import json
+import re
 import tempfile
 import threading
 import unittest
@@ -9,9 +11,16 @@ from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.request import HTTPRedirectHandler, build_opener
+from urllib.parse import urlencode
+from urllib.request import (
+    HTTPCookieProcessor,
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+)
 
 from pbp_monitoring.webui import (
+    handler_factory,
     _artifact_path,
     _https_redirect_location,
     collect_dashboard_state,
@@ -23,6 +32,92 @@ from pbp_monitoring.webui import (
 )
 from pbp_monitoring import __version__
 from pbp_monitoring.config_store import ConfigStore
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class ArtifactAuthenticationTests(unittest.TestCase):
+    """Incident evidence must be gated by the administrator session."""
+
+    def _server(self, root: Path):
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            handler_factory(root / "data", 300, root / "config" / "config.db"),
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread
+
+    def test_unauthenticated_requests_are_redirected_to_the_admin_area(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            server, thread = self._server(Path(temporary_directory))
+            base = f"http://127.0.0.1:{server.server_port}"
+            opener = build_opener(_NoRedirect())
+            try:
+                for path in (
+                    "/",
+                    "/reports/fw/run/report.html",
+                    "/artifacts/fw/run/incident.jsonl",
+                    "/artifacts/fw/run/run.zip",
+                    "/artifacts/fw/run/raw",
+                    "/artifacts/fw/run/raw/batch-0001.txt",
+                ):
+                    with self.assertRaises(HTTPError) as context:
+                        opener.open(base + path)
+                    self.assertEqual(context.exception.code, 303, path)
+                    self.assertEqual(context.exception.headers["Location"], "/admin")
+                health = opener.open(base + "/healthz")
+                self.assertEqual(health.status, 200)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_signed_in_administrator_reaches_dashboard_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            run_dir = root / "data" / "targets" / "fw-a" / "incidents" / "run-1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "report.html").write_text("fixture report", encoding="utf-8")
+            server, thread = self._server(root)
+            base = f"http://127.0.0.1:{server.server_port}"
+            opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            try:
+                setup = opener.open(base + "/admin").read().decode()
+                csrf = re.search(r'name="csrf" value="([^"]+)"', setup).group(1)
+                login = opener.open(
+                    Request(
+                        base + "/admin/setup",
+                        data=urlencode(
+                            {
+                                "csrf": csrf,
+                                "password": "long-test-password",
+                                "confirm": "long-test-password",
+                            }
+                        ).encode(),
+                    )
+                ).read().decode()
+                csrf = re.search(r'name="csrf" value="([^"]+)"', login).group(1)
+                opener.open(
+                    Request(
+                        base + "/admin/login",
+                        data=urlencode(
+                            {"csrf": csrf, "password": "long-test-password"}
+                        ).encode(),
+                    )
+                )
+                dashboard = opener.open(base + "/").read().decode()
+                self.assertIn("PBP Monitoring", dashboard)
+                report = opener.open(base + "/reports/fw-a/run-1/report.html")
+                self.assertEqual(report.status, 200)
+                self.assertIn("fixture report", report.read().decode())
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
 
 class WebUITests(unittest.TestCase):

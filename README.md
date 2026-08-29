@@ -39,6 +39,11 @@ The dashboard provides:
 - links to HTML reports, JSONL evidence, and TXT batch exports;
 - an authenticated admin area for collector settings and firewall inventory.
 
+The dashboard, the reports, and every evidence download require the
+administrator sign-in: incident captures contain device serials, addresses,
+session tuples, and raw command output, so they are protected by the same
+session as the configuration. Only `/healthz` answers without authentication.
+
 ## Triggered diagnostics
 
 The fixed, case-insensitive trigger signatures are:
