@@ -142,6 +142,15 @@ SESSION_FILTER_LIST_COMMAND = (
     "<show><session><all><filter><source>{source}</source>"
     "</filter></all></session></show>"
 )
+# Per-interface counters for the ingress interfaces the evidence itself names.
+# Operational XML validated read-only against the lab PA-440 on 2026-08-29:
+# the result carries <hw><entry><name/><port> with rx/tx counters.
+INTERFACE_COUNTER_COMMAND = (
+    "<show><counter><interface>{name}</interface></counter></show>"
+)
+INTERFACE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9._/:-]{0,31}")
+INTERFACE_COUNTER_LIMIT = 2
+INTERFACE_COUNTER_CYCLE_STRIDE = 3
 WEBHOOK_TIMEOUT_SECONDS = 5.0
 
 
@@ -2634,6 +2643,24 @@ def extract_traffic_log_entries(output: str) -> list[dict[str, Any]]:
     return entries
 
 
+def extract_interface_counters(output: str) -> dict[str, Any]:
+    """Normalize the hardware port counters of one interface."""
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return {}
+    name = (root.findtext(".//hw/entry/name") or "").strip() or None
+    port = root.find(".//hw/entry/port")
+    if port is None:
+        return {"name": name} if name else {}
+    counters: dict[str, int] = {}
+    for child in port:
+        text = (child.text or "").strip()
+        if text.lstrip("-").isdigit():
+            counters[child.tag.replace("-", "_")] = int(text)
+    return {"name": name, "counters": counters}
+
+
 def extract_session_filter_count(output: str) -> int | None:
     """Parse the <member> count of a filtered session query."""
     try:
@@ -2863,6 +2890,7 @@ class MonitorController:
         self.run_id: str | None = None
         self.trigger_session_ids: set[int] = set()
         self.trigger_source_ips: set[str] = set()
+        self.trigger_interfaces: set[str] = set()
         self.report_tasks: set[asyncio.Task[None]] = set()
         self.run_starts: deque[float] = deque()
         self.webhook_tasks: set[asyncio.Task[None]] = set()
@@ -2944,6 +2972,7 @@ class MonitorController:
             self.run_id = unique_run_id(self.cfg.output_dir)
             self.trigger_session_ids.clear()
             self.trigger_source_ips.clear()
+            self.trigger_interfaces.clear()
         if self.run_id is None:  # defensive fallback for externally manipulated state
             self.run_id = unique_run_id(self.cfg.output_dir)
         timestamp = utc_now()
@@ -2952,6 +2981,8 @@ class MonitorController:
             self.trigger_session_ids.add(metadata["session_id"])
         if isinstance(metadata.get("source_ip"), str):
             self.trigger_source_ips.add(metadata["source_ip"])
+        if isinstance(metadata.get("ingress_interface"), str):
+            self.trigger_interfaces.add(metadata["ingress_interface"])
         trigger_record = {
             "timestamp": timestamp,
             "run_id": self.run_id,
@@ -3316,6 +3347,7 @@ class MonitorController:
         session_rate_samples: dict[str, dict[str, Any]] = {}
         offender_sources: dict[str, int] = {}
         peak_packet_buffer: float | None = None
+        evidence_interfaces: set[str] = set()
         try:
             while time.monotonic() - start < self.cfg.max_monitor_seconds:
                 cycle_number += 1
@@ -3419,6 +3451,37 @@ class MonitorController:
                 for sid in lookup_ids:
                     session_last_queried[sid] = now
 
+                for summary in session_summaries.values():
+                    if isinstance(summary, dict) and isinstance(
+                        summary.get("ingress_interface"), str
+                    ):
+                        evidence_interfaces.add(summary["ingress_interface"])
+                evidence_interfaces.update(self.trigger_interfaces)
+                interface_counters: dict[str, Any] = {}
+                if (
+                    cycle_number == 1
+                    or cycle_number % INTERFACE_COUNTER_CYCLE_STRIDE == 0
+                ):
+                    # The physical view of where the flood enters, for the
+                    # interfaces the evidence itself names. Bounded set, and
+                    # only a pattern-validated name reaches the command.
+                    selected_interfaces = sorted(
+                        name
+                        for name in evidence_interfaces
+                        if INTERFACE_NAME_PATTERN.fullmatch(name)
+                    )[:INTERFACE_COUNTER_LIMIT]
+                    for interface_name in selected_interfaces:
+                        _, payload = await self._collect_command(
+                            "interface_counters",
+                            INTERFACE_COUNTER_COMMAND.format(name=interface_name),
+                        )
+                        outputs[f"interface_counters:{interface_name}"] = payload
+                        interface_counters[interface_name] = (
+                            extract_interface_counters(command_result(payload))
+                            if command_succeeded(payload)
+                            else {"error": payload.get("error")}
+                        )
+
                 percentages = extract_live_percentages(
                     command_result(outputs.get("packet_buffer_protection")),
                     command_result(outputs.get("ingress_backlogs")),
@@ -3484,6 +3547,7 @@ class MonitorController:
                         "session_details": details,
                         "session_summaries": session_summaries,
                         "session_rates": session_rates,
+                        "interface_counters": interface_counters,
                         "commands": outputs,
                     }
                 append_jsonl(output_file, cycle_record)

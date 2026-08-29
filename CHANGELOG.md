@@ -7,6 +7,12 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The ingress interfaces named by the evidence (THREAT trigger fields and
+  enriched sessions) get bounded hardware counter snapshots
+  (`show counter interface`, validated read-only on the lab PA-440): at most
+  two interfaces, sampled on the first batch then every third batch, persisted
+  per cycle as `interface_counters` with the raw responses. When session
+  evidence is thin, input bytes and drops say where the flood enters.
 - Top offender sources with live sessions are enumerated at monitor stop:
   one bounded filtered count then a capped listing per source (validated
   read-only on the lab PA-440) yields their destinations, ports, and

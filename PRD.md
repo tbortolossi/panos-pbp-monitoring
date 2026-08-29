@@ -128,7 +128,11 @@ than create a concurrent one.
    source IP alone remains valid attribution evidence but does not cause a
    session command.
 8. The complete cycle, raw XML API responses, and partial errors are written to
-   a JSONL file.
+   a JSONL file. The ingress interfaces the evidence itself names (THREAT
+   trigger fields, enriched sessions) additionally get hardware counter
+   snapshots, bounded to two interfaces and sampled on the first batch then
+   every third batch; only a pattern-validated interface name reaches the
+   command.
 9. The monitor stops after N consecutive complete measurements below the
    recovery threshold, after the configurable time-to-live since the last
    matching alert, or after the maximum duration. A new trigger resets the

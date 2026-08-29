@@ -75,7 +75,13 @@ core, runs when a firewall is saved in the admin UI rather than during an
 incident. Candidate sessions are
 enriched with `show session id <session-id>`. Consecutive cumulative byte
 counters are sampled to derive c2s, s2c, and total bit rates without scanning
-the complete session table.
+the complete session table. The ingress interfaces the evidence names (THREAT
+trigger fields, enriched sessions) additionally get `show counter interface`
+snapshots — at most two interfaces, on the first batch then every third batch —
+so input bytes and drops say where the flood enters when session evidence is
+thin. At monitor stop, the top ranked sources get their live sessions listed
+(`show session all filter source <ip>`, capped) and, for what never created a
+session, one bounded traffic-log query each.
 
 One trigger starts one run. Further matching alerts reinforce the active run
 instead of starting concurrent polling. A run ends after the configured number
