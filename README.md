@@ -88,6 +88,12 @@ instead of starting concurrent polling. A run ends after the configured number
 of complete low-resource samples, the trigger inactivity TTL, or the mandatory
 maximum duration.
 
+Zone-protection and DoS flood THREAT logs (SYN/UDP/ICMP flood events) are
+corroborating evidence: during an active incident they extend the inactivity
+window, contribute their source, destination, and ingress interface to the
+offender evidence, and appear in the capture and the probable-cause block.
+They never start a run by themselves and never delay the recovery decision.
+
 Each `run_id` is the UTC incident start time in `YYYYMMDDTHHMMSSZ` format.
 
 ## First installation on Linux

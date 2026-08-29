@@ -2643,6 +2643,25 @@ def extract_traffic_log_entries(output: str) -> list[dict[str, Any]]:
     return entries
 
 
+def is_flood_corroboration(message: str) -> bool:
+    """Recognize a zone-protection or DoS flood THREAT log.
+
+    These events typically fire before or alongside PBP and carry the attacked
+    zone and destination. They are reinforcing evidence only: a flood log
+    never starts a monitor on its own. The PBP THREAT events are floods too,
+    so a message that already matches the trigger set is excluded here.
+    """
+    if TRIGGER_REGEX.search(message):
+        return False
+    fields = message.split(",")
+    if len(fields) <= PANOS_LOG_TYPE_FIELD + 1:
+        return False
+    return (
+        fields[PANOS_LOG_TYPE_FIELD].strip().upper() == "THREAT"
+        and fields[PANOS_LOG_TYPE_FIELD + 1].strip().lower() == "flood"
+    )
+
+
 def extract_interface_counters(output: str) -> dict[str, Any]:
     """Normalize the hardware port counters of one interface."""
     try:
@@ -2886,6 +2905,7 @@ class MonitorController:
         self.client = client
         self.monitor_task: asyncio.Task[None] | None = None
         self.last_trigger_monotonic = time.monotonic()
+        self.last_corroboration_monotonic = 0.0
         self.trigger_sequence = 0
         self.run_id: str | None = None
         self.trigger_session_ids: set[int] = set()
@@ -3023,6 +3043,58 @@ class MonitorController:
             )
         else:
             LOG.info("Additional trigger received; monitor %s is already active", self.run_id)
+
+    def corroborate(
+        self,
+        message: str,
+        peer: str,
+        *,
+        transport_source_ip: str | None = None,
+    ) -> None:
+        """Attach a flood log to the active incident without starting one.
+
+        Extends the idle TTL (the attack is still observed) and feeds the
+        extracted flow into the offender evidence, but never influences the
+        recovery decision and never creates a monitor.
+        """
+        if (
+            self.monitor_task is None
+            or self.monitor_task.done()
+            or self.run_id is None
+        ):
+            return
+        self.last_corroboration_monotonic = time.monotonic()
+        metadata = extract_trigger_metadata(message)
+        if isinstance(metadata.get("session_id"), int):
+            self.trigger_session_ids.add(metadata["session_id"])
+        if isinstance(metadata.get("source_ip"), str):
+            self.trigger_source_ips.add(metadata["source_ip"])
+        if isinstance(metadata.get("ingress_interface"), str):
+            self.trigger_interfaces.add(metadata["ingress_interface"])
+        try:
+            append_jsonl(
+                incident_capture_path(self.cfg.output_dir, self.run_id),
+                {
+                    "timestamp": utc_now(),
+                    "run_id": self.run_id,
+                    "event": "flood_corroboration",
+                    "peer": peer,
+                    "transport_source_ip": transport_source_ip,
+                    "target_name": self.cfg.target_name,
+                    "message": message,
+                    "metadata": metadata,
+                },
+            )
+        except Exception:
+            LOG.exception(
+                "Unable to journal a corroborating flood log for run %s",
+                self.run_id,
+            )
+        LOG.info(
+            "Flood log corroborates monitor %s (destination %s)",
+            self.run_id,
+            metadata.get("destination_ip") or "unknown",
+        )
 
     def _redact_secret(self, value: str) -> str:
         return value.replace(self.cfg.api_key, "<redacted>") if self.cfg.api_key else value
@@ -3569,8 +3641,12 @@ class MonitorController:
                     LOG.warning("Monitor %s stopped: resources recovered", run_id)
                     stop_reason = "resources_recovered"
                     break
+                last_activity = max(
+                    self.last_trigger_monotonic,
+                    self.last_corroboration_monotonic,
+                )
                 if (
-                    time.monotonic() - self.last_trigger_monotonic
+                    time.monotonic() - last_activity
                     >= self.cfg.incident_idle_ttl_seconds
                 ):
                     LOG.warning(
@@ -3858,6 +3934,40 @@ class MultiTargetRouter:
         self.routing_tasks.add(task)
         task.add_done_callback(self.routing_tasks.discard)
 
+    def corroborate(
+        self,
+        message: str,
+        peer: str,
+        *,
+        transport_source_ip: str | None = None,
+    ) -> None:
+        """Route a flood log to the active monitors of its emitting firewall.
+
+        Same acceptance gates as a trigger, but no probe and no monitor
+        start: an idle controller simply ignores it.
+        """
+        metadata = extract_trigger_metadata(message)
+        serial = metadata.get("device_serial")
+        source = metadata.get("syslog_source_ip") or transport_source_ip
+        if self._rejection_reason(source, serial) is not None:
+            return
+        serial_target = (
+            self.by_serial.get(str(serial).lower())
+            if isinstance(serial, str)
+            else None
+        )
+        names = (
+            [serial_target]
+            if serial_target is not None
+            else self.by_source.get(source, [])
+        )
+        for name in names:
+            controller = self.controllers.get(name)
+            if controller is not None:
+                controller.corroborate(
+                    message, peer, transport_source_ip=transport_source_ip
+                )
+
     async def _probe_target(
         self,
         target_name: str,
@@ -4086,6 +4196,18 @@ class ManagedRouter:
             routing=routing,
         )
 
+    def corroborate(
+        self,
+        message: str,
+        peer: str,
+        *,
+        transport_source_ip: str | None = None,
+    ) -> None:
+        if self.router is not None:
+            self.router.corroborate(
+                message, peer, transport_source_ip=transport_source_ip
+            )
+
     async def close(self) -> None:
         if self.router is not None:
             await self.router.close()
@@ -4161,6 +4283,18 @@ class SyslogProtocol(asyncio.DatagramProtocol):
                 LOG.exception(
                     "Unable to start or reinforce a monitor from a Syslog trigger"
                 )
+        elif is_flood_corroboration(message):
+            corroborator = getattr(type(self.controller), "corroborate", None)
+            if callable(corroborator):
+                try:
+                    corroborator(
+                        self.controller,
+                        message,
+                        f"{addr[0]}:{addr[1]}",
+                        transport_source_ip=addr[0],
+                    )
+                except Exception:
+                    LOG.exception("Unable to corroborate an active incident")
 
     def error_received(self, exc: Exception) -> None:
         LOG.error("Syslog listener error: %s", exc)

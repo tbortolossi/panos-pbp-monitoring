@@ -1239,6 +1239,72 @@ class WebhookNotificationTests(unittest.TestCase):
             self.assertTrue(incident_capture_path(output_dir, run_id).exists())
 
 
+class FloodCorroborationTests(unittest.TestCase):
+    """A zone-protection flood log reinforces an active incident, never starts one."""
+
+    FLOOD_LINE = (
+        "PBP_SYSLOG_SOURCE=192.0.2.10 <14>Aug 29 10:00:00 lab-fw-01 "
+        "1,2026/08/29 10:00:00,012345678901,THREAT,flood,2561,"
+        "2026/08/29 10:00:00,203.0.113.9,198.51.100.15,0.0.0.0,0.0.0.0,"
+        "deny-dos,,,not-applicable,vsys1,outside,inside,ethernet1/1,"
+        "ethernet1/2,default,2026/08/29 10:00:00,0,1,0,0,0,0,0x0,udp,drop,"
+        '"",SYN Flood(8501),any,critical,client-to-server'
+    )
+
+    def test_flood_logs_are_recognized_but_pbp_triggers_are_not(self):
+        from pbp_monitoring.orchestrator import is_flood_corroboration
+
+        self.assertTrue(is_flood_corroboration(self.FLOOD_LINE))
+        self.assertFalse(
+            is_flood_corroboration(
+                self.FLOOD_LINE.replace("SYN Flood(8501)", "PBP Packet Drop(8507)")
+            )
+        )
+        self.assertFalse(is_flood_corroboration("ordinary system log"))
+
+    def test_a_flood_log_reinforces_the_active_incident(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            controller.run_id = "fixture-run"
+            active = asyncio.create_task(asyncio.sleep(30))
+            controller.monitor_task = active
+            try:
+                protocol = SyslogProtocol(cfg, controller)
+                protocol.datagram_received(
+                    self.FLOOD_LINE.encode("utf-8"), ("192.0.2.10", 514)
+                )
+            finally:
+                active.cancel()
+                await asyncio.gather(active, return_exceptions=True)
+            return controller
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            controller = asyncio.run(scenario(make_config(output_dir)))
+
+            self.assertIn("203.0.113.9", controller.trigger_source_ips)
+            self.assertGreater(controller.last_corroboration_monotonic, 0.0)
+            capture = incident_capture_path(output_dir, "fixture-run")
+            record = json.loads(
+                capture.read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(record["event"], "flood_corroboration")
+            self.assertEqual(record["metadata"]["destination_ip"], "198.51.100.15")
+
+    def test_a_flood_log_never_starts_a_monitor(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            controller.corroborate(self.FLOOD_LINE, "192.0.2.10:514")
+            return controller
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            controller = asyncio.run(scenario(make_config(output_dir)))
+
+            self.assertIsNone(controller.monitor_task)
+            self.assertFalse((output_dir / "incidents").exists())
+
+
 class InterfaceCounterTests(unittest.TestCase):
     """Evidence-named ingress interfaces get bounded counter snapshots."""
 

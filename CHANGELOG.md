@@ -7,6 +7,14 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Zone-protection and DoS flood THREAT logs now corroborate an active
+  incident: they extend the trigger-inactivity window, feed their extracted
+  flow (source, destination, ingress interface) into the offender evidence,
+  are copied into the capture as `flood_corroboration` events, and are
+  mentioned with their targets in the report's probable-cause block. A flood
+  log alone never starts a monitor and never delays the recovery decision.
+  No congestion-cleared System message exists on the lab release, so nothing
+  wrongly extends an incident.
 - The ingress interfaces named by the evidence (THREAT trigger fields and
   enriched sessions) get bounded hardware counter snapshots
   (`show counter interface`, validated read-only on the lab PA-440): at most

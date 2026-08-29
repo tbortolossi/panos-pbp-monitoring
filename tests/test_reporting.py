@@ -285,6 +285,33 @@ class ReportingTests(unittest.TestCase):
                 rendered,
             )
 
+    def test_flood_corroboration_is_stated_in_the_probable_cause(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "incident.jsonl"
+            self._write_records(
+                capture,
+                [
+                    {
+                        "timestamp": "2026-08-29T10:00:00+00:00",
+                        "run_id": "fixture-run",
+                        "cycle": 1,
+                        "elapsed_seconds": 1.0,
+                        "percentages": {"packet_buffer_congestion": [62]},
+                    },
+                    {
+                        "timestamp": "2026-08-29T10:00:30+00:00",
+                        "run_id": "fixture-run",
+                        "event": "flood_corroboration",
+                        "metadata": {"destination_ip": "198.51.100.15"},
+                    },
+                ],
+            )
+
+            rendered = generate_html_report(capture).read_text(encoding="utf-8")
+
+            self.assertIn("flood log(s) corroborated the incident", rendered)
+            self.assertIn("targeting 198.51.100.15", rendered)
+
     def test_offender_live_sessions_render_their_flows(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             capture = Path(temporary_directory) / "incident.jsonl"

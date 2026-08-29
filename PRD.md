@@ -82,7 +82,12 @@ than create a concurrent one.
    no candidate, is refused. A candidate saved without a serial on record
    disables that second gate for its source and keeps the source-only rule. A
    source shared by several targets is probed read-only across those candidates
-   and ambiguous results safely fan out only within that allowlist.
+   and ambiguous results safely fan out only within that allowlist. A THREAT
+   log of subtype flood that is not itself a PBP trigger (zone protection, DoS
+   protection) corroborates an active incident through the same acceptance
+   gates: it extends the trigger-inactivity window, feeds its extracted flow
+   into the offender evidence, and is copied into the capture; it never starts
+   a monitor and never affects the recovery decision.
 3. Each enabled firewall is verified read-only every `target_check_hours`, 24 by
    default and 0 to disable: `show system info` for reachability, API key
    validity and release drift, and `show statistics` only when the stored core
