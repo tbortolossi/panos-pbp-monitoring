@@ -7,6 +7,12 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- Initial administrator setup now requires a one-time setup code printed in
+  the webui container log, so a freshly deployed collector cannot be claimed
+  by whoever reaches the port first.
+- Failed sign-in and setup attempts are throttled per source address (five
+  failures per fifteen minutes), and concurrent password verifications are
+  capped so a login flood cannot exhaust the CPU with key derivations.
 - The dashboard, HTML reports, JSONL captures, TXT exports, and support ZIP
   archives now require the administrator sign-in. Incident evidence carries
   device serials, addresses, session tuples, and raw command output; it was

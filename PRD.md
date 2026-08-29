@@ -183,6 +183,9 @@ section 11 the acceptance criteria a release is validated against.
 - Require TLS 1.2 or newer, mark the administrator session cookie Secure, and
   send HSTS. Never expose the generated private key in the UI,
   logs, support archives, or evidence volume.
+- Initial administrator setup requires a one-time setup code printed in the
+  webui container log. Failed sign-in and setup attempts are throttled per
+  source address, and concurrent password verifications are capped.
 - The service must run under an unprivileged Linux account.
 
 ## 9. Produced data
