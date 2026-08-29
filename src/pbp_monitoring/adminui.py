@@ -6,6 +6,7 @@ import csv
 import html
 import ipaddress
 import io
+import re
 import secrets
 import sqlite3
 import ssl
@@ -13,7 +14,7 @@ import time
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from . import __version__
 from .config_store import ConfigStore, DEFAULT_SETTINGS, TARGET_NAME
@@ -29,6 +30,62 @@ from .panos_keygen import (
 
 SESSION_SECONDS = 8 * 60 * 60
 PENDING_CHECK_REFRESH_SECONDS = 5
+
+# PAN-OS Syslog forwarding helper. The collector never writes to the firewall:
+# these commands are rendered for the operator to review and run themselves.
+SYSLOG_OBJECT_NAME = "PBP-Docker"
+DEFAULT_SYSLOG_PORT = "514"
+DEFAULT_LOG_FORWARDING_PROFILE = "default"
+COLLECTOR_HOST_PLACEHOLDER = "<COLLECTOR_IP>"
+PBP_THREAT_IDS = ("8507", "8508", "8509")
+PANOS_OBJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,30}\Z")
+COLLECTOR_HOST = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,61}[A-Za-z0-9])?\Z")
+
+
+def syslog_commands(
+    collector_host: str,
+    syslog_port: str = DEFAULT_SYSLOG_PORT,
+    log_profile: str = DEFAULT_LOG_FORWARDING_PROFILE,
+) -> str:
+    """Render the PAN-OS CLI block that forwards PBP logs to this collector.
+
+    The Threat match list is added to an existing log forwarding profile rather
+    than replacing it, so a profile already referenced by every security rule
+    keeps its current destinations and built-in actions.
+    """
+    server = f"set shared log-settings syslog {SYSLOG_OBJECT_NAME} server {SYSLOG_OBJECT_NAME}"
+    system = f"set shared log-settings system match-list {SYSLOG_OBJECT_NAME}"
+    profile = f"set shared log-settings profiles {log_profile} match-list {SYSLOG_OBJECT_NAME}"
+    threat_filter = " or ".join(f"(threatid eq {identifier})" for identifier in PBP_THREAT_IDS)
+    return "\n".join(
+        (
+            "configure",
+            "",
+            "# Syslog server profile dedicated to the collector",
+            f"{server} server {collector_host}",
+            f"{server} transport UDP",
+            f"{server} port {syslog_port}",
+            f"{server} format BSD",
+            f"{server} facility LOG_USER",
+            "",
+            "# System logs: packet-buffer congestion alerts and transport freshness",
+            f'{system} filter "All Logs"',
+            f"{system} send-syslog [ {SYSLOG_OBJECT_NAME} ]",
+            "",
+            f"# PBP Threat logs added to the existing log forwarding profile {log_profile}",
+            f"{profile} log-type threat",
+            f'{profile} filter "({threat_filter})"',
+            f"{profile} send-syslog [ {SYSLOG_OBJECT_NAME} ]",
+            "",
+            "# Review the candidate configuration before committing",
+            f"show shared log-settings syslog {SYSLOG_OBJECT_NAME}",
+            "show shared log-settings system",
+            f"show shared log-settings profiles {log_profile}",
+            "show rulebase security rules | match log-setting",
+            "",
+            'commit description "Forward PBP System and Threat logs to the diagnostic collector"',
+        )
+    )
 
 
 def _e(value: Any) -> str:
@@ -50,7 +107,7 @@ header{{padding:22px max(20px,calc((100vw - 1080px)/2));color:white;background:l
 header a{{color:white}}main{{width:min(1080px,calc(100% - 28px));margin:22px auto 48px}}.card{{padding:20px;margin:0 0 18px;border:1px solid var(--line);border-radius:14px;background:white;box-shadow:0 4px 18px #0f172a0a}}
 h1,h2{{margin-top:0}}label{{display:block;margin:11px 0 4px;font-weight:650}}input,select{{width:100%;padding:9px 10px;border:1px solid #bdc9d8;border-radius:8px;background:white}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 14px}}button,.button{{display:inline-block;margin-top:14px;padding:9px 14px;border:0;border-radius:8px;background:var(--accent);color:white;font-weight:700;text-decoration:none;cursor:pointer}}
-button.danger{{background:var(--bad)}}.muted{{color:var(--muted)}}.notice{{padding:10px 12px;border-radius:8px;background:#e0f2fe;color:#075985}}.error{{background:#fee2e2;color:#991b1b}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}code{{overflow-wrap:anywhere}}form.inline{{display:inline}}form.inline button{{margin:0}}nav{{display:flex;gap:16px;align-items:center}}nav .version{{margin-left:auto;color:#d9f4f2}}.action-row{{display:flex;align-items:center;gap:7px}}.action-row .button,.action-row button{{display:inline-flex;align-items:center;justify-content:center;width:72px;height:34px;margin:0;padding:6px 9px}}
+button.danger{{background:var(--bad)}}.muted{{color:var(--muted)}}.notice{{padding:10px 12px;border-radius:8px;background:#e0f2fe;color:#075985}}.error{{background:#fee2e2;color:#991b1b}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}code{{overflow-wrap:anywhere}}pre{{margin:0;padding:14px;overflow-x:auto;border-radius:10px;background:#0f172a;color:#e2e8f0;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}}form.inline{{display:inline}}form.inline button{{margin:0}}nav{{display:flex;gap:16px;align-items:center}}nav .version{{margin-left:auto;color:#d9f4f2}}.action-row{{display:flex;align-items:center;gap:7px}}.action-row .button,.action-row button{{display:inline-flex;align-items:center;justify-content:center;width:72px;height:34px;margin:0;padding:6px 9px}}
 .form-actions{{display:flex;align-items:center;gap:10px;margin-top:18px}}.form-actions button,.form-actions .button{{display:inline-flex;align-items:center;height:38px;margin:0}}
 .button.secondary{{background:white;color:var(--ink);border:1px solid #bdc9d8}}
 fieldset.auth{{margin:16px 0 0;padding:4px 14px 14px;border:1px solid var(--line);border-radius:10px}}
@@ -174,7 +231,13 @@ class AdminController:
 <label>Confirm password</label><input type="password" name="confirm" autocomplete="new-password" minlength="8" required>
 <button type="submit">Create administrator</button></form></section>""")
 
-    def _dashboard(self, csrf: str, message: str = "", edit_id: int | None = None) -> str:
+    def _dashboard(
+        self,
+        csrf: str,
+        message: str = "",
+        edit_id: int | None = None,
+        syslog: dict[str, str] | None = None,
+    ) -> str:
         settings = self.store.get_settings()
         targets = self.store.list_targets()
         notice = f'<p class="notice">{_e(message)}</p>' if message else ""
@@ -224,9 +287,96 @@ class AdminController:
 </div><button type="submit">Change password</button></form></section>
 <section class="card"><h2>Firewalls</h2><table><thead><tr><th>Name</th><th>Device</th><th>Firewall IP</th><th>Serial</th><th>State</th><th>Last check</th><th>Actions</th></tr></thead><tbody>{target_rows}</tbody></table></section>
 {self._target_form(csrf, edit_target)}
+{self._syslog_card(syslog or self._syslog_options(None), targets)}
 <section class="card"><h2>Collector settings</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
 {''.join(f'<div><label>{_e(key.replace("_", " ").title())}</label><input name="{_e(key)}" value="{_e(value)}" required></div>' for key, value in settings.items())}
 </div><button type="submit">Save settings</button></form></section>""", refresh_seconds)
+
+    def _syslog_options(self, handler: Any, query: dict[str, list[str]] | None = None) -> dict[str, str]:
+        """Resolve the values the PAN-OS Syslog commands are rendered with.
+
+        The collector address defaults to the address the administrator reached
+        this page on, which is the host the firewall must send Syslog to. Every
+        value is validated: an unusable one falls back to its default and is
+        reported instead of reaching the rendered commands.
+        """
+        query = query or {}
+        warnings: list[str] = []
+
+        def submitted(field: str) -> str:
+            return str(query.get(field, [""])[-1]).strip()
+
+        host = submitted("collector_ip") or self._request_host(handler)
+        if host and not COLLECTOR_HOST.fullmatch(host):
+            warnings.append(f"ignored collector address {host!r}")
+            host = ""
+        port = submitted("syslog_port") or DEFAULT_SYSLOG_PORT
+        if not (port.isdigit() and 1 <= int(port) <= 65535):
+            warnings.append(f"ignored Syslog port {port!r}")
+            port = DEFAULT_SYSLOG_PORT
+        profile = submitted("log_profile") or DEFAULT_LOG_FORWARDING_PROFILE
+        if not PANOS_OBJECT_NAME.fullmatch(profile):
+            warnings.append(f"ignored log forwarding profile {profile!r}")
+            profile = DEFAULT_LOG_FORWARDING_PROFILE
+        return {
+            "collector_host": host or COLLECTOR_HOST_PLACEHOLDER,
+            "syslog_port": port,
+            "log_profile": profile,
+            "warning": "; ".join(warnings),
+        }
+
+    @staticmethod
+    def _request_host(handler: Any) -> str:
+        """Return the host part of the address this page was reached on."""
+        if handler is None:
+            return ""
+        header = str(getattr(handler, "headers", {}).get("Host") or "")
+        host = urlsplit(f"//{header}").hostname or ""
+        return host if COLLECTOR_HOST.fullmatch(host) else ""
+
+    def _syslog_card(self, options: dict[str, str], targets: list[dict[str, Any]]) -> str:
+        """Render the ready-to-paste PAN-OS Syslog forwarding commands."""
+        commands = syslog_commands(
+            options["collector_host"], options["syslog_port"], options["log_profile"]
+        )
+        download = "/admin/syslog-commands.txt?" + urlencode(
+            {
+                "collector_ip": options["collector_host"],
+                "syslog_port": options["syslog_port"],
+                "log_profile": options["log_profile"],
+            }
+        )
+        warning = (
+            f'<p class="notice error">{_e(options["warning"])}.</p>'
+            if options.get("warning")
+            else ""
+        )
+        unresolved = (
+            '<p class="notice error">Replace <code>&lt;COLLECTOR_IP&gt;</code> with the address '
+            "of this collector as the firewall reaches it, then submit the form again.</p>"
+            if options["collector_host"] == COLLECTOR_HOST_PLACEHOLDER
+            else ""
+        )
+        names = ", ".join(str(target["name"]) for target in targets)
+        applies = (
+            f'<p class="muted">Run this block on each configured firewall: <code>{_e(names)}</code>. '
+            "A firewall must send Syslog from the address registered as its <strong>Firewall IP</strong>; "
+            "a service route sending from another address is rejected as <code>source not allowlisted</code>.</p>"
+            if targets
+            else '<p class="muted">Add a firewall above, then run this block on it.</p>'
+        )
+        return f"""<section class="card" id="syslog"><h2>PAN-OS Syslog forwarding</h2>
+<p class="muted">These commands are for you to review and run on the firewall. The collector never writes to PAN-OS.
+They create a Syslog server profile dedicated to this collector, forward System logs so packet-buffer congestion alerts
+and transport freshness both arrive, and add the PBP Threat IDs {_e(", ".join(PBP_THREAT_IDS))} to a log forwarding profile
+you already apply to your security rules, without replacing its existing destinations.</p>
+{warning}{unresolved}{applies}
+<form method="get" action="/admin"><div class="grid">
+<div><label>Collector IP</label><input name="collector_ip" value="{_e(options["collector_host"])}" placeholder="192.0.2.20"><span class="muted">Address of this host as the firewall reaches it.</span></div>
+<div><label>Syslog port</label><input name="syslog_port" value="{_e(options["syslog_port"])}"><span class="muted">Host port published for the Syslog gateway.</span></div>
+<div><label>Log forwarding profile</label><input name="log_profile" value="{_e(options["log_profile"])}" placeholder="default"><span class="muted">Replace with the profile your security rules already reference.</span></div>
+</div><div class="form-actions"><button type="submit">Update commands</button><a class="button secondary" href="{_e(download)}">Download</a></div></form>
+<pre>{_e(commands)}</pre></section>"""
 
     @staticmethod
     def _check_summary(target: dict[str, Any]) -> str:
@@ -421,6 +571,8 @@ with <code>show system info</code>: it validates the credentials and reads the d
                     self._send(handler, self._login_page())
                 return True
             token, csrf = session
+            query = parse_qs(urlsplit(handler.path).query)
+            syslog = self._syslog_options(handler, query)
             if handler.command == "GET":
                 if path == "/admin/recovery-key.csv":
                     if self.store.recovery_key_acknowledged():
@@ -437,9 +589,23 @@ with <code>show system info</code>: it validates the credentials and reads the d
                         f"pbp-monitoring-recovery-key-v{__version__}.csv",
                     )
                     return True
-                query = parse_qs(urlsplit(handler.path).query)
+                if path == "/admin/syslog-commands.txt":
+                    self._send_download(
+                        handler,
+                        (
+                            syslog_commands(
+                                syslog["collector_host"],
+                                syslog["syslog_port"],
+                                syslog["log_profile"],
+                            )
+                            + "\n"
+                        ).encode("utf-8"),
+                        "text/plain; charset=utf-8",
+                        "pbp-monitoring-syslog-forwarding.txt",
+                    )
+                    return True
                 edit_id = int(query["edit"][-1]) if query.get("edit") else None
-                self._send(handler, self._dashboard(csrf, edit_id=edit_id))
+                self._send(handler, self._dashboard(csrf, edit_id=edit_id, syslog=syslog))
                 return True
             form = self._form(handler)
             if not secrets.compare_digest(form.get("csrf", ""), csrf):
@@ -450,10 +616,10 @@ with <code>show system info</code>: it validates the credentials and reads the d
                 self._redirect(handler, "/admin", f"PBPADMIN=; Path=/admin; Max-Age=0; HttpOnly; SameSite=Strict{secure}")
             elif path == "/admin/recovery-key/ack":
                 self.store.acknowledge_recovery_key()
-                self._send(handler, self._dashboard(csrf, "Recovery key delivery acknowledged."))
+                self._send(handler, self._dashboard(csrf, "Recovery key delivery acknowledged.", syslog=syslog))
             elif path == "/admin/settings":
                 self.store.update_settings({key: form.get(key, "") for key in DEFAULT_SETTINGS})
-                self._send(handler, self._dashboard(csrf, "Settings saved."))
+                self._send(handler, self._dashboard(csrf, "Settings saved.", syslog=syslog))
             elif path == "/admin/password":
                 if not self.store.verify_admin_password(form.get("current_password", "")):
                     raise ValueError("current administrator password is incorrect")
@@ -475,11 +641,12 @@ with <code>show system info</code>: it validates the credentials and reads the d
                         csrf,
                         "Full read-only validation requested. The collector runs it "
                         "within a few seconds, and the result appears in this list.",
+                        syslog=syslog,
                     ),
                 )
             elif path == "/admin/target/delete":
                 self.store.delete_target(int(form["target_id"]))
-                self._send(handler, self._dashboard(csrf, "Firewall deleted."))
+                self._send(handler, self._dashboard(csrf, "Firewall deleted.", syslog=syslog))
             elif path == "/admin/target/save":
                 target_id = int(form["target_id"]) if form.get("target_id", "").strip() else None
                 existing = None
@@ -553,7 +720,9 @@ with <code>show system info</code>: it validates the credentials and reads the d
                     handler,
                     self._dashboard(
                         csrf,
-                        f"Firewall saved and API key validated: {summary}. The API password was not stored.",
+                        f"Firewall saved and API key validated: {summary}. The API password"
+                        " was not stored. Forward its logs with the PAN-OS Syslog commands below.",
+                        syslog=syslog,
                     ),
                 )
             else:

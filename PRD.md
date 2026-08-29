@@ -129,7 +129,12 @@ than create a concurrent one.
     session outputs. A Web UI displays bounded Syslog reception status and
     read-only artifact links; its authenticated admin area writes only to the
     separate configuration store.
-12. Saving a firewall in the admin area performs at most two outbound calls: an
+12. The admin area renders the PAN-OS Syslog forwarding commands for the
+    operator to review and run themselves, pre-filled with the address the
+    administrator reached the page on, an editable Syslog port, and an editable
+    log forwarding profile name. It is text generation only: the collector never
+    writes to PAN-OS.
+13. Saving a firewall in the admin area performs at most two outbound calls: an
     optional HTTPS key generation from temporary credentials, then one
     read-only `show system info`. The second call validates the API key and
     supplies the stored device serial, hostname, model, and PAN-OS version. Neither call changes firewall state, and
@@ -330,6 +335,14 @@ key must be backed up and restored together.
     created between two batches. A packet rate that multiplies while the session
     count stays flat is reported as traffic that created no session, and a table
     above 80% of its capacity is reported as a constraint of its own.
+
+44. The configuration page renders the PAN-OS `set` block that forwards System
+    logs and PBP Threat IDs 8507-8509 to this collector, with the collector
+    address defaulted to the address the page was reached on and the log
+    forwarding profile name replaceable, so an existing profile is extended
+    instead of replaced. An unusable address, port, or profile name falls back
+    to its default and is reported rather than rendered into a command. The same
+    block downloads as plain text from an authenticated session only.
 
 ## 12. Possible enhancements
 
