@@ -123,8 +123,34 @@ class ConfigStoreTests(unittest.TestCase):
             store = ConfigStore(database)
             store.initialize()
 
-            self.assertEqual(store.list_targets()[0]["tls_verify"], "true")
+            migrated = store.list_targets()[0]
+            self.assertEqual(migrated["tls_verify"], "true")
+            self.assertIsNone(migrated["hostname"])
             self.assertNotIn("tls_verify", store.get_settings())
+
+    def test_device_identity_is_stored_and_kept_when_not_refreshed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = ConfigStore(Path(temporary_directory) / "config.db")
+            store.initialize()
+            target_id = store.save_target(
+                name="fw-a", panos_url="https://192.0.2.10", api_key="key",
+                serials=["001122"], syslog_sources=["192.0.2.10"],
+                device_identity={
+                    "hostname": "lab-fw-01", "model": "PA-440", "software_version": "11.1.4-h7"
+                },
+            )
+            stored = store.list_targets()[0]
+            self.assertEqual(
+                (stored["hostname"], stored["model"], stored["sw_version"]),
+                ("lab-fw-01", "PA-440", "11.1.4-h7"),
+            )
+
+            store.save_target(
+                target_id=target_id, name="fw-a", panos_url="https://192.0.2.10",
+                api_key=None, serials=["001122"], syslog_sources=["192.0.2.10"],
+            )
+
+            self.assertEqual(store.list_targets()[0]["hostname"], "lab-fw-01")
 
 
 if __name__ == "__main__":

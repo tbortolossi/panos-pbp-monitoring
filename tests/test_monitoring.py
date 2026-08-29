@@ -564,7 +564,7 @@ class MonitorTests(unittest.TestCase):
             cycle = next(record for record in records if "cycle" in record)
             self.assertTrue(succeeded)
             self.assertTrue(records[0]["identity_complete"])
-            self.assertEqual(records[0]["collector_version"], "0.4.1")
+            self.assertEqual(records[0]["collector_version"], "0.5.0")
             self.assertTrue(cycle["recovery_sample_eligible"])
             self.assertEqual(cycle["validation_errors"], [])
             self.assertIn("completed_at", cycle)
