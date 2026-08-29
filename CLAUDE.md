@@ -128,10 +128,22 @@ version actually applies.
 
 ## Delivery workflow
 
-Drive this sequence and say which step you are on. Steps 1 to 6 and 9 are local
-and reversible: run them. Ask before anything that leaves this machine —
-pushing, opening or merging a pull request, tagging, or deleting a remote
-branch.
+Drive this sequence to completion and say which step you are on as you go.
+Steps 1 to 6 and 9 are local and reversible. Steps 7 and 8 are pre-authorized:
+push the branch, open the pull request, wait for CI, and merge and tag without
+stopping to ask. Report the issue, pull request, and tag URLs.
+
+Stop and ask first, every time, for anything that destroys or rewrites
+published work:
+
+- force-pushing, or rewriting history already on the remote;
+- deleting a remote branch other than the merged pull request's own branch;
+- moving or deleting a tag that is already published;
+- merging when CI is red, or when a check could not run.
+
+The pre-authorization covers this repository's own delivery flow. It does not
+extend to the firewall: the collector stays observational, and the Mission
+section still forbids any change to PAN-OS state.
 
 1. **Functional requirement.** A non-trivial behavior change starts as a GitHub
    issue from the feature-request template (`gh issue create`), labelled
@@ -163,7 +175,8 @@ branch.
    `docker compose config`.
 8. **Merge.** Only with green CI: `gh pr merge --squash --delete-branch`, then
    `git checkout main && git pull`. Tag only when publishing a version bump:
-   `git tag -a v<x.y.z>` and push the tag.
+   `git tag -a v<x.y.z>` and push the tag. Both run without asking; a red or
+   missing check turns this back into a question for the maintainer.
 9. **Rebuild.** After any change to the image or its code:
    `docker compose build && docker compose up -d && docker compose ps`, and
    confirm the three services are healthy. The `config` and `captures` volumes
