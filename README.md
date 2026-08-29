@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring & Diagnostic Collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.9.1-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.9.1)
+[![Version](https://img.shields.io/badge/version-0.10.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.10.0)
 [![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
 
 PBP Monitoring is an event-driven, read-only diagnostic collector for PAN-OS
@@ -468,6 +468,24 @@ default. Command status and timing fields are presented as compact metadata,
 the summary separates capture facts, incident state, and peak utilization, and
 its peak metrics are grouped into packet buffers, packet descriptors, and
 system load. The lower-level event metadata is collapsed by default.
+
+The **Denied and dropped traffic** section aggregates the `drop` severity global
+counters returned by `show counter global filter delta yes` over the whole
+capture, with the total packet count, the peak per-second rate, and the number
+of batches each counter appeared in. Counters are grouped by their PAN-OS aspect
+and name prefix — policy deny, DoS or zone protection, forwarding, parse,
+resource exhaustion — so a counter renamed or added by a later PAN-OS release is
+still classified instead of being dropped from the report. A batch whose delta
+baseline was untrusted is excluded from the totals, because its sampling window
+is unknown, and the report says how many batches were counted and excluded.
+
+That section answers a question the offender table cannot. A UDP or GRE flood
+denied by a Security policy rule never reaches session setup, so the firewall
+creates no session for it: the PBP table can attribute the pressure to a source
+IP only, and `show session id` has nothing to enrich. When denied packets are
+counted while a source IP is ranked without an enriched session, the report
+states that correlation explicitly. The **Denied packets** summary card carries
+the same total, adding policy deny to DoS and zone-protection drops.
 
 Each batch requests `show running resource-monitor second last N`, where `N` is
 `ceil(poll_seconds) + 2`, bounded to 60 seconds. The two-second margin avoids

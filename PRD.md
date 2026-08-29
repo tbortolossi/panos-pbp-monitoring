@@ -180,7 +180,8 @@ these files below `targets/<target-name>/` and adds `syslog-routing.jsonl` for
 probe and routing evidence.
 
 `incidents/<run_id>/report.html` is a derived view containing a summary, timeline,
-offender ranking, per-dataplane CPU core charts, partial errors, and all
+offender ranking, denied and dropped traffic counters, per-dataplane CPU core
+charts, partial errors, and all
 collapsible raw outputs. It contains
 the JSONL SHA-256 digest; JSONL remains the source of truth. Validation mode
 similarly produces `api-checks/<run_id>/api-check.jsonl` and
@@ -307,6 +308,13 @@ key must be backed up and restored together.
     an unreachable address, or a missing serial reports an error and writes
     nothing. Additional Syslog sources imported from a legacy configuration are
     preserved across an edit.
+42. The report aggregates the `drop` severity global counters over the capture,
+    groups them by counter aspect and name prefix, and excludes a batch whose
+    delta baseline was untrusted from the totals. When packets were denied
+    before session setup and a source IP was ranked without an enriched
+    session, the report states that the pressure is consistent with traffic
+    denied by policy, DoS protection, or zone protection, which creates no
+    session to collect.
 
 ## 12. Possible enhancements
 
