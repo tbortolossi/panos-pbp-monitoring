@@ -651,8 +651,74 @@ def _entity_type(subject: str) -> str:
     return "source_ip"
 
 
+def _structured_pbp_offenders(output: str) -> list[dict[str, Any]]:
+    """Read the monitored-entry table from the structured XML form.
+
+    PAN-OS returns one ``<entry>`` per monitored session or blocked source IP,
+    carrying the same eight fields as the columns of the CLI table. The
+    dataplane is part of the enclosing element name, as in
+    ``sw.comm.s1.dp0.packet-buffer-protection``.
+    """
+    try:
+        root = ET.fromstring(output)
+    except ET.ParseError:
+        return []
+    offenders: list[dict[str, Any]] = []
+    dp_ranks: dict[str | None, int] = {}
+    for element in root.iter():
+        tag = _local_tag(element)
+        if not tag.endswith("packet-buffer-protection"):
+            continue
+        dp_match = re.search(r"(?:^|\.)(dp\d+)(?:\.|$)", tag)
+        current_dp = dp_match.group(1) if dp_match else None
+        for entry in element.iter():
+            if _local_tag(entry) != "entry":
+                continue
+            subject = (_child_text(entry, "value") or "").strip()
+            entity_type = _entity_type(subject) if subject else "unknown"
+            if entity_type == "unknown":
+                continue
+            samples = _int_value(_child_text(entry, "pcs"))
+            percentage = _float_value(_child_text(entry, "perc"))
+            packets_total = _int_value(_child_text(entry, "num-total"))
+            packets_dropped = _int_value(_child_text(entry, "num-dropped"))
+            if (
+                samples is None
+                or percentage is None
+                or packets_total is None
+                or packets_dropped is None
+            ):
+                continue
+            drop_state_raw = _child_text(entry, "drop-state")
+            dp_ranks[current_dp] = dp_ranks.get(current_dp, 0) + 1
+            offenders.append(
+                {
+                    "rank": len(offenders) + 1,
+                    "dp_rank": dp_ranks[current_dp],
+                    "dp": current_dp,
+                    "entity_type": entity_type,
+                    "session_id": int(subject) if entity_type == "session" else None,
+                    "source_ip": subject if entity_type == "source_ip" else None,
+                    "zone": _child_text(entry, "zone"),
+                    "samples": samples,
+                    "percentage": percentage,
+                    "drop_state": (drop_state_raw or "").strip().lower() == "yes",
+                    "drop_state_raw": drop_state_raw or None,
+                    "packets_total": packets_total,
+                    "packets_dropped": packets_dropped,
+                    "time_till_discard_seconds": _int_value(
+                        _child_text(entry, "time-till-discard")
+                    ),
+                }
+            )
+    return offenders
+
+
 def extract_pbp_offenders(output: str) -> list[dict[str, Any]]:
     """Parse PBP offender rows without losing direction, order, or IP entries."""
+    structured = _structured_pbp_offenders(output)
+    if structured:
+        return structured
     text = panos_result_text(output)
     offenders: list[dict[str, Any]] = []
     current_dp: str | None = None
