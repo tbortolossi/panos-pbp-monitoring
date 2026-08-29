@@ -538,6 +538,59 @@ session tracker stage l7proc: app identified
         self.assertEqual(metadata["session_id"], 42)
         self.assertEqual(metadata["source_ip"], "192.0.2.1")
 
+    THREAT_CSV_LINE = (
+        "PBP_SYSLOG_SOURCE=192.0.2.10 <14>Aug 29 10:00:00 lab-fw-01 "
+        "1,2026/08/29 10:00:00,012345678901,THREAT,flood,2561,"
+        "2026/08/29 10:00:00,203.0.113.7,198.51.100.15,0.0.0.0,0.0.0.0,"
+        '"allow-outbound,legacy",,,not-applicable,vsys1,outside,inside,'
+        "ethernet1/1,ethernet1/2,default,2026/08/29 10:00:00,123456,1,"
+        '54321,443,0,0,0x0,udp,drop,"",PBP Packet Drop(8507),any,critical,'
+        "client-to-server"
+    )
+
+    def test_positional_threat_csv_fields_expose_the_responsible_flow(self):
+        metadata = extract_trigger_metadata(self.THREAT_CSV_LINE)
+
+        self.assertEqual(metadata["trigger_type"], "pbp_packet_drop")
+        self.assertEqual(metadata["threat_id"], 8507)
+        self.assertEqual(metadata["device_serial"], "012345678901")
+        self.assertEqual(metadata["syslog_source_ip"], "192.0.2.10")
+        self.assertEqual(metadata["source_ip"], "203.0.113.7")
+        self.assertEqual(metadata["destination_ip"], "198.51.100.15")
+        self.assertEqual(metadata["source_port"], 54321)
+        self.assertEqual(metadata["destination_port"], 443)
+        self.assertEqual(metadata["session_id"], 123456)
+        self.assertEqual(metadata["application"], "not-applicable")
+        self.assertEqual(metadata["rule"], "allow-outbound,legacy")
+        self.assertEqual(metadata["from_zone"], "outside")
+        self.assertEqual(metadata["to_zone"], "inside")
+        self.assertEqual(metadata["ingress_interface"], "ethernet1/1")
+        self.assertEqual(metadata["protocol"], "udp")
+        self.assertEqual(metadata["action"], "drop")
+
+    def test_a_system_log_gets_no_positional_flow_fields(self):
+        message = (
+            "PBP_SYSLOG_SOURCE=192.0.2.10 <14>Aug 29 10:00:00 lab-fw-01 "
+            "1,2026/08/29 10:00:00,012345678901,SYSTEM,general,,"
+            "2026/08/29 10:00:00,,,general,,,,,informational,"
+            "Packet buffer congestion is at 62 percent"
+        )
+
+        metadata = extract_trigger_metadata(message)
+
+        self.assertEqual(metadata["trigger_type"], "packet_buffer_congestion")
+        self.assertEqual(metadata["device_serial"], "012345678901")
+        self.assertNotIn("source_ip", metadata)
+        self.assertNotIn("session_id", metadata)
+
+    def test_unroutable_placeholder_addresses_are_not_extracted(self):
+        line = self.THREAT_CSV_LINE.replace("203.0.113.7", "0.0.0.0")
+
+        metadata = extract_trigger_metadata(line)
+
+        self.assertNotIn("source_ip", metadata)
+        self.assertEqual(metadata["destination_ip"], "198.51.100.15")
+
     def test_native_panos_pbp_threat_name_exposes_threat_id(self):
         for name, expected in (
             ("PBP Packet Drop(8507)", 8507),

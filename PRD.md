@@ -68,8 +68,14 @@ than create a concurrent one.
 
 1. The firewall sends a System or Threat log to the Syslog collector.
 2. The listener filters the message. The raw trigger, original Syslog source,
-   sequence number, and explicitly labeled fields are correlated with the
-   incident `run_id`. In multi-target mode, source IP first defines the allowed
+   sequence number, and extracted forensic fields are correlated with the
+   incident `run_id`. A THREAT trigger's positional CSV fields are the primary
+   extraction: source and destination address, ports, application, rule, zones,
+   ingress interface, and session ID are read from their fixed comma-separated
+   positions (validated individually; a field that does not validate is
+   absent). Labelled forms remain a fallback for non-CSV relays. The extracted
+   session ID feeds immediate session enrichment and the source address feeds
+   the offender ranking. In multi-target mode, source IP first defines the allowed
    candidate set and device serial must then be one of the serials registered
    for that set: PAN-OS positions the serial in the third comma-separated field
    of every log, so a message that carries no serial, or a serial belonging to

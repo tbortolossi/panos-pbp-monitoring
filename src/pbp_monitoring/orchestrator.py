@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 from collections import deque
 import ipaddress
 import json
@@ -85,6 +86,25 @@ PANOS_LOG_TYPES = frozenset(
     }
 )
 SERIAL_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# Positional fields of a PAN-OS THREAT syslog line (comma-separated, quoted
+# fields per RFC 4180 style). The PBP THREAT events 8507/8508/8509 carry the
+# responsible flow here; PAN-OS emits no labelled form. The serial anchor in
+# fields 2/3 already proved this positional layout on production traffic.
+THREAT_CSV_POSITIONS = {
+    "source_ip": 7,
+    "destination_ip": 8,
+    "rule": 11,
+    "application": 14,
+    "from_zone": 16,
+    "to_zone": 17,
+    "ingress_interface": 18,
+    "session_id": 22,
+    "source_port": 24,
+    "destination_port": 25,
+    "protocol": 29,
+    "action": 30,
+}
+THREAT_CSV_TEXT_LIMIT = 64
 # Why a Syslog emitter was refused. These slugs are persisted in the reception
 # journal, so keep them stable.
 SYSLOG_REJECTIONS = {
@@ -2519,8 +2539,59 @@ def panos_csv_serial(message: str) -> str | None:
     return serial if SERIAL_PATTERN.fullmatch(serial) else None
 
 
+def panos_threat_csv_fields(message: str) -> dict[str, Any]:
+    """Extract the responsible flow from a THREAT log's positional CSV fields.
+
+    Every value is validated before it is kept: addresses must parse, ports
+    and session IDs must be integers in range, and text fields are trimmed and
+    bounded. A field that does not validate is simply absent, so a log from an
+    unexpected release cannot inject a wrong type; the raw message is always
+    preserved next to the extraction.
+    """
+    try:
+        fields = next(csv.reader([message]))
+    except (csv.Error, StopIteration):
+        return {}
+    if len(fields) <= PANOS_LOG_TYPE_FIELD:
+        return {}
+    if fields[PANOS_LOG_TYPE_FIELD].strip().upper() != "THREAT":
+        return {}
+    extracted: dict[str, Any] = {}
+    for name, position in THREAT_CSV_POSITIONS.items():
+        if position >= len(fields):
+            continue
+        value = fields[position].strip()
+        if not value:
+            continue
+        if name in {"source_ip", "destination_ip"}:
+            try:
+                parsed = str(ipaddress.ip_address(value))
+            except ValueError:
+                continue
+            if parsed not in {"0.0.0.0", "::"}:
+                extracted[name] = parsed
+        elif name in {"session_id", "source_port", "destination_port"}:
+            if not value.isdigit():
+                continue
+            number = int(value)
+            if name == "session_id" and number > 0:
+                extracted[name] = number
+            elif name != "session_id" and 0 < number <= 65535:
+                extracted[name] = number
+        else:
+            extracted[name] = value[:THREAT_CSV_TEXT_LIMIT]
+    return extracted
+
+
 def extract_trigger_metadata(message: str) -> dict[str, Any]:
-    """Extract only explicitly labelled forensic fields from a Syslog trigger."""
+    """Extract forensic fields from a Syslog trigger.
+
+    Positional THREAT CSV fields are the primary source: PAN-OS places the
+    responsible flow (source, destination, ports, application, rule, session)
+    at fixed comma-separated positions and never emits labelled forms in CSV
+    logs. The labelled patterns below remain as a fallback for non-CSV relays
+    and hand-fed test messages; a positional value always wins.
+    """
     metadata: dict[str, Any] = {}
     event_names = (
         ("packet_buffer_congestion", "Packet buffer congestion"),
@@ -2584,6 +2655,10 @@ def extract_trigger_metadata(message: str) -> dict[str, Any]:
             metadata[field] = str(ipaddress.ip_address(match.group(1)))
         except ValueError:
             pass
+    # Positional CSV extraction wins over every labelled fallback above: the
+    # positions are structural, a labelled string can appear anywhere inside a
+    # payload.
+    metadata.update(panos_threat_csv_fields(message))
     return metadata
 
 

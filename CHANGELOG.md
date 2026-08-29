@@ -5,6 +5,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [0.15.0] - Unreleased
 
+### Added
+
+- The responsible flow is now extracted from the trigger itself. A PBP THREAT
+  log (8507/8508/8509) positionally carries the source and destination
+  address, ports, application, rule, zones, ingress interface, and session ID
+  of the flow the firewall acted on; the collector reads those fixed CSV
+  positions (each value validated individually) instead of relying on
+  labelled forms PAN-OS never emits. The extracted session ID feeds immediate
+  `show session id` enrichment and the source address feeds the offender
+  ranking, so the source/destination/port/application answer is available
+  from the first second of an incident.
+
 ### Security
 
 - Initial administrator setup now requires a one-time setup code printed in
