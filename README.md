@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring & Diagnostic Collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.7.1-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.7.1)
+[![Version](https://img.shields.io/badge/version-0.8.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.8.0)
 [![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
 
 PBP Monitoring is an event-driven, read-only diagnostic collector for PAN-OS
@@ -205,6 +205,32 @@ version are shown in the **Device** column of the firewall list, so none of them
 is typed by hand. The firewall must be reachable when the entry is saved: an
 unreachable address, an untrusted certificate, or a rejected key is reported and
 nothing is written.
+
+### Keeping a saved firewall verified
+
+A firewall is otherwise only contacted when an incident starts, so a revoked API
+key, an address moved behind a new filter, or a deleted API administrator would
+be discovered during an incident, exactly when evidence is being lost. The
+collector therefore runs a small read-only check per enabled firewall every
+`target_check_hours`, 24 by default, and 0 disables it:
+
+- `show system info` for reachability, API key validity, and release drift;
+- `show statistics` only when the stored dataplane core map is missing or was
+  captured on a different model or PAN-OS release, refreshing it in place.
+
+A firewall in steady state therefore costs one API call a day, and no capture
+file is written. A firewall with an active incident is never checked: it is
+already polled every few seconds while under packet-buffer pressure, and the
+check must not compete with the diagnostic batches.
+
+The **Test** button beside each firewall runs the full read-only validation for
+that firewall instead: every collection command and every parser, writing a
+capture and an HTML report the dashboard already serves. The Web service mounts
+the evidence volume read-only by design and the collector exposes no port, so
+the button records the request in the shared configuration database and the
+collector runs it on its next tick, a few seconds later. The **Last check**
+column reports when either check last ran, whether it passed, and a short reason
+when it did not.
 
 Because HTTPS uses port 443 and Syslog uses port 514, one address covers both.
 When an earlier configuration allowed additional Syslog sources for a target,

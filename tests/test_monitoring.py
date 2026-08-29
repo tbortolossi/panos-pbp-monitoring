@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -8,14 +10,17 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from pbp_monitoring import __version__
+from pbp_monitoring.config_store import ConfigStore
 from pbp_monitoring.orchestrator import (
     CLOCK_COMMAND,
     DP_CORE_FUNCTIONS_COMMAND,
     OP_COMMANDS,
     SYSTEM_INFO_COMMAND,
     Config,
+    ManagedRouter,
     MultiTargetRouter,
     MonitorController,
+    run_target_checks_once,
     PanOSAPIError,
     PanOSResponse,
     SyslogProtocol,
@@ -773,6 +778,144 @@ class MonitorTests(unittest.TestCase):
             self.assertFalse(cycle["session_details"]["123"]["ok"])
             self.assertIn("session detail failed for 123", cycle["validation_errors"])
 
+
+
+class FirewallCheckTests(unittest.TestCase):
+    """The daily check must be cheap, skip busy firewalls, and never raise."""
+
+    CORE_MAP = [
+        {
+            "dataplane": "dp0",
+            "core_id": "1",
+            "functions": ["flow_lookup", "flow_fastpath", "flow_ctrl"],
+            "forwards_traffic": True,
+        }
+    ]
+
+    def _router(self, root: Path, *, identity: str, core_map=None, **identity_fields):
+        store = ConfigStore(root / "config.db")
+        store.initialize()
+        store.save_target(
+            name="fw-a",
+            panos_url="https://192.0.2.10",
+            api_key="key",
+            serials=["fixture-serial"],
+            syslog_sources=["192.0.2.10"],
+            device_identity={
+                "hostname": "fixture-fw",
+                "model": identity_fields.get("model", "PA-VM"),
+                "software_version": identity_fields.get("software_version", "11.2.4"),
+            },
+            dp_core_functions=self.CORE_MAP if core_map is None else core_map,
+        )
+        if identity is not None:
+            with sqlite3.connect(store.path) as connection:
+                connection.execute(
+                    "UPDATE targets SET dp_core_functions_identity=?", (identity,)
+                )
+        with patch.dict(os.environ, {"OUTPUT_DIR": str(root / "data")}):
+            cfg = Config.from_store(store)
+        return ManagedRouter(cfg, store), store
+
+    def test_an_unchanged_firewall_costs_one_api_call(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            router, store = self._router(Path(temporary_directory), identity="PA-VM|11.2.4")
+            client = FakeClient()
+
+            with patch("pbp_monitoring.orchestrator.PanOSClient", return_value=client):
+                asyncio.run(run_target_checks_once(router))
+
+            self.assertEqual(client.commands, [SYSTEM_INFO_COMMAND])
+            recorded = store.list_targets()[0]
+            self.assertEqual(recorded["last_check_status"], "ok")
+            self.assertEqual(recorded["last_check_kind"], "keepalive")
+            self.assertIn("1 dataplane cores mapped", recorded["last_check_detail"])
+
+    def test_a_panos_upgrade_refreshes_the_stored_identity_and_core_map(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            router, store = self._router(
+                Path(temporary_directory),
+                identity="PA-VM|11.1.0",
+                software_version="11.1.0",
+            )
+            client = FakeClient()
+
+            with patch("pbp_monitoring.orchestrator.PanOSClient", return_value=client):
+                asyncio.run(run_target_checks_once(router))
+
+            self.assertEqual(client.commands.count(DP_CORE_FUNCTIONS_COMMAND), 1)
+            refreshed = store.list_targets()[0]
+            self.assertEqual(refreshed["sw_version"], "11.2.4")
+            self.assertEqual(refreshed["dp_core_functions_identity"], "PA-VM|11.2.4")
+            self.assertEqual(
+                [entry["core_id"] for entry in refreshed["dp_core_functions"]],
+                ["0", "1"],
+            )
+            self.assertIn("stored identity refreshed", refreshed["last_check_detail"])
+
+    def test_an_unreachable_firewall_is_recorded_without_stopping_the_service(self):
+        class UnreachableClient(FakeClient):
+            def op_response(self, command: str) -> PanOSResponse:
+                raise PanOSAPIError("unable to reach the firewall", raw_response="")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            router, store = self._router(Path(temporary_directory), identity="PA-VM|11.2.4")
+
+            with patch(
+                "pbp_monitoring.orchestrator.PanOSClient",
+                return_value=UnreachableClient(),
+            ):
+                performed = asyncio.run(run_target_checks_once(router))
+
+            self.assertEqual(performed, 1)
+            recorded = store.list_targets()[0]
+            self.assertEqual(recorded["last_check_status"], "failed")
+            self.assertIn("unable to reach the firewall", recorded["last_check_detail"])
+
+    def test_a_firewall_with_an_active_incident_is_left_alone(self):
+        async def scenario(router, store):
+            controller = router.router.controllers["fw-a"]
+            controller.monitor_task = asyncio.create_task(asyncio.sleep(30))
+            try:
+                client = FakeClient()
+                with patch(
+                    "pbp_monitoring.orchestrator.PanOSClient", return_value=client
+                ):
+                    performed = await run_target_checks_once(router)
+                return performed, client.commands
+            finally:
+                controller.monitor_task.cancel()
+                await asyncio.gather(controller.monitor_task, return_exceptions=True)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            router, store = self._router(Path(temporary_directory), identity="PA-VM|11.2.4")
+
+            performed, commands = asyncio.run(scenario(router, store))
+
+            self.assertEqual(performed, 0)
+            self.assertEqual(commands, [])
+            self.assertIsNone(store.list_targets()[0]["last_check_at"])
+
+    def test_a_requested_validation_runs_every_command_and_clears_the_request(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            router, store = self._router(root, identity="PA-VM|11.2.4")
+            store.request_target_check(store.list_targets()[0]["target_id"])
+            client = FakeClient()
+
+            with patch("pbp_monitoring.orchestrator.PanOSClient", return_value=client):
+                asyncio.run(run_target_checks_once(router))
+
+            recorded = store.list_targets()[0]
+            self.assertIsNone(recorded["check_requested_at"])
+            self.assertEqual(recorded["last_check_kind"], "validation")
+            self.assertEqual(recorded["last_check_status"], "ok")
+            for command in OP_COMMANDS.values():
+                if "<resource-monitor><second><last>" in command:
+                    continue
+                self.assertIn(command, client.commands)
+            captures = list((root / "data" / "targets" / "fw-a" / "api-checks").iterdir())
+            self.assertEqual(len(captures), 1)
 
 if __name__ == "__main__":
     unittest.main()

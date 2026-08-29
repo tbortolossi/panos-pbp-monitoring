@@ -3,6 +3,38 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-08-29
+
+### Added
+
+- A periodic read-only check per enabled firewall, every `target_check_hours`
+  (24 by default, 0 disables it). It runs `show system info` for reachability,
+  API key validity and PAN-OS release drift, and `show statistics` only when the
+  stored dataplane core map is missing or was captured on a different model or
+  release, refreshing the stored copy in place. A firewall in steady state costs
+  one API call a day and no capture file is written. Until now a revoked key or
+  an unreachable firewall was only discovered during an incident, when evidence
+  was already being lost. Refs #69.
+- A **Test** button beside each firewall in the admin UI, running the full
+  read-only validation for that firewall: every collection command, every parser,
+  and a capture plus HTML report the dashboard already serves. The Web service
+  mounts the evidence volume read-only and the collector exposes no port, so the
+  request travels through the shared configuration database and the collector
+  executes it on its next tick, a few seconds later.
+- A **Last check** column reporting when either check last ran, whether it
+  passed, and a short reason when it did not.
+- Persisted `last_check_at`, `last_check_kind`, `last_check_status`,
+  `last_check_detail` and `check_requested_at` columns, migrated in place
+  (schema version 5), and a `target_check_hours` setting.
+
+### Changed
+
+- A firewall with an active incident is never checked. It is already polled every
+  few seconds while under packet-buffer pressure, and no check may compete with
+  the diagnostic batches. A routing probe in flight suspends checks as well.
+- A failed check is recorded and logged without interrupting Syslog reception or
+  any other firewall's check.
+
 ## [0.7.1] - 2026-08-29
 
 ### Fixed

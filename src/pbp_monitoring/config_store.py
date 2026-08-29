@@ -35,6 +35,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "generate_html_report": "true",
     "generate_text_export": "true",
     "syslog_fresh_seconds": "300",
+    "target_check_hours": "24",
 }
 
 
@@ -84,6 +85,11 @@ class StoredTarget:
     sw_version: str | None = None
     dp_core_functions: tuple[dict[str, Any], ...] = ()
     dp_core_functions_identity: str | None = None
+    last_check_at: str | None = None
+    last_check_kind: str | None = None
+    last_check_status: str | None = None
+    last_check_detail: str | None = None
+    check_requested_at: str | None = None
 
 
 class ConfigStore:
@@ -127,6 +133,11 @@ class ConfigStore:
                     sw_version TEXT,
                     dp_core_functions_json TEXT,
                     dp_core_functions_identity TEXT,
+                    last_check_at TEXT,
+                    last_check_kind TEXT,
+                    last_check_status TEXT,
+                    last_check_detail TEXT,
+                    check_requested_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -160,6 +171,11 @@ class ConfigStore:
                 "sw_version",
                 "dp_core_functions_json",
                 "dp_core_functions_identity",
+                "last_check_at",
+                "last_check_kind",
+                "last_check_status",
+                "last_check_detail",
+                "check_requested_at",
             ):
                 if column not in columns:
                     connection.execute(f"ALTER TABLE targets ADD COLUMN {column} TEXT")
@@ -173,8 +189,8 @@ class ConfigStore:
                 "INSERT OR IGNORE INTO meta(key,value) VALUES('revision','1')"
             )
             connection.execute(
-                """INSERT INTO meta(key,value) VALUES('schema_version','4')
-                   ON CONFLICT(key) DO UPDATE SET value='4'"""
+                """INSERT INTO meta(key,value) VALUES('schema_version','5')
+                   ON CONFLICT(key) DO UPDATE SET value='5'"""
             )
         self._chmod_private(self.path)
 
@@ -282,6 +298,11 @@ class ConfigStore:
         fresh = float(merged["syslog_fresh_seconds"])
         if not (fresh > 0 and fresh < float("inf")):
             raise ValueError("syslog_fresh_seconds must be a positive finite number")
+        check_hours = float(merged["target_check_hours"])
+        if not (0 <= check_hours <= 8760):
+            raise ValueError(
+                "target_check_hours must be between 0 (disabled) and 8760"
+            )
         for key in ("generate_html_report", "generate_text_export"):
             if merged[key].lower() not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
                 raise ValueError(f"{key} must be true or false")
@@ -429,6 +450,83 @@ class ConfigStore:
             self._bump_revision(connection)
         return result
 
+    def request_target_check(self, target_id: int) -> None:
+        """Queue a full validation for one firewall.
+
+        The Web UI mounts the evidence volume read-only and the collector
+        exposes no port, so the shared database carries the request instead.
+        """
+        with self._connect() as connection:
+            updated = connection.execute(
+                "UPDATE targets SET check_requested_at=? WHERE id=?",
+                (_utc_now(), target_id),
+            ).rowcount
+        if not updated:
+            raise ValueError("firewall no longer exists")
+
+    def record_target_check(
+        self,
+        target_id: int,
+        *,
+        kind: str,
+        status: str,
+        detail: str | None = None,
+        clear_request: bool = False,
+    ) -> None:
+        """Store the outcome of a check without disturbing the running config."""
+        with self._connect() as connection:
+            if clear_request:
+                connection.execute(
+                    """UPDATE targets SET last_check_at=?,last_check_kind=?,
+                       last_check_status=?,last_check_detail=?,check_requested_at=NULL
+                       WHERE id=?""",
+                    (_utc_now(), kind, status, detail, target_id),
+                )
+            else:
+                connection.execute(
+                    """UPDATE targets SET last_check_at=?,last_check_kind=?,
+                       last_check_status=?,last_check_detail=? WHERE id=?""",
+                    (_utc_now(), kind, status, detail, target_id),
+                )
+
+    def refresh_target_device(
+        self,
+        target_id: int,
+        *,
+        device_identity: dict[str, str],
+        dp_core_functions: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Update the identity and core map a check found to have changed."""
+        device = tuple(
+            str(device_identity.get(field) or "").strip() or None
+            for field in ("hostname", "model", "software_version")
+        )
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT dp_core_functions_json,dp_core_functions_identity
+                   FROM targets WHERE id=?""",
+                (target_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("firewall no longer exists")
+            if dp_core_functions is None:
+                core_map = (
+                    row["dp_core_functions_json"],
+                    row["dp_core_functions_identity"],
+                )
+            else:
+                core_map = (
+                    json.dumps(list(dp_core_functions)) if dp_core_functions else None,
+                    dp_core_identity(device_identity) if dp_core_functions else None,
+                )
+            connection.execute(
+                """UPDATE targets SET hostname=?,model=?,sw_version=?,
+                   dp_core_functions_json=?,dp_core_functions_identity=?,updated_at=?
+                   WHERE id=?""",
+                (*device, *core_map, _utc_now(), target_id),
+            )
+            self._bump_revision(connection)
+
     def delete_target(self, target_id: int) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM targets WHERE id=?", (target_id,))
@@ -456,6 +554,11 @@ class ConfigStore:
                     row["dp_core_functions_json"]
                 ),
                 "dp_core_functions_identity": row["dp_core_functions_identity"],
+                "last_check_at": row["last_check_at"],
+                "last_check_kind": row["last_check_kind"],
+                "last_check_status": row["last_check_status"],
+                "last_check_detail": row["last_check_detail"],
+                "check_requested_at": row["check_requested_at"],
             }
             if include_secrets:
                 try:

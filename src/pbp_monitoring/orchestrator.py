@@ -3024,6 +3024,18 @@ class MultiTargetRouter:
             return_exceptions=True,
         )
 
+    def is_target_busy(self, name: str) -> bool:
+        """Report whether one firewall is currently being polled for an incident."""
+        if self.pending:
+            # A routing probe is in flight and may poll any candidate firewall.
+            return True
+        controller = self.controllers.get(name)
+        return bool(
+            controller is not None
+            and controller.monitor_task is not None
+            and not controller.monitor_task.done()
+        )
+
     def is_busy(self) -> bool:
         return bool(self.pending) or any(
             controller.monitor_task is not None
@@ -3310,13 +3322,193 @@ async def run_configured_api_checks(cfg: Config) -> list[tuple[Path, bool]]:
     return list(await asyncio.gather(*(run_api_check(item) for item in target_configs)))
 
 
+CHECK_TICK_SECONDS = 10.0
+
+
+def _check_detail(device: dict[str, str], core_count: int, refreshed: bool) -> str:
+    parts = [
+        f"PAN-OS {device.get('software_version') or 'unknown'}",
+        f"{core_count} dataplane cores mapped" if core_count else "core map unavailable",
+    ]
+    if refreshed:
+        parts.append("stored identity refreshed")
+    return "; ".join(parts)
+
+
+async def run_target_keepalive(cfg: Config, store: ConfigStore, target: StoredTarget) -> bool:
+    """Confirm one firewall is reachable and its stored identity still current.
+
+    Read-only and deliberately small: `show system info` every time, and
+    `show statistics` only when the stored core map is missing or was captured
+    on a different model or PAN-OS release. A firewall in steady state costs one
+    API call a day.
+    """
+    controller = MonitorController(cfg, PanOSClient(cfg))
+    _, system_info = await controller._collect_command("system_info", SYSTEM_INFO_COMMAND)
+    if not command_succeeded(system_info):
+        store.record_target_check(
+            target.target_id,
+            kind="keepalive",
+            status="failed",
+            detail=str(system_info.get("error") or "show system info failed"),
+        )
+        LOG.warning(
+            "Keepalive failed for %s: %s", target.name, system_info.get("error")
+        )
+        return False
+
+    device = extract_system_info(command_result(system_info))
+    running = dp_core_identity(device)
+    stale = not target.dp_core_functions or target.dp_core_functions_identity != running
+    core_functions: list[dict[str, Any]] | None = None
+    if stale:
+        core_functions, _, _ = await controller._resolve_core_functions(
+            device, force=True
+        )
+
+    identity_changed = (
+        (target.model or None) != (device.get("model") or None)
+        or (target.sw_version or None) != (device.get("software_version") or None)
+    )
+    if identity_changed or core_functions is not None:
+        store.refresh_target_device(
+            target.target_id,
+            device_identity=device,
+            dp_core_functions=core_functions,
+        )
+    if identity_changed:
+        LOG.info(
+            "Keepalive refreshed %s: model %s, PAN-OS %s",
+            target.name,
+            device.get("model") or "unknown",
+            device.get("software_version") or "unknown",
+        )
+    count = (
+        len(core_functions)
+        if core_functions is not None
+        else len(target.dp_core_functions)
+    )
+    store.record_target_check(
+        target.target_id,
+        kind="keepalive",
+        status="ok",
+        detail=_check_detail(device, count, identity_changed or core_functions is not None),
+    )
+    return True
+
+
+async def run_target_validation(cfg: Config, store: ConfigStore, target: StoredTarget) -> bool:
+    """Run the full read-only validation batch for one firewall on request."""
+    try:
+        capture, ok = await run_api_check(cfg)
+    except Exception as exc:  # a failed validation must not stop the listener
+        LOG.exception("Validation failed for %s", target.name)
+        store.record_target_check(
+            target.target_id,
+            kind="validation",
+            status="failed",
+            detail=f"{type(exc).__name__}: {exc}",
+            clear_request=True,
+        )
+        return False
+    store.record_target_check(
+        target.target_id,
+        kind="validation",
+        status="ok" if ok else "failed",
+        detail=f"run {capture.parent.name}",
+        clear_request=True,
+    )
+    LOG.info(
+        "Validation for %s finished as %s (%s)",
+        target.name,
+        "success" if ok else "failure",
+        capture.parent.name,
+    )
+    return ok
+
+
+def _check_is_due(last_check_at: str | None, interval_hours: float, now: datetime) -> bool:
+    if interval_hours <= 0:
+        return False
+    if not last_check_at:
+        return True
+    try:
+        previous = datetime.fromisoformat(str(last_check_at))
+    except ValueError:
+        return True
+    if previous.tzinfo is None:
+        previous = previous.replace(tzinfo=timezone.utc)
+    return (now - previous).total_seconds() >= interval_hours * 3600
+
+
+async def run_target_checks_once(router: "ManagedRouter") -> int:
+    """Run every due keepalive and every requested validation, one firewall at a time.
+
+    A firewall with an active incident is skipped: it is already being polled
+    every few seconds while under packet-buffer pressure, and a check must never
+    compete with the diagnostic batches.
+    """
+    store = router.store
+    try:
+        targets = [
+            target
+            for target in store.list_targets(include_secrets=True)
+            if isinstance(target, StoredTarget) and target.enabled
+        ]
+        interval_hours = float(store.get_settings()["target_check_hours"])
+    except (OSError, ValueError, KeyError):
+        LOG.exception("Unable to read the firewall check schedule")
+        return 0
+
+    now = datetime.now(timezone.utc)
+    performed = 0
+    for target in targets:
+        if router.router is not None and router.router.is_target_busy(target.name):
+            continue
+        profile = next(
+            (
+                item
+                for item in router.cfg.target_profiles
+                if item.name == target.name
+            ),
+            None,
+        )
+        if profile is None:
+            continue
+        target_cfg = router.cfg.for_target(profile)
+        try:
+            if target.check_requested_at:
+                await run_target_validation(target_cfg, store, target)
+            elif _check_is_due(target.last_check_at, interval_hours, now):
+                await run_target_keepalive(target_cfg, store, target)
+            else:
+                continue
+        except Exception:  # one firewall must not stop the others
+            LOG.exception("Firewall check failed for %s", target.name)
+        performed += 1
+    return performed
+
+
+async def run_target_check_loop(router: "ManagedRouter") -> None:
+    while True:
+        await asyncio.sleep(CHECK_TICK_SECONDS)
+        try:
+            await run_target_checks_once(router)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # the listener must survive any check failure
+            LOG.exception("Firewall check cycle failed")
+
+
 async def run_daemon(cfg: Config) -> None:
     cfg.output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     controller: MonitorController | MultiTargetRouter | ManagedRouter
+    check_task: asyncio.Task[None] | None = None
     config_db = os.getenv("PBP_CONFIG_DB", "").strip()
     if config_db:
         controller = ManagedRouter(cfg, ConfigStore(Path(config_db)))
         LOG.info("Managed configuration enabled at revision %s", cfg.config_revision)
+        check_task = asyncio.create_task(run_target_check_loop(controller))
     elif cfg.target_profiles:
         controller = MultiTargetRouter(cfg)
         LOG.info(
@@ -3342,6 +3534,9 @@ async def run_daemon(cfg: Config) -> None:
         await stop.wait()
     finally:
         transport.close()
+        if check_task is not None:
+            check_task.cancel()
+            await asyncio.gather(check_task, return_exceptions=True)
         if isinstance(controller, (MultiTargetRouter, ManagedRouter)):
             await controller.close()
         else:
