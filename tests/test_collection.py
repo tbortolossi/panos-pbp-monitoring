@@ -549,6 +549,81 @@ packet descriptor (on-chip):
             percentages["resource_monitor_sw_tags_descriptor"], [9.0]
         )
 
+    def test_structured_pbp_xml_reports_active_mitigation_and_mode(self):
+        pbp = """
+<response status="success"><result>
+  <sw.comm.fixture.packet-buffer-protection>
+    <is-module-enabled>True</is-module-enabled>
+    <is-monitor-only>False</is-monitor-only>
+    <congestion>4352</congestion>
+    <congestion-max>97280</congestion-max>
+    <max-tolerate>77824</max-tolerate>
+    <use-latency>0</use-latency>
+    <use-buffer>1</use-buffer>
+    <is-mitigation-enabled>True</is-mitigation-enabled>
+    <is-running>True</is-running>
+  </sw.comm.fixture.packet-buffer-protection>
+</result></response>
+""".strip()
+
+        status = extract_pbp_status(pbp)
+
+        self.assertIs(status["active"], True)
+        self.assertEqual(status["mode"], "packet_buffer")
+        self.assertIs(status["enabled"], True)
+        self.assertIs(status["monitor_only"], False)
+        self.assertEqual(status["congestion_percentage"], 4.474)
+
+    def test_structured_pbp_xml_separates_idle_mitigation_from_unknown(self):
+        pbp = """
+<response status="success"><result>
+  <sw.comm.fixture.packet-buffer-protection>
+    <is-module-enabled>True</is-module-enabled>
+    <is-monitor-only>True</is-monitor-only>
+    <congestion>0</congestion>
+    <congestion-max>97280</congestion-max>
+    <use-latency>0</use-latency>
+    <use-buffer>1</use-buffer>
+    <is-running>False</is-running>
+  </sw.comm.fixture.packet-buffer-protection>
+</result></response>
+""".strip()
+
+        status = extract_pbp_status(pbp)
+
+        self.assertIs(status["active"], False)
+        self.assertIs(status["monitor_only"], True)
+        self.assertEqual(status["mode"], "packet_buffer")
+
+    def test_one_dataplane_in_mitigation_marks_the_firewall_active(self):
+        pbp = """
+<response status="success"><result>
+  <sw.comm.fixture.dp0.packet-buffer-protection>
+    <is-module-enabled>True</is-module-enabled>
+    <use-latency>1</use-latency>
+    <use-buffer>0</use-buffer>
+    <is-running>False</is-running>
+  </sw.comm.fixture.dp0.packet-buffer-protection>
+  <sw.comm.fixture.dp1.packet-buffer-protection>
+    <is-module-enabled>True</is-module-enabled>
+    <use-latency>1</use-latency>
+    <use-buffer>0</use-buffer>
+    <is-running>True</is-running>
+  </sw.comm.fixture.dp1.packet-buffer-protection>
+</result></response>
+""".strip()
+
+        status = extract_pbp_status(pbp)
+
+        self.assertIs(status["active"], True)
+        self.assertEqual(status["mode"], "latency")
+
+    def test_text_only_pbp_output_keeps_unknown_activation_state(self):
+        status = extract_pbp_status("Packet buffer protection is enabled\n")
+
+        self.assertIsNone(status["active"])
+        self.assertEqual(status["mode"], "unknown")
+
     def test_pa440_cpu_average_and_maximum_are_tracked_per_core(self):
         resource_monitor = """
 <result><resource-monitor><data-processors><dp0><second>

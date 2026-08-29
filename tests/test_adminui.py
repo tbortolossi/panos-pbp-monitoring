@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from pbp_monitoring.adminui import AdminController
+from pbp_monitoring import __version__
 from pbp_monitoring.config_store import ConfigStore
 from pbp_monitoring.panos_keygen import SystemInfoError
 from pbp_monitoring.webui import handler_factory
@@ -97,12 +98,12 @@ class AdminUITests(unittest.TestCase):
                 self.assertIn("Change administrator password", page)
                 csv_response = opener.open(base + "/admin/recovery-key.csv")
                 self.assertIn(
-                    "pbp-monitoring-recovery-key-v0.5.0.csv",
+                    f"pbp-monitoring-recovery-key-v{__version__}.csv",
                     csv_response.headers["Content-Disposition"],
                 )
                 csv_payload = csv_response.read().decode("utf-8-sig")
                 self.assertIn("product,version,recovery_key", csv_payload)
-                self.assertIn("PBP Monitoring,0.5.0", csv_payload)
+                self.assertIn(f"PBP Monitoring,{__version__}", csv_payload)
                 admin_csrf = re.search(r'name="csrf" value="([^"]+)"', page).group(1)
                 acknowledged = opener.open(
                     Request(

@@ -21,6 +21,7 @@ from pbp_monitoring.webui import (
     redirect_handler_factory,
     write_run_archive,
 )
+from pbp_monitoring import __version__
 from pbp_monitoring.config_store import ConfigStore
 
 
@@ -178,7 +179,7 @@ class WebUITests(unittest.TestCase):
             with zipfile.ZipFile(archive_buffer) as archive:
                 prefix = "pbp-run-PA-440-20260828T120000Z/"
                 manifest = json.loads(archive.read(prefix + "manifest.json"))
-                self.assertEqual(manifest["application_version"], "0.5.0")
+                self.assertEqual(manifest["application_version"], __version__)
                 self.assertIn(prefix + "incident.jsonl", archive.namelist())
                 self.assertIn(prefix + "support/syslog-triggers.jsonl", archive.namelist())
                 self.assertIn(prefix + "support/syslog-received.jsonl", archive.namelist())
