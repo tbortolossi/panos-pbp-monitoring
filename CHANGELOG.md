@@ -3,6 +3,16 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-08-29
+
+### Fixed
+
+- CPU tracking table headings render their intended symbols. Three characters
+  had been stored double-encoded, so reports showed `Hot points â‰¥ 90%` and
+  `maxâ€"min spread` instead of `Hot points ≥ 90%` and `max–min spread`, and a
+  missing timestamp rendered as `â€"` instead of `—`. Only rendered text is
+  affected; no captured evidence changes.
+
 ## [0.6.0] - 2026-08-29
 
 ### Added

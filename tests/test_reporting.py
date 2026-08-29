@@ -497,6 +497,14 @@ class CpuChartTests(unittest.TestCase):
         self.assertIn("Core function groups were not collected", html)
         self.assertIn(">core 3<", html.replace('class="axis heat-label">', ">"))
 
+    def test_report_symbols_are_not_double_encoded(self):
+        html = self._render({"dp0": {"1": 12.0, "2": 98.0}}, self.FUNCTIONS)
+
+        self.assertIn("Hot points \u2265 90%", html)
+        self.assertIn("Max\u2013min spread", html)
+        self.assertIn("high max\u2013min spread", html)
+        self.assertNotIn("\u00e2", html)
+
     def test_charts_are_omitted_when_no_core_was_sampled(self):
         html = self._render({}, self.FUNCTIONS)
 

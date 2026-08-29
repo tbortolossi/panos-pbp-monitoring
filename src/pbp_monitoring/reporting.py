@@ -692,7 +692,7 @@ def _render_cpu_tracking(
     timeline_rows: list[str] = []
     for batch_number, (_, record) in enumerate(cycles, 1):
         samples = _resource_cpu_samples(record)
-        timestamp = str(record.get("timestamp") or "â€”")
+        timestamp = str(record.get("timestamp") or "—")
         for sample in samples:
             identity = (sample["dataplane"], sample["core_id"])
             per_core.setdefault(identity, []).append(
@@ -762,7 +762,7 @@ def _render_cpu_tracking(
 
     return (
         '<p class="muted">Each batch covers the poll interval plus a two-second '
-        "safety margin, so adjacent windows overlap. A high maxâ€“min spread with "
+        "safety margin, so adjacent windows overlap. A high max–min spread with "
         "one hot core is useful "
         "corroborating evidence for flow-hash concentration. It does not, by "
         "itself, prove that a single session is responsible.</p>"
@@ -770,11 +770,11 @@ def _render_cpu_tracking(
         "<th>Dataplane</th><th>Core</th><th>Function groups</th><th>Windows</th>"
         "<th>Returned points</th>"
         "<th>Window average %</th><th>Peak %</th><th>Latest window peak %</th>"
-        "<th>Hot points â‰¥ 90%</th><th>Peak batch</th>"
+        "<th>Hot points ≥ 90%</th><th>Peak batch</th>"
         f"</tr></thead><tbody>{''.join(core_rows)}</tbody></table></div>"
         '<h3>CPU imbalance timeline</h3><div class="table-wrap"><table><thead><tr>'
         "<th>Batch</th><th>Collector time</th><th>Hottest core</th><th>Max %</th>"
-        "<th>Core average %</th><th>Maxâ€“min spread</th><th>Imbalance signal</th>"
+        "<th>Core average %</th><th>Max–min spread</th><th>Imbalance signal</th>"
         f"</tr></thead><tbody>{''.join(timeline_rows)}</tbody></table></div>"
     )
 
