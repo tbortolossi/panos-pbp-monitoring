@@ -1652,6 +1652,76 @@ def _render_probable_cause(
     )
 
 
+def _render_offender_live_sessions(events: list[tuple[int, dict[str, Any]]]) -> str:
+    """Render the live sessions enumerated for top offender sources at stop."""
+    record = next(
+        (
+            item
+            for _, item in reversed(events)
+            if str(item.get("event", "")).lower() == "offender_live_sessions"
+        ),
+        None,
+    )
+    if record is None or not isinstance(record.get("sources"), list):
+        return ""
+    blocks: list[str] = []
+    for source in record["sources"]:
+        if not isinstance(source, dict):
+            continue
+        identifier = _escape(source.get("source_ip"))
+        if source.get("ok") is not True:
+            blocks.append(
+                f'<p class="muted">Session listing for <code>{identifier}</code> '
+                f"failed: {_escape(source.get('error') or 'unknown error')}.</p>"
+            )
+            continue
+        count = source.get("session_count")
+        entries = source.get("entries")
+        if not isinstance(entries, list) or not entries:
+            blocks.append(
+                f'<p class="muted"><code>{identifier}</code> had '
+                f"{_escape(count if count is not None else '—')} live session(s) "
+                "at monitor stop; none could be listed.</p>"
+                if count
+                else f'<p class="muted"><code>{identifier}</code> had no live '
+                "session at monitor stop.</p>"
+            )
+            continue
+        rows = "".join(
+            "<tr>"
+            f'<td><code>{_escape(entry.get("destination_ip") or "—")}</code></td>'
+            f'<td class="number">{_escape(entry.get("destination_port") or "—")}</td>'
+            f'<td>{_escape(entry.get("protocol") or "—")}</td>'
+            f'<td>{_escape(entry.get("application") or "—")}</td>'
+            f'<td>{_escape(entry.get("from_zone") or "—")} &rarr; '
+            f'{_escape(entry.get("to_zone") or "—")}</td>'
+            f'<td>{_escape(entry.get("start_time") or "—")}</td>'
+            "</tr>"
+            for entry in entries
+            if isinstance(entry, dict)
+        )
+        shown = len([entry for entry in entries if isinstance(entry, dict)])
+        blocks.append(
+            f"<h3>Source <code>{identifier}</code> — "
+            f"{_escape(count if count is not None else shown)} live session(s), "
+            f"{shown} listed</h3>"
+            '<div class="table-wrap"><table>'
+            "<thead><tr><th>Destination</th><th>Port</th><th>Protocol</th>"
+            "<th>Application</th><th>Zones</th><th>Started</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table></div>"
+        )
+    if not blocks:
+        return ""
+    return (
+        '<section aria-labelledby="offender-sessions-title">'
+        '<h2 id="offender-sessions-title">Live sessions of top sources</h2>'
+        '<p class="muted">Sessions still open for the top ranked sources when the '
+        "monitor stopped, from one bounded filtered query per source.</p>"
+        + "".join(blocks)
+        + "</section>"
+    )
+
+
 def _render_offender_traffic_logs(events: list[tuple[int, dict[str, Any]]]) -> str:
     """Render the traffic-log flows recovered for unenriched offender sources."""
     record = next(
@@ -2000,7 +2070,9 @@ def _render_html(
     ) + _render_attribution_table(attribution)
     drop_counter_summary = _aggregate_drop_counters(cycles)
     drop_counters_html = _render_drop_counters(drop_counter_summary, attribution)
-    offender_logs_html = _render_offender_traffic_logs(events)
+    offender_logs_html = _render_offender_live_sessions(
+        events
+    ) + _render_offender_traffic_logs(events)
     session_series = _session_series(cycles)
     probable_cause_html = _render_probable_cause(
         attribution, drop_counter_summary, session_series, cycles
