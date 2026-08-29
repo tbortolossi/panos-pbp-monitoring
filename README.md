@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring & Diagnostic Collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.8.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.8.0)
+[![Version](https://img.shields.io/badge/version-0.9.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.9.0)
 [![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
 
 PBP Monitoring is an event-driven, read-only diagnostic collector for PAN-OS
@@ -31,7 +31,9 @@ Runtime configuration is stored in the named Docker volume
 The dashboard provides:
 
 - global Syslog reception freshness;
-- independent reception freshness for every configured firewall;
+- one card per configured firewall carrying its three live signals: Syslog
+  reception freshness, the outcome of the last read-only API check, and whether a
+  monitoring run is in progress on that firewall;
 - the 20 latest received logs;
 - active and completed runs, including their UTC start time;
 - links to HTML reports, JSONL evidence, and TXT batch exports;
@@ -223,6 +225,11 @@ file is written. A firewall with an active incident is never checked: it is
 already polled every few seconds while under packet-buffer pressure, and the
 check must not compete with the diagnostic batches.
 
+Each firewall card on the dashboard states the result of that check beside its
+Syslog freshness, and turns amber while a monitoring run is in progress on that
+firewall. The run state is read from the run files the collector already writes;
+nothing polls the firewall to determine it.
+
 The **Test** button beside each firewall runs the full read-only validation for
 that firewall instead: every collection command and every parser, writing a
 capture and an HTML report the dashboard already serves. The Web service mounts
@@ -398,6 +405,7 @@ published:
 | Generate HTML report | `true` | Build the standalone incident report |
 | Generate text export | `true` | Write startup and batch TXT files |
 | Syslog fresh seconds | `300` | Green/red dashboard freshness window |
+| Target check hours | `24` | Interval of the read-only firewall check; `0` disables it |
 
 Configuration changes are loaded at the next received datagram. When an
 incident is active, the new revision is deliberately deferred until the run
@@ -560,8 +568,8 @@ docker compose up -d
 docker compose ps
 ```
 
-After an update, verify the dashboard, the global/per-firewall freshness cards,
-and a read-only API check. Do not use `docker compose down -v`; `-v` deletes both
+After an update, verify the dashboard, the per-firewall cards, and a read-only
+API check. Do not use `docker compose down -v`; `-v` deletes both
 persistent volumes.
 
 ## Migrating an older file-based installation

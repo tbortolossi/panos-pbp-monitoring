@@ -89,8 +89,92 @@ class WebUITests(unittest.TestCase):
             self.assertTrue(state["syslog_healthy"])
             self.assertTrue(state["firewalls"][0]["healthy"])
             self.assertFalse(state["firewalls"][1]["healthy"])
-            self.assertIn("fw-a: receiving logs", rendered)
-            self.assertIn("fw-b: logs missing or stale", rendered)
+            self.assertIn("fw-a: healthy", rendered)
+            self.assertIn("Syslog: last log 2026-08-28 12:00:00 UTC", rendered)
+            self.assertIn("fw-b: needs attention", rendered)
+            self.assertIn("Syslog: no attributed log received", rendered)
+            self.assertIn("API check: never run", rendered)
+            self.assertIn("Incident: no run in progress", rendered)
+
+    def test_a_firewall_card_shows_a_run_in_progress_and_the_last_api_check(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data = Path(temporary_directory)
+            store = ConfigStore(data / "configuration" / "config.db")
+            store.initialize()
+            target_id = store.save_target(
+                name="fw-a", panos_url="https://192.0.2.10", api_key="key-a",
+                target_serial=None, serials=[], syslog_sources=["192.0.2.10"],
+            )
+            store.record_target_check(
+                target_id, kind="keepalive", status="ok",
+                detail="PAN-OS 12.2.2; 4 dataplane cores mapped",
+            )
+            run_dir = data / "targets" / "fw-a" / "incidents" / "20260828T120000Z"
+            run_dir.mkdir(parents=True)
+            (run_dir / "incident.jsonl").write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-28T12:00:00+00:00",
+                        "run_id": "20260828T120000Z",
+                        "cycle": 4,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            state = collect_dashboard_state(
+                data,
+                now=datetime(2026, 8, 28, 12, 1, tzinfo=timezone.utc),
+                config_store=store,
+            )
+            rendered = render_dashboard(state)
+
+            firewall = state["firewalls"][0]
+            self.assertEqual(firewall["active_run"], "20260828T120000Z")
+            self.assertEqual(firewall["last_check_status"], "ok")
+            self.assertIn("fw-a: monitoring run in progress", rendered)
+            self.assertIn("Incident: run 20260828T120000Z in progress", rendered)
+            self.assertIn("API check: keepalive passed at", rendered)
+            self.assertIn("4 dataplane cores mapped", rendered)
+            self.assertIn('class="status busy"', rendered)
+
+    def test_a_failed_api_check_marks_the_firewall_card(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data = Path(temporary_directory)
+            store = ConfigStore(data / "configuration" / "config.db")
+            store.initialize()
+            target_id = store.save_target(
+                name="fw-a", panos_url="https://192.0.2.10", api_key="key-a",
+                target_serial=None, serials=[], syslog_sources=["192.0.2.10"],
+            )
+            store.record_target_check(
+                target_id, kind="keepalive", status="failed",
+                detail="PanOSAPIError: unable to reach the firewall",
+            )
+            received = {
+                "timestamp": "2026-08-28T12:00:00+00:00",
+                "transport_source_ip": "192.0.2.10",
+                "target_names": ["fw-a"],
+                "trigger": False,
+                "metadata": {},
+                "message": "system log",
+            }
+            (data / "syslog-received.jsonl").write_text(
+                json.dumps(received) + "\n", encoding="utf-8"
+            )
+
+            state = collect_dashboard_state(
+                data,
+                now=datetime(2026, 8, 28, 12, 1, tzinfo=timezone.utc),
+                config_store=store,
+            )
+            rendered = render_dashboard(state)
+
+            self.assertTrue(state["firewalls"][0]["healthy"])
+            self.assertIn("fw-a: needs attention", rendered)
+            self.assertIn("API check: keepalive FAILED at", rendered)
+            self.assertIn("unable to reach the firewall", rendered)
 
     def test_dashboard_reports_fresh_logs_runs_and_escaped_content(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
