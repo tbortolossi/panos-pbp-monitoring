@@ -1,0 +1,42 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.local/
+config/
+targets.json
+master.key
+*.db
+*.sqlite
+*.sqlite3
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.coverage
+htmlcov/
+
+# Runtime evidence can contain sensitive firewall data
+captures/
+*.log
+*.zip
+backups/
+
+# Client CA certificates mounted read-only by Docker
+certs/*
+!certs/.gitkeep
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Working documents that must not be published
+docs/private/
+
+# Local editor and operating-system files
+.idea/
+.pytest_cache/
+.DS_Store
+Thumbs.db

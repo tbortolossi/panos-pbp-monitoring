@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+!.env.example
+.venv
+venv
+__pycache__
+*.pyc
+captures
+docs/private
+.idea
+.vscode
+tests
+*.egg-info
+dist
+build

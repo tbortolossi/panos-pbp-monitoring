@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a focused, read-only diagnostic improvement.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: "The collector must remain observational: no configuration commits, session clearing, blocking, process restarts, or traffic generation. Do not include confidential operational data."
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: PAN-OS compatibility or command evidence
+      description: Use only anonymized output and identify whether operational XML was confirmed with debug cli on.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: This proposal is read-only toward PAN-OS and contains no confidential data.
+          required: true

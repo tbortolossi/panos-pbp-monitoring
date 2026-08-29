@@ -1,0 +1,18 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "PBP Orchestrator",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pbp_monitoring",
+      "console": "integratedTerminal",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PBP_CONFIG_DB": "${workspaceFolder}/.local/config/config.db",
+        "OUTPUT_DIR": "${workspaceFolder}/captures"
+      },
+      "justMyCode": true
+    }
+  ]
+}

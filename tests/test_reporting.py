@@ -1,0 +1,347 @@
+import hashlib
+import io
+import json
+import os
+import stat
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
+
+from pbp_monitoring.reporting import generate_html_report, main
+
+
+class ReportingTests(unittest.TestCase):
+    def _write_records(self, path: Path, records: list[dict]) -> bytes:
+        content = "".join(
+            json.dumps(record, ensure_ascii=False) + "\n" for record in records
+        ).encode("utf-8")
+        path.write_bytes(content)
+        return content
+
+    def test_report_contains_summary_timeline_raw_data_and_hash(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "pbp-monitor-test.jsonl"
+            malicious = '<script>alert("x")</script>&'
+            source_bytes = self._write_records(
+                capture,
+                [
+                    {
+                        "timestamp": "2026-08-27T10:00:00+00:00",
+                        "collector_version": "0.2.0",
+                        "run_id": "run<&>",
+                        "target_name": "ha-a<&>",
+                        "elapsed_seconds": 0.25,
+                        "percentages": {
+                            "packet_buffer_congestion": [41, 72],
+                            "descriptor_atomic": [92],
+                            "descriptor_total": [93],
+                        },
+                        "resource_monitor_cpu_cores": [
+                            {"dataplane": "dp0", "core_id": 0, "utilization": 4},
+                            {"dataplane": "dp0", "core_id": 1, "utilization": 100},
+                        ],
+                        "candidate_session_ids": [38492],
+                        "candidate_entities": [
+                            {
+                                "rank": 1,
+                                "entity_type": "session",
+                                "session_id": 38492,
+                                "drop_state": True,
+                                "pbp_percentage_total": 72,
+                                "pbp_samples": 4088,
+                                "ingress_percentage_max": 92,
+                                "ingress_count": 3640,
+                                "evidence_sources": [
+                                    "packet_buffer_protection",
+                                    "ingress_backlogs",
+                                ],
+                                "zones": ["trust"],
+                                "group_ids": ["flow_slowpath"],
+                            }
+                        ],
+                        "session_summaries": {
+                            "38492": {
+                                "status": "parsed",
+                                "application": "ssl<&>",
+                                "rule": "allow-web",
+                                "c2s": {
+                                    "source_ip": "192.0.2.10",
+                                    "source_port": 52648,
+                                    "destination_ip": "198.51.100.20",
+                                    "destination_port": 443,
+                                    "protocol": 6,
+                                },
+                            }
+                        },
+                        "session_details": {"38492": malicious},
+                        "commands": {
+                            "packet_buffer_protection": "<result>PBP & raw</result>",
+                            "clock": {
+                                "result": "Thu Aug 27 10:00:00 UTC 2026",
+                                "raw_response": "<response><result>clock raw</result></response>",
+                                "error": None,
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": "2026-08-27T10:00:05+00:00",
+                        "run_id": "run<&>",
+                        "elapsed_seconds": 5,
+                        "parse_warnings": ["unexpected format <parser>"],
+                        "recovery_sample_eligible": False,
+                        "percentages": {
+                            "packet_buffer_congestion": [38],
+                            "descriptor_atomic": [40],
+                            "descriptor_total": [42],
+                            "resource_monitor_packet_descriptor_on_chip": [87.5],
+                        },
+                        "resource_monitor_cpu_cores": [
+                            {"dataplane": "dp0", "core_id": 0, "utilization": 5},
+                            {"dataplane": "dp0", "core_id": 1, "utilization": 20},
+                        ],
+                        "candidate_session_ids": [38492, "5<6"],
+                        "session_rates": {
+                            "38492": {
+                                "status": "calculated",
+                                "bits_per_second_total": 8_000_000,
+                            }
+                        },
+                        "session_details": {
+                            "5<6": {"error": "ERROR: disappeared", "result": None}
+                        },
+                        "commands": {
+                            "ingress_backlogs": {
+                                "ok": False,
+                                "raw_response": "RAW<&>",
+                                "result": {"usage": 42},
+                                "error": "",
+                            }
+                        },
+                    },
+                    {
+                        "timestamp": "2026-08-27T10:00:05.5+00:00",
+                        "run_id": "run<&>",
+                        "event": "trigger_received",
+                        "message": "PBP Packet Drop <unsafe>",
+                    },
+                    {
+                        "timestamp": "2026-08-27T10:00:06+00:00",
+                        "run_id": "run<&>",
+                        "event": "monitor_stopped",
+                        "reason": "resources_recovered",
+                        "elapsed_seconds": 6.5,
+                    },
+                ],
+            )
+
+            with patch.dict(os.environ, {"PANOS_API_KEY": "must-not-leak"}):
+                report = generate_html_report(capture)
+
+            self.assertEqual(report, capture.with_suffix(".html"))
+            self.assertEqual(capture.read_bytes(), source_bytes)
+            rendered = report.read_text(encoding="utf-8")
+
+            self.assertIn("Summary", rendered)
+            self.assertIn("Collector version", rendered)
+            self.assertIn("PBP Monitoring v0.4.1", rendered)
+            self.assertIn("ha-a&lt;&amp;&gt;", rendered)
+            self.assertIn("Timeline", rendered)
+            self.assertIn('class="table-wrap timeline-wrap"', rendered)
+            self.assertIn('class="timeline"', rendered)
+            self.assertIn("Offender attribution", rendered)
+            self.assertIn("Dataplane CPU core tracking", rendered)
+            self.assertIn("Per-core summary", rendered)
+            self.assertIn("CPU imbalance timeline", rendered)
+            self.assertIn("dp0/core 1", rendered)
+            self.assertIn("Imbalance signal", rendered)
+            self.assertIn("High", rendered)
+            self.assertIn("Peak Mbit/s", rendered)
+            self.assertIn(">8</td>", rendered)
+            self.assertIn("Batch details", rendered)
+            self.assertIn("PBP congestion", rendered)
+            self.assertIn("92%", rendered)
+            self.assertIn("Resource monitor descriptor on-chip", rendered)
+            self.assertIn("87.5%", rendered)
+            self.assertIn("Thu Aug 27 10:00:00 UTC 2026", rendered)
+            self.assertIn("packet_buffer_protection", rendered)
+            self.assertIn("Exact raw API response", rendered)
+            self.assertIn("RAW&lt;&amp;&gt;", rendered)
+            self.assertIn(
+                "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;&amp;", rendered
+            )
+            self.assertNotIn("<script>", rendered.lower())
+            self.assertNotIn("must-not-leak", rendered)
+            self.assertIn(hashlib.sha256(source_bytes).hexdigest(), rendered)
+            self.assertIn("resources_recovered", rendered)
+            self.assertIn("6.5 s", rendered)
+            self.assertIn("parse_warnings", rendered)
+            self.assertIn("unexpected format &lt;parser&gt;", rendered)
+            self.assertIn("Content-Security-Policy", rendered)
+            self.assertIn("Primary PBP", rendered)
+            self.assertIn("flow_slowpath", rendered)
+            self.assertIn("192.0.2.10:52648 -&gt; 198.51.100.20:443", rendered)
+            self.assertIn("ssl&lt;&amp;&gt;", rendered)
+            self.assertIn("Correlated triggers", rendered)
+            self.assertIn("PBP Packet Drop &lt;unsafe&gt;", rendered)
+            self.assertIn("Capture overview", rendered)
+            self.assertIn("Incident state", rendered)
+            self.assertIn("Peak resource utilization", rendered)
+            self.assertIn("Packet buffers", rendered)
+            self.assertIn("Packet descriptors", rendered)
+            self.assertIn("System load", rendered)
+            self.assertIn('class="card metric-card"', rendered)
+            self.assertIn('<details class="section-disclosure">', rendered)
+            self.assertNotIn('<details class="section-disclosure" open>', rendered)
+            self.assertNotIn("http://", rendered)
+            self.assertNotIn("https://", rendered)
+
+            leftovers = list(Path(temporary_directory).glob(".*.tmp"))
+            self.assertEqual(leftovers, [])
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o600)
+
+    def test_invalid_truncated_and_non_object_lines_are_warnings(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "partial.jsonl"
+            capture.write_bytes(
+                b'{"timestamp":"2026-08-27T10:00:00Z","commands":"ERROR: legacy <raw>"}\n'
+                b'{not-json}\n'
+                b'[]\n'
+                b'{"timestamp":'
+            )
+
+            report = generate_html_report(capture)
+            rendered = report.read_text(encoding="utf-8")
+
+            self.assertIn("ERROR: legacy &lt;raw&gt;", rendered)
+            self.assertIn("Line 2 ignored", rendered)
+            self.assertIn("Line 3 ignored", rendered)
+            self.assertIn("Line 4 ignored", rendered)
+            self.assertIn("invalid or truncated JSON", rendered)
+            self.assertIn("Partial errors", rendered)
+
+    def test_successful_command_does_not_render_empty_error_field(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "success.jsonl"
+            self._write_records(
+                capture,
+                [
+                    {
+                        "timestamp": "2026-08-27T10:00:00+00:00",
+                        "commands": {
+                            "clock": {
+                                "ok": True,
+                            "result": "clock output",
+                            "raw_response": "<response/>",
+                            "error": None,
+                            "started_at": "2026-08-27T10:00:00.123456+00:00",
+                            "finished_at": "2026-08-27T10:00:01.456789+00:00",
+                            "duration_seconds": 1.333333,
+                            }
+                        },
+                    }
+                ],
+            )
+
+            rendered = generate_html_report(capture).read_text(encoding="utf-8")
+
+            self.assertNotIn('class="payload-label">Error</h5>', rendered)
+            self.assertIn("clock output", rendered)
+            self.assertIn('<dl class="command-metadata">', rendered)
+            self.assertIn("Success", rendered)
+            self.assertIn("2026-08-27 10:00:00.123 UTC", rendered)
+            self.assertIn("1.33 s", rendered)
+            self.assertNotIn('class="payload-label">Ok</h5>', rendered)
+            self.assertNotIn(">true</pre>", rendered)
+            self.assertIn('<details class="exact-response">', rendered)
+            self.assertIn("<summary>Exact raw API response</summary>", rendered)
+            self.assertNotIn('<details class="exact-response" open>', rendered)
+            self.assertLess(
+                rendered.index("clock output"),
+                rendered.index("Exact raw API response"),
+            )
+
+    def test_bom_after_a_blank_line_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "bom.jsonl"
+            capture.write_bytes(
+                b"\n\xef\xbb\xbf"
+                b'{"timestamp":"2026-08-27T10:00:00Z","commands":"valid raw"}\n'
+            )
+
+            rendered = generate_html_report(capture).read_text(encoding="utf-8")
+
+            self.assertIn("valid raw", rendered)
+            self.assertNotIn("Line 2 ignored", rendered)
+
+    def test_future_top_level_structured_command_is_supported(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "future.jsonl"
+            self._write_records(
+                capture,
+                [
+                    {
+                        "timestamp": "2026-08-27T10:00:00Z",
+                        "commands": {
+                            "raw_response": "<response>whole</response>",
+                            "result": "parsed result",
+                            "error": "timeout <unsafe>",
+                        },
+                        "session_details": "legacy session detail",
+                    }
+                ],
+            )
+
+            rendered = generate_html_report(capture).read_text(encoding="utf-8")
+
+            self.assertIn("parsed result", rendered)
+            self.assertIn("&lt;response&gt;whole&lt;/response&gt;", rendered)
+            self.assertIn("timeout &lt;unsafe&gt;", rendered)
+            self.assertIn("legacy session detail", rendered)
+
+    def test_custom_output_and_cli(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "capture.jsonl"
+            output = Path(temporary_directory) / "reports" / "report.html"
+            self._write_records(capture, [{"commands": {"clock": "now"}}])
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                result = main([str(capture), "--output", str(output)])
+
+            self.assertEqual(result, 0)
+            self.assertTrue(output.is_file())
+            self.assertIn(str(output), stdout.getvalue())
+
+    def test_destination_must_not_overwrite_source(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "capture.jsonl"
+            original = self._write_records(capture, [{"commands": "raw"}])
+
+            with self.assertRaises(ValueError):
+                generate_html_report(capture, capture)
+
+            self.assertEqual(capture.read_bytes(), original)
+
+    def test_failed_atomic_replace_preserves_existing_report(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "capture.jsonl"
+            report = capture.with_suffix(".html")
+            self._write_records(capture, [{"commands": "new raw"}])
+            report.write_text("existing report", encoding="utf-8")
+
+            with patch(
+                "pbp_monitoring.reporting.os.replace",
+                side_effect=OSError("replace failed"),
+            ):
+                with self.assertRaises(OSError):
+                    generate_html_report(capture)
+
+            self.assertEqual(report.read_text(encoding="utf-8"), "existing report")
+            self.assertEqual(list(Path(temporary_directory).glob(".*.tmp")), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

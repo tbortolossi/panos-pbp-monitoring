@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panos-pbp-monitoring"
+version = "0.4.1"
+description = "Event-driven PAN-OS packet-buffer incident collector"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+keywords = ["pan-os", "packet-buffer-protection", "network-diagnostics", "syslog"]
+dependencies = ["cryptography>=43,<46"]
+
+[project.urls]
+Homepage = "https://github.com/tbortolossi/panos-pbp-monitoring"
+Documentation = "https://github.com/tbortolossi/panos-pbp-monitoring#readme"
+Issues = "https://github.com/tbortolossi/panos-pbp-monitoring/issues"
+Security = "https://github.com/tbortolossi/panos-pbp-monitoring/security/policy"
+
+[project.scripts]
+pbp-orchestrator = "pbp_monitoring.orchestrator:main"
+pbp-report = "pbp_monitoring.reporting:main"
+pbp-export-text = "pbp_monitoring.text_export:main"
+pbp-web = "pbp_monitoring.webui:main"
+pbp-config = "pbp_monitoring.config_cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

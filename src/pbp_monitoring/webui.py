@@ -1,0 +1,839 @@
+#!/usr/bin/env python3
+"""Read-only local Web UI for PBP Syslog reception and incident artifacts."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html
+import json
+import logging
+import os
+import re
+import ssl
+import threading
+import zipfile
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Sequence
+from urllib.parse import parse_qs, quote, unquote, urlsplit
+
+from . import __version__
+from .adminui import AdminController
+from .config_store import ConfigStore
+from .web_tls import ensure_self_signed_certificate
+
+
+LOG = logging.getLogger("pbp-web")
+SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+SAFE_REDIRECT_HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\Z")
+
+
+class ThreadingTLSHTTPServer(ThreadingHTTPServer):
+    """Accept TLS clients without letting one stalled handshake block all peers."""
+
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        request_handler: type[BaseHTTPRequestHandler],
+        ssl_context: ssl.SSLContext,
+    ) -> None:
+        self.ssl_context = ssl_context
+        super().__init__(server_address, request_handler)
+
+    def get_request(self) -> tuple[Any, Any]:
+        raw_socket, address = super().get_request()
+        try:
+            tls_socket = self.ssl_context.wrap_socket(
+                raw_socket,
+                server_side=True,
+                do_handshake_on_connect=False,
+            )
+            tls_socket.settimeout(15)
+            return tls_socket, address
+        except BaseException:
+            raw_socket.close()
+            raise
+
+
+def _escape(value: Any) -> str:
+    return html.escape(str(value if value not in (None, "") else "—"), quote=True)
+
+
+def _https_redirect_location(host_header: str, request_target: str, https_port: int) -> str:
+    """Build a same-host HTTPS location without trusting an arbitrary header value."""
+    if not host_header or any(character in host_header for character in "\r\n/\\"):
+        raise ValueError("invalid Host header")
+    try:
+        parsed = urlsplit(f"//{host_header}")
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid Host header") from exc
+    if not hostname or parsed.username or parsed.password:
+        raise ValueError("invalid Host header")
+    try:
+        hostname_ascii = hostname.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError("invalid Host header") from exc
+    if ":" in hostname_ascii:
+        authority = f"[{hostname_ascii}]"
+    elif SAFE_REDIRECT_HOST.fullmatch(hostname_ascii):
+        authority = hostname_ascii
+    else:
+        raise ValueError("invalid Host header")
+    if https_port != 443:
+        authority = f"{authority}:{https_port}"
+    target = request_target if request_target.startswith("/") else "/"
+    if any(character in target for character in "\r\n"):
+        raise ValueError("invalid request target")
+    return f"https://{authority}{target}"
+
+
+def redirect_handler_factory(https_port: int) -> type[BaseHTTPRequestHandler]:
+    """Return an HTTP handler which only redirects to the HTTPS listener."""
+
+    class HTTPSRedirectHandler(BaseHTTPRequestHandler):
+        server_version = f"PBPRedirect/{__version__}"
+
+        def _redirect(self) -> None:
+            try:
+                location = _https_redirect_location(
+                    self.headers.get("Host", ""), self.path, https_port
+                )
+            except ValueError:
+                self.send_error(400, "Invalid Host header")
+                return
+            self.send_response(308)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        do_GET = _redirect
+        do_HEAD = _redirect
+        do_POST = _redirect
+
+        def log_message(self, format: str, *args: Any) -> None:
+            LOG.info("HTTP redirect %s - %s", self.client_address[0], format % args)
+
+    return HTTPSRedirectHandler
+
+
+def _filtered_jsonl(path: Path, predicate: Any) -> bytes:
+    selected: list[bytes] = []
+    if not path.is_file():
+        return b""
+    try:
+        with path.open("rb") as handle:
+            for raw_line in handle:
+                try:
+                    value = json.loads(raw_line.decode("utf-8-sig"))
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(value, dict) and predicate(value):
+                    selected.append(raw_line.rstrip(b"\r\n") + b"\n")
+    except OSError:
+        return b""
+    return b"".join(selected)
+
+
+def _run_syslog_exports(run_dir: Path, target: str, run_id: str) -> dict[str, bytes]:
+    if run_dir.parent.name != "incidents":
+        return {}
+    target_root = run_dir.parent.parent
+    data_root = (
+        target_root.parent.parent
+        if target_root.parent.name == "targets"
+        else target_root
+    )
+    first = _first_json_record(run_dir / "incident.jsonl")
+    tail = _tail_json_records(run_dir / "incident.jsonl", 1)
+    started_at = _parse_time(first.get("timestamp"))
+    ended_at = _parse_time(tail[-1].get("timestamp")) if tail else None
+
+    triggers = _filtered_jsonl(
+        target_root / "syslog-triggers.jsonl",
+        lambda record: str(record.get("run_id", "")) == run_id,
+    )
+
+    def received_during_run(record: dict[str, Any]) -> bool:
+        timestamp = _parse_time(record.get("timestamp"))
+        target_names = record.get("target_names")
+        return bool(
+            started_at
+            and ended_at
+            and timestamp
+            and started_at <= timestamp <= ended_at
+            and isinstance(target_names, list)
+            and target in {str(name) for name in target_names}
+        )
+
+    received = _filtered_jsonl(
+        data_root / "syslog-received.jsonl",
+        received_during_run,
+    )
+    return {
+        "support/syslog-triggers.jsonl": triggers,
+        "support/syslog-received.jsonl": received,
+    }
+
+
+def write_run_archive(
+    destination: Any,
+    run_dir: Path,
+    *,
+    target: str,
+    run_id: str,
+) -> None:
+    """Write a portable ZIP containing one run and a checksummed manifest."""
+    root = Path(run_dir).resolve()
+    files = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    )
+    manifest_files: list[dict[str, Any]] = []
+    prefix = f"pbp-run-{target}-{run_id}"
+    with zipfile.ZipFile(
+        destination,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+        allowZip64=True,
+    ) as archive:
+        for path in files:
+            relative = path.relative_to(root).as_posix()
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+            manifest_files.append(
+                {
+                    "path": relative,
+                    "size_bytes": path.stat().st_size,
+                    "sha256": digest.hexdigest(),
+                }
+            )
+            archive.write(path, f"{prefix}/{relative}")
+        for relative, payload in _run_syslog_exports(root, target, run_id).items():
+            manifest_files.append(
+                {
+                    "path": relative,
+                    "size_bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "source": "filtered support export",
+                }
+            )
+            archive.writestr(f"{prefix}/{relative}", payload)
+        manifest = {
+            "format_version": 1,
+            "application": "PBP Monitoring",
+            "application_version": __version__,
+            "target": target,
+            "run_id": run_id,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "files": manifest_files,
+        }
+        archive.writestr(
+            f"{prefix}/manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        )
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _tail_json_records(path: Path, limit: int, max_bytes: int = 2 * 1024 * 1024) -> list[dict[str, Any]]:
+    if limit <= 0 or not path.is_file():
+        return []
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            start = max(0, end - max_bytes)
+            handle.seek(start)
+            data = handle.read()
+    except OSError:
+        return []
+    lines = data.splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]
+    records: list[dict[str, Any]] = []
+    for raw in reversed(lines):
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+            if len(records) >= limit:
+                break
+    records.reverse()
+    return records
+
+
+def _first_json_record(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            for line in handle:
+                try:
+                    value = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(value, dict):
+                    return value
+    except OSError:
+        pass
+    return {}
+
+
+def _run_id_time(run_id: str) -> str | None:
+    try:
+        parsed = datetime.strptime(run_id, "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+    return parsed.isoformat()
+
+
+def _display_utc(value: Any) -> str:
+    parsed = _parse_time(value)
+    return parsed.strftime("%Y-%m-%d %H:%M:%S UTC") if parsed else str(value or "—")
+
+
+def _text_export_metadata(path: Path) -> dict[str, Any]:
+    metadata: dict[str, str] = {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for _line_number, line in zip(range(20), handle):
+                if ": " not in line:
+                    continue
+                key, value = line.rstrip("\r\n").split(": ", 1)
+                metadata[key] = value
+    except OSError:
+        pass
+    return {
+        "name": path.name,
+        "batch": metadata.get("Batch") or ("Startup" if path.name == "startup.txt" else "—"),
+        "collector_time": metadata.get("Collector time"),
+        "firewall_time": metadata.get("Firewall time"),
+        "duration_seconds": metadata.get("Cycle duration seconds"),
+        "size_bytes": path.stat().st_size if path.is_file() else 0,
+    }
+
+
+def collect_text_exports(raw_dir: Path) -> list[dict[str, Any]]:
+    """Return bounded-header metadata for human-readable TXT artifacts."""
+    if not raw_dir.is_dir():
+        return []
+    paths = sorted(raw_dir.glob("batch-*.txt"))
+    startup = raw_dir / "startup.txt"
+    if startup.is_file():
+        paths.insert(0, startup)
+    return [_text_export_metadata(path) for path in paths]
+
+
+def render_text_export_index(
+    target: str,
+    run_id: str,
+    exports: list[dict[str, Any]],
+) -> str:
+    target_url = quote(target, safe="")
+    run_url = quote(run_id, safe="")
+    rows: list[str] = []
+    for item in exports:
+        filename = str(item.get("name", ""))
+        file_url = quote(filename, safe="")
+        size_kib = float(item.get("size_bytes", 0)) / 1024
+        rows.append(
+            "<tr>"
+            f"<td><strong>{_escape('Startup' if filename == 'startup.txt' else f'Batch {item.get("batch")}')}</strong><code>{_escape(filename)}</code></td>"
+            f"<td>{_escape(_display_utc(item.get('collector_time')))}</td>"
+            f"<td>{_escape(item.get('firewall_time'))}</td>"
+            f"<td class=\"number\">{_escape(item.get('duration_seconds'))}</td>"
+            f"<td class=\"number\">{size_kib:.1f} KiB</td>"
+            f'<td class="actions"><a href="/artifacts/{target_url}/{run_url}/raw/{file_url}">View</a>'
+            f'<a class="secondary" href="/artifacts/{target_url}/{run_url}/raw/{file_url}?download=1">Download</a></td>'
+            "</tr>"
+        )
+    if not rows:
+        rows.append('<tr><td colspan="6" class="muted">No TXT export.</td></tr>')
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>TXT exports { _escape(run_id) }</title><style>
+:root{{--ink:#172033;--muted:#64748b;--line:#dbe3ee;--soft:#f4f7fb;--accent:#155e75}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--soft);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}}
+header{{padding:28px max(20px,calc((100vw - 1200px)/2));color:#fff;background:linear-gradient(125deg,#0f172a,#155e75)}}h1{{margin:0;font-size:clamp(24px,4vw,38px)}}header p{{margin:6px 0 0;color:#d9f4f2}}
+main{{width:min(1200px,calc(100% - 28px));margin:22px auto 42px}}.toolbar{{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}}.toolbar span{{color:var(--muted)}}
+.table-wrap{{overflow:auto;max-height:75vh;border:1px solid var(--line);border-radius:12px;background:#fff;scrollbar-gutter:stable}}table{{width:100%;border-collapse:collapse;white-space:nowrap}}th,td{{padding:11px 13px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}}th{{position:sticky;top:0;z-index:2;background:#eef3f8;color:#334155;font-size:12px;text-transform:uppercase}}
+td:first-child strong,td:first-child code{{display:block}}td:first-child code{{margin-top:2px;color:var(--muted);font-size:11px}}.number{{text-align:right;font-variant-numeric:tabular-nums}}.actions{{display:flex;gap:8px}}a{{display:inline-block;padding:6px 10px;border-radius:7px;background:var(--accent);color:#fff;text-decoration:none;font-weight:700}}a.secondary{{border:1px solid #bae6fd;background:#f0f9ff;color:#0369a1}}.back{{background:transparent;color:#0369a1;padding:0}}.muted{{color:var(--muted)}}
+</style></head><body><header><h1>TXT batch exports</h1><p>Run {_escape(run_id)} &middot; target {_escape(target)}</p></header><main><div class="toolbar"><a class="back" href="/">&larr; Back to dashboard</a><span>{len(exports)} files</span></div>
+<div class="table-wrap"><table><thead><tr><th>Batch</th><th>Execution time (UTC)</th><th>Firewall time</th><th>Duration (s)</th><th>Size</th><th>Actions</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div></main></body></html>"""
+
+
+def _target_roots(data_dir: Path) -> list[tuple[str, Path]]:
+    targets = data_dir / "targets"
+    found: list[tuple[str, Path]] = []
+    if targets.is_dir():
+        for path in sorted(targets.iterdir()):
+            if path.is_dir() and SAFE_COMPONENT.fullmatch(path.name):
+                found.append((path.name, path))
+    if not found and (data_dir / "incidents").is_dir():
+        found.append(("standalone", data_dir))
+    return found
+
+
+def collect_dashboard_state(
+    data_dir: Path,
+    *,
+    log_limit: int = 20,
+    run_limit: int = 20,
+    now: datetime | None = None,
+    freshness_seconds: float = 300,
+    config_store: ConfigStore | None = None,
+) -> dict[str, Any]:
+    """Build a bounded dashboard snapshot without loading full incident files."""
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    status_logs = _tail_json_records(data_dir / "syslog-received.jsonl", 200)
+    logs = status_logs[-log_limit:]
+    latest_time = _parse_time(status_logs[-1].get("timestamp")) if status_logs else None
+    age_seconds = (
+        max(0.0, (current - latest_time).total_seconds()) if latest_time else None
+    )
+    syslog_healthy = age_seconds is not None and age_seconds <= freshness_seconds
+
+    runs: list[dict[str, Any]] = []
+    for target, root in _target_roots(data_dir):
+        incidents = root / "incidents"
+        if not incidents.is_dir():
+            continue
+        for directory in incidents.iterdir():
+            if not directory.is_dir() or not SAFE_COMPONENT.fullmatch(directory.name):
+                continue
+            capture = directory / "incident.jsonl"
+            first = _first_json_record(capture)
+            tail = _tail_json_records(capture, 3)
+            last = tail[-1] if tail else {}
+            stopped = last.get("event") == "monitor_stopped"
+            runs.append(
+                {
+                    "target": target,
+                    "run_id": directory.name,
+                    "started_at": first.get("timestamp")
+                    or _run_id_time(directory.name),
+                    "status": "completed" if stopped else "active",
+                    "stop_reason": last.get("reason") if stopped else None,
+                    "cycles": last.get("cycles") if stopped else last.get("cycle"),
+                    "updated_at": last.get("timestamp"),
+                    "report": (directory / "report.html").is_file(),
+                    "jsonl": capture.is_file(),
+                    "text_files": len(list((directory / "raw").glob("*.txt")))
+                    if (directory / "raw").is_dir()
+                    else 0,
+                }
+            )
+    runs.sort(key=lambda item: item["run_id"], reverse=True)
+    firewall_statuses: list[dict[str, Any]] = []
+    if config_store is not None and config_store.path.is_file():
+        try:
+            targets = config_store.list_targets()
+        except (OSError, ValueError):
+            targets = []
+        chronological_logs = status_logs
+        for target in targets:
+            matching: list[dict[str, Any]] = []
+            for record in chronological_logs:
+                names = record.get("target_names")
+                if isinstance(names, list) and target["name"] in names:
+                    matching.append(record)
+                    continue
+                metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+                source = metadata.get("syslog_source_ip") or record.get("transport_source_ip")
+                serial = metadata.get("device_serial")
+                if source in target["syslog_sources"] and (
+                    not serial or str(serial) in target["serials"]
+                ):
+                    matching.append(record)
+            last = matching[-1] if matching else None
+            last_time = _parse_time(last.get("timestamp")) if last else None
+            target_age = max(0.0, (current - last_time).total_seconds()) if last_time else None
+            firewall_statuses.append(
+                {
+                    "name": target["name"],
+                    "enabled": target["enabled"],
+                    "healthy": bool(target["enabled"] and target_age is not None and target_age <= freshness_seconds),
+                    "last_received_at": last.get("timestamp") if last else None,
+                    "age_seconds": target_age,
+                }
+            )
+    return {
+        "generated_at": current.isoformat(),
+        "syslog_healthy": syslog_healthy,
+        "syslog_age_seconds": age_seconds,
+        "logs": list(reversed(logs)),
+        "runs": runs[:run_limit],
+        "firewalls": firewall_statuses,
+    }
+
+
+def render_dashboard(state: dict[str, Any], refresh_seconds: int = 5) -> str:
+    healthy = bool(state.get("syslog_healthy"))
+    age = state.get("syslog_age_seconds")
+    status_class = "ok" if healthy else "bad"
+    status_text = "Syslog reception is active" if healthy else "Syslog reception is missing or stale"
+    age_text = (
+        f"Last log received {int(age)} seconds ago"
+        if isinstance(age, (int, float))
+        else "No log received"
+    )
+
+    log_rows: list[str] = []
+    for record in state.get("logs", []):
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        kind = metadata.get("trigger_type") or (
+            "trigger" if record.get("trigger") else "other"
+        )
+        message = str(record.get("message", ""))
+        if len(message) > 320:
+            message = message[:317] + "..."
+        log_rows.append(
+            "<tr>"
+            f"<td>{_escape(record.get('timestamp'))}</td>"
+            f"<td>{_escape(metadata.get('syslog_source_ip') or record.get('transport_source_ip'))}</td>"
+            f"<td><span class=\"badge {'trigger' if record.get('trigger') else ''}\">{_escape(kind)}</span></td>"
+            f"<td class=\"message\">{_escape(message)}</td>"
+            "</tr>"
+        )
+    if not log_rows:
+        log_rows.append('<tr><td colspan="4" class="muted">No log observed.</td></tr>')
+
+    run_rows: list[str] = []
+    for run in state.get("runs", []):
+        target = quote(str(run.get("target", "")), safe="")
+        run_id = quote(str(run.get("run_id", "")), safe="")
+        links: list[str] = []
+        if run.get("report"):
+            links.append(f'<a href="/reports/{target}/{run_id}/report.html">HTML report</a>')
+        if run.get("jsonl"):
+            links.append(f'<a href="/artifacts/{target}/{run_id}/incident.jsonl">JSONL</a>')
+        if run.get("text_files"):
+            links.append(f'<a href="/artifacts/{target}/{run_id}/raw/">TXT ({int(run["text_files"])})</a>')
+        if run.get("jsonl"):
+            links.append(f'<a href="/artifacts/{target}/{run_id}/run.zip">ZIP support</a>')
+        active = run.get("status") == "active"
+        run_rows.append(
+            "<tr>"
+            f"<td>{_escape(run.get('target'))}</td>"
+            f"<td><code>{_escape(run.get('run_id'))}</code></td>"
+            f"<td>{_escape(run.get('started_at'))}</td>"
+            f"<td><span class=\"badge {'active' if active else 'done'}\">{'Active' if active else 'Completed'}</span></td>"
+            f"<td>{_escape(run.get('cycles'))}</td>"
+            f"<td>{_escape(run.get('stop_reason'))}</td>"
+            f"<td>{' &middot; '.join(links) or '&mdash;'}</td>"
+            "</tr>"
+        )
+    if not run_rows:
+        run_rows.append('<tr><td colspan="7" class="muted">No run recorded.</td></tr>')
+
+    firewall_cards: list[str] = []
+    for firewall in state.get("firewalls", []):
+        firewall_age = firewall.get("age_seconds")
+        detail = (
+            f"Last log {_display_utc(firewall.get('last_received_at'))} ({int(firewall_age)} seconds ago)"
+            if isinstance(firewall_age, (int, float))
+            else "No attributed log received"
+        )
+        firewall_cards.append(
+            f'<div class="status {"ok" if firewall.get("healthy") else "bad"}"><span class="dot"></span><div>'
+            f'<strong>{_escape(firewall.get("name"))}: {"receiving logs" if firewall.get("healthy") else "logs missing or stale"}</strong>'
+            f'<span>{_escape(detail)}</span></div></div>'
+        )
+
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="{max(2, int(refresh_seconds))}">
+<meta name="referrer" content="no-referrer"><title>PBP Monitoring</title>
+<style>
+:root{{--ink:#172033;--muted:#64748b;--line:#dbe3ee;--soft:#f4f7fb;--ok:#15803d;--bad:#b42318;--accent:#155e75}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--soft);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}}
+header{{padding:28px max(20px,calc((100vw - 1280px)/2));color:#fff;background:linear-gradient(125deg,#0f172a,#155e75)}}
+h1{{margin:0;font-size:clamp(25px,4vw,40px)}}header p{{margin:5px 0 0;color:#d9f4f2}}main{{width:min(1280px,calc(100% - 28px));margin:22px auto 42px}}
+.status{{display:flex;align-items:center;gap:13px;padding:16px 18px;border:1px solid var(--line);border-radius:12px;background:#fff}}
+.status-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-top:12px}}
+.dot{{width:18px;height:18px;border-radius:50%;background:var(--bad);box-shadow:0 0 0 5px #fee2e2}}.status.ok .dot{{background:var(--ok);box-shadow:0 0 0 5px #dcfce7}}
+.status strong{{display:block;font-size:17px}}.muted,.status span{{color:var(--muted)}}section{{margin-top:24px}}h2{{margin:0 0 12px}}
+.table-wrap{{overflow:auto;max-height:55vh;border:1px solid var(--line);border-radius:12px;background:#fff;scrollbar-gutter:stable}}table{{width:100%;border-collapse:collapse;white-space:nowrap}}
+th,td{{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}th{{position:sticky;top:0;background:#eef3f8;font-size:12px;text-transform:uppercase}}
+.message{{max-width:680px;white-space:normal;overflow-wrap:anywhere;font:12px/1.45 ui-monospace,Consolas,monospace}}.badge{{display:inline-block;padding:2px 8px;border-radius:999px;background:#e2e8f0;font-size:11px;font-weight:700}}
+.badge.trigger,.badge.active{{background:#fef3c7;color:#92400e}}.badge.done{{background:#dcfce7;color:#166534}}a{{color:#0369a1;font-weight:650}}code{{color:#075985}}
+</style></head><body><header><h1>PBP Monitoring <small style="font-size:14px;font-weight:600">v{_escape(__version__)}</small></h1><p>Dashboard &middot; refreshes every {max(2, int(refresh_seconds))} seconds &middot; <a style="color:white" href="/admin">Admin</a></p></header><main>
+<div class="status {status_class}"><span class="dot"></span><div><strong>{_escape(status_text)}</strong><span>{_escape(age_text)}</span></div></div>
+<div class="status-grid">{''.join(firewall_cards)}</div>
+<section><h2>20 most recent received logs</h2><div class="table-wrap"><table><thead><tr><th>Time (UTC)</th><th>Observed source</th><th>Type</th><th>Message</th></tr></thead><tbody>{''.join(log_rows)}</tbody></table></div></section>
+<section><h2>Recent runs</h2><div class="table-wrap"><table><thead><tr><th>Target</th><th>Run ID</th><th>Start time (UTC)</th><th>Status</th><th>Batches</th><th>Stop reason</th><th>Artifacts</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table></div></section>
+</main></body></html>"""
+
+
+def _artifact_path(data_dir: Path, target: str, run_id: str, *parts: str) -> Path | None:
+    components = (target, run_id, *parts)
+    if any(not SAFE_COMPONENT.fullmatch(component) for component in components):
+        return None
+    root = (data_dir / "targets" / target / "incidents" / run_id).resolve()
+    candidate = root.joinpath(*parts).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    return candidate
+
+
+def handler_factory(
+    data_dir: Path,
+    freshness_seconds: float,
+    config_db: Path | None = None,
+    *,
+    tls_enabled: bool = False,
+) -> type[BaseHTTPRequestHandler]:
+    config_store = ConfigStore(config_db) if config_db else None
+    admin = (
+        AdminController(
+            config_store,
+            allow_remote=True,
+            secure_cookie=tls_enabled,
+        )
+        if config_store
+        else None
+    )
+
+    class DashboardHandler(BaseHTTPRequestHandler):
+        server_version = f"PBPWeb/{__version__}"
+
+        def _headers(self, status: int, content_type: str, length: int | None = None) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'")
+            if tls_enabled:
+                self.send_header("Strict-Transport-Security", "max-age=31536000")
+            if length is not None:
+                self.send_header("Content-Length", str(length))
+            self.end_headers()
+
+        def _send_bytes(self, payload: bytes, content_type: str, status: int = 200) -> None:
+            self._headers(status, content_type, len(payload))
+            if self.command != "HEAD":
+                self.wfile.write(payload)
+
+        def _serve_file(self, path: Path, content_type: str, *, attachment: bool = False) -> None:
+            if not path.is_file():
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(path.stat().st_size))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            if attachment:
+                self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+            self.end_headers()
+            if self.command != "HEAD":
+                with path.open("rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        self.wfile.write(chunk)
+
+        def _serve_run_archive(self, run_dir: Path, target: str, run_id: str) -> None:
+            if not run_dir.is_dir():
+                self.send_error(404)
+                return
+            filename = f"pbp-run-{target}-{run_id}-v{__version__}.zip"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            if self.command != "HEAD":
+                write_run_archive(
+                    self.wfile,
+                    run_dir,
+                    target=target,
+                    run_id=run_id,
+                )
+
+        def do_HEAD(self) -> None:
+            self.do_GET()
+
+        def do_POST(self) -> None:
+            path = unquote(urlsplit(self.path).path)
+            if admin is not None and admin.handle(self, path):
+                return
+            self.send_error(404)
+
+        def do_GET(self) -> None:
+            request_url = urlsplit(self.path)
+            path = unquote(request_url.path)
+            if admin is not None and admin.handle(self, path):
+                return
+            if path == "/healthz":
+                self._send_bytes(b"ok\n", "text/plain; charset=utf-8")
+                return
+            if path == "/":
+                effective_freshness = freshness_seconds
+                if config_store is not None:
+                    try:
+                        effective_freshness = float(config_store.get_settings()["syslog_fresh_seconds"])
+                    except (KeyError, OSError, ValueError):
+                        pass
+                state = collect_dashboard_state(
+                    data_dir,
+                    freshness_seconds=effective_freshness,
+                    config_store=config_store,
+                )
+                self._send_bytes(render_dashboard(state).encode("utf-8"), "text/html; charset=utf-8")
+                return
+            parts = [part for part in path.split("/") if part]
+            if len(parts) == 4 and parts[0] == "reports" and parts[3] == "report.html":
+                artifact = _artifact_path(data_dir, parts[1], parts[2], "report.html")
+                self._serve_file(artifact, "text/html; charset=utf-8") if artifact else self.send_error(404)
+                return
+            if len(parts) == 4 and parts[0] == "artifacts" and parts[3] == "incident.jsonl":
+                artifact = _artifact_path(data_dir, parts[1], parts[2], "incident.jsonl")
+                self._serve_file(artifact, "application/x-ndjson", attachment=True) if artifact else self.send_error(404)
+                return
+            if len(parts) == 4 and parts[0] == "artifacts" and parts[3] == "run.zip":
+                capture = _artifact_path(data_dir, parts[1], parts[2], "incident.jsonl")
+                if capture is None or not capture.is_file():
+                    self.send_error(404)
+                else:
+                    self._serve_run_archive(capture.parent, parts[1], parts[2])
+                return
+            if len(parts) == 4 and parts[0] == "artifacts" and parts[3] == "raw":
+                raw_dir = _artifact_path(data_dir, parts[1], parts[2], "raw")
+                if raw_dir is None or not raw_dir.is_dir():
+                    self.send_error(404)
+                    return
+                page = render_text_export_index(
+                    parts[1],
+                    parts[2],
+                    collect_text_exports(raw_dir),
+                )
+                self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            if len(parts) == 5 and parts[0] == "artifacts" and parts[3] == "raw":
+                artifact = _artifact_path(data_dir, parts[1], parts[2], "raw", parts[4])
+                attachment = parse_qs(request_url.query).get("download") == ["1"]
+                self._serve_file(
+                    artifact,
+                    "text/plain; charset=utf-8",
+                    attachment=attachment,
+                ) if artifact else self.send_error(404)
+                return
+            self.send_error(404)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            LOG.info("%s - %s", self.client_address[0], format % args)
+
+    return DashboardHandler
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=Path(os.getenv("WEB_DATA_DIR", "/data")))
+    parser.add_argument("--host", default=os.getenv("WEB_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("WEB_PORT", "8080")))
+    parser.add_argument("--redirect-port", type=int, default=int(os.getenv("WEB_HTTP_REDIRECT_PORT", "8081")))
+    parser.add_argument("--https-public-port", type=int, default=int(os.getenv("WEB_HTTPS_PUBLIC_PORT", "8088")))
+    parser.add_argument("--fresh-seconds", type=float, default=float(os.getenv("WEB_LOG_FRESH_SECONDS", "300")))
+    parser.add_argument("--config-db", type=Path, default=Path(os.getenv("PBP_CONFIG_DB", "/config/config.db")))
+    parser.add_argument("--tls-cert", type=Path, default=Path(os.getenv("WEB_TLS_CERT", "").strip() or "/config/web-tls.crt"))
+    parser.add_argument("--tls-key", type=Path, default=Path(os.getenv("WEB_TLS_KEY", "").strip() or "/config/web-tls.key"))
+    parser.add_argument("--tls-hostnames", default=os.getenv("WEB_TLS_HOSTNAMES", "localhost,127.0.0.1"))
+    args = parser.parse_args(argv)
+    if (
+        not 1 <= args.port <= 65535
+        or not 1 <= args.redirect_port <= 65535
+        or not 1 <= args.https_public_port <= 65535
+        or args.port == args.redirect_port
+        or args.fresh_seconds <= 0
+    ):
+        parser.error("ports and fresh-seconds must be positive, valid, and distinct")
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    configured_certificate = bool(
+        os.getenv("WEB_TLS_CERT", "").strip() or os.getenv("WEB_TLS_KEY", "").strip()
+    )
+    if configured_certificate:
+        if not args.tls_cert.is_file() or not args.tls_key.is_file():
+            parser.error("WEB_TLS_CERT and WEB_TLS_KEY must identify readable files")
+    else:
+        ensure_self_signed_certificate(
+            args.tls_cert,
+            args.tls_key,
+            [value.strip() for value in args.tls_hostnames.split(",")],
+        )
+    tls_enabled = True
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(args.tls_cert, args.tls_key)
+    server = ThreadingTLSHTTPServer(
+        (args.host, args.port),
+        handler_factory(
+            args.data_dir,
+            args.fresh_seconds,
+            args.config_db,
+            tls_enabled=tls_enabled,
+        ),
+        context,
+    )
+    redirect_server = ThreadingHTTPServer(
+        (args.host, args.redirect_port),
+        redirect_handler_factory(args.https_public_port),
+    )
+    redirect_thread = threading.Thread(target=redirect_server.serve_forever, daemon=True)
+    redirect_thread.start()
+    LOG.info(
+        "Dashboard listening on %s://%s:%s",
+        "https" if tls_enabled else "http",
+        args.host,
+        args.port,
+    )
+    LOG.info(
+        "HTTP redirect listening on http://%s:%s and targeting HTTPS port %s",
+        args.host,
+        args.redirect_port,
+        args.https_public_port,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        redirect_server.shutdown()
+        redirect_server.server_close()
+        redirect_thread.join(timeout=2)
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

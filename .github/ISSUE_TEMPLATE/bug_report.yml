@@ -1,0 +1,45 @@
+name: Bug report
+description: Report reproducible incorrect behavior without confidential operational data.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include API keys, passwords, management addresses, serial numbers, customer names, raw production captures, or support archives. Use private vulnerability reporting for security issues."
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: "0.4.1"
+    validations:
+      required: true
+  - type: input
+    id: panos
+    attributes:
+      label: PAN-OS version and anonymized model
+      placeholder: "PAN-OS 12.2.x, anonymized hardware family"
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps using anonymized data
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data-safety confirmation
+      options:
+        - label: I removed credentials, real addresses, serial numbers, customer identifiers, captures, and other confidential data.
+          required: true

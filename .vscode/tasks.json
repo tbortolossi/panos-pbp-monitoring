@@ -1,0 +1,24 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Tests",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"],
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Compile check",
+      "type": "process",
+      "command": "${command:python.interpreterPath}",
+      "args": ["-m", "compileall", "-q", "src/pbp_monitoring", "tools"],
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}
