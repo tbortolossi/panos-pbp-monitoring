@@ -378,6 +378,11 @@ key must be backed up and restored together.
     instead of replaced. An unusable address, port, or profile name falls back
     to its default and is reported rather than rendered into a command. The same
     block downloads as plain text from an authenticated session only.
+45. The report opens with a probable-cause block composing the peak buffer
+    usage, the strongest offender with its flow, the denied-traffic
+    correlation, and the session-table verdict. Ranked sessions are rolled up
+    by source address in a top-sources table, and a pressure chart plots
+    packet-buffer, descriptor, and session-table utilization per batch.
 
 ## 12. Possible enhancements
 

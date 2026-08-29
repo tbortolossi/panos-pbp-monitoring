@@ -524,6 +524,15 @@ the summary separates capture facts, incident state, and peak utilization, and
 its peak metrics are grouped into packet buffers, packet descriptors, and
 system load. The lower-level event metadata is collapsed by default.
 
+The report opens with a **Probable cause** block: the peak buffer usage, the
+strongest offender with its flow and rate, the denied-traffic correlation, and
+the session-table verdict, composed into a few sentences ready for a TAC case.
+A **Top sources** table above the attribution ranking rolls ranked sessions up
+by source address — a scan or flood spread over hundreds of short sessions is
+attributed to the source that owns them — and a **Pressure over time** chart
+plots packet-buffer, descriptor, and session-table utilization batch by batch
+so the offender's first appearance can be aligned with the pressure curve.
+
 The **Denied and dropped traffic** section aggregates the `drop` severity global
 counters returned by `show counter global filter delta yes` over the whole
 capture, with the total packet count, the peak per-second rate, and the number
