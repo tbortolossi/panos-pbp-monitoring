@@ -1145,6 +1145,38 @@ class MonitorTests(unittest.TestCase):
 
 
 
+class TriggerFlowExtractionTests(unittest.TestCase):
+    """A THREAT trigger's positional fields must feed the enrichment path."""
+
+    THREAT_CSV_LINE = (
+        "PBP_SYSLOG_SOURCE=192.0.2.10 <14>Aug 29 10:00:00 lab-fw-01 "
+        "1,2026/08/29 10:00:00,012345678901,THREAT,flood,2561,"
+        "2026/08/29 10:00:00,203.0.113.7,198.51.100.15,0.0.0.0,0.0.0.0,"
+        "allow-outbound,,,not-applicable,vsys1,outside,inside,"
+        "ethernet1/1,ethernet1/2,default,2026/08/29 10:00:00,123456,1,"
+        '54321,443,0,0,0x0,udp,drop,"",PBP Packet Drop(8507),any,critical,'
+        "client-to-server"
+    )
+
+    def test_a_threat_trigger_feeds_session_and_source_enrichment(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            with patch.object(
+                controller, "_monitor", side_effect=lambda run_id: asyncio.sleep(0)
+            ):
+                controller.trigger(self.THREAT_CSV_LINE, "192.0.2.10:514")
+                ids = set(controller.trigger_session_ids)
+                sources = set(controller.trigger_source_ips)
+                await asyncio.gather(controller.monitor_task, return_exceptions=True)
+            return ids, sources
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            ids, sources = asyncio.run(scenario(make_config(Path(temporary_directory))))
+
+            self.assertEqual(ids, {123456})
+            self.assertEqual(sources, {"203.0.113.7"})
+
+
 class RunStartRateLimitTests(unittest.TestCase):
     """A forged trigger flood must not cycle unlimited monitoring runs."""
 
