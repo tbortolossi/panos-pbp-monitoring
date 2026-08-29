@@ -20,7 +20,7 @@ are declared in `pyproject.toml`, and tests belong under `tests/`.
 
 ## Change requirements
 
-- Read `PRD.md`, `README.md`, and `AGENTS.md` before changing behavior.
+- Read `PRD.md`, `README.md`, and `CLAUDE.md` before changing behavior.
 - Never add mitigation actions, configuration calls, commits, session clears,
   process restarts, or arbitrary operational commands.
 - Keep API keys, management addresses, customer names, serial numbers, and raw
