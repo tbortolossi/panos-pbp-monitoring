@@ -1145,6 +1145,72 @@ class MonitorTests(unittest.TestCase):
 
 
 
+class WebhookNotificationTests(unittest.TestCase):
+    """An incident must announce itself without ever blocking the monitor."""
+
+    def test_webhook_fires_on_start_and_stop(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            payloads = []
+            with patch.object(
+                controller, "_post_webhook", side_effect=payloads.append
+            ):
+                controller.trigger("PBP Packet Drop (8507)", "192.0.2.1:514")
+                await asyncio.gather(controller.monitor_task, return_exceptions=True)
+                await controller.wait_for_reports()
+            return payloads
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cfg = make_config(
+                Path(temporary_directory),
+                webhook_url="https://hooks.invalid/pbp",
+            )
+            payloads = asyncio.run(scenario(cfg))
+
+            events = [payload["event"] for payload in payloads]
+            self.assertIn("incident_started", events)
+            self.assertIn("incident_stopped", events)
+            stopped = next(
+                payload
+                for payload in payloads
+                if payload["event"] == "incident_stopped"
+            )
+            self.assertIn("reason", stopped)
+            self.assertIn("report_path", stopped)
+
+    def test_no_webhook_configured_sends_nothing(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            with patch.object(controller, "_post_webhook") as post:
+                controller.trigger("PBP Packet Drop (8507)", "192.0.2.1:514")
+                await asyncio.gather(controller.monitor_task, return_exceptions=True)
+                await controller.wait_for_reports()
+            return post
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            post = asyncio.run(scenario(make_config(Path(temporary_directory))))
+
+            post.assert_not_called()
+
+    def test_a_failing_webhook_never_stops_the_monitor(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            with patch.object(
+                controller, "_post_webhook", side_effect=OSError("unreachable")
+            ):
+                controller.trigger("PBP Packet Drop (8507)", "192.0.2.1:514")
+                await asyncio.gather(controller.monitor_task, return_exceptions=True)
+                await controller.wait_for_reports()
+            return controller.run_id
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            cfg = make_config(output_dir, webhook_url="https://hooks.invalid/pbp")
+            run_id = asyncio.run(scenario(cfg))
+
+            self.assertTrue(incident_capture_path(output_dir, run_id).exists())
+
+
 class OffenderTrafficLogTests(unittest.TestCase):
     """Sources without a session get one bounded traffic-log lookup at stop."""
 

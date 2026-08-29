@@ -433,6 +433,14 @@ published:
 | Generate text export | `true` | Write startup and batch TXT files |
 | Syslog fresh seconds | `300` | Green/red dashboard freshness window |
 | Target check hours | `24` | Interval of the read-only firewall check; `0` disables it |
+| Webhook URL | *(empty)* | Incident notifications; empty disables them |
+
+When a webhook URL is configured, the collector POSTs a JSON payload at
+incident start (run, firewall, trigger metadata including the extracted flow)
+and at incident stop (stop reason, batch count, top ranked sources, report
+path). The call is best effort with a five-second timeout: a failing or slow
+endpoint is logged and never delays collection. Use an HTTPS endpoint on a
+trusted network; the payload contains addresses and device names.
 
 Configuration changes are loaded at the next received datagram. When an
 incident is active, the new revision is deliberately deferred until the run
