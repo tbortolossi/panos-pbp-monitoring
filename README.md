@@ -55,6 +55,7 @@ Each collection batch runs:
 ```text
 show clock
 show session packet-buffer-protection
+show session info
 show running resource-monitor ingress-backlogs
 show running resource-monitor
 debug dataplane pool statistics
@@ -486,6 +487,23 @@ IP only, and `show session id` has nothing to enrich. When denied packets are
 counted while a source IP is ranked without an enriched session, the report
 states that correlation explicitly. The **Denied packets** summary card carries
 the same total, adding policy deny to DoS and zone-protection drops.
+
+The **Session table** section follows `show session info` batch by batch: the
+allocated sessions and the table utilization, the split by protocol with the
+remainder shown as `Other`, the new connection rate, the packet rate, the
+throughput, and the number of sessions created between two batches, derived from
+the since-bootup counter. Peaks are summarized as cards above the table.
+
+The section states what the session table did while the buffers were under
+pressure. A table above 80% of its capacity is a constraint of its own, because
+PAN-OS then accelerates session aging and can refuse new sessions. A packet rate
+that multiplies while the session count barely moves means packets arrived
+without sessions being created, which is what a flood denied before session
+setup looks like from the session table, and it must be read together with the
+denied and dropped traffic section. Sessions growing with the load point back to
+the offender attribution table instead. PAN-OS prints the utilization truncated
+to a whole percent, so the report derives it from allocated over supported to
+keep the movement of a lightly loaded table visible.
 
 Each batch requests `show running resource-monitor second last N`, where `N` is
 `ceil(poll_seconds) + 2`, bounded to 60 seconds. The two-second margin avoids

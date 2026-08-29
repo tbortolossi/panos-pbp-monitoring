@@ -18,6 +18,7 @@ from pbp_monitoring.orchestrator import (
     extract_live_percentages,
     extract_resource_cpu_cores,
     extract_pbp_offenders,
+    extract_session_info,
     extract_pbp_status,
     extract_session_ids,
     extract_session_summary,
@@ -265,6 +266,86 @@ Session/IP Address | Zone | PCS | Percentage | State | Total | Dropped | Time ti
 </result>"""
 
         self.assertEqual(extract_pbp_offenders(output), [])
+
+    def test_session_info_reads_the_table_protocol_mix_and_rates_from_xml(self):
+        output = """<result>
+  <num-max>200000</num-max>
+  <num-active>315</num-active>
+  <num-tcp>204</num-tcp>
+  <num-udp>111</num-udp>
+  <num-icmp>0</num-icmp>
+  <num-predict>0</num-predict>
+  <num-installed>1383770</num-installed>
+  <cps>2</cps>
+  <pps>118</pps>
+  <kbps>219</kbps>
+  <dp>*.dp0</dp>
+</result>"""
+
+        parsed = extract_session_info(output)
+
+        self.assertEqual(len(parsed["dataplanes"]), 1)
+        dataplane = parsed["dataplanes"][0]
+        self.assertEqual(dataplane["dp"], "*.dp0")
+        self.assertEqual(dataplane["allocated"], 315)
+        self.assertEqual(dataplane["supported"], 200000)
+        self.assertEqual(dataplane["tcp"], 204)
+        self.assertEqual(dataplane["udp"], 111)
+        self.assertEqual(dataplane["created_since_bootup"], 1383770)
+        self.assertEqual(dataplane["connection_rate_cps"], 2)
+        self.assertEqual(dataplane["packet_rate_pps"], 118)
+        self.assertEqual(dataplane["throughput_kbps"], 219)
+        # PAN-OS returns no utilization field, so it is derived.
+        self.assertEqual(dataplane["utilization_percentage"], 0.16)
+        self.assertEqual(parsed["totals"]["allocated"], 315)
+
+    def test_session_info_reads_the_cli_text_form_of_every_dataplane(self):
+        output = """
+target-dp:                                       *.dp0
+Number of sessions supported:                    200000
+Number of allocated sessions:                    421
+Number of active TCP sessions:                   206
+Number of active UDP sessions:                   215
+Number of active ICMP sessions:                  0
+Number of active predict sessions:               1
+Session table utilization:                       0%
+Number of sessions created since bootup:         1254101
+Packet rate:                                     160/s
+Throughput:                                      623 kbps
+New connection establish rate:                   4 cps
+
+target-dp:                                       *.dp1
+Number of sessions supported:                    200000
+Number of allocated sessions:                    79
+Number of active TCP sessions:                   40
+Number of active UDP sessions:                   39
+Packet rate:                                     20/s
+Throughput:                                      100 kbps
+New connection establish rate:                   1 cps
+"""
+
+        parsed = extract_session_info(output)
+
+        self.assertEqual(
+            [dataplane["dp"] for dataplane in parsed["dataplanes"]],
+            ["*.dp0", "*.dp1"],
+        )
+        self.assertEqual(parsed["dataplanes"][0]["allocated"], 421)
+        self.assertEqual(parsed["dataplanes"][0]["predict"], 1)
+        self.assertEqual(parsed["dataplanes"][1]["tcp"], 40)
+        totals = parsed["totals"]
+        self.assertEqual(totals["allocated"], 500)
+        self.assertEqual(totals["supported"], 400000)
+        self.assertEqual(totals["packet_rate_pps"], 180)
+        self.assertEqual(totals["throughput_kbps"], 723)
+        self.assertEqual(totals["connection_rate_cps"], 5)
+        self.assertEqual(totals["utilization_percentage"], 0.12)
+
+    def test_session_info_failure_yields_no_dataplane_instead_of_raising(self):
+        parsed = extract_session_info("<response status=\"error\"><msg/></response>")
+
+        self.assertEqual(parsed["dataplanes"], [])
+        self.assertIsNone(parsed["totals"]["allocated"])
 
     def test_ingress_backlogs_retains_dp_groups_and_any_ip_protocol(self):
         output = """

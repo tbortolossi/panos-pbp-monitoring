@@ -58,6 +58,7 @@ def resource_monitor_command(poll_seconds: float) -> str:
 
 OP_COMMANDS = {
     "packet_buffer_protection": "<show><session><packet-buffer-protection/></session></show>",
+    "session_info": "<show><session><info/></session></show>",
     "ingress_backlogs": "<show><running><resource-monitor><ingress-backlogs/></resource-monitor></running></show>",
     "resource_monitor": resource_monitor_command(5),
     "dataplane_pool_statistics": "<debug><dataplane><pool><statistics/></pool></dataplane></debug>",
@@ -874,6 +875,181 @@ def extract_pbp_status(
     # The structured form is authoritative when the release returns it.
     status.update(_structured_pbp_state(output))
     return status
+
+
+_SESSION_INFO_XML_FIELDS = (
+    ("num-max", "supported"),
+    ("num-active", "allocated"),
+    ("num-tcp", "tcp"),
+    ("num-udp", "udp"),
+    ("num-icmp", "icmp"),
+    ("num-sctp-sess", "sctp_sessions"),
+    ("num-sctp-assoc", "sctp_associations"),
+    ("num-gtpc", "gtpc"),
+    ("num-gtpu-active", "gtpu_active"),
+    ("num-gtpu-pending", "gtpu_pending"),
+    ("num-http2-5gc", "http2_5gc"),
+    ("num-pfcpc", "pfcp"),
+    ("num-imsi", "imsi"),
+    ("num-bcast", "bcast"),
+    ("num-mcast", "mcast"),
+    ("num-predict", "predict"),
+    ("num-installed", "created_since_bootup"),
+    ("cps", "connection_rate_cps"),
+    ("pps", "packet_rate_pps"),
+    ("kbps", "throughput_kbps"),
+)
+_SESSION_INFO_TEXT_FIELDS = (
+    ("Number of sessions supported", "supported"),
+    ("Number of allocated sessions", "allocated"),
+    ("Number of active TCP sessions", "tcp"),
+    ("Number of active UDP sessions", "udp"),
+    ("Number of active ICMP sessions", "icmp"),
+    ("Number of active GTPc sessions", "gtpc"),
+    ("Number of active HTTP2-5gc sessions", "http2_5gc"),
+    ("Number of active GTPu sessions", "gtpu_active"),
+    ("Number of pending GTPu sessions", "gtpu_pending"),
+    ("Number of active BCAST sessions", "bcast"),
+    ("Number of active MCAST sessions", "mcast"),
+    ("Number of active predict sessions", "predict"),
+    ("Number of active SCTP sessions", "sctp_sessions"),
+    ("Number of active SCTP associations", "sctp_associations"),
+    ("Number of active PFCP sessions", "pfcp"),
+    ("Number of active IMSI sessions", "imsi"),
+    ("Number of sessions created since bootup", "created_since_bootup"),
+    ("Session table utilization", "utilization_percentage"),
+    ("Packet rate", "packet_rate_pps"),
+    ("Throughput", "throughput_kbps"),
+    ("New connection establish rate", "connection_rate_cps"),
+)
+_SESSION_INFO_COUNTS = tuple(
+    key for _, key in _SESSION_INFO_XML_FIELDS if key != "supported"
+) + ("supported",)
+
+
+def _session_number(value: str | None) -> int | float | None:
+    """Keep counters as integers and rates as the number PAN-OS reported."""
+    number = _float_value(value)
+    if number is None:
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _session_utilization(allocated: Any, supported: Any) -> float | None:
+    """Derive the session table utilization the API does not return as a field."""
+    if not isinstance(allocated, (int, float)) or not isinstance(supported, (int, float)):
+        return None
+    if supported <= 0:
+        return None
+    return round(float(allocated) * 100.0 / float(supported), 2)
+
+
+def _session_info_totals(dataplanes: list[dict[str, Any]]) -> dict[str, Any]:
+    """Sum per-dataplane counters so a chassis reports one device-wide view."""
+    totals: dict[str, Any] = {}
+    for key in _SESSION_INFO_COUNTS:
+        values = [
+            dataplane[key]
+            for dataplane in dataplanes
+            if isinstance(dataplane.get(key), (int, float))
+        ]
+        totals[key] = sum(values) if values else None
+    totals["utilization_percentage"] = _session_utilization(
+        totals.get("allocated"),
+        totals.get("supported"),
+    )
+    if totals["utilization_percentage"] is None:
+        reported = [
+            dataplane["utilization_percentage"]
+            for dataplane in dataplanes
+            if isinstance(dataplane.get("utilization_percentage"), (int, float))
+        ]
+        totals["utilization_percentage"] = max(reported) if reported else None
+    return totals
+
+
+def extract_session_info(output: str) -> dict[str, Any]:
+    """Parse the session table, protocol mix, and traffic rates of each dataplane.
+
+    ``show session info`` is the only command that states how many sessions
+    exist while the buffers are under pressure. A flood denied before session
+    setup raises the packet rate without moving the session counters, which is
+    exactly what separates it from a session-based flood.
+    """
+    dataplanes: list[dict[str, Any]] = []
+
+    def add(dataplane: str | None, values: dict[str, Any]) -> None:
+        if not any(value is not None for value in values.values()):
+            return
+        record: dict[str, Any] = {"dp": dataplane}
+        for key in _SESSION_INFO_COUNTS:
+            record[key] = values.get(key)
+        # PAN-OS prints the utilization truncated to a whole percent, which
+        # hides the movement of a session table this far from its limit.
+        utilization = _session_utilization(
+            values.get("allocated"),
+            values.get("supported"),
+        )
+        if utilization is None:
+            reported = values.get("utilization_percentage")
+            utilization = reported if isinstance(reported, (int, float)) else None
+        record["utilization_percentage"] = utilization
+        dataplanes.append(record)
+
+    try:
+        root = ET.fromstring(output)
+    except ET.ParseError:
+        root = None
+
+    if root is not None:
+        for element in root.iter():
+            children = {_local_tag(child): child for child in element}
+            if "num-max" not in children and "num-active" not in children:
+                continue
+            values: dict[str, Any] = {}
+            for tag, key in _SESSION_INFO_XML_FIELDS:
+                child = children.get(tag)
+                values[key] = _session_number(
+                    child.text if child is not None else None
+                )
+            dp_element = children.get("dp")
+            dataplane = (
+                dp_element.text.strip()
+                if dp_element is not None and dp_element.text
+                else None
+            )
+            add(dataplane, values)
+        if dataplanes:
+            return {"dataplanes": dataplanes, "totals": _session_info_totals(dataplanes)}
+
+    current_dp: str | None = None
+    values = {}
+    for line in panos_result_text(output).splitlines():
+        target = re.match(r"\s*target-dp\s*:\s*(\S+)", line, re.I)
+        if target:
+            add(current_dp, values)
+            current_dp = target.group(1)
+            values = {}
+            continue
+        label, separator, remainder = line.partition(":")
+        if not separator:
+            continue
+        name = label.strip().lower()
+        key = next(
+            (
+                field
+                for text, field in _SESSION_INFO_TEXT_FIELDS
+                if text.lower() == name
+            ),
+            None,
+        )
+        if key is None:
+            continue
+        number = re.search(r"-?\d+(?:\.\d+)?", remainder)
+        if number:
+            values[key] = _session_number(number.group(0))
+    add(current_dp, values)
+    return {"dataplanes": dataplanes, "totals": _session_info_totals(dataplanes)}
 
 
 def extract_ingress_backlogs(output: str) -> dict[str, list[dict[str, Any]]]:
@@ -2668,6 +2844,9 @@ class MonitorController:
                 )
                 pbp_offenders = extract_pbp_offenders(pbp_result)
                 pbp_status = extract_pbp_status(pbp_result, pbp_offenders)
+                session_info = extract_session_info(
+                    command_result(outputs.get("session_info"))
+                )
                 ingress_backlogs = extract_ingress_backlogs(ingress_result)
                 dataplane_pools = extract_dataplane_pool_statistics(
                     dataplane_pool_result
@@ -2749,6 +2928,7 @@ class MonitorController:
                         "candidate_entities": candidate_entities,
                         "pbp_status": pbp_status,
                         "pbp_offenders": pbp_offenders,
+                        "session_info": session_info,
                         "ingress_backlogs": ingress_backlogs,
                         "dataplane_pools": dataplane_pools,
                         "global_counters_delta": global_counters,
@@ -3274,6 +3454,7 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
     dataplane_pool_result = command_result(outputs.get("dataplane_pool_statistics"))
     pbp_offenders = extract_pbp_offenders(pbp_result)
     pbp_status = extract_pbp_status(pbp_result, pbp_offenders)
+    session_info = extract_session_info(command_result(outputs.get("session_info")))
     ingress_backlogs = extract_ingress_backlogs(ingress_result)
     dataplane_pools = extract_dataplane_pool_statistics(dataplane_pool_result)
     global_counters = extract_global_counters(
@@ -3346,6 +3527,7 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
             "candidate_entities": candidate_entities,
             "pbp_status": pbp_status,
             "pbp_offenders": pbp_offenders,
+            "session_info": session_info,
             "ingress_backlogs": ingress_backlogs,
             "dataplane_pools": dataplane_pools,
             "global_counters_delta": global_counters,

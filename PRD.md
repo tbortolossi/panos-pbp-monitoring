@@ -93,6 +93,7 @@ than create a concurrent one.
    the following commands in parallel every five seconds without waiting for
    the clock request to time out:
    - `show session packet-buffer-protection`;
+   - `show session info`;
    - `show running resource-monitor ingress-backlogs`;
    - `show running resource-monitor`;
    - `debug dataplane pool statistics`;
@@ -102,7 +103,13 @@ than create a concurrent one.
    time until discard. Both output forms are accepted: the pipe-delimited CLI
    table and the structured XML `<entry>` form returned by the API on current
    PAN-OS releases, whose fields map one for one onto the same columns. `ingress-backlogs` separately preserves slot/DP,
-   ATOMIC/TOTAL, groups, counts, and flow details.
+   ATOMIC/TOTAL, groups, counts, and flow details. `show session info` is parsed
+   per dataplane and summed device-wide into `session_info`: sessions supported
+   and allocated, the protocol mix, the sessions created since bootup, the new
+   connection rate, the packet rate, and the throughput. Its utilization is
+   derived from allocated over supported, because PAN-OS returns no utilization
+   field through the API and truncates it to a whole percent in the CLI. No
+   parsed view ever replaces the raw output kept in the JSONL.
 7. Entities are ranked by RED evidence, contribution, and corroboration. The
    collector immediately calls `show session id <id>` for priority sessions,
    including an ID explicitly supplied by the trigger, with bounded concurrency,
@@ -182,8 +189,8 @@ these files below `targets/<target-name>/` and adds `syslog-routing.jsonl` for
 probe and routing evidence.
 
 `incidents/<run_id>/report.html` is a derived view containing a summary, timeline,
-offender ranking, denied and dropped traffic counters, per-dataplane CPU core
-charts, partial errors, and all
+offender ranking, denied and dropped traffic counters, the session table
+evolution, per-dataplane CPU core charts, partial errors, and all
 collapsible raw outputs. It contains
 the JSONL SHA-256 digest; JSONL remains the source of truth. Validation mode
 similarly produces `api-checks/<run_id>/api-check.jsonl` and
@@ -223,7 +230,7 @@ key must be backed up and restored together.
 1. A log without a PBP pattern triggers no collection.
 2. Each of the four default messages from an allowlisted source starts a monitor.
 3. Two closely spaced triggers create only one monitor.
-4. Every cycle contains the five diagnostic results and the clock, or an explicit error
+4. Every cycle contains the six diagnostic results and the clock, or an explicit error
    for each call, with the raw response when available.
 5. An ID found in output causes a `show session id` call.
 6. An IPv4 address in the PBP table is not interpreted as an ID.
@@ -317,6 +324,12 @@ key must be backed up and restored together.
     session, the report states that the pressure is consistent with traffic
     denied by policy, DoS protection, or zone protection, which creates no
     session to collect.
+43. Every batch records the session table view returned by `show session info`,
+    and the report shows its evolution: allocated sessions, derived utilization,
+    protocol mix, new connection rate, packet rate, throughput, and the sessions
+    created between two batches. A packet rate that multiplies while the session
+    count stays flat is reported as traffic that created no session, and a table
+    above 80% of its capacity is reported as a constraint of its own.
 
 ## 12. Possible enhancements
 

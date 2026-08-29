@@ -687,5 +687,134 @@ class DropCounterTests(unittest.TestCase):
         self.assertNotIn('<p class="verdict', html)
 
 
+class SessionTableTests(unittest.TestCase):
+    """show session info tells whether the flood created sessions at all."""
+
+    def _session_info(self, **values) -> dict:
+        totals = {
+            "supported": 200000,
+            "allocated": values.get("allocated"),
+            "tcp": values.get("tcp"),
+            "udp": values.get("udp"),
+            "icmp": 0,
+            "created_since_bootup": values.get("created"),
+            "connection_rate_cps": values.get("cps"),
+            "packet_rate_pps": values.get("pps"),
+            "throughput_kbps": values.get("kbps"),
+            "utilization_percentage": round(
+                values.get("allocated", 0) * 100 / 200000, 2
+            ),
+        }
+        return {"dataplanes": [{"dp": "*.dp0", **totals}], "totals": totals}
+
+    def _render(self, cycles: list[dict]) -> str:
+        records: list[dict] = [
+            {
+                "timestamp": "2026-08-27T10:00:00+00:00",
+                "run_id": "session-run",
+                "event": "monitor_started",
+                "collector_version": "test",
+                "device": {"serial": "fixture", "model": "PA-fixture"},
+            }
+        ]
+        for batch, cycle in enumerate(cycles, 1):
+            record = {
+                "timestamp": f"2026-08-27T10:0{batch}:00+00:00",
+                "run_id": "session-run",
+                "cycle": batch,
+                "elapsed_seconds": float(batch),
+                "percentages": {"packet_buffer_congestion": [61]},
+                "commands": {},
+            }
+            record.update(cycle)
+            records.append(record)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "sessions.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            report = generate_html_report(capture, capture.with_suffix(".html"))
+            return report.read_text(encoding="utf-8")
+
+    def test_session_counters_and_rates_are_reported_for_every_batch(self):
+        html = self._render(
+            [
+                {
+                    "session_info": self._session_info(
+                        allocated=421,
+                        tcp=206,
+                        udp=215,
+                        created=1254101,
+                        cps=4,
+                        pps=160,
+                        kbps=623,
+                    )
+                },
+                {
+                    "session_info": self._session_info(
+                        allocated=460,
+                        tcp=210,
+                        udp=250,
+                        created=1254301,
+                        cps=9,
+                        pps=310,
+                        kbps=940,
+                    )
+                },
+            ]
+        )
+
+        self.assertIn("Session table", html)
+        self.assertIn("Peak allocated sessions", html)
+        self.assertIn(">460 / 200000<", html)
+        self.assertIn("Peak new connections", html)
+        self.assertIn("Peak packet rate", html)
+        self.assertIn("Peak throughput", html)
+        # Sessions created between the first and the last batch.
+        self.assertIn("Sessions created", html)
+        self.assertIn(">200<", html)
+        self.assertIn(">623<", html)
+
+    def test_a_flood_without_new_sessions_is_named_in_the_verdict(self):
+        html = self._render(
+            [
+                {
+                    "session_info": self._session_info(
+                        allocated=420, tcp=205, udp=215, created=1000, cps=4, pps=150,
+                        kbps=600,
+                    )
+                },
+                {
+                    "session_info": self._session_info(
+                        allocated=424, tcp=205, udp=219, created=1020, cps=5, pps=9000,
+                        kbps=800,
+                    )
+                },
+            ]
+        )
+
+        self.assertIn("Packets arrived without sessions being created", html)
+
+    def test_a_saturated_session_table_is_reported_as_a_constraint(self):
+        html = self._render(
+            [
+                {
+                    "session_info": self._session_info(
+                        allocated=180000, tcp=90000, udp=90000, created=10,
+                        cps=900, pps=90000, kbps=800000,
+                    )
+                }
+            ]
+        )
+
+        self.assertIn("accelerates session aging", html)
+
+    def test_capture_without_session_info_states_it_instead_of_an_empty_table(self):
+        html = self._render([{"commands": {}}])
+
+        self.assertIn("No session table snapshot was recorded in this capture.", html)
+
+
 if __name__ == "__main__":
     unittest.main()
