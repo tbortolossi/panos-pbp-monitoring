@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-08-29
+
+### Added
+
+- Each dashboard firewall card now carries three live signals instead of one:
+  Syslog reception freshness, the outcome of the last read-only API check, and
+  whether a monitoring run is in progress on that firewall. A card turns amber
+  while a run is active and red when Syslog is stale or the last check failed.
+  The run state is derived from the run files the collector already writes, so
+  nothing polls the firewall to determine it. Refs #69.
+
+### Changed
+
+- The firewall card headline reports the overall state (`healthy`,
+  `monitoring run in progress`, `needs attention`) rather than Syslog reception
+  alone, which is now one of the lines beneath it.
+
 ## [0.8.0] - 2026-08-29
 
 ### Added
