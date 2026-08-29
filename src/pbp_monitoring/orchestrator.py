@@ -122,6 +122,14 @@ SYSLOG_STATUS_MAX_BYTES = 4 * 1024 * 1024
 # runs and grow the evidence volume without limit.
 RUN_START_LIMIT = 12
 RUN_START_WINDOW_SECONDS = 3600
+# End-of-incident traffic-log lookup for offender sources that no session
+# command could enrich (traffic denied before session setup, RED-blocked
+# sources). Read-only, bounded, and template-fixed: only a validated IP is
+# interpolated into the query.
+OFFENDER_LOG_SOURCE_LIMIT = 3
+OFFENDER_LOG_NLOGS = 20
+OFFENDER_LOG_TIMEOUT_SECONDS = 20.0
+OFFENDER_LOG_POLL_SECONDS = 0.5
 
 
 def utc_now() -> str:
@@ -547,10 +555,9 @@ class PanOSClient:
             RejectRedirectHandler(),
         )
 
-    def op_response(self, command_xml: str) -> PanOSResponse:
-        params = {"type": "op", "cmd": command_xml}
+    def _api_request(self, params: dict[str, str]) -> tuple[ET.Element, str]:
         if self.cfg.target_serial:
-            params["target"] = self.cfg.target_serial
+            params = {**params, "target": self.cfg.target_serial}
         request = Request(
             f"{self.cfg.panos_url}/api/",
             data=urlencode(params).encode("utf-8"),
@@ -590,6 +597,39 @@ class PanOSClient:
                 message or "PAN-OS operation failed",
                 raw_response=response_text,
             )
+        return root, response_text
+
+    def op_response(self, command_xml: str) -> PanOSResponse:
+        root, response_text = self._api_request({"type": "op", "cmd": command_xml})
+        result = root.find("result")
+        result_xml = (
+            ET.tostring(result, encoding="unicode") if result is not None else response_text
+        )
+        return PanOSResponse(result_xml=result_xml, raw_response=response_text)
+
+    def log_query_job(self, log_type: str, query: str, nlogs: int) -> str:
+        """Enqueue a read-only log query and return the firewall job id."""
+        root, response_text = self._api_request(
+            {
+                "type": "log",
+                "log-type": log_type,
+                "query": query,
+                "nlogs": str(int(nlogs)),
+            }
+        )
+        job = root.findtext(".//job")
+        if not job or not job.strip().isdigit():
+            raise PanOSAPIError(
+                "PAN-OS did not return a log job id",
+                raw_response=response_text,
+            )
+        return job.strip()
+
+    def log_query_result(self, job_id: str) -> PanOSResponse:
+        """Fetch the state and entries of one previously enqueued log job."""
+        root, response_text = self._api_request(
+            {"type": "log", "action": "get", "job-id": job_id}
+        )
         result = root.find("result")
         result_xml = (
             ET.tostring(result, encoding="unicode") if result is not None else response_text
@@ -2539,6 +2579,45 @@ def panos_csv_serial(message: str) -> str | None:
     return serial if SERIAL_PATTERN.fullmatch(serial) else None
 
 
+def extract_log_job_status(output: str) -> str:
+    """Return the job status (ACT, FIN, ...) from a log query result."""
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return ""
+    return (root.findtext(".//job/status") or "").strip().upper()
+
+
+def extract_traffic_log_entries(output: str) -> list[dict[str, Any]]:
+    """Normalize traffic log entries recovered for an unenriched offender."""
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return []
+    entries: list[dict[str, Any]] = []
+    for element in root.iter("entry"):
+        entry = {
+            name: (element.findtext(tag) or "").strip() or None
+            for name, tag in (
+                ("receive_time", "receive_time"),
+                ("source_ip", "src"),
+                ("destination_ip", "dst"),
+                ("source_port", "sport"),
+                ("destination_port", "dport"),
+                ("protocol", "proto"),
+                ("application", "app"),
+                ("rule", "rule"),
+                ("action", "action"),
+                ("from_zone", "from"),
+                ("to_zone", "to"),
+                ("session_end_reason", "session_end_reason"),
+            )
+        }
+        if entry["source_ip"] or entry["destination_ip"]:
+            entries.append(entry)
+    return entries
+
+
 def panos_threat_csv_fields(message: str) -> dict[str, Any]:
     """Extract the responsible flow from a THREAT log's positional CSV fields.
 
@@ -2913,6 +2992,86 @@ class MonitorController:
         )
         return dict(pairs)
 
+    async def _collect_offender_traffic_logs(
+        self,
+        output_file: Path,
+        run_id: str,
+        offender_sources: dict[str, int],
+    ) -> None:
+        """Recover flow detail for unenriched offender sources from the traffic log.
+
+        One bounded, read-only log query per top source, run once at monitor
+        stop so no query competes with the diagnostic batches. The query
+        template is fixed; only a validated IP address is interpolated.
+        """
+        ranked = sorted(
+            offender_sources, key=lambda ip: offender_sources[ip], reverse=True
+        )
+        results: list[dict[str, Any]] = []
+        for source in ranked[:OFFENDER_LOG_SOURCE_LIMIT]:
+            try:
+                normalized = str(ipaddress.ip_address(source))
+            except ValueError:
+                continue
+            outcome: dict[str, Any] = {
+                "source_ip": normalized,
+                "ranked_batches": offender_sources[source],
+                "ok": False,
+            }
+            try:
+                job_id = await asyncio.to_thread(
+                    self.client.log_query_job,
+                    "traffic",
+                    f"(addr.src in '{normalized}')",
+                    OFFENDER_LOG_NLOGS,
+                )
+                deadline = time.monotonic() + OFFENDER_LOG_TIMEOUT_SECONDS
+                response: PanOSResponse | None = None
+                status = ""
+                while time.monotonic() < deadline:
+                    response = await asyncio.to_thread(
+                        self.client.log_query_result, job_id
+                    )
+                    status = extract_log_job_status(response.result_xml)
+                    if status == "FIN":
+                        break
+                    await asyncio.sleep(OFFENDER_LOG_POLL_SECONDS)
+                if response is None or status != "FIN":
+                    outcome["error"] = (
+                        f"log job {job_id} did not finish within "
+                        f"{OFFENDER_LOG_TIMEOUT_SECONDS:.0f}s"
+                    )
+                else:
+                    outcome.update(
+                        {
+                            "ok": True,
+                            "job_id": job_id,
+                            "entries": extract_traffic_log_entries(
+                                response.result_xml
+                            ),
+                            "raw_response": self._redact_secret(
+                                response.raw_response
+                            ),
+                        }
+                    )
+            except Exception as exc:  # one source must not discard the others
+                outcome["error"] = self._redact_secret(
+                    f"{type(exc).__name__}: {exc}"
+                )
+            results.append(outcome)
+        if not results:
+            return
+        append_jsonl(
+            output_file,
+            {
+                "timestamp": utc_now(),
+                "run_id": run_id,
+                "event": "offender_traffic_logs",
+                "target_name": self.cfg.target_name,
+                "sources": results,
+            },
+        )
+
     async def _session_details(self, ids: list[int]) -> dict[str, dict[str, Any]]:
         semaphore = asyncio.Semaphore(4)
 
@@ -2986,6 +3145,7 @@ class MonitorController:
             )
         )
         session_rate_samples: dict[str, dict[str, Any]] = {}
+        offender_sources: dict[str, int] = {}
         try:
             while time.monotonic() - start < self.cfg.max_monitor_seconds:
                 cycle_number += 1
@@ -3059,6 +3219,12 @@ class MonitorController:
                     sorted(self.trigger_session_ids),
                     sorted(self.trigger_source_ips),
                 )
+                for entity in candidate_entities:
+                    if entity.get("entity_type") != "source_ip":
+                        continue
+                    source = entity.get("source_ip")
+                    if isinstance(source, str) and source:
+                        offender_sources[source] = offender_sources.get(source, 0) + 1
                 ids = [
                     int(entity["session_id"])
                     for entity in candidate_entities
@@ -3184,6 +3350,18 @@ class MonitorController:
                 if not startup_task.done():
                     startup_task.cancel()
                     await asyncio.gather(startup_task, return_exceptions=True)
+            if stop_reason != "cancelled" and offender_sources:
+                # A source denied before session setup or RED-blocked has no
+                # session to inspect; the firewall's own traffic log carries
+                # its destination, port, rule, and action.
+                try:
+                    await self._collect_offender_traffic_logs(
+                        output_file, run_id, offender_sources
+                    )
+                except Exception:
+                    LOG.exception(
+                        "Offender traffic log lookup failed for %s", run_id
+                    )
             try:
                 append_jsonl(
                     output_file,

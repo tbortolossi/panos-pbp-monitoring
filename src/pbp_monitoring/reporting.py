@@ -1329,6 +1329,73 @@ def _unenriched_source_ips(attribution: list[dict[str, Any]]) -> list[str]:
     return identifiers
 
 
+def _render_offender_traffic_logs(events: list[tuple[int, dict[str, Any]]]) -> str:
+    """Render the traffic-log flows recovered for unenriched offender sources."""
+    record = next(
+        (
+            item
+            for _, item in reversed(events)
+            if str(item.get("event", "")).lower() == "offender_traffic_logs"
+        ),
+        None,
+    )
+    if record is None or not isinstance(record.get("sources"), list):
+        return ""
+    blocks: list[str] = []
+    for source in record["sources"]:
+        if not isinstance(source, dict):
+            continue
+        identifier = _escape(source.get("source_ip"))
+        if source.get("ok") is not True:
+            blocks.append(
+                f'<p class="muted">Traffic log lookup for <code>{identifier}</code> '
+                f"failed: {_escape(source.get('error') or 'unknown error')}.</p>"
+            )
+            continue
+        entries = source.get("entries")
+        if not isinstance(entries, list) or not entries:
+            blocks.append(
+                f'<p class="muted">The traffic log returned no entry for '
+                f"<code>{identifier}</code> in the queried window.</p>"
+            )
+            continue
+        rows = "".join(
+            "<tr>"
+            f'<td>{_escape(entry.get("receive_time") or "—")}</td>'
+            f'<td><code>{_escape(entry.get("destination_ip") or "—")}</code></td>'
+            f'<td class="number">{_escape(entry.get("destination_port") or "—")}</td>'
+            f'<td>{_escape(entry.get("protocol") or "—")}</td>'
+            f'<td>{_escape(entry.get("application") or "—")}</td>'
+            f'<td>{_escape(entry.get("rule") or "—")}</td>'
+            f'<td>{_escape(entry.get("action") or "—")}</td>'
+            f'<td>{_escape(entry.get("from_zone") or "—")} &rarr; '
+            f'{_escape(entry.get("to_zone") or "—")}</td>'
+            "</tr>"
+            for entry in entries
+            if isinstance(entry, dict)
+        )
+        blocks.append(
+            f"<h3>Source <code>{identifier}</code> — {len(entries)} recent "
+            'traffic log entries</h3><div class="table-wrap"><table>'
+            "<thead><tr><th>Receive time</th><th>Destination</th><th>Port</th>"
+            "<th>Protocol</th><th>Application</th><th>Rule</th><th>Action</th>"
+            "<th>Zones</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table></div>"
+        )
+    if not blocks:
+        return ""
+    return (
+        '<section aria-labelledby="offender-logs-title">'
+        '<h2 id="offender-logs-title">Traffic log evidence for unenriched sources</h2>'
+        '<p class="muted">These sources were ranked from PBP evidence but had no '
+        "session to inspect (traffic denied before session setup, or a RED-blocked "
+        "source). The flows below come from the firewall's own traffic log, "
+        "queried read-only once at monitor stop.</p>"
+        + "".join(blocks)
+        + "</section>"
+    )
+
+
 def _render_drop_counters(
     summary: dict[str, Any],
     attribution: list[dict[str, Any]],
@@ -1638,6 +1705,7 @@ def _render_html(
     attribution_html = _render_attribution_table(attribution)
     drop_counter_summary = _aggregate_drop_counters(cycles)
     drop_counters_html = _render_drop_counters(drop_counter_summary, attribution)
+    offender_logs_html = _render_offender_traffic_logs(events)
     session_series = _session_series(cycles)
     session_table_html = _render_session_table(session_series)
     core_functions = next(
@@ -2069,6 +2137,7 @@ def _render_html(
       <h2 id="drop-counters-title">Denied and dropped traffic</h2>
       {drop_counters_html}
     </section>
+    {offender_logs_html}
     <section aria-labelledby="session-table-title">
       <h2 id="session-table-title">Session table</h2>
       {session_table_html}
