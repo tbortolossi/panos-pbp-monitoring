@@ -7,6 +7,10 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The dashboard's recent-runs table now compares incidents side by side:
+  each completed run shows its peak packet-buffer percentage and its top
+  ranked sources, read from a summary the stop marker now carries, so a
+  recurring offender across days is visible without opening each report.
 - Optional webhook notifications: a **Webhook URL** setting makes the
   collector POST a JSON payload when an incident opens (run, firewall,
   trigger metadata with the extracted flow) and when it closes (stop reason,

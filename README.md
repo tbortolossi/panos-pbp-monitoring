@@ -35,7 +35,9 @@ The dashboard provides:
   reception freshness, the outcome of the last read-only API check, and whether a
   monitoring run is in progress on that firewall;
 - the 20 latest received logs;
-- active and completed runs, including their UTC start time;
+- active and completed runs, including their UTC start time, and for each
+  completed run its peak packet-buffer percentage and top ranked sources, so
+  a recurring offender across incidents is visible without opening reports;
 - links to HTML reports, JSONL evidence, and TXT batch exports;
 - an authenticated admin area for collector settings and firewall inventory.
 

@@ -3192,6 +3192,7 @@ class MonitorController:
         )
         session_rate_samples: dict[str, dict[str, Any]] = {}
         offender_sources: dict[str, int] = {}
+        peak_packet_buffer: float | None = None
         try:
             while time.monotonic() - start < self.cfg.max_monitor_seconds:
                 cycle_number += 1
@@ -3307,6 +3308,16 @@ class MonitorController:
                         self.cfg.recovery_threshold,
                     )
                 )
+                for buffer_key in (
+                    "packet_buffer_congestion",
+                    "resource_monitor_packet_buffer",
+                ):
+                    for value in percentages.get(buffer_key) or []:
+                        peak_packet_buffer = (
+                            float(value)
+                            if peak_packet_buffer is None
+                            else max(peak_packet_buffer, float(value))
+                        )
                 trigger_reinforced = self.trigger_sequence != seen_trigger_sequence
                 if trigger_reinforced:
                     seen_trigger_sequence = self.trigger_sequence
@@ -3419,6 +3430,15 @@ class MonitorController:
                         "reason": stop_reason,
                         "cycles": cycle_number,
                         "elapsed_seconds": round(time.monotonic() - start, 3),
+                        # Summarized here so the dashboard can compare runs
+                        # from its bounded tail read, without scanning the
+                        # whole capture.
+                        "peak_packet_buffer_pct": peak_packet_buffer,
+                        "top_sources": sorted(
+                            offender_sources,
+                            key=lambda ip: offender_sources[ip],
+                            reverse=True,
+                        )[:OFFENDER_LOG_SOURCE_LIMIT],
                     },
                 )
             except Exception:

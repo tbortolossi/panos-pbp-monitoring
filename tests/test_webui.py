@@ -338,7 +338,14 @@ class WebUITests(unittest.TestCase):
             (run / "raw").mkdir(parents=True)
             records = [
                 {"cycle": 1, "timestamp": "2026-08-28T12:00:01+00:00"},
-                {"event": "monitor_stopped", "timestamp": "2026-08-28T12:00:02+00:00", "reason": "resources_recovered", "cycles": 1},
+                {
+                    "event": "monitor_stopped",
+                    "timestamp": "2026-08-28T12:00:02+00:00",
+                    "reason": "resources_recovered",
+                    "cycles": 1,
+                    "peak_packet_buffer_pct": 62.5,
+                    "top_sources": ["203.0.113.7"],
+                },
             ]
             (run / "incident.jsonl").write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
             (run / "report.html").write_text("report", encoding="utf-8")
@@ -384,6 +391,9 @@ class WebUITests(unittest.TestCase):
             )
             self.assertIn("TXT (1)", rendered)
             self.assertIn("ZIP support", rendered)
+            self.assertIn("Peak buffer", rendered)
+            self.assertIn("62.5%", rendered)
+            self.assertIn("203.0.113.7", rendered)
             self.assertIn("pbp_packet_drop", rendered)
             self.assertNotIn("<script>", rendered.lower())
             self.assertIn("&lt;script&gt;", rendered)

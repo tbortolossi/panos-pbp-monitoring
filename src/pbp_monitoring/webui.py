@@ -441,6 +441,14 @@ def collect_dashboard_state(
                     "status": "completed" if stopped else "active",
                     "stop_reason": last.get("reason") if stopped else None,
                     "cycles": last.get("cycles") if stopped else last.get("cycle"),
+                    "peak_packet_buffer_pct": (
+                        last.get("peak_packet_buffer_pct") if stopped else None
+                    ),
+                    "top_sources": (
+                        last.get("top_sources")
+                        if stopped and isinstance(last.get("top_sources"), list)
+                        else []
+                    ),
                     "updated_at": last.get("timestamp"),
                     "report": (directory / "report.html").is_file(),
                     "jsonl": capture.is_file(),
@@ -582,6 +590,12 @@ def render_dashboard(state: dict[str, Any], refresh_seconds: int = 5) -> str:
         if run.get("jsonl"):
             links.append(f'<a href="/artifacts/{target}/{run_id}/run.zip">ZIP support</a>')
         active = run.get("status") == "active"
+        peak = run.get("peak_packet_buffer_pct")
+        peak_text = (
+            f"{peak:g}%" if isinstance(peak, (int, float)) else "—"
+        )
+        top_sources = run.get("top_sources") or []
+        top_text = ", ".join(str(source) for source in top_sources[:3]) or "—"
         run_rows.append(
             "<tr>"
             f"<td>{_escape(run.get('target'))}</td>"
@@ -589,12 +603,14 @@ def render_dashboard(state: dict[str, Any], refresh_seconds: int = 5) -> str:
             f"<td>{_escape(run.get('started_at'))}</td>"
             f"<td><span class=\"badge {'active' if active else 'done'}\">{'Active' if active else 'Completed'}</span></td>"
             f"<td>{_escape(run.get('cycles'))}</td>"
+            f"<td>{_escape(peak_text)}</td>"
+            f"<td><code>{_escape(top_text)}</code></td>"
             f"<td>{_escape(run.get('stop_reason'))}</td>"
             f"<td>{' &middot; '.join(links) or '&mdash;'}</td>"
             "</tr>"
         )
     if not run_rows:
-        run_rows.append('<tr><td colspan="7" class="muted">No run recorded.</td></tr>')
+        run_rows.append('<tr><td colspan="9" class="muted">No run recorded.</td></tr>')
 
     firewall_cards: list[str] = []
     for firewall in state.get("firewalls", []):
@@ -649,7 +665,7 @@ th,td{{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;ver
 <div class="status {status_class}"><span class="dot"></span><div><strong>{_escape(status_text)}</strong><span>{_escape(age_text)}</span></div></div>
 <div class="status-grid">{''.join(firewall_cards)}</div>
 <section><h2>20 most recent received logs</h2><div class="table-wrap"><table><thead><tr><th>Time (UTC)</th><th>Observed source</th><th>Type</th><th>Message</th></tr></thead><tbody>{''.join(log_rows)}</tbody></table></div></section>
-<section><h2>Recent runs</h2><div class="table-wrap"><table><thead><tr><th>Target</th><th>Run ID</th><th>Start time (UTC)</th><th>Status</th><th>Batches</th><th>Stop reason</th><th>Artifacts</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table></div></section>
+<section><h2>Recent runs</h2><div class="table-wrap"><table><thead><tr><th>Target</th><th>Run ID</th><th>Start time (UTC)</th><th>Status</th><th>Batches</th><th>Peak buffer</th><th>Top sources</th><th>Stop reason</th><th>Artifacts</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table></div></section>
 </main></body></html>"""
 
 
