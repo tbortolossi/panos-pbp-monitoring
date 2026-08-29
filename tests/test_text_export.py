@@ -59,5 +59,58 @@ class TextExportTests(unittest.TestCase):
             self.assertFalse((destination / "raw").exists())
 
 
+    def test_startup_export_states_the_core_map_reused_from_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            incident = Path(temporary_directory) / "incident.jsonl"
+            startup = {
+                "event": "monitor_started",
+                "run_id": "20260828T120000Z",
+                "dp_core_functions": [
+                    {
+                        "dataplane": "dp0",
+                        "core_id": "0",
+                        "functions": ["pan_timer"],
+                        "forwards_traffic": False,
+                    },
+                    {
+                        "dataplane": "dp0",
+                        "core_id": "1",
+                        "functions": ["flow_lookup", "flow_fastpath", "flow_mgmt"],
+                        "forwards_traffic": True,
+                    },
+                ],
+                "dp_core_functions_source": "configuration",
+                "commands": {},
+            }
+
+            rendered = write_record_text_export(incident, startup).read_text(
+                encoding="utf-8"
+            )
+
+            self.assertIn(
+                "DATAPLANE CORE FUNCTION GROUPS (source: configuration)", rendered
+            )
+            self.assertIn("dp0 core 0 [no fastpath]: pan_timer", rendered)
+            self.assertIn(
+                "dp0 core 1 [forwards traffic]: flow_lookup flow_fastpath flow_mgmt",
+                rendered,
+            )
+
+    def test_a_record_without_a_core_map_renders_no_core_section(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            incident = Path(temporary_directory) / "incident.jsonl"
+            startup = {
+                "event": "monitor_started",
+                "run_id": "20260828T120000Z",
+                "dp_core_functions": [],
+                "commands": {},
+            }
+
+            rendered = write_record_text_export(incident, startup).read_text(
+                encoding="utf-8"
+            )
+
+            self.assertNotIn("DATAPLANE CORE FUNCTION GROUPS", rendered)
+
 if __name__ == "__main__":
     unittest.main()

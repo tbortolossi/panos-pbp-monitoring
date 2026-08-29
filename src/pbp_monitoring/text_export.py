@@ -49,6 +49,42 @@ def _payload_sections(name: str, payload: Any) -> list[str]:
     return lines
 
 
+def _core_function_sections(record: dict[str, Any]) -> list[str]:
+    """Render the dataplane core map so an exported run explains its own charts.
+
+    The map is stored per firewall, so an incident that reuses it carries no
+    `show statistics` payload. Without this section the text evidence would not
+    say which cores forward traffic, and a reader could not tell which cores
+    were comparable.
+    """
+    entries = record.get("dp_core_functions")
+    if not isinstance(entries, list) or not entries:
+        return []
+    source = _text(record.get("dp_core_functions_source")) or "unknown"
+    header = f"=== DATAPLANE CORE FUNCTION GROUPS (source: {source}) ==="
+    lines = [header, ""]
+    for entry in entries:
+        if not isinstance(entry, dict):
+            lines.append(_text(entry))
+            continue
+        dataplane = _text(entry.get("dataplane")) or "-"
+        core_id = _text(entry.get("core_id")) or "-"
+        functions = entry.get("functions")
+        rendered = (
+            " ".join(_text(name) for name in functions)
+            if isinstance(functions, list)
+            else _text(functions)
+        )
+        role = (
+            "forwards traffic"
+            if entry.get("forwards_traffic") is True
+            else "no fastpath"
+        )
+        lines.append(f"{dataplane} core {core_id} [{role}]: {rendered or '-'}")
+    lines.append("")
+    return lines
+
+
 def render_record_text(record: dict[str, Any]) -> str:
     """Render one startup or cycle record without dropping raw command data."""
     cycle = record.get("cycle")
@@ -66,6 +102,8 @@ def render_record_text(record: dict[str, Any]) -> str:
         f"Cycle duration seconds: {_text(record.get('cycle_duration_seconds')) or '-'}",
         "",
     ]
+
+    lines.extend(_core_function_sections(record))
 
     commands = record.get("commands")
     if isinstance(commands, dict):

@@ -3,6 +3,19 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-08-29
+
+### Fixed
+
+- `raw/startup.txt` states the dataplane core-to-function-group map and where it
+  came from. The text export renders an explicit field list plus commands and
+  session lookups, and the map was in none of them; before 0.7.0 it reached the
+  file only as a side effect of the `show statistics` response being carried in
+  `commands`. Reusing the stored map removed that payload, so an exported run,
+  and the support ZIP that bundles it, no longer said which cores carry
+  `flow_fastpath` and therefore which cores were comparable. The JSONL and the
+  HTML report were unaffected. Refs #67.
+
 ## [0.7.0] - 2026-08-29
 
 ### Changed
