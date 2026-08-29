@@ -12,6 +12,7 @@ from pbp_monitoring.orchestrator import (
     build_candidate_entities,
     derive_session_rates,
     extract_dataplane_pool_statistics,
+    extract_dp_core_functions,
     extract_global_counters,
     extract_ingress_backlogs,
     extract_live_percentages,
@@ -454,6 +455,56 @@ pkt_recv                                  43       11 info      packet    pktpro
         self.assertEqual(parsed["flow_counters"][0]["id"], 1131)
         self.assertEqual(len(parsed["significant_counters"]), 1)
 
+    def test_core_function_groups_are_read_from_statistics_xml(self):
+        statistics = """
+<result>
+  <entry><dp>dp0</dp><entries>
+    <entry><id>0</id><pid>1000</pid><modules>
+      <member>pan_timer</member>
+    </modules></entry>
+    <entry><id>1</id><pid>1001</pid><modules>
+      <member>flow_lookup</member><member>flow_fastpath</member>
+      <member>flow_mgmt</member>
+    </modules></entry>
+  </entries></entry>
+  <entry><dp>dp1</dp><entries>
+    <entry><id>1</id><pid>2001</pid><modules>
+      <member>flow_lookup</member><member>flow_fastpath</member>
+    </modules></entry>
+  </entries></entry>
+</result>
+""".strip()
+
+        cores = extract_dp_core_functions(statistics)
+
+        self.assertEqual(
+            [(core["dataplane"], core["core_id"]) for core in cores],
+            [("dp0", "0"), ("dp0", "1"), ("dp1", "1")],
+        )
+        self.assertEqual(cores[0]["functions"], ["pan_timer"])
+        self.assertFalse(cores[0]["forwards_traffic"])
+        self.assertTrue(cores[1]["forwards_traffic"])
+        self.assertIn("flow_mgmt", cores[1]["functions"])
+
+    def test_core_function_groups_fall_back_to_cli_task_lines(self):
+        statistics = (
+            "<result>"
+            "task  0(pid:   4292) pan_timer\n"
+            "task  1(pid:   4287) flow_lookup flow_fastpath flow_ctrl\n"
+            "</result>"
+        )
+
+        cores = extract_dp_core_functions(statistics)
+
+        self.assertEqual([core["core_id"] for core in cores], ["0", "1"])
+        self.assertEqual(cores[0]["dataplane"], "dp0")
+        self.assertEqual(cores[1]["functions"], ["flow_lookup", "flow_fastpath", "flow_ctrl"])
+        self.assertTrue(cores[1]["forwards_traffic"])
+
+    def test_unreadable_statistics_output_yields_no_core_functions(self):
+        self.assertEqual(extract_dp_core_functions(""), [])
+        self.assertEqual(extract_dp_core_functions("<result>not a task list</result>"), [])
+
     def test_resource_monitor_uses_latest_value_from_second_view(self):
         resource_monitor = """
 Resource monitoring sampling data (per second):
@@ -548,6 +599,81 @@ packet descriptor (on-chip):
         self.assertEqual(
             percentages["resource_monitor_sw_tags_descriptor"], [9.0]
         )
+
+    def test_structured_pbp_xml_reports_active_mitigation_and_mode(self):
+        pbp = """
+<response status="success"><result>
+  <sw.comm.fixture.packet-buffer-protection>
+    <is-module-enabled>True</is-module-enabled>
+    <is-monitor-only>False</is-monitor-only>
+    <congestion>4352</congestion>
+    <congestion-max>97280</congestion-max>
+    <max-tolerate>77824</max-tolerate>
+    <use-latency>0</use-latency>
+    <use-buffer>1</use-buffer>
+    <is-mitigation-enabled>True</is-mitigation-enabled>
+    <is-running>True</is-running>
+  </sw.comm.fixture.packet-buffer-protection>
+</result></response>
+""".strip()
+
+        status = extract_pbp_status(pbp)
+
+        self.assertIs(status["active"], True)
+        self.assertEqual(status["mode"], "packet_buffer")
+        self.assertIs(status["enabled"], True)
+        self.assertIs(status["monitor_only"], False)
+        self.assertEqual(status["congestion_percentage"], 4.474)
+
+    def test_structured_pbp_xml_separates_idle_mitigation_from_unknown(self):
+        pbp = """
+<response status="success"><result>
+  <sw.comm.fixture.packet-buffer-protection>
+    <is-module-enabled>True</is-module-enabled>
+    <is-monitor-only>True</is-monitor-only>
+    <congestion>0</congestion>
+    <congestion-max>97280</congestion-max>
+    <use-latency>0</use-latency>
+    <use-buffer>1</use-buffer>
+    <is-running>False</is-running>
+  </sw.comm.fixture.packet-buffer-protection>
+</result></response>
+""".strip()
+
+        status = extract_pbp_status(pbp)
+
+        self.assertIs(status["active"], False)
+        self.assertIs(status["monitor_only"], True)
+        self.assertEqual(status["mode"], "packet_buffer")
+
+    def test_one_dataplane_in_mitigation_marks_the_firewall_active(self):
+        pbp = """
+<response status="success"><result>
+  <sw.comm.fixture.dp0.packet-buffer-protection>
+    <is-module-enabled>True</is-module-enabled>
+    <use-latency>1</use-latency>
+    <use-buffer>0</use-buffer>
+    <is-running>False</is-running>
+  </sw.comm.fixture.dp0.packet-buffer-protection>
+  <sw.comm.fixture.dp1.packet-buffer-protection>
+    <is-module-enabled>True</is-module-enabled>
+    <use-latency>1</use-latency>
+    <use-buffer>0</use-buffer>
+    <is-running>True</is-running>
+  </sw.comm.fixture.dp1.packet-buffer-protection>
+</result></response>
+""".strip()
+
+        status = extract_pbp_status(pbp)
+
+        self.assertIs(status["active"], True)
+        self.assertEqual(status["mode"], "latency")
+
+    def test_text_only_pbp_output_keeps_unknown_activation_state(self):
+        status = extract_pbp_status("Packet buffer protection is enabled\n")
+
+        self.assertIsNone(status["active"])
+        self.assertEqual(status["mode"], "unknown")
 
     def test_pa440_cpu_average_and_maximum_are_tracked_per_core(self):
         resource_monitor = """
