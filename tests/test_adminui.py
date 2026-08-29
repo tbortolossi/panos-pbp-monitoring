@@ -416,5 +416,45 @@ class AdminUITests(unittest.TestCase):
                 self.assertIn("validation requested", page.lower())
                 self.assertIn("Validation queued", page)
 
+    def test_the_configuration_page_reloads_only_while_a_validation_is_queued(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "config").mkdir(parents=True, exist_ok=True)
+            store = ConfigStore(root / "config" / "config.db")
+            store.initialize()
+            target_id = store.save_target(
+                name="PA-440",
+                panos_url="https://192.0.2.10",
+                api_key="stored-key",
+                serials=["001122334455"],
+                syslog_sources=["192.0.2.10"],
+            )
+            with signed_in_admin(root) as (opener, base, csrf, _page):
+                settled = opener.open(base + "/admin").read().decode()
+                self.assertNotIn('http-equiv="refresh"', settled)
+
+                queued = opener.open(
+                    Request(
+                        base + "/admin/target/check",
+                        data=urlencode({"csrf": csrf, "target_id": str(target_id)}).encode(),
+                    )
+                ).read().decode()
+                self.assertIn('<meta http-equiv="refresh" content="5">', queued)
+
+                editing = opener.open(base + f"/admin?edit={target_id}").read().decode()
+                self.assertNotIn('http-equiv="refresh"', editing)
+
+                store.record_target_check(
+                    target_id,
+                    kind="validation",
+                    status="ok",
+                    detail="run 20260829T172715Z",
+                    clear_request=True,
+                )
+                finished = opener.open(base + "/admin").read().decode()
+                self.assertNotIn('http-equiv="refresh"', finished)
+                self.assertIn("Passed", finished)
+
+
 if __name__ == "__main__":
     unittest.main()
