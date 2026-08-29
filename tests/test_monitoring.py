@@ -27,6 +27,7 @@ from pbp_monitoring.orchestrator import (
     TargetProfile,
     extract_trigger_metadata,
     append_jsonl,
+    append_recent_syslog,
     run_api_check,
     run_configured_api_checks,
     resource_monitor_command,
@@ -1082,6 +1083,18 @@ class PersistenceResilienceTests(unittest.TestCase):
             lines = path.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 2)
             self.assertEqual(json.loads(lines[1]), {"event": "next"})
+
+    def test_reception_journal_compaction_converges_below_the_size_cap(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "syslog-received.jsonl"
+            with patch("pbp_monitoring.orchestrator.SYSLOG_STATUS_MAX_BYTES", 300):
+                for index in range(10):
+                    append_recent_syslog(path, {"n": index, "pad": "x" * 80})
+
+            self.assertLessEqual(path.stat().st_size, 300)
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(lines)
+            self.assertEqual(json.loads(lines[-1])["n"], 9)
 
     def test_a_journal_write_failure_still_starts_the_monitor(self):
         async def scenario(cfg):

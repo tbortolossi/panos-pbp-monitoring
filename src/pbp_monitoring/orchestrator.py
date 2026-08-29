@@ -2423,6 +2423,13 @@ def append_recent_syslog(path: Path, payload: dict[str, Any]) -> None:
             return
         with path.open("rb") as source:
             recent = deque(source, maxlen=SYSLOG_STATUS_RECORD_LIMIT)
+        # The newest records alone can exceed the size threshold (a registered
+        # sender's full message bodies are stored). Trim by size as well, or
+        # compaction never converges and every subsequent datagram rewrites
+        # and fsyncs the whole file on the event loop.
+        total = sum(len(record) for record in recent)
+        while len(recent) > 1 and total > SYSLOG_STATUS_MAX_BYTES:
+            total -= len(recent.popleft())
         temporary_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
