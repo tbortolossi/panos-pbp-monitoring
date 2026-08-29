@@ -7,6 +7,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Every batch now collects `show session info` and persists it under
+  `session_info`, per dataplane and summed device-wide: sessions supported and
+  allocated, the session table utilization, the protocol mix, the sessions
+  created since bootup, the new connection rate, the packet rate, and the
+  throughput. The report gained a **Session table** section showing that
+  evolution batch by batch with its peaks. It answers, from the session table
+  itself, whether the traffic that filled the buffers created sessions at all: a
+  packet rate that multiplies while the session count stays flat is traffic
+  denied before session setup, while a table above 80% of its capacity is a
+  constraint of its own. The utilization is derived from allocated over
+  supported because PAN-OS truncates it to a whole percent. Refs #77.
+
 - The incident and API-check reports gained a **Denied and dropped traffic**
   section. It aggregates the `drop` severity global counters already collected
   by `show counter global filter delta yes` over the whole capture, grouped by

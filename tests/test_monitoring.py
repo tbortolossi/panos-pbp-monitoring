@@ -94,6 +94,13 @@ class FakeClient:
             )
         if command == OP_COMMANDS["packet_buffer_protection"]:
             return response("<result>Congestion: 10/100 (10%)</result>")
+        if command == OP_COMMANDS["session_info"]:
+            return response(
+                "<result><num-max>200000</num-max><num-active>421</num-active>"
+                "<num-tcp>206</num-tcp><num-udp>215</num-udp><num-icmp>0</num-icmp>"
+                "<num-installed>1254101</num-installed><cps>4</cps><pps>160</pps>"
+                "<kbps>623</kbps><dp>*.dp0</dp></result>"
+            )
         if command == OP_COMMANDS["ingress_backlogs"]:
             return response("<result>USAGE - ATOMIC: 11% TOTAL: 12%</result>")
         if "<resource-monitor><second><last>" in command:
@@ -409,6 +416,10 @@ class MonitorTests(unittest.TestCase):
                 ["syslog_trigger"],
             )
             self.assertEqual(cycle["session_summaries"]["42"]["status"], "lookup_failed")
+            self.assertEqual(cycle["session_info"]["totals"]["allocated"], 421)
+            self.assertEqual(
+                cycle["session_info"]["dataplanes"][0]["connection_rate_cps"], 4
+            )
             self.assertTrue(
                 (incident_capture_path(output_dir, run_id).parent / "report.html").is_file()
             )
@@ -704,6 +715,12 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(records[0]["collector_version"], __version__)
             self.assertTrue(cycle["recovery_sample_eligible"])
             self.assertEqual(cycle["validation_errors"], [])
+            self.assertEqual(cycle["session_info"]["totals"]["allocated"], 421)
+            self.assertEqual(cycle["session_info"]["totals"]["tcp"], 206)
+            self.assertEqual(cycle["session_info"]["totals"]["packet_rate_pps"], 160)
+            self.assertEqual(
+                cycle["session_info"]["totals"]["utilization_percentage"], 0.21
+            )
             self.assertIn("completed_at", cycle)
             self.assertIn("cycle_duration_seconds", cycle)
             cores = cycle["resource_monitor_cpu_cores"]

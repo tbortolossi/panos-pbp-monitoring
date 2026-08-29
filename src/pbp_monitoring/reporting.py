@@ -1409,6 +1409,218 @@ def _render_drop_counters(
     )
 
 
+_SESSION_PROTOCOLS = (
+    ("tcp", "TCP"),
+    ("udp", "UDP"),
+    ("icmp", "ICMP"),
+    ("sctp_sessions", "SCTP"),
+    ("gtpc", "GTPc"),
+    ("gtpu_active", "GTPu"),
+    ("http2_5gc", "HTTP2-5gc"),
+    ("pfcp", "PFCP"),
+    ("imsi", "IMSI"),
+    ("bcast", "BCAST"),
+    ("mcast", "MCAST"),
+    ("predict", "Predict"),
+)
+
+
+def _session_info_totals(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the device-wide session counters persisted for one batch."""
+    session_info = record.get("session_info")
+    if not isinstance(session_info, dict):
+        return {}
+    totals = session_info.get("totals")
+    if isinstance(totals, dict) and any(
+        isinstance(value, (int, float)) for value in totals.values()
+    ):
+        return totals
+    dataplanes = session_info.get("dataplanes")
+    if isinstance(dataplanes, list) and dataplanes:
+        first = dataplanes[0]
+        if isinstance(first, dict):
+            return first
+    return {}
+
+
+def _session_number(totals: dict[str, Any], key: str) -> float | None:
+    value = totals.get(key)
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _session_series(
+    cycles: Sequence[tuple[int, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Collect the per-batch session table view in capture order."""
+    series: list[dict[str, Any]] = []
+    for batch_number, (_, record) in enumerate(cycles, 1):
+        totals = _session_info_totals(record)
+        if not totals:
+            continue
+        allocated = _session_number(totals, "allocated")
+        known = [
+            value
+            for key, _ in _SESSION_PROTOCOLS
+            if (value := _session_number(totals, key)) is not None
+        ]
+        other = (
+            max(0.0, allocated - sum(known))
+            if allocated is not None and known
+            else None
+        )
+        series.append(
+            {
+                "batch": batch_number,
+                "clock": _firewall_clock(record) or "—",
+                "allocated": allocated,
+                "supported": _session_number(totals, "supported"),
+                "utilization": _session_number(totals, "utilization_percentage"),
+                "protocols": {
+                    key: _session_number(totals, key) for key, _ in _SESSION_PROTOCOLS
+                },
+                "other": other,
+                "cps": _session_number(totals, "connection_rate_cps"),
+                "pps": _session_number(totals, "packet_rate_pps"),
+                "kbps": _session_number(totals, "throughput_kbps"),
+                "created": _session_number(totals, "created_since_bootup"),
+            }
+        )
+    return series
+
+
+def _session_peak(series: Sequence[dict[str, Any]], key: str) -> float | None:
+    values = [item[key] for item in series if isinstance(item.get(key), float)]
+    return max(values) if values else None
+
+
+def _session_verdict(series: Sequence[dict[str, Any]]) -> tuple[str, str]:
+    """State what the session table did while the buffers were under pressure."""
+    allocated = [item["allocated"] for item in series if item["allocated"] is not None]
+    packet_rates = [item["pps"] for item in series if item["pps"] is not None]
+    utilization = _session_peak(series, "utilization")
+
+    if utilization is not None and utilization >= 80:
+        return (
+            "isolated",
+            f"The session table peaked at {_format_number(utilization)}% of its "
+            "capacity. At that level PAN-OS accelerates session aging and can "
+            "refuse new sessions, so the session table is itself a constraint "
+            "and not only a symptom.",
+        )
+    if allocated and packet_rates and min(allocated) > 0 and min(packet_rates) > 0:
+        session_growth = max(allocated) / min(allocated)
+        packet_growth = max(packet_rates) / min(packet_rates)
+        if packet_growth >= 2 and session_growth < 1.2:
+            return (
+                "isolated",
+                f"The packet rate varied by a factor of "
+                f"{_format_number(round(packet_growth, 2))} while the number of "
+                f"allocated sessions stayed within "
+                f"{_format_number(round((session_growth - 1) * 100, 1))}%. Packets "
+                "arrived without sessions being created, which is the signature of "
+                "traffic denied before session setup or of a few sessions carrying "
+                "the flood; read it with the denied and dropped traffic section.",
+            )
+        if session_growth >= 1.2:
+            return (
+                "mixed",
+                f"Allocated sessions grew by "
+                f"{_format_number(round((session_growth - 1) * 100, 1))}% during the "
+                "capture, so session setup followed the load. The offender "
+                "attribution table is the primary evidence for which sessions did it.",
+            )
+    return (
+        "collective",
+        "The session table stayed stable during the capture: neither its "
+        "utilization nor the session count identifies a single contributor, so "
+        "the buffer pressure has to be attributed from the offender and drop "
+        "evidence.",
+    )
+
+
+def _render_session_table(series: Sequence[dict[str, Any]]) -> str:
+    if not series:
+        return (
+            '<p class="muted">No session table snapshot was recorded in this '
+            "capture. Either <code>show session info</code> could not be collected, "
+            "or the capture predates its collection; the batch details below carry "
+            "the exact response.</p>"
+        )
+
+    state, verdict = _session_verdict(series)
+    supported = next(
+        (item["supported"] for item in series if item["supported"] is not None),
+        None,
+    )
+    created = [item["created"] for item in series if item["created"] is not None]
+    created_delta = created[-1] - created[0] if len(created) > 1 else None
+    cards = "".join(
+        (
+            '<article class="card"><span class="card-label">Peak allocated sessions'
+            f'</span><strong>{_escape(_format_number(_session_peak(series, "allocated")))}'
+            + (f' / {_escape(_format_number(supported))}' if supported else "")
+            + "</strong></article>",
+            '<article class="card"><span class="card-label">Peak session table'
+            f'</span><strong>{_escape(_format_number(_session_peak(series, "utilization")))}'
+            "%</strong></article>",
+            '<article class="card"><span class="card-label">Peak new connections'
+            f'</span><strong>{_escape(_format_number(_session_peak(series, "cps")))}'
+            " cps</strong></article>",
+            '<article class="card"><span class="card-label">Peak packet rate</span>'
+            f'<strong>{_escape(_format_number(_session_peak(series, "pps")))}'
+            " /s</strong></article>",
+            '<article class="card"><span class="card-label">Peak throughput</span>'
+            f'<strong>{_escape(_format_number(_session_peak(series, "kbps")))}'
+            " kbps</strong></article>",
+            '<article class="card"><span class="card-label">Sessions created</span>'
+            f'<strong>{_escape(_format_number(created_delta))}</strong></article>',
+        )
+    )
+
+    protocol_headers = "".join(
+        f"<th>{_escape(label)}</th>" for _, label in _SESSION_PROTOCOLS
+    )
+    rows = []
+    previous_created: float | None = None
+    for item in series:
+        new_sessions = (
+            item["created"] - previous_created
+            if item["created"] is not None and previous_created is not None
+            else None
+        )
+        if item["created"] is not None:
+            previous_created = item["created"]
+        protocol_cells = "".join(
+            f'<td class="number">'
+            f'{_escape(_format_number(item["protocols"].get(key)))}</td>'
+            for key, _ in _SESSION_PROTOCOLS
+        )
+        rows.append(
+            "<tr>"
+            f'<td class="number">{_escape(item["batch"])}</td>'
+            f'<td>{_escape(item["clock"])}</td>'
+            f'<td class="number">{_escape(_format_number(item["allocated"]))}</td>'
+            f'<td class="number">{_escape(_format_number(item["utilization"]))}</td>'
+            + protocol_cells
+            + f'<td class="number">{_escape(_format_number(item["other"]))}</td>'
+            f'<td class="number">{_escape(_format_number(item["cps"]))}</td>'
+            f'<td class="number">{_escape(_format_number(item["pps"]))}</td>'
+            f'<td class="number">{_escape(_format_number(item["kbps"]))}</td>'
+            f'<td class="number">{_escape(_format_number(new_sessions))}</td>'
+            "</tr>"
+        )
+
+    return (
+        f'<p class="verdict verdict-{state}">{verdict}</p>'
+        f'<div class="cards">{cards}</div>'
+        '<div class="table-wrap"><table><thead><tr>'
+        "<th>Batch</th><th>Firewall time</th><th>Allocated</th><th>Table %</th>"
+        f"{protocol_headers}<th>Other</th><th>New /s</th><th>Packets /s</th>"
+        "<th>kbps</th><th>New sessions</th>"
+        f'</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+    )
+
+
 def _render_html(
     source: Path,
     records: list[tuple[int, dict[str, Any]]],
@@ -1426,6 +1638,8 @@ def _render_html(
     attribution_html = _render_attribution_table(attribution)
     drop_counter_summary = _aggregate_drop_counters(cycles)
     drop_counters_html = _render_drop_counters(drop_counter_summary, attribution)
+    session_series = _session_series(cycles)
+    session_table_html = _render_session_table(session_series)
     core_functions = next(
         (
             record["dp_core_functions"]
@@ -1854,6 +2068,10 @@ def _render_html(
     <section aria-labelledby="drop-counters-title">
       <h2 id="drop-counters-title">Denied and dropped traffic</h2>
       {drop_counters_html}
+    </section>
+    <section aria-labelledby="session-table-title">
+      <h2 id="session-table-title">Session table</h2>
+      {session_table_html}
     </section>
     <section aria-labelledby="cpu-tracking-title">
       <h2 id="cpu-tracking-title">Dataplane CPU core tracking</h2>
