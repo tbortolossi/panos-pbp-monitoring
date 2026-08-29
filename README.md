@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring & Diagnostic Collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.9.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.9.0)
+[![Version](https://img.shields.io/badge/version-0.9.1-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.9.1)
 [![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
 
 PBP Monitoring is an event-driven, read-only diagnostic collector for PAN-OS
@@ -235,9 +235,12 @@ that firewall instead: every collection command and every parser, writing a
 capture and an HTML report the dashboard already serves. The Web service mounts
 the evidence volume read-only by design and the collector exposes no port, so
 the button records the request in the shared configuration database and the
-collector runs it on its next tick, a few seconds later. The **Last check**
-column reports when either check last ran, whether it passed, and a short reason
-when it did not.
+collector runs it on its next tick, a few seconds later. While a validation is
+queued the configuration page reloads itself every five seconds so the outcome
+appears without a manual refresh; it stops reloading as soon as no validation is
+pending, and never reloads while a firewall form is open for editing. The
+**Last check** column reports when either check last ran, whether it passed, and
+a short reason when it did not.
 
 Because HTTPS uses port 443 and Syslog uses port 514, one address covers both.
 When an earlier configuration allowed additional Syslog sources for a target,

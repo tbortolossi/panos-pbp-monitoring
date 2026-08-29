@@ -28,15 +28,21 @@ from .panos_keygen import (
 
 
 SESSION_SECONDS = 8 * 60 * 60
+PENDING_CHECK_REFRESH_SECONDS = 5
 
 
 def _e(value: Any) -> str:
     return html.escape(str(value or ""), quote=True)
 
 
-def _layout(title: str, body: str) -> str:
+def _layout(title: str, body: str, refresh_seconds: int | None = None) -> str:
+    refresh = (
+        f'<meta http-equiv="refresh" content="{max(2, int(refresh_seconds))}">'
+        if refresh_seconds
+        else ""
+    )
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">{refresh}
 <title>{_e(title)} · PBP Monitoring</title><style>
 :root{{--ink:#172033;--muted:#64748b;--line:#dbe3ee;--soft:#f4f7fb;--accent:#155e75;--bad:#b42318;--ok:#15803d}}
 *{{box-sizing:border-box}}body{{margin:0;background:var(--soft);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}}
@@ -188,6 +194,15 @@ class AdminController:
             )
         target_rows = "".join(rows) or '<tr><td colspan="7" class="muted">No firewall configured yet.</td></tr>'
         edit_target = next((target for target in targets if target["target_id"] == edit_id), None)
+        # A queued validation is cleared by the collector within seconds, so the
+        # page reloads itself until the outcome is known. Editing a firewall
+        # suspends the reload: it must never discard what is being typed.
+        refresh_seconds = (
+            PENDING_CHECK_REFRESH_SECONDS
+            if edit_target is None
+            and any(target.get("check_requested_at") for target in targets)
+            else None
+        )
         recovery = ""
         if not self.store.recovery_key_acknowledged():
             recovery_key = self.store.recovery_key()
@@ -211,13 +226,16 @@ class AdminController:
 {self._target_form(csrf, edit_target)}
 <section class="card"><h2>Collector settings</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
 {''.join(f'<div><label>{_e(key.replace("_", " ").title())}</label><input name="{_e(key)}" value="{_e(value)}" required></div>' for key, value in settings.items())}
-</div><button type="submit">Save settings</button></form></section>""")
+</div><button type="submit">Save settings</button></form></section>""", refresh_seconds)
 
     @staticmethod
     def _check_summary(target: dict[str, Any]) -> str:
         """Render the outcome of the last automatic or requested firewall check."""
         if target.get("check_requested_at"):
-            return '<span class="muted">Validation queued</span>'
+            return (
+                '<span class="muted">Validation queued</span>'
+                '<div class="muted">Waiting for the collector</div>'
+            )
         checked_at = target.get("last_check_at")
         if not checked_at:
             return '<span class="muted">Never checked</span>'

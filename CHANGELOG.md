@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.9.1] - 2026-08-29
+
+### Fixed
+
+- The configuration page kept showing `Validation queued` after the collector
+  had already finished the requested validation, because the page never
+  refreshed. It now reloads itself every five seconds while at least one
+  firewall has a queued validation, and stops as soon as none is pending. The
+  reload is suspended while a firewall form is open for editing so it cannot
+  discard what is being typed. Refs #72.
+
 ## [0.9.0] - 2026-08-29
 
 ### Added
