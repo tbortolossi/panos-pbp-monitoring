@@ -2399,9 +2399,20 @@ def extract_firewall_clock(output: str) -> str | None:
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        size = os.fstat(descriptor).st_size
+        if size:
+            os.lseek(descriptor, size - 1, os.SEEK_SET)
+            if os.read(descriptor, 1) != b"\n":
+                # A crash mid-write left a torn line: close it first, so the
+                # loss stays confined to the truncated record instead of also
+                # corrupting the one being appended.
+                line = "\n" + line
+        os.write(descriptor, line.encode("utf-8"))
+    finally:
+        os.close(descriptor)
 
 
 def append_recent_syslog(path: Path, payload: dict[str, Any]) -> None:
@@ -2646,14 +2657,20 @@ class MonitorController:
             "metadata": metadata,
             "routing": routing,
         }
-        append_jsonl(
-            self.cfg.output_dir / "syslog-triggers.jsonl",
-            trigger_record,
-        )
-        append_jsonl(
-            incident_capture_path(self.cfg.output_dir, self.run_id),
-            trigger_record,
-        )
+        try:
+            append_jsonl(
+                self.cfg.output_dir / "syslog-triggers.jsonl",
+                trigger_record,
+            )
+            append_jsonl(
+                incident_capture_path(self.cfg.output_dir, self.run_id),
+                trigger_record,
+            )
+        except Exception:
+            # The journal is evidence, but collection is the mission: a full
+            # disk or a permission error must not stop the monitor from
+            # starting while the firewall is under pressure.
+            LOG.exception("Unable to journal the trigger for run %s", self.run_id)
         if starts_monitor:
             self.monitor_task = asyncio.create_task(self._monitor(self.run_id))
             LOG.warning("Trigger received from %s; starting monitor %s", peer, self.run_id)
@@ -3022,21 +3039,27 @@ class MonitorController:
             stop_reason = "monitor_error"
             LOG.exception("Monitor %s stopped after an unexpected error", run_id)
         finally:
-            if not system_info_task.done():
-                system_info_task.cancel()
-                await asyncio.gather(system_info_task, return_exceptions=True)
-            append_jsonl(
-                output_file,
-                {
-                    "timestamp": utc_now(),
-                    "run_id": run_id,
-                    "event": "monitor_stopped",
-                    "target_name": self.cfg.target_name,
-                    "reason": stop_reason,
-                    "cycles": cycle_number,
-                    "elapsed_seconds": round(time.monotonic() - start, 3),
-                },
-            )
+            for startup_task in (system_info_task, global_counter_primer_task):
+                if not startup_task.done():
+                    startup_task.cancel()
+                    await asyncio.gather(startup_task, return_exceptions=True)
+            try:
+                append_jsonl(
+                    output_file,
+                    {
+                        "timestamp": utc_now(),
+                        "run_id": run_id,
+                        "event": "monitor_stopped",
+                        "target_name": self.cfg.target_name,
+                        "reason": stop_reason,
+                        "cycles": cycle_number,
+                        "elapsed_seconds": round(time.monotonic() - start, 3),
+                    },
+                )
+            except Exception:
+                # The report must still be produced from whatever evidence was
+                # captured, even when the stop marker cannot be written.
+                LOG.exception("Unable to write the stop record for run %s", run_id)
             self._schedule_report(output_file)
 
 
@@ -3500,11 +3523,16 @@ class SyslogProtocol(asyncio.DatagramProtocol):
         except Exception:
             LOG.exception("Unable to record Syslog reception status")
         if is_trigger:
-            self.controller.trigger(
-                message,
-                f"{addr[0]}:{addr[1]}",
-                transport_source_ip=addr[0],
-            )
+            try:
+                self.controller.trigger(
+                    message,
+                    f"{addr[0]}:{addr[1]}",
+                    transport_source_ip=addr[0],
+                )
+            except Exception:
+                LOG.exception(
+                    "Unable to start or reinforce a monitor from a Syslog trigger"
+                )
 
     def error_received(self, exc: Exception) -> None:
         LOG.error("Syslog listener error: %s", exc)

@@ -26,6 +26,7 @@ from pbp_monitoring.orchestrator import (
     SyslogProtocol,
     TargetProfile,
     extract_trigger_metadata,
+    append_jsonl,
     run_api_check,
     run_configured_api_checks,
     resource_monitor_command,
@@ -1023,6 +1024,68 @@ class MonitorTests(unittest.TestCase):
             self.assertFalse(cycle["session_details"]["123"]["ok"])
             self.assertIn("session detail failed for 123", cycle["validation_errors"])
 
+
+
+class PersistenceResilienceTests(unittest.TestCase):
+    """Evidence writes may fail; collection and reporting must carry on."""
+
+    def test_append_jsonl_confines_a_torn_write_to_one_record(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "incident.jsonl"
+            path.write_text('{"event": "cycle", "trunca', encoding="utf-8")
+
+            append_jsonl(path, {"event": "next"})
+
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(json.loads(lines[1]), {"event": "next"})
+
+    def test_a_journal_write_failure_still_starts_the_monitor(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            with patch(
+                "pbp_monitoring.orchestrator.append_jsonl",
+                side_effect=OSError("disk full"),
+            ):
+                controller.trigger("PBP Packet Drop (8507)", "192.0.2.1:514")
+                self.assertIsNotNone(controller.monitor_task)
+            await asyncio.gather(controller.monitor_task, return_exceptions=True)
+            await controller.wait_for_reports()
+            return controller.run_id
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            run_id = asyncio.run(scenario(make_config(output_dir)))
+
+            capture = incident_capture_path(output_dir, run_id)
+            self.assertTrue(capture.exists())
+
+    def test_a_failing_trigger_does_not_break_the_datagram_handler(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cfg = make_config(Path(temporary_directory))
+            controller = Mock()
+            controller.trigger.side_effect = OSError("disk full")
+            protocol = SyslogProtocol(cfg, controller)
+
+            protocol.datagram_received(
+                b"PBP Session Discarded (8508)", ("192.0.2.1", 514)
+            )
+
+            controller.trigger.assert_called_once()
+
+    def test_a_failed_stop_record_still_schedules_the_report(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            with patch.object(controller, "_schedule_report") as schedule:
+                with patch(
+                    "pbp_monitoring.orchestrator.append_jsonl",
+                    side_effect=OSError("disk full"),
+                ):
+                    await controller._monitor("fixture-run")
+            schedule.assert_called_once()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            asyncio.run(scenario(make_config(Path(temporary_directory))))
 
 
 class FirewallCheckTests(unittest.TestCase):
