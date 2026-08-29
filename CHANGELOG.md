@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
-## [0.10.0] - 2026-08-29
+## [0.11.0] - 2026-08-29
 
 ### Added
 
@@ -19,6 +19,29 @@ follows [Semantic Versioning](https://semver.org/).
   constraint of its own. The utilization is derived from allocated over
   supported because PAN-OS truncates it to a whole percent. Refs #77.
 
+### Fixed
+
+- The packet-buffer-protection offender table is now parsed in its structured
+  XML form, not only as the pipe-delimited CLI table. Current PAN-OS releases
+  return one `<entry>` per monitored session or blocked source IP through the
+  API, so on those firewalls the collector was ranking no offender at all: the
+  candidate session list stayed empty, no `show session id` enrichment ran, and
+  the report showed an empty attribution table with `—` in the Timeline
+  `Sessions` column even though the firewall had reported entries in
+  `Drop State: Yes`. Only captures collected after this fix carry offenders: the
+  report renders the ranking persisted in the JSONL and does not re-parse the raw
+  command output, so regenerating the report of an older capture changes nothing.
+  Refs #76.
+
+### Changed
+
+- Each batch now issues one additional read-only API call, `show session info`.
+  No firewall state is changed.
+
+## [0.10.0] - 2026-08-29
+
+### Added
+
 - The incident and API-check reports gained a **Denied and dropped traffic**
   section. It aggregates the `drop` severity global counters already collected
   by `show counter global filter delta yes` over the whole capture, grouped by
@@ -33,20 +56,6 @@ follows [Semantic Versioning](https://semver.org/).
   so PAN-OS can attribute the buffer pressure to a source IP only and
   `show session id` has nothing to return. A **Denied packets** card was added
   to the incident-state summary. Refs #74.
-
-### Fixed
-
-- The packet-buffer-protection offender table is now parsed in its structured
-  XML form, not only as the pipe-delimited CLI table. Current PAN-OS releases
-  return one `<entry>` per monitored session or blocked source IP through the
-  API, so on those firewalls the collector was ranking no offender at all: the
-  candidate session list stayed empty, no `show session id` enrichment ran, and
-  the report showed an empty attribution table with `—` in the Timeline
-  `Sessions` column even though the firewall had reported entries in
-  `Drop State: Yes`. Only captures collected after this fix carry offenders: the
-  report renders the ranking persisted in the JSONL and does not re-parse the raw
-  command output, so regenerating the report of an older capture changes nothing.
-  Refs #76.
 
 ### Changed
 
