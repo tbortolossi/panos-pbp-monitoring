@@ -65,6 +65,7 @@ OP_COMMANDS = {
 }
 
 SYSTEM_INFO_COMMAND = "<show><system><info/></system></show>"
+DP_CORE_FUNCTIONS_COMMAND = "<show><statistics/></show>"
 CLOCK_COMMAND = "<show><clock/></show>"
 
 DEVICE_IDENTITY_FIELDS = ("serial", "model", "software_version")
@@ -1552,6 +1553,76 @@ def _structured_ingress_percentages(output: str, tag: str) -> list[float]:
     return values
 
 
+FASTPATH_FUNCTION = "flow_fastpath"
+TASK_LINE = re.compile(
+    r"^\s*task\s+(?P<core>\d+)\s*\(\s*pid\s*:\s*(?P<pid>\d+)\s*\)\s*(?P<modules>.*)$",
+    re.I,
+)
+
+
+def extract_dp_core_functions(statistics: str) -> list[dict[str, Any]]:
+    """Return the static core-to-function-group map for every dataplane.
+
+    PAN-OS assigns each dataplane core a fixed set of function groups, so cores
+    are not interchangeable and a quiet core is not necessarily an idle one.
+    The map is constant for a platform and PAN-OS release, which is why it is
+    collected once per incident rather than on every poll.
+    """
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(dataplane: str, core_id: str, functions: list[str]) -> None:
+        identity = (dataplane, core_id)
+        if identity in seen or not functions:
+            return
+        seen.add(identity)
+        entries.append(
+            {
+                "dataplane": dataplane,
+                "core_id": core_id,
+                "functions": functions,
+                "forwards_traffic": FASTPATH_FUNCTION in functions,
+            }
+        )
+
+    try:
+        root = ET.fromstring(statistics)
+    except ET.ParseError:
+        root = None
+
+    if root is not None:
+        for element in root.iter():
+            if _local_tag(element) != "entry":
+                continue
+            dataplane = _child_text(element, "dp")
+            if not dataplane:
+                continue
+            for core in element.iter():
+                if _local_tag(core) != "entry" or core is element:
+                    continue
+                core_id = _child_text(core, "id")
+                if core_id is None:
+                    continue
+                functions = [
+                    member.text.strip()
+                    for module in core
+                    if _local_tag(module) == "modules"
+                    for member in module
+                    if _local_tag(member) == "member" and member.text
+                ]
+                add(dataplane.strip().lower(), core_id, functions)
+        if entries:
+            return entries
+
+    for line in panos_result_text(statistics).splitlines():
+        match = TASK_LINE.match(line)
+        if not match:
+            continue
+        functions = match.group("modules").split()
+        add("dp0", match.group("core"), functions)
+    return entries
+
+
 def extract_resource_cpu_cores(resource_monitor: str) -> list[dict[str, Any]]:
     """Return per-core CPU series and summaries from the per-second view."""
     samples: list[dict[str, Any]] = []
@@ -2426,6 +2497,9 @@ class MonitorController:
         system_info_task = asyncio.create_task(
             self._collect_command("system_info", SYSTEM_INFO_COMMAND)
         )
+        dp_core_functions_task = asyncio.create_task(
+            self._collect_command("dp_core_functions", DP_CORE_FUNCTIONS_COMMAND)
+        )
         global_counter_primer_task = asyncio.create_task(
             self._collect_command(
                 "global_counters_baseline",
@@ -2439,13 +2513,24 @@ class MonitorController:
                 cycle_start = time.monotonic()
                 cycle_started_at = utc_now()
                 if cycle_number == 1:
-                    (_, system_info), outputs = await asyncio.gather(
-                        system_info_task,
-                        self._op_commands(global_counter_primer_task),
+                    (_, system_info), (_, dp_core_functions), outputs = (
+                        await asyncio.gather(
+                            system_info_task,
+                            dp_core_functions_task,
+                            self._op_commands(global_counter_primer_task),
+                        )
                     )
                     _, global_counter_baseline = global_counter_primer_task.result()
                     device = extract_system_info(command_result(system_info))
                     identity_warnings = device_identity_warnings(device)
+                    core_functions = extract_dp_core_functions(
+                        command_result(dp_core_functions)
+                    )
+                    startup_warnings = list(identity_warnings)
+                    if not core_functions:
+                        startup_warnings.append(
+                            "dataplane core function groups could not be read"
+                        )
                     startup_record = {
                         "timestamp": started_at,
                         "collector_version": __version__,
@@ -2454,9 +2539,11 @@ class MonitorController:
                         "target_name": self.cfg.target_name,
                         "device": device,
                         "identity_complete": not identity_warnings,
-                        "parse_warnings": identity_warnings,
+                        "parse_warnings": startup_warnings,
+                        "dp_core_functions": core_functions,
                         "commands": {
                             "system_info": system_info,
+                            "dp_core_functions": dp_core_functions,
                             "global_counters_baseline": global_counter_baseline,
                         },
                     }
@@ -3027,13 +3114,18 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
             OP_COMMANDS["global_counters_delta"],
         )
     )
-    (_, system_info), outputs = await asyncio.gather(
+    (_, system_info), (_, dp_core_functions), outputs = await asyncio.gather(
         controller._collect_command("system_info", SYSTEM_INFO_COMMAND),
+        controller._collect_command("dp_core_functions", DP_CORE_FUNCTIONS_COMMAND),
         controller._op_commands(global_counter_primer_task),
     )
     _, global_counter_baseline = global_counter_primer_task.result()
     device = extract_system_info(command_result(system_info))
     identity_warnings = device_identity_warnings(device)
+    core_functions = extract_dp_core_functions(command_result(dp_core_functions))
+    startup_warnings = list(identity_warnings)
+    if not core_functions:
+        startup_warnings.append("dataplane core function groups could not be read")
     startup_record = {
         "timestamp": started_at,
         "collector_version": __version__,
@@ -3043,9 +3135,11 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
         "target_name": cfg.target_name,
         "device": device,
         "identity_complete": not identity_warnings,
-        "parse_warnings": identity_warnings,
+        "parse_warnings": startup_warnings,
+        "dp_core_functions": core_functions,
         "commands": {
             "system_info": system_info,
+            "dp_core_functions": dp_core_functions,
             "global_counters_baseline": global_counter_baseline,
         },
     }

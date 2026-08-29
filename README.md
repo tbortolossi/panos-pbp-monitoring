@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring & Diagnostic Collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.5.1-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.5.1)
+[![Version](https://img.shields.io/badge/version-0.6.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.6.0)
 [![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
 
 PBP Monitoring is an event-driven, read-only diagnostic collector for PAN-OS
@@ -59,7 +59,9 @@ debug dataplane pool statistics
 show counter global filter delta yes
 ```
 
-`show system info` runs once at incident startup. Candidate sessions are
+`show system info` and `show statistics` run once at incident startup: the first
+identifies the device, the second returns the function groups assigned to each
+dataplane core. Candidate sessions are
 enriched with `show session id <session-id>`. Consecutive cumulative byte
 counters are sampled to derive c2s, s2c, and total bit rates without scanning
 the complete session table.
@@ -434,11 +436,34 @@ returned per-core average and maximum is preserved, together with the latest
 value, window average, window peak, hot-point count, and sample count. Adjacent
 windows intentionally overlap and must not be summed as unique seconds.
 
-The HTML report summarizes every core across the run and shows a batch timeline
-with the hottest core, window average, maxâ€“min spread, and a high-imbalance
-signal. This signal corroborates possible flow-hash concentration; it does not
-prove that one session alone is responsible, so it must be read alongside
-session rates, PBP offenders, and ingress backlogs.
+The HTML report draws one section per dataplane, so a chassis with several
+dataplanes produces one set of charts per DP. Each section states whether the
+load rose on every comparable core or on only a few of them, then shows a
+heatmap of core by batch, which stays readable at 64 cores, and a line chart of
+the hottest cores against the median of their peers. Both are inline SVG: the
+report stays a single self-contained file with no script and no external asset.
+The per-core summary table and the batch imbalance timeline remain underneath as
+the detailed evidence.
+
+The distinction the charts are built for is the one that matters
+operationally. Every comparable core rising together is aggregate load. One core
+saturated while its peers stay cold is flow-hash concentration, which is what a
+single very high-rate session looks like from the dataplane. This corroborates
+possible flow-hash concentration; it does not prove that one session alone is
+responsible, so it must be read alongside session rates, PBP offenders, and
+ingress backlogs.
+
+Dataplane cores are not interchangeable, so the comparison is restricted to
+cores that actually forward traffic. At incident startup the collector runs
+`show statistics` once and stores the function groups PAN-OS assigns to each
+core as `dp_core_functions` in the `monitor_started` record. The map is static
+for a platform and PAN-OS release, so it is never repeated during polling. Cores
+are labelled by what distinguishes them from their peers, such as `flow_mgmt`,
+`flow_ctrl`, or `pan_timer`, and only cores carrying `flow_fastpath` are
+compared: a timer core sitting permanently at 0% is not a sign of imbalance. If
+the firewall cannot answer the command, the batch records a
+`dataplane core function groups could not be read` warning, and the charts still
+render with cores labelled by number.
 
 Copy one incident to the Linux host without modifying the volume:
 

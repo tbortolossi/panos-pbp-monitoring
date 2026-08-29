@@ -3,6 +3,35 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-08-29
+
+### Added
+
+- HTML reports draw the dataplane CPU per core instead of only tabulating it.
+  Each dataplane gets its own section with a heatmap of core by batch, which
+  stays readable on a chassis with 64 cores, and a line chart of the hottest
+  cores against the median of their comparable peers. Both are inline SVG, so
+  the report remains a single self-contained file with no script and no
+  external asset.
+- A stated verdict per dataplane distinguishing an isolated hot core, which is
+  what flow-hash concentration from a single high-rate session looks like, from
+  a collective rise, which is aggregate load. The verdict is corroborating
+  evidence and does not on its own prove that one session is responsible.
+- The core-to-function-group map is collected once per incident with
+  `show statistics` and persisted as `dp_core_functions` in the
+  `monitor_started` record. PAN-OS assigns fixed function groups to each core,
+  so a core carrying `flow_mgmt`, `flow_ctrl`, or `pan_timer` is not comparable
+  to a pure fastpath core. Cores are labelled with what distinguishes them, and
+  only cores carrying `flow_fastpath` are compared. Refs #62.
+
+### Changed
+
+- The per-core summary table gains a Function groups column.
+- A firewall that cannot answer `show statistics` records a
+  `dataplane core function groups could not be read` warning and still renders
+  the charts, with cores labelled by number. Device identity completeness is
+  unaffected.
+
 ## [0.5.1] - 2026-08-29
 
 ### Fixed
