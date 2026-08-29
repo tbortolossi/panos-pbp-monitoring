@@ -38,6 +38,10 @@ accordingly:
   target credentials.
 - `Dockerfile`, `compose.yaml`, and `docker/`: supported container deployment.
 - `PRD.md`: authoritative product behavior and acceptance criteria.
+- `README.md`: project overview, quick start, and security model. The detailed
+  operator documentation lives in `docs/installation.md`, `docs/operations.md`,
+  `docs/reporting.md`, and `docs/troubleshooting.md`; keep the page that owns a
+  behavior in sync when that behavior changes.
 
 ## Change rules
 
