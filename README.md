@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring & Diagnostic Collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.14.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.14.0)
+[![Version](https://img.shields.io/badge/version-0.14.1-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.14.1)
 [![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
 
 PBP Monitoring is an event-driven, read-only diagnostic collector for PAN-OS

@@ -230,6 +230,7 @@ class MonitorTests(unittest.TestCase):
             )
             self.assertEqual(record["suppressed"], "device_serial_not_registered")
             self.assertNotIn("message", record)
+            self.assertEqual(record["target_names"], [])
             self.assertFalse(
                 (output_dir / "targets" / "PA-lab" / "syslog-triggers.jsonl").exists()
             )

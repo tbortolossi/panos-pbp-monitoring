@@ -58,6 +58,38 @@ class WebUITests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_a_suppressed_record_does_not_keep_a_firewall_healthy(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data = Path(temporary_directory)
+            store = ConfigStore(data / "configuration" / "config.db")
+            store.initialize()
+            store.save_target(
+                name="fw-a", panos_url="https://192.0.2.10", api_key="key-a",
+                target_serial=None, serials=["012345678901"],
+                syslog_sources=["192.0.2.10"],
+            )
+            suppressed = {
+                "timestamp": "2026-08-28T12:00:00+00:00",
+                "transport_source_ip": "192.0.2.3",
+                "target_names": [],
+                "trigger": True,
+                "metadata": {"syslog_source_ip": "192.0.2.10"},
+                "suppressed": "device_serial_not_registered",
+            }
+            (data / "syslog-received.jsonl").write_text(
+                json.dumps(suppressed) + "\n", encoding="utf-8"
+            )
+            state = collect_dashboard_state(
+                data,
+                now=datetime(2026, 8, 28, 12, 1, tzinfo=timezone.utc),
+                config_store=store,
+            )
+            rendered = render_dashboard(state)
+            self.assertFalse(state["firewalls"][0]["healthy"])
+            self.assertIsNone(state["firewalls"][0]["last_received_at"])
+            self.assertIn("fw-a: needs attention", rendered)
+            self.assertIn("not stored: device serial is not the registered one", rendered)
+
     def test_dashboard_has_global_and_per_firewall_reception_state(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             data = Path(temporary_directory)
