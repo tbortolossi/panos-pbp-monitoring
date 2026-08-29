@@ -180,7 +180,9 @@ similarly produces `api-checks/<run_id>/api-check.jsonl` and
 
 `incidents/<run_id>/raw/startup.txt` and `raw/batch-NNNN.txt` provide readable
 command-by-command exports, including result, error, exact raw XML response, and
-session lookups. `syslog-received.jsonl` is a compacted status journal for the
+session lookups. The startup export also states the dataplane
+core-to-function-group map and its source, which an incident reusing the stored
+map does not carry as a command payload. `syslog-received.jsonl` is a compacted status journal for the
 dashboard, not a replacement for incident evidence.
 The Web UI streams a ZIP support export containing these run artifacts and a
 versioned checksum manifest.

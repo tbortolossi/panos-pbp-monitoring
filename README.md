@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring & Diagnostic Collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.7.0)
+[![Version](https://img.shields.io/badge/version-0.7.1-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.7.1)
 [![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
 
 PBP Monitoring is an event-driven, read-only diagnostic collector for PAN-OS
@@ -403,7 +403,9 @@ Each incident contains:
 
 - `incident.jsonl`: authoritative structured and exact raw evidence;
 - `report.html`: standalone human report with the JSONL SHA-256 digest;
-- `raw/startup.txt`: startup commands and raw HTTP/XML response;
+- `raw/startup.txt`: startup commands and raw HTTP/XML response, plus the
+  dataplane core-to-function-group map and where it came from, so an exported run
+  explains its own CPU charts;
 - `raw/batch-NNNN.txt`: human-readable export for every batch.
 
 The dashboard's **ZIP support** action downloads the complete run as one
