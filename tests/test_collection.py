@@ -44,8 +44,8 @@ class StubHTTPResponse:
     def getcode(self):
         return self.status
 
-    def read(self):
-        return self.payload
+    def read(self, limit: int = -1):
+        return self.payload if limit is None or limit < 0 else self.payload[:limit]
 
 
 def make_client(target_serial=None):
@@ -84,6 +84,39 @@ class PanOSClientCollectionTests(unittest.TestCase):
             "<result><value>ready</value></result>",
         )
         self.assertEqual(client.op(command), response.result_xml)
+
+    @patch("pbp_monitoring.orchestrator.build_opener")
+    def test_a_doctype_in_the_response_is_refused(self, mocked_build_opener):
+        raw = (
+            '<!DOCTYPE bomb [<!ENTITY a "x">]>'
+            '<response status="success"><result>&a;</result></response>'
+        )
+        mocked_build_opener.return_value.open.return_value = StubHTTPResponse(raw)
+
+        with self.assertRaises(PanOSAPIError) as raised:
+            make_client().op_response("<show><clock/></show>")
+
+        self.assertIn("invalid XML", str(raised.exception))
+
+    @patch("pbp_monitoring.orchestrator.build_opener")
+    def test_an_oversized_response_is_refused_without_being_stored(self, mocked_build_opener):
+        class OversizedResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def read(self, limit: int = -1):
+                return b"x" * (limit if limit and limit > 0 else 1)
+
+        mocked_build_opener.return_value.open.return_value = OversizedResponse()
+
+        with self.assertRaises(PanOSAPIError) as raised:
+            make_client().op_response("<show><clock/></show>")
+
+        self.assertIn("size limit", str(raised.exception))
+        self.assertEqual(raised.exception.raw_response, "")
 
     @patch("pbp_monitoring.orchestrator.build_opener")
     def test_panos_error_preserves_exact_raw_response_on_exception(self, mocked_build_opener):

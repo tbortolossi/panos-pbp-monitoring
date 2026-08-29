@@ -32,6 +32,7 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_ope
 
 from . import __version__
 from .config_store import ConfigStore, StoredTarget, dp_core_identity
+from .panos_keygen import parse_untrusted_xml, read_bounded_response
 from .text_export import write_record_text_export
 
 
@@ -538,15 +539,20 @@ class PanOSClient:
                 request,
                 timeout=self.cfg.request_timeout,
             ) as response:
-                response_text = response.read().decode("utf-8", errors="replace")
+                response_text = read_bounded_response(response)
         except HTTPError as exc:
-            response_text = exc.read().decode("utf-8", errors="replace")
+            try:
+                response_text = read_bounded_response(exc)
+            except ValueError as limit_exc:
+                raise PanOSAPIError(str(limit_exc), raw_response="") from exc
             raise PanOSAPIError(
                 f"PAN-OS returned HTTP error {exc.code}",
                 raw_response=response_text,
             ) from exc
+        except ValueError as exc:
+            raise PanOSAPIError(str(exc), raw_response="") from exc
         try:
-            root = ET.fromstring(response_text)
+            root = parse_untrusted_xml(response_text)
         except ET.ParseError as exc:
             raise PanOSAPIError(
                 "PAN-OS returned invalid XML",

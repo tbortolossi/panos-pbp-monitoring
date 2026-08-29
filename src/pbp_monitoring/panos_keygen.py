@@ -12,6 +12,27 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_ope
 
 SYSTEM_INFO_COMMAND = "<show><system><info/></system></show>"
 DP_CORE_FUNCTIONS_COMMAND = "<show><statistics/></show>"
+MAX_API_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
+def read_bounded_response(response: object) -> str:
+    """Read an API response body with a hard size ceiling."""
+    payload = response.read(MAX_API_RESPONSE_BYTES + 1)  # type: ignore[attr-defined]
+    if len(payload) > MAX_API_RESPONSE_BYTES:
+        raise ValueError("the firewall response exceeds the size limit")
+    return payload.decode("utf-8", errors="replace")
+
+
+def parse_untrusted_xml(text: str) -> ET.Element:
+    """Parse PAN-OS XML while refusing document type declarations.
+
+    The stdlib parser never fetches external entities, but it does expand
+    internal ones. No legitimate PAN-OS API response carries a DOCTYPE, so the
+    document is refused before parsing rather than risking entity expansion.
+    """
+    if "<!doctype" in text.lower():
+        raise ET.ParseError("document type declaration refused")
+    return ET.fromstring(text)
 
 
 class PanOSAdminError(RuntimeError):
@@ -76,9 +97,11 @@ def _read_api_response(
 ) -> ET.Element:
     try:
         with opener(request, timeout=timeout, context=ssl_context) as response:  # type: ignore[operator]
-            response_text = response.read().decode("utf-8", errors="replace")
+            response_text = read_bounded_response(response)
     except HTTPError as exc:
         raise error(f"the firewall returned HTTP error {exc.code}") from exc
+    except ValueError as exc:
+        raise error(str(exc)) from exc
     except URLError as exc:
         if isinstance(exc.reason, ssl.SSLCertVerificationError):
             raise error(
@@ -86,7 +109,7 @@ def _read_api_response(
             ) from exc
         raise error("unable to reach the firewall") from exc
     try:
-        return ET.fromstring(response_text)
+        return parse_untrusted_xml(response_text)
     except ET.ParseError as exc:
         raise error("the firewall returned invalid XML") from exc
 

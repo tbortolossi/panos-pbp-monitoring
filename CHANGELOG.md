@@ -13,6 +13,10 @@ follows [Semantic Versioning](https://semver.org/).
 - Failed sign-in and setup attempts are throttled per source address (five
   failures per fifteen minutes), and concurrent password verifications are
   capped so a login flood cannot exhaust the CPU with key derivations.
+- PAN-OS API responses are now read with an 8 MB ceiling and refused when they
+  carry an XML document type declaration, closing memory-exhaustion paths from
+  a misbehaving or intercepted endpoint (TLS verification defaults to disabled
+  for appliance-certificate compatibility, which makes this boundary matter).
 - The dashboard, HTML reports, JSONL captures, TXT exports, and support ZIP
   archives now require the administrator sign-in. Incident evidence carries
   device serials, addresses, session tuples, and raw command output; it was
