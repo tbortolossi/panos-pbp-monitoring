@@ -2452,6 +2452,22 @@ def incident_capture_path(output_dir: Path, run_id: str) -> Path:
     return output_dir / "incidents" / run_id / "incident.jsonl"
 
 
+def unique_run_id(output_dir: Path, path_builder=incident_capture_path) -> str:
+    """Return a run identifier whose capture directory does not exist yet.
+
+    The timestamp has one-second granularity, so a monitor that ends and a new
+    trigger arriving within the same second would otherwise merge two incidents
+    into one evidence file. A monotonic suffix keeps every run distinct.
+    """
+    base = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id = base
+    suffix = 2
+    while path_builder(output_dir, run_id).parent.exists():
+        run_id = f"{base}-{suffix}"
+        suffix += 1
+    return run_id
+
+
 def api_check_capture_path(output_dir: Path, run_id: str) -> Path:
     """Keep validation artifacts separate from triggered incidents."""
     return output_dir / "api-checks" / run_id / "api-check.jsonl"
@@ -2633,11 +2649,11 @@ class MonitorController:
         self.trigger_sequence += 1
         starts_monitor = self.monitor_task is None or self.monitor_task.done()
         if starts_monitor:
-            self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            self.run_id = unique_run_id(self.cfg.output_dir)
             self.trigger_session_ids.clear()
             self.trigger_source_ips.clear()
         if self.run_id is None:  # defensive fallback for externally manipulated state
-            self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            self.run_id = unique_run_id(self.cfg.output_dir)
         timestamp = utc_now()
         metadata = extract_trigger_metadata(message)
         if isinstance(metadata.get("session_id"), int):
@@ -3541,7 +3557,7 @@ class SyslogProtocol(asyncio.DatagramProtocol):
 async def run_api_check(cfg: Config) -> tuple[Path, bool]:
     """Run one allowlisted, read-only collection batch without opening Syslog."""
     cfg.output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id = unique_run_id(cfg.output_dir, api_check_capture_path)
     output_file = api_check_capture_path(cfg.output_dir, run_id)
     client = PanOSClient(cfg)
     controller = MonitorController(cfg, client)
