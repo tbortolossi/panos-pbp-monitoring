@@ -7,6 +7,15 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A journal write failure (full disk, permissions) no longer prevents incident
+  collection: the monitor starts even when the trigger cannot be journalled,
+  the HTML report is generated even when the stop marker cannot be written,
+  and the datagram handler survives any trigger failure.
+- A crash in the middle of a JSONL append now costs exactly the truncated
+  record: the next append closes the torn line instead of corrupting the
+  following record too.
+- The global-counter primer task is cancelled when a monitor stops before its
+  first cycle completes.
 - The firewall check loop reloads the configuration before resolving
   connection profiles. A firewall saved after daemon startup is now checked
   without waiting for an unrelated Syslog datagram, and an edited firewall is
