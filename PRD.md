@@ -70,9 +70,13 @@ than create a concurrent one.
 2. The listener filters the message. The raw trigger, original Syslog source,
    sequence number, and explicitly labeled fields are correlated with the
    incident `run_id`. In multi-target mode, source IP first defines the allowed
-   candidate set and device serial may select within it. A source shared by
-   several targets is probed read-only across those candidates and ambiguous
-   results safely fan out only within that allowlist.
+   candidate set and device serial must then be one of the serials registered
+   for that set: PAN-OS positions the serial in the third comma-separated field
+   of every log, so a message that carries no serial, or a serial belonging to
+   no candidate, is refused. A candidate saved without a serial on record
+   disables that second gate for its source and keeps the source-only rule. A
+   source shared by several targets is probed read-only across those candidates
+   and ambiguous results safely fan out only within that allowlist.
 3. Each enabled firewall is verified read-only every `target_check_hours`, 24 by
    default and 0 to disable: `show system info` for reachability, API key
    validity and release drift, and `show statistics` only when the stored core
@@ -213,7 +217,11 @@ trigger flag and `target_names: []` are kept, the record is marked
 `suppressed: "source_not_registered"`, and neither the message text nor the
 metadata extracted from it is persisted. The reception stays visible so a new
 firewall can be identified and registered, and the collector never stores the
-content of a log nobody expected.
+content of a log nobody expected. The same rule applies to a message whose
+device serial is not the one read from the firewall when it was saved, marked
+`device_serial_not_registered`, and to a message carrying no serial at all while
+a serial is registered for its source, marked `device_serial_missing`. Those
+slugs are persisted and stable.
 The Web UI streams a ZIP support export containing these run artifacts and a
 versioned checksum manifest.
 
@@ -285,8 +293,9 @@ key must be backed up and restored together.
     trigger.
 23. `--check-api` validates every configured target and returns failure if any
     target validation fails.
-24. A matching trigger from an unlisted source, or with a serial inconsistent
-    with that source's candidates, causes no API call and starts no monitor.
+24. A matching trigger from an unlisted source, with no device serial, or with a
+    serial inconsistent with that source's candidates, causes no API call,
+    starts no monitor, and is journalled without its payload.
 25. Two valid snapshots of one candidate session produce c2s, s2c, and total
     throughput; a counter decrease or changed start time produces no false rate.
 26. The global-counter primer is preserved separately and the first recorded

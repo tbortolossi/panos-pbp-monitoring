@@ -247,10 +247,15 @@ address: the gateway prepends `PBP_SYSLOG_SOURCE=<ip>` so the collector can
 attribute a message to a registered target. `target_names: []` means the sender
 is not registered as a target in the admin UI yet.
 
-A sender that is not a declared Syslog source of any firewall is journalled as
-`suppressed: "source_not_registered"`, with no `message` field and no extracted
-metadata other than that source address. The reception is still visible, so the
-check above still proves the transport, but the text of the log is not stored.
-Register the firewall in the admin UI to record its messages.
+A message is stored, and can start a monitor, only when its source address is a
+declared Syslog source and its device serial is the one read from that firewall
+when it was saved. PAN-OS positions the serial in the third comma-separated
+field of every log. Anything else is journalled with a `suppressed` slug
+(`source_not_registered`, `device_serial_missing`, or
+`device_serial_not_registered`), with no `message` field and no extracted
+metadata other than the source address. The reception is still visible, so the
+check above still proves the transport, but the text of the log is not stored
+and no API call is made. The transport test above carries no serial, so expect
+it to be suppressed; that is the correct result.
 
 Never generate a real packet-buffer flood to test the collector.

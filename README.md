@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring & Diagnostic Collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.13.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.13.0)
+[![Version](https://img.shields.io/badge/version-0.14.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.14.0)
 [![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
 
 PBP Monitoring is an event-driven, read-only diagnostic collector for PAN-OS
@@ -202,8 +202,9 @@ In **Admin > Firewalls**, enter:
 
 Saving contacts the firewall once with `show system info`. That single read-only
 call validates the API key and returns the device serial, hostname, model, and
-PAN-OS version. All four are stored: the serial is what attributes an HA or
-multi-firewall Syslog message to this target, and the hostname, model, and
+PAN-OS version. All four are stored: the serial is what attributes a Syslog
+message to this target and what the collector requires a log to carry before it
+is accepted, and the hostname, model, and
 version are shown in the **Device** column of the firewall list, so none of them
 is typed by hand. The firewall must be reachable when the entry is saved: an
 unreachable address, an untrusted certificate, or a rejected key is reported and
@@ -464,11 +465,25 @@ digests for transfer to another workstation or a support case. It also contains:
   target between the first and last run timestamps.
 
 The reception journal records every datagram the collector receives, but it
-stores the text of a message only when the sender is a declared Syslog source of
-a firewall. A log from an unregistered host is kept as a bounded trace marked
-`suppressed: "source_not_registered"`, carrying its source address so the
-firewall can be recognized and added in the admin UI, and nothing else. The
-dashboard shows those rows as *not stored: source is not a registered firewall*.
+stores the text of a message only when the sender passes two gates: the source
+address must be a declared Syslog source of a firewall, and the device serial the
+message carries must be the one read from that firewall when it was saved. PAN-OS
+positions the serial in the third comma-separated field of every log, so this
+costs nothing to check on real traffic.
+
+Anything else is kept as a bounded trace carrying its source address, so the
+firewall can be recognized and added in the admin UI, and nothing else:
+
+| `suppressed` | Meaning | Dashboard |
+| --- | --- | --- |
+| `source_not_registered` | the sender is not a declared Syslog source | *not stored: source is not a registered firewall* |
+| `device_serial_missing` | no device serial in the message | *not stored: no device serial in the message* |
+| `device_serial_not_registered` | the serial is not the registered one | *not stored: device serial is not the registered one* |
+
+The same rule gates monitoring: a refused message starts no incident and causes
+no API call, so a spoofed or stray sender cannot make the collector fill the
+capture volume. A firewall saved without a serial on record keeps the
+source-only rule until it is saved again.
 
 The reception journal is intentionally bounded, so the second file contains the
 matching messages still retained when the ZIP is downloaded. The authoritative

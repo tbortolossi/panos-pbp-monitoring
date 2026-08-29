@@ -3,6 +3,30 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.14.0] - 2026-08-29
+
+### Fixed
+
+- The device serial is now actually extracted from PAN-OS Syslog. The parser
+  only looked for a labelled `serial=` form, which PAN-OS never emits: it
+  positions the serial in the third comma-separated field, anchored by the log
+  type in the fourth. The serial check was therefore dead code on real traffic.
+  The labelled form is kept as a fallback, and the positional field wins because
+  it is structural rather than a string that can appear anywhere in a payload.
+
+### Changed
+
+- A Syslog message is stored, and can start a monitor, only when its source
+  address is a declared Syslog source **and** its device serial is one of the
+  serials read from that firewall when it was saved. A refused message is
+  journalled as a bounded trace with no payload, marked
+  `source_not_registered`, `device_serial_missing`, or
+  `device_serial_not_registered`, and causes no API call and no incident. A
+  spoofed or stray sender can therefore no longer make the collector write
+  incident captures to the capture volume. A firewall saved without a serial on
+  record keeps the previous source-only rule for its source, so an existing
+  deployment does not silently stop collecting. Refs #87.
+
 ## [0.13.0] - 2026-08-29
 
 ### Changed

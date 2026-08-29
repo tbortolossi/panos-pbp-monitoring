@@ -507,6 +507,13 @@ def collect_dashboard_state(
     }
 
 
+SUPPRESSION_REASONS = {
+    "source_not_registered": "source is not a registered firewall",
+    "device_serial_missing": "no device serial in the message",
+    "device_serial_not_registered": "device serial is not the registered one",
+}
+
+
 def _check_line(firewall: dict[str, Any]) -> str:
     """Summarize the last read-only firewall check for the dashboard card."""
     if firewall.get("check_requested_at"):
@@ -539,8 +546,11 @@ def render_dashboard(state: dict[str, Any], refresh_seconds: int = 5) -> str:
         kind = metadata.get("trigger_type") or (
             "trigger" if record.get("trigger") else "other"
         )
-        if record.get("suppressed") == "source_not_registered":
-            message = "not stored: source is not a registered firewall"
+        suppressed = record.get("suppressed")
+        if isinstance(suppressed, str) and suppressed:
+            message = "not stored: " + SUPPRESSION_REASONS.get(
+                suppressed, "sender is not a registered firewall"
+            )
         else:
             message = str(record.get("message", ""))
             if len(message) > 320:
