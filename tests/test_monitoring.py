@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+from pbp_monitoring import __version__
 from pbp_monitoring.orchestrator import (
     CLOCK_COMMAND,
     OP_COMMANDS,
@@ -564,7 +565,7 @@ class MonitorTests(unittest.TestCase):
             cycle = next(record for record in records if "cycle" in record)
             self.assertTrue(succeeded)
             self.assertTrue(records[0]["identity_complete"])
-            self.assertEqual(records[0]["collector_version"], "0.5.0")
+            self.assertEqual(records[0]["collector_version"], __version__)
             self.assertTrue(cycle["recovery_sample_eligible"])
             self.assertEqual(cycle["validation_errors"], [])
             self.assertIn("completed_at", cycle)

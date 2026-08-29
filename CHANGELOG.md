@@ -3,6 +3,21 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] - 2026-08-29
+
+### Fixed
+
+- Packet Buffer Protection activation state is read from the structured
+  operational XML returned by current PAN-OS releases. `extract_pbp_status`
+  matched only the CLI text form, so a firewall actively dropping traffic was
+  recorded as `active: null` and `mode: "unknown"`, and HTML reports rendered
+  the PBP state as unknown. `enabled`, `active`, `mode`, and `monitor_only` now
+  come from `is-module-enabled`, `is-running`, `use-buffer`/`use-latency`, and
+  `is-monitor-only`, with the text form kept as a fallback. On a chassis, one
+  dataplane in mitigation marks the firewall as active. This also restores
+  incident attribution, which treats `active is True` as evidence that a
+  candidate firewall is affected. Refs #59.
+
 ## [0.5.0] - 2026-08-29
 
 ### Added

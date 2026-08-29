@@ -9,6 +9,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from pbp_monitoring import __version__
 from pbp_monitoring.reporting import generate_html_report, main
 
 
@@ -145,7 +146,7 @@ class ReportingTests(unittest.TestCase):
 
             self.assertIn("Summary", rendered)
             self.assertIn("Collector version", rendered)
-            self.assertIn("PBP Monitoring v0.5.0", rendered)
+            self.assertIn(f"PBP Monitoring v{__version__}", rendered)
             self.assertIn("ha-a&lt;&amp;&gt;", rendered)
             self.assertIn("Timeline", rendered)
             self.assertIn('class="table-wrap timeline-wrap"', rendered)

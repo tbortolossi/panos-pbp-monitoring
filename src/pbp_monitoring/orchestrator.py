@@ -688,6 +688,59 @@ def extract_pbp_offenders(output: str) -> list[dict[str, Any]]:
     return offenders
 
 
+def _panos_flag(value: str | None) -> bool | None:
+    """Interpret the boolean-like element text used by operational XML."""
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"true", "yes", "1"}:
+        return True
+    if normalized in {"false", "no", "0"}:
+        return False
+    return None
+
+
+def _structured_pbp_state(output: str) -> dict[str, Any]:
+    """Read PBP mode and activation flags from the structured XML form.
+
+    A chassis reports one element per dataplane, so a single dataplane in
+    mitigation is enough to consider the firewall affected.
+    """
+    try:
+        root = ET.fromstring(output)
+    except ET.ParseError:
+        return {}
+    enabled: list[bool] = []
+    running: list[bool] = []
+    monitor_only: list[bool] = []
+    modes: list[str] = []
+    for element in root.iter():
+        if not _local_tag(element).endswith("packet-buffer-protection"):
+            continue
+        for name, sink in (
+            ("is-module-enabled", enabled),
+            ("is-running", running),
+            ("is-monitor-only", monitor_only),
+        ):
+            flag = _panos_flag(_child_text(element, name))
+            if flag is not None:
+                sink.append(flag)
+        if _panos_flag(_child_text(element, "use-latency")):
+            modes.append("latency")
+        elif _panos_flag(_child_text(element, "use-buffer")):
+            modes.append("packet_buffer")
+    state: dict[str, Any] = {}
+    if enabled:
+        state["enabled"] = any(enabled)
+    if running:
+        state["active"] = any(running)
+    if monitor_only:
+        state["monitor_only"] = any(monitor_only)
+    if modes:
+        state["mode"] = "latency" if "latency" in modes else "packet_buffer"
+    return state
+
+
 def extract_pbp_status(
     output: str,
     offenders: list[dict[str, Any]] | None = None,
@@ -729,7 +782,7 @@ def extract_pbp_status(
             None,
         )
     )
-    return {
+    status: dict[str, Any] = {
         "enabled": enabled,
         "active": active,
         "mode": mode,
@@ -739,6 +792,9 @@ def extract_pbp_status(
         "congestion_percentage": max(congestion_values) if congestion_values else None,
         "drop_probability_percentage": drop_probability,
     }
+    # The structured form is authoritative when the release returns it.
+    status.update(_structured_pbp_state(output))
+    return status
 
 
 def extract_ingress_backlogs(output: str) -> dict[str, list[dict[str, Any]]]:
