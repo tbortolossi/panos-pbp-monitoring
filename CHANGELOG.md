@@ -22,6 +22,18 @@ follows [Semantic Versioning](https://semver.org/).
   `show session id` has nothing to return. A **Denied packets** card was added
   to the incident-state summary. Refs #74.
 
+### Fixed
+
+- The packet-buffer-protection offender table is now parsed in its structured
+  XML form, not only as the pipe-delimited CLI table. Current PAN-OS releases
+  return one `<entry>` per monitored session or blocked source IP through the
+  API, so on those firewalls the collector was ranking no offender at all: the
+  candidate session list stayed empty, no `show session id` enrichment ran, and
+  the report showed an empty attribution table with `—` in the Timeline
+  `Sessions` column even though the firewall had reported entries in
+  `Drop State: Yes`. Existing captures recover their offenders when their report
+  is regenerated. Refs #76.
+
 ### Changed
 
 - No firewall interaction changed. The section is derived from evidence already

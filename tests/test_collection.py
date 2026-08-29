@@ -195,6 +195,77 @@ Session/IP Address | Zone | PCS | Percentage | State | Total | Dropped | Time ti
         self.assertTrue(status["active"])
         self.assertEqual(status["drop_probability_percentage"], 74.0)
 
+    def test_pbp_offenders_parse_the_structured_xml_entry_table(self):
+        output = """<result>
+  <sw.comm.s1.dp0.packet-buffer-protection>
+    <is-module-enabled>True</is-module-enabled>
+    <is-monitor-only>False</is-monitor-only>
+    <is-running>True</is-running>
+    <use-buffer>1</use-buffer>
+    <congestion>54000</congestion>
+    <congestion-max>97280</congestion-max>
+    <entries>
+      <entry>
+        <value>54048</value>
+        <zone>untrust</zone>
+        <pcs>622</pcs>
+        <perc>7</perc>
+        <drop-state>Yes</drop-state>
+        <num-total>252</num-total>
+        <num-dropped>9</num-dropped>
+        <time-till-discard>60</time-till-discard>
+        <heap-index>0</heap-index>
+      </entry>
+      <entry>
+        <value>192.0.2.10</value>
+        <zone>trust</zone>
+        <pcs>416</pcs>
+        <perc>5</perc>
+        <drop-state>No</drop-state>
+        <num-total>11105</num-total>
+        <num-dropped>0</num-dropped>
+        <time-till-discard>60</time-till-discard>
+        <heap-index>1</heap-index>
+      </entry>
+    </entries>
+  </sw.comm.s1.dp0.packet-buffer-protection>
+</result>"""
+
+        offenders = extract_pbp_offenders(output)
+
+        self.assertEqual(len(offenders), 2)
+        self.assertEqual(offenders[0]["entity_type"], "session")
+        self.assertEqual(offenders[0]["session_id"], 54048)
+        self.assertEqual(offenders[0]["dp"], "dp0")
+        self.assertEqual(offenders[0]["zone"], "untrust")
+        self.assertEqual(offenders[0]["samples"], 622)
+        self.assertEqual(offenders[0]["percentage"], 7.0)
+        self.assertTrue(offenders[0]["drop_state"])
+        self.assertEqual(offenders[0]["packets_total"], 252)
+        self.assertEqual(offenders[0]["packets_dropped"], 9)
+        self.assertEqual(offenders[0]["time_till_discard_seconds"], 60)
+        self.assertEqual(offenders[1]["entity_type"], "source_ip")
+        self.assertEqual(offenders[1]["source_ip"], "192.0.2.10")
+        self.assertFalse(offenders[1]["drop_state"])
+
+        entities = build_candidate_entities(offenders, [], [])
+        self.assertEqual(entities[0]["session_id"], 54048)
+        self.assertEqual(entities[1]["source_ip"], "192.0.2.10")
+
+        status = extract_pbp_status(output, offenders)
+        self.assertTrue(status["active"])
+        self.assertEqual(status["mode"], "packet_buffer")
+
+    def test_pbp_offenders_ignore_a_structured_response_without_entries(self):
+        output = """<result>
+  <sw.comm.s1.dp0.packet-buffer-protection>
+    <is-module-enabled>True</is-module-enabled>
+    <is-running>False</is-running>
+  </sw.comm.s1.dp0.packet-buffer-protection>
+</result>"""
+
+        self.assertEqual(extract_pbp_offenders(output), [])
+
     def test_ingress_backlogs_retains_dp_groups_and_any_ip_protocol(self):
         output = """
 -- SLOT: s1, DP: dp0 --

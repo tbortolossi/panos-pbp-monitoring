@@ -99,7 +99,9 @@ than create a concurrent one.
    - `show counter global filter delta yes`.
 6. The PBP table is structured without losing rows or directions: session or
    source-IP type, zone, rank, samples, percentage, `Drop State`, packets, and
-   time until discard. `ingress-backlogs` separately preserves slot/DP,
+   time until discard. Both output forms are accepted: the pipe-delimited CLI
+   table and the structured XML `<entry>` form returned by the API on current
+   PAN-OS releases, whose fields map one for one onto the same columns. `ingress-backlogs` separately preserves slot/DP,
    ATOMIC/TOTAL, groups, counts, and flow details.
 7. Entities are ranked by RED evidence, contribution, and corroboration. The
    collector immediately calls `show session id <id>` for priority sessions,
