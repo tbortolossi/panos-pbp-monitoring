@@ -19,6 +19,7 @@ from . import __version__
 from .config_store import ConfigStore, DEFAULT_SETTINGS, TARGET_NAME
 from .panos_keygen import (
     PanOSAdminError,
+    fetch_dp_core_functions,
     fetch_system_info,
     generate_api_key,
     make_ssl_context,
@@ -461,6 +462,9 @@ with <code>show system info</code>: it validates the credentials and reads the d
                 identity = fetch_system_info(
                     panos_url, api_key, ssl_context=context, timeout=timeout
                 )
+                core_functions = fetch_dp_core_functions(
+                    panos_url, api_key, ssl_context=context, timeout=timeout
+                )
                 replaced = {firewall_ip}
                 if existing is not None:
                     replaced.add(urlsplit(existing.panos_url).hostname or "")
@@ -479,6 +483,7 @@ with <code>show system info</code>: it validates the credentials and reads the d
                     tls_verify=tls,
                     enabled=form.get("enabled") == "true",
                     device_identity=identity,
+                    dp_core_functions=core_functions,
                 )
                 summary = " ".join(
                     part
@@ -489,6 +494,9 @@ with <code>show system info</code>: it validates the credentials and reads the d
                         f"PAN-OS {identity['software_version']}"
                         if identity.get("software_version")
                         else "",
+                        f"{len(core_functions)} dataplane cores mapped"
+                        if core_functions
+                        else "dataplane core map unavailable",
                     )
                     if part
                 )

@@ -513,6 +513,77 @@ class MonitorTests(unittest.TestCase):
             self.assertTrue(records[1]["recovery_sample_eligible"])
             self.assertEqual(records[-1]["reason"], "resources_recovered")
 
+    def test_stored_core_map_spares_the_firewall_an_api_call(self):
+        stored = (
+            {
+                "dataplane": "dp0",
+                "core_id": "1",
+                "functions": ["flow_lookup", "flow_fastpath"],
+                "forwards_traffic": True,
+            },
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            client = FakeClient()
+            controller = MonitorController(
+                make_config(
+                    output_dir,
+                    dp_core_functions=stored,
+                    dp_core_functions_identity="PA-VM|11.2.4",
+                ),
+                client,
+            )
+            controller.last_trigger_monotonic = 0
+
+            asyncio.run(controller._monitor("cached-map-run"))
+
+            self.assertNotIn(DP_CORE_FUNCTIONS_COMMAND, client.commands)
+            startup = json.loads(
+                incident_capture_path(output_dir, "cached-map-run")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertEqual(startup["dp_core_functions"], [dict(stored[0])])
+            self.assertEqual(startup["dp_core_functions_source"], "configuration")
+            self.assertNotIn("dp_core_functions", startup["commands"])
+            self.assertEqual(startup["parse_warnings"], [])
+
+    def test_a_panos_upgrade_makes_the_stored_core_map_be_read_again(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            client = FakeClient()
+            controller = MonitorController(
+                make_config(
+                    output_dir,
+                    dp_core_functions=(
+                        {
+                            "dataplane": "dp0",
+                            "core_id": "1",
+                            "functions": ["flow_lookup"],
+                            "forwards_traffic": False,
+                        },
+                    ),
+                    dp_core_functions_identity="PA-VM|11.1.0",
+                ),
+                client,
+            )
+            controller.last_trigger_monotonic = 0
+
+            asyncio.run(controller._monitor("upgraded-run"))
+
+            self.assertEqual(client.commands.count(DP_CORE_FUNCTIONS_COMMAND), 1)
+            startup = json.loads(
+                incident_capture_path(output_dir, "upgraded-run")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertEqual(startup["dp_core_functions_source"], "firewall")
+            self.assertEqual(
+                [entry["core_id"] for entry in startup["dp_core_functions"]],
+                ["0", "1"],
+            )
+            self.assertIn("dp_core_functions", startup["commands"])
+
     def test_unreadable_core_functions_warn_without_stopping_collection(self):
         class NoStatisticsClient(FakeClient):
             def op_response(self, command: str) -> PanOSResponse:

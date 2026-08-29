@@ -31,7 +31,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from . import __version__
-from .config_store import ConfigStore, StoredTarget
+from .config_store import ConfigStore, StoredTarget, dp_core_identity
 from .text_export import write_record_text_export
 
 
@@ -145,6 +145,8 @@ class TargetProfile:
     serials: tuple[str, ...] = ()
     syslog_sources: tuple[str, ...] = ()
     tls_verify: bool | str = False
+    dp_core_functions: tuple[dict[str, Any], ...] = ()
+    dp_core_functions_identity: str | None = None
 
 
 def load_target_profiles(path: Path) -> tuple[TargetProfile, ...]:
@@ -288,6 +290,8 @@ class Config:
     target_name: str | None = None
     target_profiles: tuple[TargetProfile, ...] = ()
     config_revision: int | None = None
+    dp_core_functions: tuple[dict[str, Any], ...] = ()
+    dp_core_functions_identity: str | None = None
 
     def __post_init__(self) -> None:
         numeric_rules = (
@@ -410,6 +414,8 @@ class Config:
                     serials=item.serials,
                     syslog_sources=item.syslog_sources,
                     tls_verify=_parse_tls_verify(item.tls_verify),
+                    dp_core_functions=item.dp_core_functions,
+                    dp_core_functions_identity=item.dp_core_functions_identity,
                 )
             )
         primary = profiles[0] if profiles else None
@@ -418,6 +424,10 @@ class Config:
             api_key=primary.api_key if primary else "",
             target_serial=primary.target_serial if primary else None,
             tls_verify=primary.tls_verify if primary else False,
+            dp_core_functions=primary.dp_core_functions if primary else (),
+            dp_core_functions_identity=(
+                primary.dp_core_functions_identity if primary else None
+            ),
             syslog_host=os.getenv("SYSLOG_HOST", "0.0.0.0"),
             syslog_port=int(os.getenv("SYSLOG_PORT", "5514")),
             poll_seconds=float(values["poll_seconds"]),
@@ -445,6 +455,8 @@ class Config:
             output_dir=self.output_dir / "targets" / profile.name,
             target_name=profile.name,
             target_profiles=(),
+            dp_core_functions=profile.dp_core_functions,
+            dp_core_functions_identity=profile.dp_core_functions_identity,
         )
 
 
@@ -2370,6 +2382,37 @@ class MonitorController:
     def _redact_secret(self, value: str) -> str:
         return value.replace(self.cfg.api_key, "<redacted>") if self.cfg.api_key else value
 
+    async def _resolve_core_functions(
+        self,
+        device: dict[str, str],
+        *,
+        force: bool = False,
+    ) -> tuple[list[dict[str, Any]], str, dict[str, Any] | None]:
+        """Return the dataplane core map, calling the firewall only when needed.
+
+        The map is captured once when the firewall is saved, so an incident
+        normally reuses it and spends no API call on a firewall that is already
+        under pressure. A PAN-OS upgrade can reassign function groups, so a
+        stored map is only trusted while the model and release still match.
+        """
+        running = dp_core_identity(device)
+        stored = [dict(entry) for entry in self.cfg.dp_core_functions]
+        if not force and stored and running and self.cfg.dp_core_functions_identity == running:
+            return stored, "configuration", None
+        if stored and not force:
+            LOG.warning(
+                "Stored dataplane core map for %s was captured on %s but the "
+                "firewall reports %s; reading it again and save the firewall to "
+                "refresh the stored copy",
+                self.cfg.target_name or self.cfg.panos_url,
+                self.cfg.dp_core_functions_identity or "an unknown release",
+                running or "an unknown release",
+            )
+        _, payload = await self._collect_command(
+            "dp_core_functions", DP_CORE_FUNCTIONS_COMMAND
+        )
+        return extract_dp_core_functions(command_result(payload)), "firewall", payload
+
     async def _collect_command(
         self,
         name: str,
@@ -2497,9 +2540,6 @@ class MonitorController:
         system_info_task = asyncio.create_task(
             self._collect_command("system_info", SYSTEM_INFO_COMMAND)
         )
-        dp_core_functions_task = asyncio.create_task(
-            self._collect_command("dp_core_functions", DP_CORE_FUNCTIONS_COMMAND)
-        )
         global_counter_primer_task = asyncio.create_task(
             self._collect_command(
                 "global_counters_baseline",
@@ -2513,19 +2553,18 @@ class MonitorController:
                 cycle_start = time.monotonic()
                 cycle_started_at = utc_now()
                 if cycle_number == 1:
-                    (_, system_info), (_, dp_core_functions), outputs = (
-                        await asyncio.gather(
-                            system_info_task,
-                            dp_core_functions_task,
-                            self._op_commands(global_counter_primer_task),
-                        )
+                    (_, system_info), outputs = await asyncio.gather(
+                        system_info_task,
+                        self._op_commands(global_counter_primer_task),
                     )
                     _, global_counter_baseline = global_counter_primer_task.result()
                     device = extract_system_info(command_result(system_info))
                     identity_warnings = device_identity_warnings(device)
-                    core_functions = extract_dp_core_functions(
-                        command_result(dp_core_functions)
-                    )
+                    (
+                        core_functions,
+                        core_functions_source,
+                        dp_core_functions,
+                    ) = await self._resolve_core_functions(device)
                     startup_warnings = list(identity_warnings)
                     if not core_functions:
                         startup_warnings.append(
@@ -2541,9 +2580,14 @@ class MonitorController:
                         "identity_complete": not identity_warnings,
                         "parse_warnings": startup_warnings,
                         "dp_core_functions": core_functions,
+                        "dp_core_functions_source": core_functions_source,
                         "commands": {
                             "system_info": system_info,
-                            "dp_core_functions": dp_core_functions,
+                            **(
+                                {"dp_core_functions": dp_core_functions}
+                                if dp_core_functions is not None
+                                else {}
+                            ),
                             "global_counters_baseline": global_counter_baseline,
                         },
                     }
@@ -3114,15 +3158,16 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
             OP_COMMANDS["global_counters_delta"],
         )
     )
-    (_, system_info), (_, dp_core_functions), outputs = await asyncio.gather(
+    (_, system_info), outputs = await asyncio.gather(
         controller._collect_command("system_info", SYSTEM_INFO_COMMAND),
-        controller._collect_command("dp_core_functions", DP_CORE_FUNCTIONS_COMMAND),
         controller._op_commands(global_counter_primer_task),
     )
     _, global_counter_baseline = global_counter_primer_task.result()
     device = extract_system_info(command_result(system_info))
     identity_warnings = device_identity_warnings(device)
-    core_functions = extract_dp_core_functions(command_result(dp_core_functions))
+    core_functions, core_functions_source, dp_core_functions = (
+        await controller._resolve_core_functions(device, force=True)
+    )
     startup_warnings = list(identity_warnings)
     if not core_functions:
         startup_warnings.append("dataplane core function groups could not be read")
@@ -3137,6 +3182,7 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
         "identity_complete": not identity_warnings,
         "parse_warnings": startup_warnings,
         "dp_core_functions": core_functions,
+        "dp_core_functions_source": core_functions_source,
         "commands": {
             "system_info": system_info,
             "dp_core_functions": dp_core_functions,

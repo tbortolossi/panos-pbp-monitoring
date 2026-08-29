@@ -73,12 +73,13 @@ than create a concurrent one.
    candidate set and device serial may select within it. A source shared by
    several targets is probed read-only across those candidates and ambiguous
    results safely fan out only within that allowlist.
-3. At startup, the monitor runs `show system info` and `show statistics` once
-   each, without delaying the first diagnostic batch. `show statistics` returns
-   the function groups PAN-OS assigns to every dataplane core. That map is
-   static for a platform and PAN-OS release, so it is never repeated during
-   polling, and a firewall that cannot answer it records a parse warning and
-   keeps collecting.
+3. At startup, the monitor runs `show system info` once without delaying the
+   first diagnostic batch. The dataplane core-to-function-group map returned by
+   `show statistics` is captured once per firewall, when the firewall is saved,
+   and stored with the model and PAN-OS release it was captured on. An incident
+   reuses it and spends no API call unless that identity no longer matches, in
+   which case it is read again for that incident. A firewall that cannot answer
+   the command records a parse warning and keeps collecting.
 4. At incident startup, the monitor primes the global-counter delta baseline
    separately. At the start of each batch, it starts `show clock`, then collects
    the following commands in parallel every five seconds without waiting for
@@ -164,8 +165,9 @@ firewall clock, ranked candidate entities, PBP rows, ingress details, normalized
 session snapshots and rates, dataplane pool headroom, global/flow/significant
 counter views, parsing status, and raw XML command responses. A
 `monitor_started` record preserves the identity returned by `show system info`
-and the `dp_core_functions` core-to-function-group map, and a `monitor_stopped`
-record gives the stop reason. Multi-target mode roots
+and the `dp_core_functions` core-to-function-group map with the
+`dp_core_functions_source` field naming where that map came from, and a
+`monitor_stopped` record gives the stop reason. Multi-target mode roots
 these files below `targets/<target-name>/` and adds `syslog-routing.jsonl` for
 probe and routing evidence.
 
@@ -223,8 +225,10 @@ key must be backed up and restored together.
 10. Three complete measurements below the default threshold stop collection;
     an error or unrecognized format does not count as a low measurement.
 11. The maximum duration stops an incident that never recovers.
-12. `show system info` and `show statistics` run once per incident, and
-    `show clock` once per batch.
+12. `show system info` runs once per incident and `show clock` once per batch.
+    `show statistics` runs once per firewall at save time, is not called during
+    an incident whose stored map still matches the running release, and is
+    always called by `--check-api`.
 13. The report charts each dataplane separately and states whether the load rose
     on every comparable core or on a few of them. Only cores carrying
     `flow_fastpath` are compared, because PAN-OS assigns some cores to

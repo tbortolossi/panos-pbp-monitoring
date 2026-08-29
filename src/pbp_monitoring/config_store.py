@@ -38,6 +38,32 @@ DEFAULT_SETTINGS: dict[str, str] = {
 }
 
 
+def dp_core_identity(device_identity: dict[str, str] | None) -> str | None:
+    """Return the model and PAN-OS release a core map was captured on.
+
+    Function groups are assigned per platform and per release, so a map is only
+    trustworthy while both still match.
+    """
+    identity = device_identity or {}
+    model = str(identity.get("model") or "").strip()
+    version = str(identity.get("software_version") or "").strip()
+    if not model or not version:
+        return None
+    return f"{model}|{version}"
+
+
+def _decode_core_functions(payload: Any) -> tuple[dict[str, Any], ...]:
+    if not payload:
+        return ()
+    try:
+        entries = json.loads(str(payload))
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(entries, list):
+        return ()
+    return tuple(entry for entry in entries if isinstance(entry, dict))
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -56,6 +82,8 @@ class StoredTarget:
     hostname: str | None = None
     model: str | None = None
     sw_version: str | None = None
+    dp_core_functions: tuple[dict[str, Any], ...] = ()
+    dp_core_functions_identity: str | None = None
 
 
 class ConfigStore:
@@ -97,6 +125,8 @@ class ConfigStore:
                     hostname TEXT,
                     model TEXT,
                     sw_version TEXT,
+                    dp_core_functions_json TEXT,
+                    dp_core_functions_identity TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -124,7 +154,13 @@ class ConfigStore:
                 connection.execute(
                     "UPDATE targets SET tls_verify=?", (legacy_value,)
                 )
-            for column in ("hostname", "model", "sw_version"):
+            for column in (
+                "hostname",
+                "model",
+                "sw_version",
+                "dp_core_functions_json",
+                "dp_core_functions_identity",
+            ):
                 if column not in columns:
                     connection.execute(f"ALTER TABLE targets ADD COLUMN {column} TEXT")
             connection.execute("DELETE FROM settings WHERE key='tls_verify'")
@@ -137,8 +173,8 @@ class ConfigStore:
                 "INSERT OR IGNORE INTO meta(key,value) VALUES('revision','1')"
             )
             connection.execute(
-                """INSERT INTO meta(key,value) VALUES('schema_version','3')
-                   ON CONFLICT(key) DO UPDATE SET value='3'"""
+                """INSERT INTO meta(key,value) VALUES('schema_version','4')
+                   ON CONFLICT(key) DO UPDATE SET value='4'"""
             )
         self._chmod_private(self.path)
 
@@ -290,9 +326,15 @@ class ConfigStore:
         tls_verify: str = "false",
         enabled: bool = True,
         device_identity: dict[str, str] | None = None,
+        dp_core_functions: list[dict[str, Any]] | None = None,
         target_id: int | None = None,
     ) -> int:
-        """Persist a firewall; `device_identity` carries `show system info` fields."""
+        """Persist a firewall; `device_identity` carries `show system info` fields.
+
+        `dp_core_functions` is the static core-to-function-group map read once
+        from the firewall. It is stored with the identity it was captured on so
+        a PAN-OS upgrade can invalidate it. `None` keeps the stored copy.
+        """
         name = name.strip()
         if not TARGET_NAME.fullmatch(name):
             raise ValueError("target name must contain only letters, digits, dot, dash or underscore")
@@ -307,6 +349,12 @@ class ConfigStore:
             str(identity.get(field) or "").strip() or None
             for field in ("hostname", "model", "software_version")
         )
+        core_map: tuple[str | None, str | None] | None = None
+        if dp_core_functions is not None:
+            core_map = (
+                json.dumps(list(dp_core_functions)) if dp_core_functions else None,
+                dp_core_identity(identity) if dp_core_functions else None,
+            )
         tls_verify = str(tls_verify).strip() or "false"
         if tls_verify.lower() in {"0", "no", "off"}:
             tls_verify = "false"
@@ -335,18 +383,22 @@ class ConfigStore:
                     """INSERT INTO targets
                        (name,panos_url,api_key_ciphertext,target_serial,serials_json,
                         syslog_sources_json,tls_verify,enabled,hostname,model,sw_version,
+                        dp_core_functions_json,dp_core_functions_identity,
                         created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         name, panos_url, ciphertext, target_serial,
                         json.dumps(normalized_serials), json.dumps(normalized_sources),
-                        tls_verify, int(enabled), *device, now, now,
+                        tls_verify, int(enabled), *device, *(core_map or (None, None)),
+                        now, now,
                     ),
                 )
                 result = int(cursor.lastrowid)
             else:
                 row = connection.execute(
-                    "SELECT api_key_ciphertext,hostname,model,sw_version FROM targets WHERE id=?",
+                    """SELECT api_key_ciphertext,hostname,model,sw_version,
+                              dp_core_functions_json,dp_core_functions_identity
+                       FROM targets WHERE id=?""",
                     (target_id,),
                 ).fetchone()
                 if row is None:
@@ -356,15 +408,21 @@ class ConfigStore:
                     ciphertext = self._fernet().encrypt(api_key.strip().encode()).decode()
                 if not device_identity:
                     device = (row["hostname"], row["model"], row["sw_version"])
+                if core_map is None:
+                    core_map = (
+                        row["dp_core_functions_json"],
+                        row["dp_core_functions_identity"],
+                    )
                 connection.execute(
                     """UPDATE targets SET name=?,panos_url=?,api_key_ciphertext=?,
                        target_serial=?,serials_json=?,syslog_sources_json=?,tls_verify=?,enabled=?,
-                       hostname=?,model=?,sw_version=?,updated_at=?
+                       hostname=?,model=?,sw_version=?,
+                       dp_core_functions_json=?,dp_core_functions_identity=?,updated_at=?
                        WHERE id=?""",
                     (
                         name, panos_url, ciphertext, target_serial,
                         json.dumps(normalized_serials), json.dumps(normalized_sources),
-                        tls_verify, int(enabled), *device, now, target_id,
+                        tls_verify, int(enabled), *device, *core_map, now, target_id,
                     ),
                 )
                 result = target_id
@@ -394,6 +452,10 @@ class ConfigStore:
                 "hostname": row["hostname"],
                 "model": row["model"],
                 "sw_version": row["sw_version"],
+                "dp_core_functions": _decode_core_functions(
+                    row["dp_core_functions_json"]
+                ),
+                "dp_core_functions_identity": row["dp_core_functions_identity"],
             }
             if include_secrets:
                 try:

@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring & Diagnostic Collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.6.1-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.6.1)
+[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.7.0)
 [![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
 
 PBP Monitoring is an event-driven, read-only diagnostic collector for PAN-OS
@@ -59,9 +59,10 @@ debug dataplane pool statistics
 show counter global filter delta yes
 ```
 
-`show system info` and `show statistics` run once at incident startup: the first
-identifies the device, the second returns the function groups assigned to each
-dataplane core. Candidate sessions are
+`show system info` runs once at incident startup to identify the device.
+`show statistics`, which returns the function groups assigned to each dataplane
+core, runs when a firewall is saved in the admin UI rather than during an
+incident. Candidate sessions are
 enriched with `show session id <session-id>`. Consecutive cumulative byte
 counters are sampled to derive c2s, s2c, and total bit rates without scanning
 the complete session table.
@@ -454,16 +455,32 @@ responsible, so it must be read alongside session rates, PBP offenders, and
 ingress backlogs.
 
 Dataplane cores are not interchangeable, so the comparison is restricted to
-cores that actually forward traffic. At incident startup the collector runs
-`show statistics` once and stores the function groups PAN-OS assigns to each
-core as `dp_core_functions` in the `monitor_started` record. The map is static
-for a platform and PAN-OS release, so it is never repeated during polling. Cores
-are labelled by what distinguishes them from their peers, such as `flow_mgmt`,
-`flow_ctrl`, or `pan_timer`, and only cores carrying `flow_fastpath` are
-compared: a timer core sitting permanently at 0% is not a sign of imbalance. If
-the firewall cannot answer the command, the batch records a
-`dataplane core function groups could not be read` warning, and the charts still
-render with cores labelled by number.
+cores that actually forward traffic. Cores are labelled by what distinguishes
+them from their peers, such as `flow_mgmt`, `flow_ctrl`, or `pan_timer`, and
+only cores carrying `flow_fastpath` are compared: a timer core sitting
+permanently at 0% is not a sign of imbalance.
+
+That map comes from `show statistics`, which PAN-OS answers with one entry per
+core. Because the assignment is fixed for a platform and PAN-OS release, the
+command runs **once per firewall**, when the firewall is saved in the admin UI,
+next to the `show system info` call that already validates the API key. The
+result is stored with the firewall and the release it was captured on, so an
+incident spends no API call on a firewall that is already under pressure. The
+save confirmation reports how many cores were mapped.
+
+A PAN-OS upgrade can reassign function groups, so a stored map is only trusted
+while the model and PAN-OS version still match what the incident reads from
+`show system info`. On a mismatch the collector reads the map again for that
+incident and logs that the firewall should be saved again to refresh the stored
+copy. Each `monitor_started` record carries the map it used and a
+`dp_core_functions_source` field naming where it came from, `configuration` or
+`firewall`, so incident evidence stays self-contained. `--check-api` always
+calls the command, because its purpose is to prove that the configured API
+administrator can run everything the collector needs.
+
+A firewall that cannot answer the command is still saved normally. The incident
+records a `dataplane core function groups could not be read` warning, and the
+charts still render with cores labelled by number.
 
 Copy one incident to the Linux host without modifying the volume:
 

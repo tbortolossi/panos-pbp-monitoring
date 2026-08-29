@@ -3,6 +3,33 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-08-29
+
+### Changed
+
+- The dataplane core-to-function-group map is captured once per firewall instead
+  of once per incident. `show statistics` now runs when a firewall is saved in
+  the admin UI, next to the `show system info` call that already validates the
+  API key, and the result is stored with the firewall. An incident reuses it and
+  spends no API call on a firewall that is already under packet-buffer pressure
+  and being polled every five seconds. The save confirmation reports how many
+  cores were mapped. Refs #65.
+- A stored map is trusted only while the model and PAN-OS release still match
+  what the incident reads from `show system info`, because an upgrade can
+  reassign function groups. On a mismatch the collector reads the map again for
+  that incident and logs that the firewall should be saved again. `--check-api`
+  always calls the command, since it exists to prove the API administrator can
+  run everything the collector needs.
+- `monitor_started` records gain `dp_core_functions_source`, naming whether the
+  map came from `configuration` or from the `firewall`, and carry the map they
+  used either way, so incident evidence stays self-contained.
+
+### Added
+
+- Persisted `dp_core_functions_json` and `dp_core_functions_identity` columns,
+  migrated in place (schema version 4). Existing firewalls keep working with an
+  empty map until they are next saved; their incidents read the map as before.
+
 ## [0.6.1] - 2026-08-29
 
 ### Fixed
