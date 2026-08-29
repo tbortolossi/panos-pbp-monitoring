@@ -3476,6 +3476,10 @@ class SyslogProtocol(asyncio.DatagramProtocol):
         # observed survives, and it is already validated as an IP address.
         source = metadata.get("syslog_source_ip")
         record["metadata"] = {"syslog_source_ip": source} if source else {}
+        # A refused message must not stand in for the firewall it claims to come
+        # from, or a stray sender would keep its reception indicator alive while
+        # the firewall itself has stopped forwarding.
+        record["target_names"] = []
         record["suppressed"] = reason
         return record
 

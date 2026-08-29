@@ -460,6 +460,8 @@ def collect_dashboard_state(
         for target in targets:
             matching: list[dict[str, Any]] = []
             for record in chronological_logs:
+                if record.get("suppressed"):
+                    continue
                 names = record.get("target_names")
                 if isinstance(names, list) and target["name"] in names:
                     matching.append(record)

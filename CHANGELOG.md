@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.14.1] - 2026-08-29
+
+### Fixed
+
+- A refused Syslog message no longer stands in for the firewall it claims to
+  come from. Its journal record kept the `target_names` derived from the source
+  address, so the dashboard counted it as a healthy reception: a stray or
+  spoofed sender could keep a firewall's Syslog indicator green while that
+  firewall had actually stopped forwarding. Suppressed records now carry an
+  empty `target_names` and are excluded from per-firewall reception health.
+
 ## [0.14.0] - 2026-08-29
 
 ### Fixed
