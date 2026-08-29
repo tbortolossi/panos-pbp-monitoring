@@ -17,6 +17,19 @@ from pbp_monitoring import __version__
 from pbp_monitoring.config_store import ConfigStore
 from pbp_monitoring.panos_keygen import SystemInfoError
 from pbp_monitoring.webui import handler_factory
+from tests.support import (
+    SERVER_POLL_INTERVAL,
+    start_fast_password_hashing,
+    stop_fast_password_hashing,
+)
+
+
+def setUpModule():
+    start_fast_password_hashing()
+
+
+def tearDownModule():
+    stop_fast_password_hashing()
 
 
 DEVICE_IDENTITY = {
@@ -73,7 +86,11 @@ def signed_in_admin(root: Path):
         server = ThreadingHTTPServer(
             ("127.0.0.1", 0), handler_factory(root / "data", 300, root / "config" / "config.db")
         )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": SERVER_POLL_INTERVAL},
+        daemon=True,
+    )
     thread.start()
     opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
     base = f"http://127.0.0.1:{server.server_port}"
@@ -116,7 +133,11 @@ class AdminUITests(unittest.TestCase):
                     ("127.0.0.1", 0),
                     handler_factory(root / "data", 300, root / "config" / "config.db"),
                 )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": SERVER_POLL_INTERVAL},
+                daemon=True,
+            )
             thread.start()
             opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
             base = f"http://127.0.0.1:{server.server_port}"
@@ -192,7 +213,11 @@ class AdminUITests(unittest.TestCase):
                     ("127.0.0.1", 0),
                     handler_factory(root / "data", 300, root / "config" / "config.db"),
                 )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": SERVER_POLL_INTERVAL},
+                daemon=True,
+            )
             thread.start()
             opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
             base = f"http://127.0.0.1:{server.server_port}"
@@ -244,7 +269,11 @@ class AdminUITests(unittest.TestCase):
                     ("127.0.0.1", 0),
                     handler_factory(root / "data", 300, root / "config" / "config.db"),
                 )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": SERVER_POLL_INTERVAL},
+                daemon=True,
+            )
             thread.start()
             opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
             base = f"http://127.0.0.1:{server.server_port}"

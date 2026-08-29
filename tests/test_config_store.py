@@ -6,6 +6,19 @@ from unittest.mock import patch
 
 from pbp_monitoring.config_store import ConfigStore, StoredTarget
 from pbp_monitoring.orchestrator import Config
+from tests.support import (
+    SHIPPED_PBKDF2_ITERATIONS,
+    start_fast_password_hashing,
+    stop_fast_password_hashing,
+)
+
+
+def setUpModule():
+    start_fast_password_hashing()
+
+
+def tearDownModule():
+    stop_fast_password_hashing()
 
 
 class ConfigStoreTests(unittest.TestCase):
@@ -34,6 +47,10 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertEqual(config.target_profiles[0].api_key, "secret-api-key")
             self.assertTrue(config.target_profiles[0].tls_verify)
             self.assertTrue(config.for_target(config.target_profiles[0]).tls_verify)
+
+    def test_the_shipped_password_hashing_cost_stays_at_recommended_strength(self):
+        """The suite lowers this cost; the shipped default must stay strong."""
+        self.assertGreaterEqual(SHIPPED_PBKDF2_ITERATIONS, 600_000)
 
     def test_master_key_persists_and_password_is_salted(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

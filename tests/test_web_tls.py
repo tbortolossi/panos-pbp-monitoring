@@ -11,6 +11,7 @@ from cryptography import x509
 
 from pbp_monitoring.web_tls import ensure_self_signed_certificate
 from pbp_monitoring.webui import ThreadingTLSHTTPServer, handler_factory
+from tests.support import SERVER_POLL_INTERVAL
 
 
 class WebTLSTests(unittest.TestCase):
@@ -30,7 +31,11 @@ class WebTLSTests(unittest.TestCase):
                 handler_factory(root / "data", 300, tls_enabled=True),
                 context,
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": SERVER_POLL_INTERVAL},
+                daemon=True,
+            )
             thread.start()
             stalled = socket.create_connection(("127.0.0.1", server.server_port))
             try:

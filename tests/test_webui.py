@@ -33,6 +33,19 @@ from pbp_monitoring.webui import (
 )
 from pbp_monitoring import __version__
 from pbp_monitoring.config_store import ConfigStore
+from tests.support import (
+    SERVER_POLL_INTERVAL,
+    start_fast_password_hashing,
+    stop_fast_password_hashing,
+)
+
+
+def setUpModule():
+    start_fast_password_hashing()
+
+
+def tearDownModule():
+    stop_fast_password_hashing()
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -65,7 +78,11 @@ class ArtifactAuthenticationTests(unittest.TestCase):
             )
         finally:
             logger.removeHandler(catcher)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": SERVER_POLL_INTERVAL},
+            daemon=True,
+        )
         thread.start()
         return server, thread, catcher.code
 
@@ -155,7 +172,11 @@ class WebUITests(unittest.TestCase):
         server = ThreadingHTTPServer(
             ("127.0.0.1", 0), redirect_handler_factory(8088)
         )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": SERVER_POLL_INTERVAL},
+            daemon=True,
+        )
         thread.start()
         try:
             with self.assertRaises(HTTPError) as response:
