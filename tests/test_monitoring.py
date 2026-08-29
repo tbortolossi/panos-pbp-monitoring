@@ -1239,6 +1239,86 @@ class WebhookNotificationTests(unittest.TestCase):
             self.assertTrue(incident_capture_path(output_dir, run_id).exists())
 
 
+class OffenderSessionListingTests(unittest.TestCase):
+    """A source with live sessions gets one bounded filtered listing at stop."""
+
+    class SessionClient(FakeClient):
+        def op_response(self, command: str) -> PanOSResponse:
+            if "<count>yes</count>" in command:
+                return response("<result><member>2</member></result>")
+            if "<filter><source>" in command:
+                return response(
+                    "<result><entry><dst>198.51.100.20</dst>"
+                    "<source>203.0.113.7</source><sport>60934</sport>"
+                    "<dport>443</dport><proto>17</proto>"
+                    "<application>quic</application>"
+                    "<from>outside</from><to>inside</to>"
+                    "<start-time>Sat Aug 29 23:15:12 2026</start-time>"
+                    "</entry><entry><dst>198.51.100.21</dst>"
+                    "<source>203.0.113.7</source><sport>60935</sport>"
+                    "<dport>443</dport><proto>17</proto>"
+                    "<application>quic</application>"
+                    "<from>outside</from><to>inside</to>"
+                    "<start-time>Sat Aug 29 23:15:13 2026</start-time>"
+                    "</entry></result>"
+                )
+            return super().op_response(command)
+
+    def test_live_sessions_are_counted_listed_and_journalled(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, self.SessionClient())
+            output_file = incident_capture_path(cfg.output_dir, "fixture-run")
+            await controller._collect_offender_session_listing(
+                output_file, "fixture-run", {"203.0.113.7": 3}
+            )
+            return output_file
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_file = asyncio.run(
+                scenario(make_config(Path(temporary_directory)))
+            )
+
+            record = json.loads(
+                output_file.read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(record["event"], "offender_live_sessions")
+            source = record["sources"][0]
+            self.assertTrue(source["ok"])
+            self.assertEqual(source["session_count"], 2)
+            self.assertEqual(len(source["entries"]), 2)
+            self.assertEqual(source["entries"][0]["destination_ip"], "198.51.100.20")
+            self.assertEqual(source["entries"][0]["application"], "quic")
+
+    def test_a_source_without_sessions_skips_the_listing_command(self):
+        class CountOnlyClient(FakeClient):
+            def op_response(self, command: str) -> PanOSResponse:
+                if "<count>yes</count>" in command:
+                    return response("<result><member>0</member></result>")
+                raise AssertionError(f"Unexpected command: {command}")
+
+        async def scenario(cfg):
+            client = CountOnlyClient()
+            controller = MonitorController(cfg, client)
+            output_file = incident_capture_path(cfg.output_dir, "fixture-run")
+            await controller._collect_offender_session_listing(
+                output_file, "fixture-run", {"203.0.113.7": 3}
+            )
+            return output_file
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_file = asyncio.run(
+                scenario(make_config(Path(temporary_directory)))
+            )
+
+            record = json.loads(
+                output_file.read_text(encoding="utf-8").splitlines()[0]
+            )
+            source = record["sources"][0]
+            self.assertTrue(source["ok"])
+            self.assertEqual(source["session_count"], 0)
+            self.assertEqual(source["entries"], [])
+
+
 class OffenderTrafficLogTests(unittest.TestCase):
     """Sources without a session get one bounded traffic-log lookup at stop."""
 

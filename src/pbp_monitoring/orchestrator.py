@@ -130,6 +130,18 @@ OFFENDER_LOG_SOURCE_LIMIT = 3
 OFFENDER_LOG_NLOGS = 20
 OFFENDER_LOG_TIMEOUT_SECONDS = 20.0
 OFFENDER_LOG_POLL_SECONDS = 0.5
+OFFENDER_SESSION_ENTRY_LIMIT = 20
+# Operational XML validated read-only against the lab PA-440 on 2026-08-29:
+# the count form returns <result><member>N</member></result>, the list form
+# returns <result><entry> elements with source, dst, ports, proto, and zones.
+SESSION_FILTER_COUNT_COMMAND = (
+    "<show><session><all><filter><source>{source}</source>"
+    "<count>yes</count></filter></all></session></show>"
+)
+SESSION_FILTER_LIST_COMMAND = (
+    "<show><session><all><filter><source>{source}</source>"
+    "</filter></all></session></show>"
+)
 WEBHOOK_TIMEOUT_SECONDS = 5.0
 
 
@@ -2622,6 +2634,45 @@ def extract_traffic_log_entries(output: str) -> list[dict[str, Any]]:
     return entries
 
 
+def extract_session_filter_count(output: str) -> int | None:
+    """Parse the <member> count of a filtered session query."""
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return None
+    text = (root.findtext(".//member") or "").strip()
+    return int(text) if text.isdigit() else None
+
+
+def extract_session_filter_entries(output: str) -> list[dict[str, Any]]:
+    """Normalize the entries of a filtered session listing, bounded."""
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return []
+    entries: list[dict[str, Any]] = []
+    for element in root.iter("entry"):
+        entry = {
+            name: (element.findtext(tag) or "").strip() or None
+            for name, tag in (
+                ("source_ip", "source"),
+                ("destination_ip", "dst"),
+                ("source_port", "sport"),
+                ("destination_port", "dport"),
+                ("protocol", "proto"),
+                ("application", "application"),
+                ("from_zone", "from"),
+                ("to_zone", "to"),
+                ("start_time", "start-time"),
+            )
+        }
+        if entry["destination_ip"]:
+            entries.append(entry)
+        if len(entries) >= OFFENDER_SESSION_ENTRY_LIMIT:
+            break
+    return entries
+
+
 def panos_threat_csv_fields(message: str) -> dict[str, Any]:
     """Extract the responsible flow from a THREAT log's positional CSV fields.
 
@@ -3037,6 +3088,78 @@ class MonitorController:
         )
         return dict(pairs)
 
+    async def _collect_offender_session_listing(
+        self,
+        output_file: Path,
+        run_id: str,
+        offender_sources: dict[str, int],
+    ) -> None:
+        """Enumerate the live sessions of top offender sources, bounded.
+
+        A flood passing policy keeps live sessions; a filtered count then a
+        capped listing yields their destinations, ports, and applications
+        without scanning the session table. Run first at monitor stop, before
+        the slower log queries, because live sessions are the volatile part.
+        """
+        ranked = sorted(
+            offender_sources, key=lambda ip: offender_sources[ip], reverse=True
+        )
+        results: list[dict[str, Any]] = []
+        for source in ranked[:OFFENDER_LOG_SOURCE_LIMIT]:
+            try:
+                normalized = str(ipaddress.ip_address(source))
+            except ValueError:
+                continue
+            outcome: dict[str, Any] = {
+                "source_ip": normalized,
+                "ranked_batches": offender_sources[source],
+                "ok": False,
+            }
+            _, count_payload = await self._collect_command(
+                "session_filter_count",
+                SESSION_FILTER_COUNT_COMMAND.format(source=normalized),
+            )
+            count = (
+                extract_session_filter_count(command_result(count_payload))
+                if command_succeeded(count_payload)
+                else None
+            )
+            outcome["session_count"] = count
+            if count is None:
+                outcome["error"] = count_payload.get("error") or "count not parsed"
+            elif count == 0:
+                outcome.update({"ok": True, "entries": []})
+            else:
+                _, list_payload = await self._collect_command(
+                    "session_filter_list",
+                    SESSION_FILTER_LIST_COMMAND.format(source=normalized),
+                )
+                if command_succeeded(list_payload):
+                    outcome.update(
+                        {
+                            "ok": True,
+                            "entries": extract_session_filter_entries(
+                                command_result(list_payload)
+                            ),
+                            "raw_response": list_payload.get("raw_response"),
+                        }
+                    )
+                else:
+                    outcome["error"] = list_payload.get("error")
+            results.append(outcome)
+        if not results:
+            return
+        append_jsonl(
+            output_file,
+            {
+                "timestamp": utc_now(),
+                "run_id": run_id,
+                "event": "offender_live_sessions",
+                "target_name": self.cfg.target_name,
+                "sources": results,
+            },
+        )
+
     async def _collect_offender_traffic_logs(
         self,
         output_file: Path,
@@ -3408,9 +3531,17 @@ class MonitorController:
                     startup_task.cancel()
                     await asyncio.gather(startup_task, return_exceptions=True)
             if stop_reason != "cancelled" and offender_sources:
-                # A source denied before session setup or RED-blocked has no
-                # session to inspect; the firewall's own traffic log carries
-                # its destination, port, rule, and action.
+                # Live sessions first (volatile), then the traffic log for
+                # what never created a session: together they recover the
+                # destination/port/application detail of the top sources.
+                try:
+                    await self._collect_offender_session_listing(
+                        output_file, run_id, offender_sources
+                    )
+                except Exception:
+                    LOG.exception(
+                        "Offender session listing failed for %s", run_id
+                    )
                 try:
                     await self._collect_offender_traffic_logs(
                         output_file, run_id, offender_sources

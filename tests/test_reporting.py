@@ -285,6 +285,52 @@ class ReportingTests(unittest.TestCase):
                 rendered,
             )
 
+    def test_offender_live_sessions_render_their_flows(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "incident.jsonl"
+            self._write_records(
+                capture,
+                [
+                    {
+                        "timestamp": "2026-08-29T10:00:00+00:00",
+                        "run_id": "fixture-run",
+                        "cycle": 1,
+                        "elapsed_seconds": 1.0,
+                        "percentages": {"packet_buffer_congestion": [62]},
+                    },
+                    {
+                        "timestamp": "2026-08-29T10:01:00+00:00",
+                        "run_id": "fixture-run",
+                        "event": "offender_live_sessions",
+                        "sources": [
+                            {
+                                "source_ip": "203.0.113.7",
+                                "ok": True,
+                                "session_count": 2,
+                                "entries": [
+                                    {
+                                        "destination_ip": "198.51.100.20",
+                                        "destination_port": "443",
+                                        "protocol": "17",
+                                        "application": "quic<&>",
+                                        "from_zone": "outside",
+                                        "to_zone": "inside",
+                                        "start_time": "Sat Aug 29 23:15:12 2026",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ],
+            )
+
+            rendered = generate_html_report(capture).read_text(encoding="utf-8")
+
+            self.assertIn("Live sessions of top sources", rendered)
+            self.assertIn("198.51.100.20", rendered)
+            self.assertIn("quic&lt;&amp;&gt;", rendered)
+            self.assertNotIn("quic<&>", rendered)
+
     def test_offender_traffic_logs_render_their_recovered_flows(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             capture = Path(temporary_directory) / "incident.jsonl"

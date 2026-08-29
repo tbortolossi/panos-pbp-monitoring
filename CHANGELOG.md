@@ -7,6 +7,11 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Top offender sources with live sessions are enumerated at monitor stop:
+  one bounded filtered count then a capped listing per source (validated
+  read-only on the lab PA-440) yields their destinations, ports, and
+  applications without scanning the session table, and the report gains a
+  "Live sessions of top sources" section.
 - The dashboard's recent-runs table now compares incidents side by side:
   each completed run shows its peak packet-buffer percentage and its top
   ranked sources, read from a summary the stop marker now carries, so a
