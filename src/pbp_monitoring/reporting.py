@@ -1595,6 +1595,7 @@ def _render_probable_cause(
     drop_counter_summary: dict[str, Any],
     session_series: list[dict[str, Any]],
     cycles: list[tuple[int, dict[str, Any]]],
+    events: list[tuple[int, dict[str, Any]]] | None = None,
 ) -> str:
     """Compose the scattered verdicts into a few sentences an engineer can paste."""
     if not cycles:
@@ -1637,6 +1638,27 @@ def _render_probable_cause(
         sentences.append(
             f"The strongest evidence points to {entity_label}{detail}"
             f"{drop_text}{rate_text}."
+        )
+    corroborations = [
+        record
+        for _, record in (events or [])
+        if str(record.get("event", "")).lower() == "flood_corroboration"
+    ]
+    if corroborations:
+        destinations = sorted(
+            {
+                str(metadata["destination_ip"])
+                for record in corroborations
+                if isinstance(metadata := record.get("metadata"), dict)
+                and metadata.get("destination_ip")
+            }
+        )
+        destination_text = (
+            f" targeting {_escape(', '.join(destinations))}" if destinations else ""
+        )
+        sentences.append(
+            f"{len(corroborations)} zone-protection or DoS flood log(s) "
+            f"corroborated the incident{destination_text}."
         )
     if drop_counter_summary.get("items"):
         sentences.append(_drop_counter_verdict(drop_counter_summary, attribution)[1])
@@ -2075,7 +2097,7 @@ def _render_html(
     ) + _render_offender_traffic_logs(events)
     session_series = _session_series(cycles)
     probable_cause_html = _render_probable_cause(
-        attribution, drop_counter_summary, session_series, cycles
+        attribution, drop_counter_summary, session_series, cycles, events
     )
     pressure_chart_html = _render_pressure_chart(cycles)
     session_table_html = _render_session_table(session_series)
