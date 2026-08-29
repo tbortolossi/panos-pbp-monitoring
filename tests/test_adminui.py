@@ -369,5 +369,52 @@ class AdminUITests(unittest.TestCase):
             self.assertTrue(remote_enabled._is_loopback(remote))
 
 
+    def test_the_test_button_queues_a_validation_for_the_collector(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with signed_in_admin(root) as (opener, base, csrf, _page):
+                with patch(
+                    "pbp_monitoring.adminui.generate_api_key", return_value="generated-key"
+                ), patch(
+                    "pbp_monitoring.adminui.fetch_system_info", return_value=dict(DEVICE_IDENTITY)
+                ), patch(
+                    "pbp_monitoring.adminui.fetch_dp_core_functions",
+                    return_value=[dict(entry) for entry in CORE_FUNCTIONS],
+                ):
+                    opener.open(
+                        Request(
+                            base + "/admin/target/save",
+                            data=urlencode(
+                                {
+                                    "csrf": csrf,
+                                    "target_id": "",
+                                    "name": "PA-440",
+                                    "firewall_ip": "192.0.2.10",
+                                    "auth_method": "credentials",
+                                    "api_key": "",
+                                    "username": "pbp_monitor_admin",
+                                    "password": "temporary-password",
+                                    "tls_verify": "false",
+                                    "enabled": "true",
+                                }
+                            ).encode(),
+                        )
+                    ).read()
+
+                store = ConfigStore(root / "config" / "config.db")
+                target_id = store.list_targets()[0]["target_id"]
+                self.assertIsNone(store.list_targets()[0]["check_requested_at"])
+
+                page = opener.open(
+                    Request(
+                        base + "/admin/target/check",
+                        data=urlencode({"csrf": csrf, "target_id": str(target_id)}).encode(),
+                    )
+                ).read().decode()
+
+                self.assertTrue(store.list_targets()[0]["check_requested_at"])
+                self.assertIn("validation requested", page.lower())
+                self.assertIn("Validation queued", page)
+
 if __name__ == "__main__":
     unittest.main()

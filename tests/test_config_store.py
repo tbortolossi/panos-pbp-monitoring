@@ -188,5 +188,76 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertEqual(kept.dp_core_functions_identity, "PA-440|11.1.4-h7")
 
 
+    def test_a_requested_check_is_queued_then_cleared_by_its_result(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = ConfigStore(Path(temporary_directory) / "config.db")
+            store.initialize()
+            target_id = store.save_target(
+                name="fw-a", panos_url="https://192.0.2.10", api_key="key",
+                serials=["001122"], syslog_sources=["192.0.2.10"],
+            )
+
+            store.request_target_check(target_id)
+            queued = store.list_targets()[0]
+            self.assertTrue(queued["check_requested_at"])
+            self.assertIsNone(queued["last_check_at"])
+
+            store.record_target_check(
+                target_id, kind="validation", status="ok",
+                detail="run 20260829T120000Z", clear_request=True,
+            )
+
+            done = store.list_targets()[0]
+            self.assertIsNone(done["check_requested_at"])
+            self.assertEqual(done["last_check_status"], "ok")
+            self.assertEqual(done["last_check_kind"], "validation")
+            self.assertEqual(done["last_check_detail"], "run 20260829T120000Z")
+
+    def test_refreshing_a_device_updates_its_core_map_and_the_revision(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = ConfigStore(Path(temporary_directory) / "config.db")
+            store.initialize()
+            target_id = store.save_target(
+                name="fw-a", panos_url="https://192.0.2.10", api_key="key",
+                serials=["001122"], syslog_sources=["192.0.2.10"],
+                device_identity={
+                    "hostname": "fw", "model": "PA-440", "software_version": "11.1.0"
+                },
+                dp_core_functions=[
+                    {"dataplane": "dp0", "core_id": "1", "functions": ["flow_fastpath"],
+                     "forwards_traffic": True}
+                ],
+            )
+            before = store.revision()
+
+            store.refresh_target_device(
+                target_id,
+                device_identity={
+                    "hostname": "fw", "model": "PA-440", "software_version": "12.2.2"
+                },
+                dp_core_functions=[
+                    {"dataplane": "dp0", "core_id": "1",
+                     "functions": ["flow_fastpath", "flow_ctrl"], "forwards_traffic": True}
+                ],
+            )
+
+            refreshed = store.list_targets(include_secrets=True)[0]
+            self.assertEqual(refreshed.sw_version, "12.2.2")
+            self.assertEqual(refreshed.dp_core_functions_identity, "PA-440|12.2.2")
+            self.assertIn("flow_ctrl", refreshed.dp_core_functions[0]["functions"])
+            self.assertNotEqual(store.revision(), before)
+
+    def test_the_check_interval_is_bounded_and_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = ConfigStore(Path(temporary_directory) / "config.db")
+            store.initialize()
+            self.assertEqual(store.get_settings()["target_check_hours"], "24")
+
+            store.update_settings({"target_check_hours": "0"})
+            self.assertEqual(store.get_settings()["target_check_hours"], "0")
+
+            with self.assertRaises(ValueError):
+                store.update_settings({"target_check_hours": "-1"})
+
 if __name__ == "__main__":
     unittest.main()

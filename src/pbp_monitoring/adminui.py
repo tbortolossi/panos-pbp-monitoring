@@ -181,10 +181,12 @@ class AdminController:
                 f"<td><code>{_e(self._firewall_ip(target))}</code></td>"
                 f"<td><code>{_e(', '.join(target['serials']) or '-')}</code></td>"
                 f"<td>{'Enabled' if target['enabled'] else 'Disabled'}</td>"
+                f"<td>{self._check_summary(target)}</td>"
                 f"<td><div class=\"action-row\"><a class=\"button\" href=\"/admin?edit={target['target_id']}\">Edit</a>"
+                f"<form class=\"inline\" method=\"post\" action=\"/admin/target/check\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><input type=\"hidden\" name=\"target_id\" value=\"{target['target_id']}\"><button class=\"secondary\" type=\"submit\">Test</button></form>"
                 f"<form class=\"inline\" method=\"post\" action=\"/admin/target/delete\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><input type=\"hidden\" name=\"target_id\" value=\"{target['target_id']}\"><button class=\"danger\" type=\"submit\">Delete</button></form></div></td></tr>"
             )
-        target_rows = "".join(rows) or '<tr><td colspan="6" class="muted">No firewall configured yet.</td></tr>'
+        target_rows = "".join(rows) or '<tr><td colspan="7" class="muted">No firewall configured yet.</td></tr>'
         edit_target = next((target for target in targets if target["target_id"] == edit_id), None)
         recovery = ""
         if not self.store.recovery_key_acknowledged():
@@ -205,11 +207,30 @@ class AdminController:
 <div><label>New password (8 characters minimum)</label><input type="password" name="new_password" autocomplete="new-password" minlength="8" required></div>
 <div><label>Confirm new password</label><input type="password" name="confirm_password" autocomplete="new-password" minlength="8" required></div>
 </div><button type="submit">Change password</button></form></section>
-<section class="card"><h2>Firewalls</h2><table><thead><tr><th>Name</th><th>Device</th><th>Firewall IP</th><th>Serial</th><th>State</th><th>Actions</th></tr></thead><tbody>{target_rows}</tbody></table></section>
+<section class="card"><h2>Firewalls</h2><table><thead><tr><th>Name</th><th>Device</th><th>Firewall IP</th><th>Serial</th><th>State</th><th>Last check</th><th>Actions</th></tr></thead><tbody>{target_rows}</tbody></table></section>
 {self._target_form(csrf, edit_target)}
 <section class="card"><h2>Collector settings</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
 {''.join(f'<div><label>{_e(key.replace("_", " ").title())}</label><input name="{_e(key)}" value="{_e(value)}" required></div>' for key, value in settings.items())}
 </div><button type="submit">Save settings</button></form></section>""")
+
+    @staticmethod
+    def _check_summary(target: dict[str, Any]) -> str:
+        """Render the outcome of the last automatic or requested firewall check."""
+        if target.get("check_requested_at"):
+            return '<span class="muted">Validation queued</span>'
+        checked_at = target.get("last_check_at")
+        if not checked_at:
+            return '<span class="muted">Never checked</span>'
+        status = str(target.get("last_check_status") or "")
+        kind = str(target.get("last_check_kind") or "check")
+        label = "Passed" if status == "ok" else "Failed"
+        colour = "#047857" if status == "ok" else "var(--bad)"
+        detail = str(target.get("last_check_detail") or "")
+        return (
+            f'<strong style="color:{colour}">{_e(label)}</strong>'
+            f'<div class="muted">{_e(kind)} &middot; {_e(str(checked_at)[:19])}Z</div>'
+            + (f'<div class="muted">{_e(detail)}</div>' if detail else "")
+        )
 
     @staticmethod
     def _device_summary(target: dict[str, Any]) -> str:
@@ -427,6 +448,16 @@ with <code>show system info</code>: it validates the credentials and reads the d
                     handler,
                     "/admin",
                     f"PBPADMIN=; Path=/admin; Max-Age=0; HttpOnly; SameSite=Strict{secure}",
+                )
+            elif path == "/admin/target/check":
+                self.store.request_target_check(int(form["target_id"]))
+                self._send(
+                    handler,
+                    self._dashboard(
+                        csrf,
+                        "Full read-only validation requested. The collector runs it "
+                        "within a few seconds, and the result appears in this list.",
+                    ),
                 )
             elif path == "/admin/target/delete":
                 self.store.delete_target(int(form["target_id"]))
