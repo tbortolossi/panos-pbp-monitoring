@@ -523,6 +523,123 @@ class MonitorTests(unittest.TestCase):
             router.controllers["fw-a"].trigger.assert_not_called()
             self.assertEqual(router.controllers["fw-b"].trigger.call_count, 2)
 
+    def test_follow_up_triggers_reuse_the_routing_decision_while_active(self):
+        async def exercise(output_dir: Path):
+            profiles = (
+                TargetProfile(
+                    "fw-a",
+                    "https://fw-a.invalid",
+                    "key-a",
+                    syslog_sources=("198.51.100.1",),
+                ),
+                TargetProfile(
+                    "fw-b",
+                    "https://fw-b.invalid",
+                    "key-b",
+                    syslog_sources=("198.51.100.1",),
+                ),
+            )
+            router = MultiTargetRouter(
+                make_config(output_dir, target_profiles=profiles)
+            )
+            router.controllers["fw-a"].trigger = Mock()
+            router.controllers["fw-b"].trigger = Mock()
+            probe_calls = []
+
+            async def probe(target_name):
+                probe_calls.append(target_name)
+                return target_name, {
+                    "reachable": True,
+                    "affected": target_name == "fw-b",
+                    "commands": {},
+                }
+
+            router._probe_target = probe
+            router.trigger(
+                "PBP Packet Drop",
+                "198.51.100.1:514",
+                transport_source_ip="198.51.100.1",
+            )
+            await asyncio.gather(*tuple(router.routing_tasks))
+            # Simulate the monitor the dispatched trigger would have started.
+            active = asyncio.create_task(asyncio.sleep(30))
+            router.controllers["fw-b"].monitor_task = active
+            try:
+                router.trigger(
+                    "PBP Session Discarded",
+                    "198.51.100.1:514",
+                    transport_source_ip="198.51.100.1",
+                )
+                await asyncio.gather(
+                    *tuple(router.routing_tasks), return_exceptions=True
+                )
+            finally:
+                active.cancel()
+                await asyncio.gather(active, return_exceptions=True)
+            return router, probe_calls
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            router, probe_calls = asyncio.run(exercise(Path(temporary_directory)))
+
+            self.assertEqual(sorted(probe_calls), ["fw-a", "fw-b"])
+            self.assertEqual(router.controllers["fw-b"].trigger.call_count, 2)
+            router.controllers["fw-a"].trigger.assert_not_called()
+            reuse = router.controllers["fw-b"].trigger.call_args.kwargs["routing"]
+            self.assertEqual(reuse["method"], "reuse_active_routing")
+
+    def test_a_trigger_after_the_monitor_ends_probes_again(self):
+        async def exercise(output_dir: Path):
+            profiles = (
+                TargetProfile(
+                    "fw-a",
+                    "https://fw-a.invalid",
+                    "key-a",
+                    syslog_sources=("198.51.100.1",),
+                ),
+                TargetProfile(
+                    "fw-b",
+                    "https://fw-b.invalid",
+                    "key-b",
+                    syslog_sources=("198.51.100.1",),
+                ),
+            )
+            router = MultiTargetRouter(
+                make_config(output_dir, target_profiles=profiles)
+            )
+            router.controllers["fw-a"].trigger = Mock()
+            router.controllers["fw-b"].trigger = Mock()
+            probe_calls = []
+
+            async def probe(target_name):
+                probe_calls.append(target_name)
+                return target_name, {
+                    "reachable": True,
+                    "affected": target_name == "fw-b",
+                    "commands": {},
+                }
+
+            router._probe_target = probe
+            router.trigger(
+                "PBP Packet Drop",
+                "198.51.100.1:514",
+                transport_source_ip="198.51.100.1",
+            )
+            await asyncio.gather(*tuple(router.routing_tasks))
+            # No monitor is active for the selected target: the decision is
+            # stale, so a new trigger must probe the candidates again.
+            router.trigger(
+                "PBP Packet Drop",
+                "198.51.100.1:514",
+                transport_source_ip="198.51.100.1",
+            )
+            await asyncio.gather(*tuple(router.routing_tasks))
+            return probe_calls
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            probe_calls = asyncio.run(exercise(Path(temporary_directory)))
+
+            self.assertEqual(len(probe_calls), 4)
+
     def test_multi_target_ambiguous_probe_fans_out(self):
         async def exercise(output_dir: Path):
             profiles = (

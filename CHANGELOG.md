@@ -7,6 +7,12 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A shared Syslog source without a registered serial no longer probes every
+  candidate firewall on each trigger during an active incident: the routing
+  decision is remembered while a selected monitor is running, so a trigger
+  storm reinforces the current incident instead of adding continuous probe
+  load on firewalls already under buffer pressure. The routing journal is now
+  bounded like the reception journal.
 - Reception-journal compaction now trims by size as well as by record count.
   When the newest 200 stored messages alone exceeded the 4 MB cap, every
   subsequent datagram re-read, rewrote, and fsynced the whole journal on the

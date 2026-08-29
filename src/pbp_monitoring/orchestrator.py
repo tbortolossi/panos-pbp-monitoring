@@ -3114,6 +3114,10 @@ class MultiTargetRouter:
             list[tuple[str, str, str | None, dict[str, Any]]],
         ] = {}
         self.routing_tasks: set[asyncio.Task[None]] = set()
+        # Last probe decision per routing key, honored while a selected
+        # monitor is still active so a trigger storm reinforces the current
+        # incident instead of probing every candidate again (change rule 8).
+        self.routing_decisions: dict[str, list[str]] = {}
 
     def classify_message(
         self, message: str, transport_source_ip: str | None
@@ -3247,6 +3251,30 @@ class MultiTargetRouter:
             return
 
         pending_key = f"{serial or ''}|{source or peer}"
+        remembered = self.routing_decisions.get(pending_key)
+        if remembered is not None:
+            active = [
+                name
+                for name in remembered
+                if (controller := self.controllers.get(name)) is not None
+                and controller.monitor_task is not None
+                and not controller.monitor_task.done()
+            ]
+            if active:
+                self._dispatch(
+                    active,
+                    message,
+                    peer,
+                    transport_source_ip,
+                    {
+                        "method": "reuse_active_routing",
+                        "device_serial": serial,
+                        "syslog_source_ip": source,
+                        "fanout": len(active) > 1,
+                    },
+                )
+                return
+            del self.routing_decisions[pending_key]
         queue = self.pending.setdefault(pending_key, [])
         queue.append((message, peer, transport_source_ip, metadata))
         if len(queue) > 1:
@@ -3331,6 +3359,7 @@ class MultiTargetRouter:
                 selected = reachable or candidate_names
                 method = "parallel_probe_ambiguous_fanout"
             queued = self.pending.pop(pending_key, [])
+            self.routing_decisions[pending_key] = list(selected)
             routing_record = {
                 "timestamp": utc_now(),
                 "event": "target_routing_probe",
@@ -3340,7 +3369,10 @@ class MultiTargetRouter:
                 "queued_triggers": len(queued),
                 "probes": probes,
             }
-            append_jsonl(
+            # The routing journal carries full probe outputs, so it is bounded
+            # like the reception journal; the incident evidence itself lives in
+            # each selected target's own capture.
+            append_recent_syslog(
                 self.cfg.output_dir / "syslog-routing.jsonl",
                 routing_record,
             )
