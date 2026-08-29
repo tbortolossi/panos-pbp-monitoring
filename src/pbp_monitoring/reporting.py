@@ -273,9 +273,419 @@ def _core_sort_key(identity: tuple[str, str]) -> tuple[str, int, str]:
     return dataplane, numeric_core, core_id
 
 
+_HEAT_SCALE = (
+    (10.0, "#eef2f7", "0-10"),
+    (25.0, "#dbeafe", "10-25"),
+    (50.0, "#bfdbfe", "25-50"),
+    (70.0, "#fde68a", "50-70"),
+    (85.0, "#fb923c", "70-85"),
+    (95.0, "#ef4444", "85-95"),
+    (float("inf"), "#991b1b", "95-100"),
+)
+_SERIES_COLORS = ("#b91c1c", "#c2410c", "#a16207", "#0f766e", "#1d4ed8")
+_CHART_WIDTH = 920
+_HIGHLIGHT_CORES = 5
+
+
+def _core_roles(core_functions: Sequence[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
+    """Describe what distinguishes each core from its peers on the same dataplane.
+
+    Every core of a dataplane shares a base set of function groups. Only the
+    extra groups explain why one core behaves differently, so those are what the
+    charts label.
+    """
+    by_dataplane: dict[str, list[dict[str, Any]]] = {}
+    for entry in core_functions:
+        if not isinstance(entry, dict):
+            continue
+        core_id = entry.get("core_id")
+        functions = entry.get("functions")
+        if core_id in (None, "") or not isinstance(functions, list):
+            continue
+        by_dataplane.setdefault(str(entry.get("dataplane") or "dp0"), []).append(
+            {
+                "core_id": str(core_id),
+                "functions": [str(name) for name in functions],
+                "forwards_traffic": bool(entry.get("forwards_traffic")),
+            }
+        )
+
+    roles: dict[tuple[str, str], dict[str, Any]] = {}
+    for dataplane, entries in by_dataplane.items():
+        forwarding = [
+            frozenset(entry["functions"])
+            for entry in entries
+            if entry["forwards_traffic"] and entry["functions"]
+        ]
+        sets = forwarding or [
+            frozenset(entry["functions"]) for entry in entries if entry["functions"]
+        ]
+        common = frozenset.intersection(*sets) if sets else frozenset()
+        for entry in entries:
+            distinctive = sorted(set(entry["functions"]) - common)
+            if distinctive:
+                label = " + ".join(distinctive[:3])
+            elif entry["forwards_traffic"]:
+                label = "fastpath only"
+            else:
+                label = " + ".join(entry["functions"][:3]) or "—"
+            roles[(dataplane, entry["core_id"])] = {
+                "label": label,
+                "functions": entry["functions"],
+                "forwards_traffic": entry["forwards_traffic"],
+            }
+    return roles
+
+
+def _cpu_series(
+    cycles: Sequence[tuple[int, dict[str, Any]]],
+) -> tuple[list[tuple[int, str]], dict[tuple[str, str], dict[int, float]]]:
+    """Return the sampled batches and the window peak of every core per batch."""
+    batches: list[tuple[int, str]] = []
+    peaks: dict[tuple[str, str], dict[int, float]] = {}
+    for batch_number, (_, record) in enumerate(cycles, 1):
+        samples = _resource_cpu_samples(record)
+        if not samples:
+            continue
+        batches.append((batch_number, str(record.get("timestamp") or "—")))
+        for sample in samples:
+            identity = (sample["dataplane"], sample["core_id"])
+            peaks.setdefault(identity, {})[batch_number] = sample["window_peak"]
+    return batches, peaks
+
+
+def _heat_colour(value: float) -> str:
+    for limit, colour, _ in _HEAT_SCALE:
+        if value < limit:
+            return colour
+    return _HEAT_SCALE[-1][1]
+
+
+def _median(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    count = len(ordered)
+    middle = count // 2
+    if count % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _core_label(dataplane: str, core_id: str, roles: dict[tuple[str, str], dict[str, Any]]) -> str:
+    role = roles.get((dataplane, core_id))
+    if role:
+        return f"core {core_id} · {role['label']}"
+    return f"core {core_id}"
+
+
+def _line_chart(
+    dataplane: str,
+    batches: Sequence[tuple[int, str]],
+    cores: Sequence[str],
+    peaks: dict[tuple[str, str], dict[int, float]],
+    roles: dict[tuple[str, str], dict[str, Any]],
+    comparable: Sequence[str],
+) -> str:
+    """Plot every core, highlighting the hottest, against the median of its peers."""
+    left, right, top, bottom = 46, 18, 16, 34
+    height = 250
+    count = len(batches)
+    plot_width = _CHART_WIDTH - left - right
+    step = plot_width / (count - 1) if count > 1 else 0.0
+
+    def x_at(index: int) -> float:
+        if count == 1:
+            return left + plot_width / 2
+        return left + index * step
+
+    def y_at(value: float) -> float:
+        bounded = max(0.0, min(100.0, value))
+        return top + (100.0 - bounded) * (height - top - bottom) / 100.0
+
+    def path_for(core_id: str) -> tuple[str, list[tuple[float, float]]]:
+        series = peaks.get((dataplane, core_id), {})
+        points = [
+            (x_at(index), y_at(series[batch_number]))
+            for index, (batch_number, _) in enumerate(batches)
+            if batch_number in series
+        ]
+        return " ".join(f"{x:.1f},{y:.1f}" for x, y in points), points
+
+    parts: list[str] = []
+    for gridline in (0, 25, 50, 75, 100):
+        y = y_at(gridline)
+        parts.append(
+            f'<line x1="{left}" y1="{y:.1f}" x2="{_CHART_WIDTH - right}" y2="{y:.1f}" '
+            'stroke="#e2e8f0" stroke-width="1"/>'
+            f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end" class="axis">{gridline}%</text>'
+        )
+
+    tick_stride = max(1, math.ceil(count / 12))
+    for index, (batch_number, _) in enumerate(batches):
+        if index % tick_stride and index != count - 1:
+            continue
+        parts.append(
+            f'<text x="{x_at(index):.1f}" y="{height - 12}" text-anchor="middle" '
+            f'class="axis">{_escape(batch_number)}</text>'
+        )
+
+    ranking = sorted(
+        cores,
+        key=lambda core_id: max(peaks.get((dataplane, core_id), {}).values(), default=0.0),
+        reverse=True,
+    )
+    highlighted = ranking[:_HIGHLIGHT_CORES]
+    for core_id in cores:
+        if core_id in highlighted:
+            continue
+        points, _ = path_for(core_id)
+        if points:
+            parts.append(
+                f'<polyline points="{points}" fill="none" stroke="#cbd5e1" stroke-width="1"/>'
+            )
+
+    if len(comparable) > 2:
+        median_points = []
+        for index, (batch_number, _) in enumerate(batches):
+            values = [
+                peaks[(dataplane, core_id)][batch_number]
+                for core_id in comparable
+                if batch_number in peaks.get((dataplane, core_id), {})
+            ]
+            if values:
+                median_points.append((x_at(index), y_at(_median(values))))
+        if median_points:
+            joined = " ".join(f"{x:.1f},{y:.1f}" for x, y in median_points)
+            parts.append(
+                f'<polyline points="{joined}" fill="none" stroke="#0f172a" '
+                'stroke-width="1.6" stroke-dasharray="6 4"/>'
+            )
+
+    legend: list[str] = []
+    for position, core_id in enumerate(highlighted):
+        colour = _SERIES_COLORS[position % len(_SERIES_COLORS)]
+        points, coordinates = path_for(core_id)
+        if not points:
+            continue
+        if len(coordinates) == 1:
+            x, y = coordinates[0]
+            parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="{colour}"/>')
+        else:
+            parts.append(
+                f'<polyline points="{points}" fill="none" stroke="{colour}" stroke-width="2"/>'
+            )
+        legend.append(
+            f'<span class="key"><i style="background:{colour}"></i>'
+            f'{_escape(_core_label(dataplane, core_id, roles))}</span>'
+        )
+    if len(comparable) > 2:
+        legend.append(
+            '<span class="key"><i class="dashed"></i>median of comparable cores</span>'
+        )
+    legend.append('<span class="key"><i style="background:#cbd5e1"></i>other cores</span>')
+
+    title = f"Window peak CPU per core on {dataplane}, batch by batch"
+    return (
+        f'<svg class="chart" viewBox="0 0 {_CHART_WIDTH} {height}" width="{_CHART_WIDTH}" '
+        f'height="{height}" role="img" aria-label="{_escape(title)}">'
+        f"<title>{_escape(title)}</title>{''.join(parts)}</svg>"
+        f'<p class="chart-legend">{"".join(legend)}</p>'
+        '<p class="muted chart-caption">Horizontal axis: batch number. Vertical axis: '
+        "window peak CPU.</p>"
+    )
+
+
+def _heatmap(
+    dataplane: str,
+    batches: Sequence[tuple[int, str]],
+    cores: Sequence[str],
+    peaks: dict[tuple[str, str], dict[int, float]],
+    roles: dict[tuple[str, str], dict[str, Any]],
+) -> str:
+    """Draw core by batch as coloured cells, which stays readable at 64 cores."""
+    label_width = 196
+    value_width = 46
+    cell_height = 15
+    columns = len(batches)
+    cell_width = max(5, min(24, (_CHART_WIDTH - label_width - value_width) // max(1, columns)))
+    width = label_width + columns * cell_width + value_width
+    height = 22 + len(cores) * cell_height
+
+    parts: list[str] = []
+    for row, core_id in enumerate(cores):
+        y = 22 + row * cell_height
+        series = peaks.get((dataplane, core_id), {})
+        parts.append(
+            f'<text x="0" y="{y + 11}" class="axis heat-label">'
+            f'{_escape(_core_label(dataplane, core_id, roles))}</text>'
+        )
+        for column, (batch_number, timestamp) in enumerate(batches):
+            x = label_width + column * cell_width
+            if batch_number not in series:
+                parts.append(
+                    f'<rect x="{x}" y="{y}" width="{cell_width - 1}" '
+                    f'height="{cell_height - 1}" fill="#f8fafc" stroke="#e2e8f0"/>'
+                )
+                continue
+            value = series[batch_number]
+            parts.append(
+                f'<rect x="{x}" y="{y}" width="{cell_width - 1}" height="{cell_height - 1}" '
+                f'fill="{_heat_colour(value)}">'
+                f"<title>{_escape(f'batch {batch_number} · core {core_id} · ')}"
+                f"{_escape(_format_number(value))}% · {_escape(timestamp)}</title></rect>"
+            )
+        peak = max(series.values(), default=None)
+        parts.append(
+            f'<text x="{width}" y="{y + 11}" text-anchor="end" class="axis">'
+            f"{_escape(_format_number(peak))}%</text>"
+        )
+
+    for column, (batch_number, _) in enumerate(batches):
+        if column % max(1, math.ceil(columns / 16)) and column != columns - 1:
+            continue
+        parts.append(
+            f'<text x="{label_width + column * cell_width + cell_width / 2:.1f}" y="14" '
+            f'text-anchor="middle" class="axis">{_escape(batch_number)}</text>'
+        )
+
+    scale = "".join(
+        f'<span class="key"><i style="background:{colour}"></i>{label}%</span>'
+        for _, colour, label in _HEAT_SCALE
+    )
+    title = f"Window peak CPU heatmap for {dataplane}"
+    return (
+        f'<svg class="chart" viewBox="0 0 {width} {height}" width="{width}" height="{height}" '
+        f'role="img" aria-label="{_escape(title)}">'
+        f"<title>{_escape(title)}</title>{''.join(parts)}</svg>"
+        f'<p class="chart-legend">{scale}</p>'
+        '<p class="muted chart-caption">One row per core, one column per batch. The '
+        "rightmost figure is the highest window peak the core reached during the run.</p>"
+    )
+
+
+def _dataplane_verdict(
+    dataplane: str,
+    batches: Sequence[tuple[int, str]],
+    comparable: Sequence[str],
+    peaks: dict[tuple[str, str], dict[int, float]],
+    roles: dict[tuple[str, str], dict[str, Any]],
+    labelled: bool,
+) -> str:
+    """State whether the load rose on every comparable core or on a few of them."""
+    if len(comparable) < 2:
+        return (
+            '<p class="muted">Only one comparable core was sampled on '
+            f"{_escape(dataplane)}, so a hot core cannot be told apart from overall load.</p>"
+        )
+
+    hottest_batch = None
+    hottest_value = -1.0
+    hottest_core = ""
+    for batch_number, _ in batches:
+        for core_id in comparable:
+            value = peaks.get((dataplane, core_id), {}).get(batch_number)
+            if value is not None and value > hottest_value:
+                hottest_value, hottest_batch, hottest_core = value, batch_number, core_id
+    if hottest_batch is None:
+        return ""
+
+    values = [
+        peaks[(dataplane, core_id)][hottest_batch]
+        for core_id in comparable
+        if hottest_batch in peaks.get((dataplane, core_id), {})
+    ]
+    median = _median(values)
+    spread = hottest_value - median
+    above_half = sum(1 for value in values if value >= hottest_value / 2)
+
+    if hottest_value < 60:
+        verdict = "No core came close to saturation during this capture."
+        state = "calm"
+    elif spread >= 40 and above_half <= max(1, len(values) // 4):
+        verdict = (
+            f"{_escape(_core_label(dataplane, hottest_core, roles))} peaked at "
+            f"{_escape(_format_number(hottest_value))}% while the median comparable core "
+            f"stayed at {_escape(_format_number(median))}%. An isolated hot core is what "
+            "flow-hash concentration looks like, so a single high-rate session is worth "
+            "checking against the offender and session-rate evidence."
+        )
+        state = "isolated"
+    elif spread < 20:
+        verdict = (
+            f"Every comparable core moved together, peaking at "
+            f"{_escape(_format_number(hottest_value))}% against a median of "
+            f"{_escape(_format_number(median))}%. That is aggregate load rather than one "
+            "session pinned to a core."
+        )
+        state = "collective"
+    else:
+        verdict = (
+            f"{_escape(_core_label(dataplane, hottest_core, roles))} led at "
+            f"{_escape(_format_number(hottest_value))}% with a median of "
+            f"{_escape(_format_number(median))}%. Several cores are loaded and the pattern "
+            "is not conclusive on its own."
+        )
+        state = "mixed"
+
+    note = (
+        ""
+        if labelled
+        else (
+            " Core function groups were not collected, so every sampled core is compared, "
+            "including any that never forward traffic."
+        )
+    )
+    return (
+        f'<p class="verdict verdict-{state}"><strong>{_escape(dataplane)} · batch '
+        f"{_escape(hottest_batch)}</strong> — {verdict}{note}</p>"
+    )
+
+
+def _render_cpu_charts(
+    cycles: Sequence[tuple[int, dict[str, Any]]],
+    core_functions: Sequence[dict[str, Any]],
+) -> str:
+    batches, peaks = _cpu_series(cycles)
+    if not batches or not peaks:
+        return ""
+    roles = _core_roles(core_functions)
+
+    dataplanes: dict[str, list[str]] = {}
+    for dataplane, core_id in peaks:
+        dataplanes.setdefault(dataplane, []).append(core_id)
+
+    sections: list[str] = []
+    for dataplane in sorted(dataplanes):
+        cores = sorted(
+            dataplanes[dataplane],
+            key=lambda core_id: _core_sort_key((dataplane, core_id)),
+        )
+        forwarding = [
+            core_id
+            for core_id in cores
+            if roles.get((dataplane, core_id), {}).get("forwards_traffic")
+        ]
+        labelled = bool(forwarding)
+        comparable = forwarding or cores
+        sections.append(
+            f'<h3>{_escape(dataplane)} <span class="muted">· {_escape(len(cores))} cores'
+            + (
+                f", {_escape(len(forwarding))} forwarding traffic"
+                if labelled
+                else ", function groups unavailable"
+            )
+            + "</span></h3>"
+            + _dataplane_verdict(dataplane, batches, comparable, peaks, roles, labelled)
+            + _line_chart(dataplane, batches, cores, peaks, roles, comparable)
+            + _heatmap(dataplane, batches, cores, peaks, roles)
+        )
+    return "".join(sections)
+
+
 def _render_cpu_tracking(
     cycles: Sequence[tuple[int, dict[str, Any]]],
+    core_functions: Sequence[dict[str, Any]] = (),
 ) -> str:
+    roles = _core_roles(core_functions)
     per_core: dict[
         tuple[str, str], list[tuple[int, str, float, float, int, int]]
     ] = {}
@@ -333,10 +743,13 @@ def _render_cpu_tracking(
         peak_batch, peak_time, _, _, _, _ = next(
             observation for observation in observations if observation[3] == peak
         )
+        role = roles.get((dataplane, core_id))
+        functions = " ".join(role["functions"]) if role else "—"
         core_rows.append(
             "<tr>"
             f'<td>{_escape(dataplane)}</td>'
             f'<td class="number">{_escape(core_id)}</td>'
+            f'<td class="wrap">{_escape(functions)}</td>'
             f'<td class="number">{_escape(len(maximum_values))}</td>'
             f'<td class="number">{_escape(sum(observation[5] for observation in observations))}</td>'
             f'<td class="number">{_escape(_format_number(sum(average_values) / len(average_values)))}</td>'
@@ -354,7 +767,8 @@ def _render_cpu_tracking(
         "corroborating evidence for flow-hash concentration. It does not, by "
         "itself, prove that a single session is responsible.</p>"
         '<h3>Per-core summary</h3><div class="table-wrap"><table><thead><tr>'
-        "<th>Dataplane</th><th>Core</th><th>Windows</th><th>Returned points</th>"
+        "<th>Dataplane</th><th>Core</th><th>Function groups</th><th>Windows</th>"
+        "<th>Returned points</th>"
         "<th>Window average %</th><th>Peak %</th><th>Latest window peak %</th>"
         "<th>Hot points â‰¥ 90%</th><th>Peak batch</th>"
         f"</tr></thead><tbody>{''.join(core_rows)}</tbody></table></div>"
@@ -815,7 +1229,17 @@ def _render_html(
     ]
     attribution = _aggregate_attribution(cycles)
     attribution_html = _render_attribution_table(attribution)
-    cpu_tracking_html = _render_cpu_tracking(cycles)
+    core_functions = next(
+        (
+            record["dp_core_functions"]
+            for _, record in events
+            if isinstance(record.get("dp_core_functions"), list)
+            and record["dp_core_functions"]
+        ),
+        [],
+    )
+    cpu_charts_html = _render_cpu_charts(cycles, core_functions)
+    cpu_tracking_html = _render_cpu_tracking(cycles, core_functions)
     pbp_statuses = [
         record.get("pbp_status")
         for _, record in cycles
@@ -1178,6 +1602,18 @@ def _render_html(
     .pill {{ margin-left:auto; padding:2px 8px; border-radius:999px; background:#dff6f2; color:#115e59; font-size:11px; font-weight:700; }}
     .pill.bad {{ background:#fee4e2; color:var(--danger); }}
     .signal-high {{ color:var(--danger); font-weight:800; }}
+    .chart {{ display:block; max-width:100%; height:auto; margin:6px 0 4px; padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:#fff; }}
+    .chart text.axis {{ fill:#475569; font:11px ui-sans-serif,system-ui,sans-serif; }}
+    .chart text.heat-label {{ font-size:10.5px; }}
+    .chart-legend {{ display:flex; flex-wrap:wrap; gap:6px 14px; margin:2px 0 4px; color:#475569; font-size:12px; }}
+    .chart-legend .key {{ display:inline-flex; align-items:center; gap:6px; }}
+    .chart-legend i {{ width:13px; height:11px; border:1px solid #94a3b8; border-radius:3px; }}
+    .chart-legend i.dashed {{ height:0; border:0; border-top:2px dashed #0f172a; border-radius:0; }}
+    .chart-caption {{ margin:0 0 14px; font-size:12px; }}
+    .verdict {{ margin:8px 0 10px; padding:11px 13px; border-left:4px solid var(--line); border-radius:8px; background:var(--soft); }}
+    .verdict-isolated {{ border-left-color:var(--danger); background:#fef2f2; }}
+    .verdict-collective {{ border-left-color:#0f766e; background:#f0fdfa; }}
+    .verdict-mixed {{ border-left-color:#f59e0b; background:#fffbeb; }}
     code {{ overflow-wrap:anywhere; color:#075985; }}
     .payload-label {{ padding:0 12px; color:#475569; }}
     details.exact-response {{ margin:10px 12px 12px; border:1px solid var(--line); border-radius:8px; background:#fff; overflow:hidden; }}
@@ -1217,6 +1653,7 @@ def _render_html(
     </section>
     <section aria-labelledby="cpu-tracking-title">
       <h2 id="cpu-tracking-title">Dataplane CPU core tracking</h2>
+      {cpu_charts_html}
       {cpu_tracking_html}
     </section>
     <section aria-labelledby="timeline-title">

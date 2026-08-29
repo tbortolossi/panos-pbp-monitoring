@@ -344,5 +344,164 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(list(Path(temporary_directory).glob(".*.tmp")), [])
 
 
+
+class CpuChartTests(unittest.TestCase):
+    """The charts must answer one question: did every core rise, or just one?"""
+
+    FUNCTIONS = [
+        {
+            "dataplane": "dp0",
+            "core_id": "0",
+            "functions": ["pan_timer"],
+            "forwards_traffic": False,
+        },
+        {
+            "dataplane": "dp0",
+            "core_id": "1",
+            "functions": ["flow_lookup", "flow_fastpath", "flow_mgmt"],
+            "forwards_traffic": True,
+        },
+        {
+            "dataplane": "dp0",
+            "core_id": "2",
+            "functions": ["flow_lookup", "flow_fastpath", "flow_ctrl"],
+            "forwards_traffic": True,
+        },
+        {
+            "dataplane": "dp0",
+            "core_id": "3",
+            "functions": ["flow_lookup", "flow_fastpath"],
+            "forwards_traffic": True,
+        },
+        {
+            "dataplane": "dp1",
+            "core_id": "1",
+            "functions": ["flow_lookup", "flow_fastpath"],
+            "forwards_traffic": True,
+        },
+        {
+            "dataplane": "dp1",
+            "core_id": "2",
+            "functions": ["flow_lookup", "flow_fastpath"],
+            "forwards_traffic": True,
+        },
+        {
+            "dataplane": "dp1",
+            "core_id": "3",
+            "functions": ["flow_lookup", "flow_fastpath"],
+            "forwards_traffic": True,
+        },
+    ]
+
+    def _core(self, dataplane: str, core_id: str, value: float) -> dict:
+        return {
+            "dataplane": dataplane,
+            "core_id": core_id,
+            "utilization": value,
+            "average": value,
+            "maximum": value,
+            "window_average": value,
+            "window_peak": value,
+            "seconds_at_or_above_90": 1 if value >= 90 else 0,
+            "sample_count": 5,
+        }
+
+    def _render(self, loads: dict[str, dict[str, float]], functions: list | None) -> str:
+        startup = {
+            "timestamp": "2026-08-27T10:00:00+00:00",
+            "run_id": "chart-run",
+            "event": "monitor_started",
+            "collector_version": "test",
+            "device": {"serial": "fixture", "model": "PA-fixture"},
+            "identity_complete": True,
+        }
+        if functions is not None:
+            startup["dp_core_functions"] = functions
+        records = [startup]
+        for batch in range(1, 5):
+            cores = [
+                self._core(dataplane, core_id, value)
+                for dataplane, per_core in loads.items()
+                for core_id, value in per_core.items()
+            ]
+            records.append(
+                {
+                    "timestamp": f"2026-08-27T10:0{batch}:00+00:00",
+                    "run_id": "chart-run",
+                    "cycle": batch,
+                    "elapsed_seconds": float(batch),
+                    "percentages": {"packet_buffer_congestion": [50]},
+                    "resource_monitor_cpu_cores": cores,
+                    "commands": {},
+                }
+            )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "chart.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            report = generate_html_report(capture, capture.with_suffix(".html"))
+            return report.read_text(encoding="utf-8")
+
+    def test_one_saturated_core_is_reported_as_flow_hash_concentration(self):
+        html = self._render(
+            {"dp0": {"0": 0.0, "1": 12.0, "2": 12.0, "3": 98.0}},
+            self.FUNCTIONS,
+        )
+
+        self.assertIn("verdict-isolated", html)
+        self.assertIn("An isolated hot core is what flow-hash concentration looks like", html)
+        self.assertIn("core 3 · fastpath only", html)
+
+    def test_every_core_rising_together_is_not_blamed_on_one_session(self):
+        html = self._render(
+            {"dp1": {"1": 79.0, "2": 81.0, "3": 80.0}},
+            self.FUNCTIONS,
+        )
+
+        self.assertIn("verdict-collective", html)
+        self.assertIn("aggregate load rather than one session pinned to a core", html)
+        self.assertNotIn("An isolated hot core", html)
+
+    def test_each_dataplane_is_charted_separately(self):
+        html = self._render(
+            {
+                "dp0": {"0": 0.0, "1": 12.0, "2": 12.0, "3": 98.0},
+                "dp1": {"1": 79.0, "2": 81.0, "3": 80.0},
+            },
+            self.FUNCTIONS,
+        )
+
+        self.assertEqual(html.count('<svg class="chart"'), 4)
+        self.assertIn("An isolated hot core", html)
+        self.assertIn("aggregate load rather than one session", html)
+        self.assertNotIn("<script", html.lower())
+
+    def test_cores_are_labelled_and_non_forwarding_cores_are_not_compared(self):
+        html = self._render(
+            {"dp0": {"0": 0.0, "1": 12.0, "2": 12.0, "3": 98.0}},
+            self.FUNCTIONS,
+        )
+
+        self.assertIn("core 0 · pan_timer", html)
+        self.assertIn("core 1 · flow_mgmt", html)
+        self.assertIn("core 2 · flow_ctrl", html)
+        self.assertIn("4 cores, 3 forwarding traffic", html)
+
+    def test_charts_still_render_when_function_groups_are_missing(self):
+        html = self._render({"dp0": {"1": 12.0, "2": 12.0, "3": 98.0}}, None)
+
+        self.assertEqual(html.count('<svg class="chart"'), 2)
+        self.assertIn("function groups unavailable", html)
+        self.assertIn("Core function groups were not collected", html)
+        self.assertIn(">core 3<", html.replace('class="axis heat-label">', ">"))
+
+    def test_charts_are_omitted_when_no_core_was_sampled(self):
+        html = self._render({}, self.FUNCTIONS)
+
+        self.assertNotIn('<svg class="chart"', html)
+        self.assertIn("No per-core CPU samples were recorded.", html)
+
 if __name__ == "__main__":
     unittest.main()

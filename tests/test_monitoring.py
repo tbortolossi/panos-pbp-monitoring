@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from pbp_monitoring import __version__
 from pbp_monitoring.orchestrator import (
     CLOCK_COMMAND,
+    DP_CORE_FUNCTIONS_COMMAND,
     OP_COMMANDS,
     SYSTEM_INFO_COMMAND,
     Config,
@@ -76,6 +77,16 @@ class FakeClient:
             )
         if command == CLOCK_COMMAND:
             return response("<result>Thu Aug 27 10:00:00 UTC 2026</result>")
+        if command == DP_CORE_FUNCTIONS_COMMAND:
+            return response(
+                "<result><entry><dp>dp0</dp><entries>"
+                "<entry><id>0</id><pid>1000</pid><modules>"
+                "<member>pan_timer</member></modules></entry>"
+                "<entry><id>1</id><pid>1001</pid><modules>"
+                "<member>flow_lookup</member><member>flow_fastpath</member>"
+                "<member>flow_ctrl</member></modules></entry>"
+                "</entries></entry></result>"
+            )
         if command == OP_COMMANDS["packet_buffer_protection"]:
             return response("<result>Congestion: 10/100 (10%)</result>")
         if command == OP_COMMANDS["ingress_backlogs"]:
@@ -453,6 +464,7 @@ class MonitorTests(unittest.TestCase):
             asyncio.run(controller._monitor("fixture-run"))
 
             self.assertEqual(client.commands.count(SYSTEM_INFO_COMMAND), 1)
+            self.assertEqual(client.commands.count(DP_CORE_FUNCTIONS_COMMAND), 1)
             self.assertEqual(client.commands.count(CLOCK_COMMAND), 1)
             self.assertEqual(
                 client.commands.count(OP_COMMANDS["global_counters_delta"]),
@@ -474,6 +486,24 @@ class MonitorTests(unittest.TestCase):
             ]
             self.assertEqual(records[0]["event"], "monitor_started")
             self.assertEqual(records[0]["device"]["hostname"], "fixture-fw")
+            self.assertEqual(
+                records[0]["dp_core_functions"],
+                [
+                    {
+                        "dataplane": "dp0",
+                        "core_id": "0",
+                        "functions": ["pan_timer"],
+                        "forwards_traffic": False,
+                    },
+                    {
+                        "dataplane": "dp0",
+                        "core_id": "1",
+                        "functions": ["flow_lookup", "flow_fastpath", "flow_ctrl"],
+                        "forwards_traffic": True,
+                    },
+                ],
+            )
+            self.assertIn("dp_core_functions", records[0]["commands"])
             self.assertIn("global_counters_baseline", records[0]["commands"])
             self.assertEqual(records[1]["firewall_clock"], "Thu Aug 27 10:00:00 UTC 2026")
             self.assertEqual(
@@ -482,6 +512,36 @@ class MonitorTests(unittest.TestCase):
             )
             self.assertTrue(records[1]["recovery_sample_eligible"])
             self.assertEqual(records[-1]["reason"], "resources_recovered")
+
+    def test_unreadable_core_functions_warn_without_stopping_collection(self):
+        class NoStatisticsClient(FakeClient):
+            def op_response(self, command: str) -> PanOSResponse:
+                if command == DP_CORE_FUNCTIONS_COMMAND:
+                    raise PanOSAPIError("unsupported", raw_response="raw failure")
+                return super().op_response(command)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            client = NoStatisticsClient()
+            controller = MonitorController(make_config(output_dir), client)
+            controller.last_trigger_monotonic = 0
+
+            asyncio.run(controller._monitor("no-statistics-run"))
+
+            records = [
+                json.loads(line)
+                for line in incident_capture_path(output_dir, "no-statistics-run")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            startup = records[0]
+            self.assertEqual(startup["dp_core_functions"], [])
+            self.assertIn(
+                "dataplane core function groups could not be read",
+                startup["parse_warnings"],
+            )
+            self.assertTrue(startup["identity_complete"])
+            self.assertGreater(len(records), 2)
 
     def test_partial_metrics_do_not_count_as_recovery(self):
         class PartialClient(FakeClient):

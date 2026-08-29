@@ -12,6 +12,7 @@ from pbp_monitoring.orchestrator import (
     build_candidate_entities,
     derive_session_rates,
     extract_dataplane_pool_statistics,
+    extract_dp_core_functions,
     extract_global_counters,
     extract_ingress_backlogs,
     extract_live_percentages,
@@ -453,6 +454,56 @@ pkt_recv                                  43       11 info      packet    pktpro
         self.assertEqual(parsed["flow_counters"][0]["dataplane"], "dp0")
         self.assertEqual(parsed["flow_counters"][0]["id"], 1131)
         self.assertEqual(len(parsed["significant_counters"]), 1)
+
+    def test_core_function_groups_are_read_from_statistics_xml(self):
+        statistics = """
+<result>
+  <entry><dp>dp0</dp><entries>
+    <entry><id>0</id><pid>1000</pid><modules>
+      <member>pan_timer</member>
+    </modules></entry>
+    <entry><id>1</id><pid>1001</pid><modules>
+      <member>flow_lookup</member><member>flow_fastpath</member>
+      <member>flow_mgmt</member>
+    </modules></entry>
+  </entries></entry>
+  <entry><dp>dp1</dp><entries>
+    <entry><id>1</id><pid>2001</pid><modules>
+      <member>flow_lookup</member><member>flow_fastpath</member>
+    </modules></entry>
+  </entries></entry>
+</result>
+""".strip()
+
+        cores = extract_dp_core_functions(statistics)
+
+        self.assertEqual(
+            [(core["dataplane"], core["core_id"]) for core in cores],
+            [("dp0", "0"), ("dp0", "1"), ("dp1", "1")],
+        )
+        self.assertEqual(cores[0]["functions"], ["pan_timer"])
+        self.assertFalse(cores[0]["forwards_traffic"])
+        self.assertTrue(cores[1]["forwards_traffic"])
+        self.assertIn("flow_mgmt", cores[1]["functions"])
+
+    def test_core_function_groups_fall_back_to_cli_task_lines(self):
+        statistics = (
+            "<result>"
+            "task  0(pid:   4292) pan_timer\n"
+            "task  1(pid:   4287) flow_lookup flow_fastpath flow_ctrl\n"
+            "</result>"
+        )
+
+        cores = extract_dp_core_functions(statistics)
+
+        self.assertEqual([core["core_id"] for core in cores], ["0", "1"])
+        self.assertEqual(cores[0]["dataplane"], "dp0")
+        self.assertEqual(cores[1]["functions"], ["flow_lookup", "flow_fastpath", "flow_ctrl"])
+        self.assertTrue(cores[1]["forwards_traffic"])
+
+    def test_unreadable_statistics_output_yields_no_core_functions(self):
+        self.assertEqual(extract_dp_core_functions(""), [])
+        self.assertEqual(extract_dp_core_functions("<result>not a task list</result>"), [])
 
     def test_resource_monitor_uses_latest_value_from_second_view(self):
         resource_monitor = """
