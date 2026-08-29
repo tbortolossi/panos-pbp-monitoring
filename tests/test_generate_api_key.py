@@ -29,8 +29,8 @@ class FakeResponse:
     def __exit__(self, exc_type, exc_value, traceback):
         return False
 
-    def read(self):
-        return self.body
+    def read(self, limit: int = -1):
+        return self.body if limit is None or limit < 0 else self.body[:limit]
 
 
 class GenerateAPIKeyTests(unittest.TestCase):
