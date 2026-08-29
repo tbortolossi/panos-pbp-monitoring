@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir --no-index --find-links /wheels panos-pbp-monitor
     && rm -rf /wheels
 
 LABEL org.opencontainers.image.title="PAN-OS PBP Monitoring" \
-      org.opencontainers.image.version="0.6.1" \
+      org.opencontainers.image.version="0.7.0" \
       org.opencontainers.image.description="Event-driven PAN-OS packet-buffer diagnostic collector" \
       org.opencontainers.image.source="https://github.com/tbortolossi/panos-pbp-monitoring" \
       org.opencontainers.image.licenses="LicenseRef-Proprietary"

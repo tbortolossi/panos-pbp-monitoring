@@ -25,6 +25,21 @@ DEVICE_IDENTITY = {
     "software_version": "11.1.4-h7",
 }
 
+CORE_FUNCTIONS = [
+    {
+        "dataplane": "dp0",
+        "core_id": "0",
+        "functions": ["pan_timer"],
+        "forwards_traffic": False,
+    },
+    {
+        "dataplane": "dp0",
+        "core_id": "1",
+        "functions": ["flow_lookup", "flow_fastpath", "flow_ctrl"],
+        "forwards_traffic": True,
+    },
+]
+
 
 @contextlib.contextmanager
 def signed_in_admin(root: Path):
@@ -162,7 +177,10 @@ class AdminUITests(unittest.TestCase):
                     "pbp_monitoring.adminui.generate_api_key", return_value="generated-key"
                 ) as keygen, patch(
                     "pbp_monitoring.adminui.fetch_system_info", return_value=dict(DEVICE_IDENTITY)
-                ) as system_info:
+                ) as system_info, patch(
+                    "pbp_monitoring.adminui.fetch_dp_core_functions",
+                    return_value=[dict(entry) for entry in CORE_FUNCTIONS],
+                ):
                     saved = opener.open(
                         Request(
                             base + "/admin/target/save",
@@ -194,6 +212,9 @@ class AdminUITests(unittest.TestCase):
                 self.assertEqual(target.api_key, "generated-key")
                 self.assertEqual(target.tls_verify, "false")
                 self.assertIsNone(target.target_serial)
+                self.assertEqual(target.dp_core_functions, tuple(CORE_FUNCTIONS))
+                self.assertEqual(target.dp_core_functions_identity, "PA-440|11.1.4-h7")
+                self.assertIn("2 dataplane cores mapped", saved)
 
     def test_a_blank_name_falls_back_to_the_panos_hostname(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -201,6 +222,9 @@ class AdminUITests(unittest.TestCase):
             with signed_in_admin(root) as (opener, base, csrf, _page):
                 with patch(
                     "pbp_monitoring.adminui.fetch_system_info", return_value=dict(DEVICE_IDENTITY)
+                ), patch(
+                    "pbp_monitoring.adminui.fetch_dp_core_functions",
+                    return_value=[dict(entry) for entry in CORE_FUNCTIONS],
                 ):
                     page = opener.open(
                         Request(
@@ -307,7 +331,10 @@ class AdminUITests(unittest.TestCase):
                 self.assertIn("198.51.100.7", form)
                 with patch(
                     "pbp_monitoring.adminui.fetch_system_info", return_value=dict(DEVICE_IDENTITY)
-                ) as system_info:
+                ) as system_info, patch(
+                    "pbp_monitoring.adminui.fetch_dp_core_functions",
+                    return_value=[dict(entry) for entry in CORE_FUNCTIONS],
+                ):
                     opener.open(
                         Request(
                             base + "/admin/target/save",

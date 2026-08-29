@@ -11,6 +11,7 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_ope
 
 
 SYSTEM_INFO_COMMAND = "<show><system><info/></system></show>"
+DP_CORE_FUNCTIONS_COMMAND = "<show><statistics/></show>"
 
 
 class PanOSAdminError(RuntimeError):
@@ -159,3 +160,43 @@ def fetch_system_info(
     if not identity.get("serial"):
         raise SystemInfoError("PAN-OS did not return a device serial number")
     return identity
+
+
+def fetch_dp_core_functions(
+    firewall_url: str,
+    api_key: str,
+    *,
+    ssl_context: ssl.SSLContext,
+    timeout: float = 15.0,
+    opener: object = _open_without_redirects,
+) -> list[dict[str, object]]:
+    """Read the static dataplane core-to-function-group map, tolerating failure.
+
+    PAN-OS assigns fixed function groups to each dataplane core, so this map
+    only has to be read once per firewall. It is diagnostic context rather than
+    a validation step: a firewall that cannot answer must still be saved, so
+    every failure returns an empty map instead of raising.
+    """
+    body = urlencode({"type": "op", "cmd": DP_CORE_FUNCTIONS_COMMAND}).encode()
+    request = Request(
+        f"{firewall_url}/api/",
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    request.add_unredirected_header("X-PAN-KEY", api_key)
+    try:
+        root = _read_api_response(
+            request,
+            ssl_context=ssl_context,
+            timeout=timeout,
+            opener=opener,
+            error=SystemInfoError,
+        )
+    except PanOSAdminError:
+        return []
+    if root.attrib.get("status") != "success":
+        return []
+    from .orchestrator import extract_dp_core_functions
+
+    return extract_dp_core_functions(ET.tostring(root, encoding="unicode"))

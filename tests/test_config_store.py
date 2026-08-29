@@ -126,6 +126,8 @@ class ConfigStoreTests(unittest.TestCase):
             migrated = store.list_targets()[0]
             self.assertEqual(migrated["tls_verify"], "true")
             self.assertIsNone(migrated["hostname"])
+            self.assertEqual(migrated["dp_core_functions"], ())
+            self.assertIsNone(migrated["dp_core_functions_identity"])
             self.assertNotIn("tls_verify", store.get_settings())
 
     def test_device_identity_is_stored_and_kept_when_not_refreshed(self):
@@ -151,6 +153,39 @@ class ConfigStoreTests(unittest.TestCase):
             )
 
             self.assertEqual(store.list_targets()[0]["hostname"], "lab-fw-01")
+
+    def test_core_map_is_stored_with_the_release_it_was_captured_on(self):
+        core_functions = [
+            {
+                "dataplane": "dp0",
+                "core_id": "1",
+                "functions": ["flow_lookup", "flow_fastpath"],
+                "forwards_traffic": True,
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = ConfigStore(Path(temporary_directory) / "config.db")
+            store.initialize()
+            target_id = store.save_target(
+                name="fw-a", panos_url="https://192.0.2.10", api_key="key",
+                serials=["001122"], syslog_sources=["192.0.2.10"],
+                device_identity={
+                    "hostname": "lab-fw-01", "model": "PA-440", "software_version": "11.1.4-h7"
+                },
+                dp_core_functions=core_functions,
+            )
+            stored = store.list_targets(include_secrets=True)[0]
+            self.assertEqual(stored.dp_core_functions, tuple(core_functions))
+            self.assertEqual(stored.dp_core_functions_identity, "PA-440|11.1.4-h7")
+
+            store.save_target(
+                target_id=target_id, name="fw-a", panos_url="https://192.0.2.10",
+                api_key=None, serials=["001122"], syslog_sources=["192.0.2.10"],
+            )
+
+            kept = store.list_targets(include_secrets=True)[0]
+            self.assertEqual(kept.dp_core_functions, tuple(core_functions))
+            self.assertEqual(kept.dp_core_functions_identity, "PA-440|11.1.4-h7")
 
 
 if __name__ == "__main__":
