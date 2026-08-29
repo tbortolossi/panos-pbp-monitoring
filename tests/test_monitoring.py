@@ -1162,5 +1162,72 @@ class FirewallCheckTests(unittest.TestCase):
             captures = list((root / "data" / "targets" / "fw-a" / "api-checks").iterdir())
             self.assertEqual(len(captures), 1)
 
+    def test_a_firewall_saved_after_startup_is_checked_without_syslog_traffic(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = ConfigStore(root / "config.db")
+            store.initialize()
+            with patch.dict(os.environ, {"OUTPUT_DIR": str(root / "data")}):
+                cfg = Config.from_store(store)
+            router = ManagedRouter(cfg, store)
+            store.save_target(
+                name="fw-a",
+                panos_url="https://192.0.2.10",
+                api_key="key",
+                serials=["fixture-serial"],
+                syslog_sources=["192.0.2.10"],
+                device_identity={
+                    "hostname": "fixture-fw",
+                    "model": "PA-VM",
+                    "software_version": "11.2.4",
+                },
+                dp_core_functions=self.CORE_MAP,
+            )
+            store.request_target_check(store.list_targets()[0]["target_id"])
+            client = FakeClient()
+
+            with patch("pbp_monitoring.orchestrator.PanOSClient", return_value=client):
+                performed = asyncio.run(run_target_checks_once(router))
+
+            self.assertEqual(performed, 1)
+            recorded = store.list_targets()[0]
+            self.assertIsNone(recorded["check_requested_at"])
+            self.assertEqual(recorded["last_check_kind"], "validation")
+
+    def test_an_edited_firewall_is_checked_at_its_new_address(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            router, store = self._router(root, identity="PA-VM|11.2.4")
+            recorded = store.list_targets(include_secrets=True)[0]
+            store.save_target(
+                target_id=recorded.target_id,
+                name="fw-a",
+                panos_url="https://192.0.2.20",
+                api_key="key",
+                serials=["fixture-serial"],
+                syslog_sources=["192.0.2.20"],
+                device_identity={
+                    "hostname": "fixture-fw",
+                    "model": "PA-VM",
+                    "software_version": "11.2.4",
+                },
+                dp_core_functions=self.CORE_MAP,
+            )
+            store.request_target_check(store.list_targets()[0]["target_id"])
+            captured_urls: list[str] = []
+
+            def capture_client(cfg):
+                captured_urls.append(cfg.panos_url)
+                return FakeClient()
+
+            with patch(
+                "pbp_monitoring.orchestrator.PanOSClient",
+                side_effect=capture_client,
+            ):
+                asyncio.run(run_target_checks_once(router))
+
+            self.assertTrue(captured_urls)
+            self.assertEqual(set(captured_urls), {"https://192.0.2.20"})
+
 if __name__ == "__main__":
     unittest.main()

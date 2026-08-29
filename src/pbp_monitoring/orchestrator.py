@@ -3807,6 +3807,10 @@ async def run_target_checks_once(router: "ManagedRouter") -> int:
     every few seconds while under packet-buffer pressure, and a check must never
     compete with the diagnostic batches.
     """
+    # The loop runs outside the Syslog datagram path, so it must refresh the
+    # in-memory profiles itself or a firewall saved after startup stays
+    # invisible until an unrelated datagram arrives.
+    router._reload_if_needed()
     store = router.store
     try:
         targets = [
