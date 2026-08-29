@@ -38,6 +38,10 @@ accordingly:
   target credentials.
 - `Dockerfile`, `compose.yaml`, and `docker/`: supported container deployment.
 - `PRD.md`: authoritative product behavior and acceptance criteria.
+- `README.md`: project overview, quick start, and security model. The detailed
+  operator documentation lives in `docs/installation.md`, `docs/operations.md`,
+  `docs/reporting.md`, and `docs/troubleshooting.md`; keep the page that owns a
+  behavior in sync when that behavior changes.
 
 ## Change rules
 
@@ -173,10 +177,26 @@ section still forbids any change to PAN-OS state.
    template: summary, validation checklist, and safety confirmation. CI runs
    the unit tests and `compileall` on Python 3.10 and 3.13, plus
    `docker compose config`.
-8. **Merge.** Only with green CI: `gh pr merge --squash --delete-branch`, then
-   `git checkout main && git pull`. Tag only when publishing a version bump:
-   `git tag -a v<x.y.z>` and push the tag. Both run without asking; a red or
-   missing check turns this back into a question for the maintainer.
+8. **Merge and publish.** Only with green CI: `gh pr merge --squash
+   --delete-branch`, then `git checkout main && git pull`. Tag only when
+   publishing a version bump: `git tag -a v<x.y.z>` and push the tag. Both run
+   without asking; a red or missing check turns this back into a question for
+   the maintainer.
+
+   A pushed tag is not a published version. Every tag must also carry a GitHub
+   release, otherwise the repository's front page keeps advertising an old
+   version as the latest one. Create it in the same step, with the notes taken
+   verbatim from the matching `CHANGELOG.md` section:
+
+   ```bash
+   gh release create v<x.y.z> --verify-tag --latest \
+     --title "v<x.y.z> — <short headline>" --notes-file <notes.md>
+   ```
+
+   Then confirm with `gh release list` that the new version is the one marked
+   `Latest`. Check the same thing whenever a release is mentioned: run
+   `git tag --sort=-v:refname | head -1` against `gh release view --json tagName`
+   and reconcile any tag left without a release.
 9. **Rebuild.** After any change to the image or its code:
    `docker compose build && docker compose up -d && docker compose ps`, and
    confirm the three services are healthy. The `config` and `captures` volumes
