@@ -32,5 +32,11 @@ application content. Install and validate the generated self-signed certificate,
 or configure a certificate issued by the organization's trusted CA, before
 entering credentials on an untrusted network.
 
-Plain TCP and UDP Syslog are not encrypted. Use a TLS-capable gateway or a
-protected management network when transport confidentiality is required.
+Plain TCP and UDP Syslog are not encrypted and carry no source authentication.
+The collector's source-address and device-serial gates attribute a message to
+a registered firewall; they do not authenticate the sender, because a serial
+is printed in every PAN-OS log. Run the Syslog path over a trusted or tightly
+filtered network segment. The collector additionally caps monitoring-run
+starts per firewall per hour so a forged trigger stream cannot cycle
+collection runs without limit. Use a TLS-capable gateway or a protected
+management network when transport confidentiality is required.

@@ -1145,6 +1145,63 @@ class MonitorTests(unittest.TestCase):
 
 
 
+class RunStartRateLimitTests(unittest.TestCase):
+    """A forged trigger flood must not cycle unlimited monitoring runs."""
+
+    def test_run_starts_beyond_the_window_limit_are_journalled_only(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            started = 0
+            with patch.object(
+                controller, "_monitor", side_effect=lambda run_id: asyncio.sleep(0)
+            ):
+                with patch("pbp_monitoring.orchestrator.RUN_START_LIMIT", 3):
+                    for _ in range(5):
+                        controller.trigger("PBP Packet Drop (8507)", "192.0.2.1:514")
+                        if controller.monitor_task is not None:
+                            await asyncio.gather(
+                                controller.monitor_task, return_exceptions=True
+                            )
+                    started = len(controller.run_starts)
+            return started
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            started = asyncio.run(scenario(make_config(output_dir)))
+
+            self.assertEqual(started, 3)
+            journal = (output_dir / "syslog-triggers.jsonl").read_text(encoding="utf-8")
+            records = [json.loads(line) for line in journal.splitlines()]
+            limited = [
+                record
+                for record in records
+                if record.get("event") == "trigger_rate_limited"
+            ]
+            self.assertEqual(len(limited), 2)
+
+    def test_a_reinforcement_is_never_rate_limited(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            active = asyncio.create_task(asyncio.sleep(30))
+            controller.monitor_task = active
+            try:
+                with patch("pbp_monitoring.orchestrator.RUN_START_LIMIT", 0):
+                    controller.trigger("PBP Packet Drop (8507)", "192.0.2.1:514")
+                return controller.trigger_sequence
+            finally:
+                active.cancel()
+                await asyncio.gather(active, return_exceptions=True)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            sequence = asyncio.run(scenario(make_config(output_dir)))
+
+            self.assertEqual(sequence, 1)
+            journal = (output_dir / "syslog-triggers.jsonl").read_text(encoding="utf-8")
+            record = json.loads(journal.splitlines()[0])
+            self.assertEqual(record.get("event"), "trigger_received")
+
+
 class RunIdTests(unittest.TestCase):
     """Two incidents in the same wall-clock second must not share a capture."""
 

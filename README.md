@@ -499,6 +499,16 @@ no API call, so a spoofed or stray sender cannot make the collector fill the
 capture volume. A firewall saved without a serial on record keeps the
 source-only rule until it is saved again.
 
+**Trust model.** UDP Syslog carries no source authentication, and the device
+serial appears in every PAN-OS log and support case: the two gates *attribute*
+a message to a firewall, they do not *authenticate* it. Someone who knows a
+registered firewall's address and serial can forge accepted triggers. Run the
+Syslog path over a trusted network segment (management VLAN, tunnel, or a
+tightly filtered path), exactly like the API path. As a damage limit, the
+collector starts at most 12 monitoring runs per firewall per hour; triggers
+beyond that are journalled as `trigger_rate_limited` without starting a run,
+and reinforcements of an active run are never limited.
+
 The reception journal is intentionally bounded, so the second file contains the
 matching messages still retained when the ZIP is downloaded. The authoritative
 trigger copies remain in `incident.jsonl` and the target trigger journal. A ZIP
