@@ -1145,6 +1145,34 @@ class MonitorTests(unittest.TestCase):
 
 
 
+class StopRecordSummaryTests(unittest.TestCase):
+    """The stop marker must summarize the run for the dashboard's tail read."""
+
+    def test_monitor_stopped_carries_peak_buffer_and_top_sources(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            controller.trigger_source_ips = {"203.0.113.7"}
+            await controller._monitor("fixture-run")
+            await controller.wait_for_reports()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            asyncio.run(scenario(make_config(output_dir)))
+
+            capture = incident_capture_path(output_dir, "fixture-run")
+            records = [
+                json.loads(line)
+                for line in capture.read_text(encoding="utf-8").splitlines()
+            ]
+            stop = next(
+                record
+                for record in records
+                if record.get("event") == "monitor_stopped"
+            )
+            self.assertEqual(stop["peak_packet_buffer_pct"], 10.0)
+            self.assertEqual(stop["top_sources"], ["203.0.113.7"])
+
+
 class WebhookNotificationTests(unittest.TestCase):
     """An incident must announce itself without ever blocking the monitor."""
 

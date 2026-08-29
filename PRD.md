@@ -212,7 +212,9 @@ counter views, parsing status, and raw XML command responses. A
 `monitor_started` record preserves the identity returned by `show system info`
 and the `dp_core_functions` core-to-function-group map with the
 `dp_core_functions_source` field naming where that map came from, and a
-`monitor_stopped` record gives the stop reason. Multi-target mode roots
+`monitor_stopped` record gives the stop reason together with a run summary
+(peak packet-buffer percentage and top ranked sources) that the dashboard
+reads from its bounded tail read to compare runs. Multi-target mode roots
 these files below `targets/<target-name>/` and adds `syslog-routing.jsonl` for
 probe and routing evidence.
 
