@@ -760,6 +760,15 @@ def handler_factory(
             if path == "/healthz":
                 self._send_bytes(b"ok\n", "text/plain; charset=utf-8")
                 return
+            if admin is not None and not admin.is_authenticated(self):
+                # Incident evidence carries serials, addresses, session tuples
+                # and raw command output: it is gated by the same session as
+                # the configuration, and fails closed.
+                self.send_response(303)
+                self.send_header("Location", "/admin")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
             if path == "/":
                 effective_freshness = freshness_seconds
                 if config_store is not None:

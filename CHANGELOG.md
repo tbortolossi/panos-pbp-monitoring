@@ -5,6 +5,16 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [0.15.0] - Unreleased
 
+### Security
+
+- The dashboard, HTML reports, JSONL captures, TXT exports, and support ZIP
+  archives now require the administrator sign-in. Incident evidence carries
+  device serials, addresses, session tuples, and raw command output; it was
+  previously served to anyone who could reach the web port. Only `/healthz`
+  stays open for the container health check. The admin session cookie scope
+  widened from `/admin` to the whole site; an existing session may need one
+  new sign-in after the upgrade.
+
 ### Fixed
 
 - A shared Syslog source without a registered serial no longer probes every

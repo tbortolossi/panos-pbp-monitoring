@@ -6,6 +6,7 @@ import csv
 import html
 import ipaddress
 import io
+import logging
 import re
 import secrets
 import sqlite3
@@ -27,6 +28,8 @@ from .panos_keygen import (
     normalize_firewall_url,
 )
 
+
+LOG = logging.getLogger("pbp-adminui")
 
 SESSION_SECONDS = 8 * 60 * 60
 PENDING_CHECK_REFRESH_SECONDS = 5
@@ -202,6 +205,19 @@ class AdminController:
             raise ValueError("invalid form size")
         values = parse_qs(handler.rfile.read(length).decode("utf-8"), keep_blank_values=True)
         return {key: items[-1] for key, items in values.items() if items}
+
+    def is_authenticated(self, handler: Any) -> bool:
+        """Report whether this request carries a live administrator session.
+
+        Used by the dashboard to gate incident evidence behind the same
+        session as the configuration. Fails closed: no password configured or
+        no valid cookie both deny.
+        """
+        try:
+            return self.store.has_admin_password() and self._session(handler) is not None
+        except Exception:
+            LOG.exception("Unable to evaluate the administrator session")
+            return False
 
     def _session(self, handler: Any) -> tuple[str, str] | None:
         cookie = SimpleCookie(handler.headers.get("Cookie", ""))
@@ -566,7 +582,7 @@ with <code>show system info</code>: it validates the credentials and reads the d
                         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
                         self.sessions[token] = (time.monotonic() + SESSION_SECONDS, csrf)
                         secure = "; Secure" if self.secure_cookie else ""
-                        self._redirect(handler, "/admin", f"PBPADMIN={token}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS}{secure}")
+                        self._redirect(handler, "/admin", f"PBPADMIN={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS}{secure}")
                 else:
                     self._send(handler, self._login_page())
                 return True
@@ -613,7 +629,7 @@ with <code>show system info</code>: it validates the credentials and reads the d
             if path == "/admin/logout":
                 self.sessions.pop(token, None)
                 secure = "; Secure" if self.secure_cookie else ""
-                self._redirect(handler, "/admin", f"PBPADMIN=; Path=/admin; Max-Age=0; HttpOnly; SameSite=Strict{secure}")
+                self._redirect(handler, "/admin", f"PBPADMIN=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure}")
             elif path == "/admin/recovery-key/ack":
                 self.store.acknowledge_recovery_key()
                 self._send(handler, self._dashboard(csrf, "Recovery key delivery acknowledged.", syslog=syslog))
@@ -631,7 +647,7 @@ with <code>show system info</code>: it validates the credentials and reads the d
                 self._redirect(
                     handler,
                     "/admin",
-                    f"PBPADMIN=; Path=/admin; Max-Age=0; HttpOnly; SameSite=Strict{secure}",
+                    f"PBPADMIN=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure}",
                 )
             elif path == "/admin/target/check":
                 self.store.request_target_check(int(form["target_id"]))
