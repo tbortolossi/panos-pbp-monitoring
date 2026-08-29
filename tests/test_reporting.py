@@ -203,6 +203,61 @@ class ReportingTests(unittest.TestCase):
             if os.name == "posix":
                 self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o600)
 
+    def test_offender_traffic_logs_render_their_recovered_flows(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "incident.jsonl"
+            self._write_records(
+                capture,
+                [
+                    {
+                        "timestamp": "2026-08-29T10:00:00+00:00",
+                        "run_id": "fixture-run",
+                        "cycle": 1,
+                        "elapsed_seconds": 1.0,
+                        "percentages": {"packet_buffer_congestion": [62]},
+                    },
+                    {
+                        "timestamp": "2026-08-29T10:01:00+00:00",
+                        "run_id": "fixture-run",
+                        "event": "offender_traffic_logs",
+                        "sources": [
+                            {
+                                "source_ip": "203.0.113.7",
+                                "ok": True,
+                                "entries": [
+                                    {
+                                        "receive_time": "2026/08/29 10:00:05",
+                                        "source_ip": "203.0.113.7",
+                                        "destination_ip": "198.51.100.15",
+                                        "destination_port": "443",
+                                        "protocol": "udp",
+                                        "application": "not-applicable",
+                                        "rule": "deny-flood<&>",
+                                        "action": "deny",
+                                        "from_zone": "outside",
+                                        "to_zone": "inside",
+                                    }
+                                ],
+                            },
+                            {
+                                "source_ip": "203.0.113.8",
+                                "ok": False,
+                                "error": "log job 272 did not finish within 20s",
+                            },
+                        ],
+                    },
+                ],
+            )
+
+            report = generate_html_report(capture)
+            rendered = report.read_text(encoding="utf-8")
+
+            self.assertIn("Traffic log evidence for unenriched sources", rendered)
+            self.assertIn("198.51.100.15", rendered)
+            self.assertIn("deny-flood&lt;&amp;&gt;", rendered)
+            self.assertIn("did not finish within 20s", rendered)
+            self.assertNotIn("deny-flood<&>", rendered)
+
     def test_invalid_truncated_and_non_object_lines_are_warnings(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             capture = Path(temporary_directory) / "partial.jsonl"

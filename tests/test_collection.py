@@ -24,6 +24,8 @@ from pbp_monitoring.orchestrator import (
     extract_session_summary,
     extract_system_info,
     extract_trigger_metadata,
+    extract_log_job_status,
+    extract_traffic_log_entries,
 )
 
 
@@ -84,6 +86,44 @@ class PanOSClientCollectionTests(unittest.TestCase):
             "<result><value>ready</value></result>",
         )
         self.assertEqual(client.op(command), response.result_xml)
+
+    @patch("pbp_monitoring.orchestrator.build_opener")
+    def test_log_query_enqueues_then_fetches_and_parses_the_job(self, mocked_build_opener):
+        enqueue = (
+            '<response status="success"><result>'
+            "<msg><line>query job enqueued with jobid 271</line></msg>"
+            "<job>271</job></result></response>"
+        )
+        result = (
+            '<response status="success"><result>'
+            "<job><status>FIN</status><id>271</id></job>"
+            '<log><logs count="1"><entry logid="1">'
+            "<receive_time>2026/08/29 10:00:05</receive_time>"
+            "<src>203.0.113.7</src><dst>198.51.100.15</dst>"
+            "<sport>54321</sport><dport>443</dport><proto>udp</proto>"
+            "<app>not-applicable</app><rule>deny-flood</rule>"
+            "<action>deny</action><from>outside</from><to>inside</to>"
+            "<session_end_reason>policy-deny</session_end_reason>"
+            "</entry></logs></log></result></response>"
+        )
+        mocked_build_opener.return_value.open.side_effect = [
+            StubHTTPResponse(enqueue),
+            StubHTTPResponse(result),
+        ]
+        client = make_client()
+
+        job = client.log_query_job("traffic", "(addr.src in '203.0.113.7')", 20)
+        response = client.log_query_result(job)
+
+        self.assertEqual(job, "271")
+        self.assertEqual(extract_log_job_status(response.result_xml), "FIN")
+        entries = extract_traffic_log_entries(response.result_xml)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["destination_ip"], "198.51.100.15")
+        self.assertEqual(entries[0]["destination_port"], "443")
+        self.assertEqual(entries[0]["rule"], "deny-flood")
+        self.assertEqual(entries[0]["action"], "deny")
+        self.assertEqual(entries[0]["from_zone"], "outside")
 
     @patch("pbp_monitoring.orchestrator.build_opener")
     def test_a_doctype_in_the_response_is_refused(self, mocked_build_opener):

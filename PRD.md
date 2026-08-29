@@ -132,7 +132,14 @@ than create a concurrent one.
 9. The monitor stops after N consecutive complete measurements below the
    recovery threshold, after the configurable time-to-live since the last
    matching alert, or after the maximum duration. A new trigger resets the
-   recovery sequence and the alert inactivity timer.
+   recovery sequence and the alert inactivity timer. At stop (except on
+   service shutdown), the collector runs one bounded read-only traffic-log
+   query per top ranked source IP that had no session to inspect (at most 3
+   sources, 20 entries each, fixed query template interpolating only a
+   validated address): traffic denied before session setup or RED-blocked has
+   no session, and the firewall's own traffic log carries its destination,
+   port, rule, and action. Raw responses are preserved as evidence and a
+   failed lookup never blocks the stop marker or the report.
 10. After the stop marker is written, a standalone HTML report is generated in
    the background from the JSONL file.
 11. Each completed batch also writes an atomic TXT view of its command and

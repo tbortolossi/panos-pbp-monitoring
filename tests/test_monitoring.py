@@ -1145,6 +1145,82 @@ class MonitorTests(unittest.TestCase):
 
 
 
+class OffenderTrafficLogTests(unittest.TestCase):
+    """Sources without a session get one bounded traffic-log lookup at stop."""
+
+    class LogClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.queries = []
+
+        def log_query_job(self, log_type, query, nlogs):
+            self.queries.append((log_type, query, nlogs))
+            return "271"
+
+        def log_query_result(self, job_id):
+            return PanOSResponse(
+                result_xml=(
+                    "<result><job><status>FIN</status></job>"
+                    '<log><logs count="1"><entry>'
+                    "<receive_time>2026/08/29 10:00:05</receive_time>"
+                    "<src>203.0.113.7</src><dst>198.51.100.15</dst>"
+                    "<sport>54321</sport><dport>443</dport><proto>udp</proto>"
+                    "<app>not-applicable</app><rule>deny-flood</rule>"
+                    "<action>deny</action><from>outside</from><to>inside</to>"
+                    "</entry></logs></log></result>"
+                ),
+                raw_response="<response status=\"success\"/>",
+            )
+
+    def test_only_valid_addresses_are_queried_and_evidence_is_written(self):
+        async def scenario(cfg):
+            client = self.LogClient()
+            controller = MonitorController(cfg, client)
+            output_file = incident_capture_path(cfg.output_dir, "fixture-run")
+            await controller._collect_offender_traffic_logs(
+                output_file,
+                "fixture-run",
+                {"203.0.113.7": 4, "not-an-address": 9},
+            )
+            return client, output_file
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            client, output_file = asyncio.run(
+                scenario(make_config(Path(temporary_directory)))
+            )
+
+            self.assertEqual(
+                client.queries,
+                [("traffic", "(addr.src in '203.0.113.7')", 20)],
+            )
+            record = json.loads(
+                output_file.read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(record["event"], "offender_traffic_logs")
+            source = record["sources"][0]
+            self.assertTrue(source["ok"])
+            self.assertEqual(source["source_ip"], "203.0.113.7")
+            self.assertEqual(source["entries"][0]["rule"], "deny-flood")
+            self.assertEqual(source["entries"][0]["destination_ip"], "198.51.100.15")
+
+    def test_the_monitor_stop_path_queries_ranked_sources(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            controller.trigger_source_ips = {"203.0.113.7"}
+            with patch.object(
+                controller, "_collect_offender_traffic_logs", new=AsyncMock()
+            ) as lookup:
+                await controller._monitor("fixture-run")
+            return lookup
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            lookup = asyncio.run(scenario(make_config(Path(temporary_directory))))
+
+            lookup.assert_awaited_once()
+            offender_sources = lookup.await_args.args[2]
+            self.assertIn("203.0.113.7", offender_sources)
+
+
 class TriggerFlowExtractionTests(unittest.TestCase):
     """A THREAT trigger's positional fields must feed the enrichment path."""
 

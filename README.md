@@ -542,6 +542,15 @@ counted while a source IP is ranked without an enriched session, the report
 states that correlation explicitly. The **Denied packets** summary card carries
 the same total, adding policy deny to DoS and zone-protection drops.
 
+For exactly those sources, the collector recovers the missing flow detail from
+the firewall itself: at monitor stop it runs one bounded, read-only traffic-log
+query per top ranked source without a session (at most 3 sources, 20 entries
+each), and the report's **Traffic log evidence for unenriched sources** section
+lists the recovered destinations, ports, applications, rules, and actions — the
+part of the source/destination/port/application answer that no session command
+can provide for denied traffic. The raw log responses are preserved in the
+JSONL capture, and a failed lookup never delays the stop marker or the report.
+
 The **Session table** section follows `show session info` batch by batch: the
 allocated sessions and the table utilization, the split by protocol with the
 remainder shown as `Other`, the new connection rate, the packet rate, the

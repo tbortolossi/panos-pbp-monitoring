@@ -7,6 +7,13 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Unenriched offender sources now get flow detail from the firewall's own
+  traffic log. When a ranked source IP had no session to inspect (flood
+  denied before session setup, RED-blocked source), the collector runs one
+  bounded read-only log query per top source at monitor stop and the HTML
+  report gains a "Traffic log evidence for unenriched sources" section with
+  the recovered destinations, ports, rules, and actions. Raw responses are
+  preserved in the capture as TAC evidence.
 - The responsible flow is now extracted from the trigger itself. A PBP THREAT
   log (8507/8508/8509) positionally carries the source and destination
   address, ports, application, rule, zones, ingress interface, and session ID
