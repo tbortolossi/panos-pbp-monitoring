@@ -539,9 +539,12 @@ def render_dashboard(state: dict[str, Any], refresh_seconds: int = 5) -> str:
         kind = metadata.get("trigger_type") or (
             "trigger" if record.get("trigger") else "other"
         )
-        message = str(record.get("message", ""))
-        if len(message) > 320:
-            message = message[:317] + "..."
+        if record.get("suppressed") == "source_not_registered":
+            message = "not stored: source is not a registered firewall"
+        else:
+            message = str(record.get("message", ""))
+            if len(message) > 320:
+                message = message[:317] + "..."
         log_rows.append(
             "<tr>"
             f"<td>{_escape(record.get('timestamp'))}</td>"

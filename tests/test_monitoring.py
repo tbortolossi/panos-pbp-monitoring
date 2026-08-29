@@ -153,6 +153,114 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(records[1]["metadata"]["threat_id"], 8507)
             controller.trigger.assert_called_once()
 
+    def test_unregistered_sender_is_journalled_without_its_message(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            profiles = (
+                TargetProfile(
+                    "declared",
+                    "https://fw.invalid",
+                    "key",
+                    syslog_sources=("198.51.100.1",),
+                ),
+            )
+            cfg = make_config(output_dir, target_profiles=profiles)
+            router = MultiTargetRouter(cfg)
+            protocol = SyslogProtocol(cfg, router)
+
+            protocol.datagram_received(
+                b"PBP_SYSLOG_SOURCE=203.0.113.9 secrets and PBP Packet Drop(8507)",
+                ("192.0.2.3", 514),
+            )
+
+            record = json.loads(
+                (output_dir / "syslog-received.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertEqual(record["suppressed"], "source_not_registered")
+            self.assertNotIn("message", record)
+            self.assertEqual(record["target_names"], [])
+            self.assertEqual(record["metadata"], {"syslog_source_ip": "203.0.113.9"})
+            self.assertTrue(record["trigger"])
+            self.assertNotIn("secrets", json.dumps(record))
+
+    def test_registered_sender_keeps_its_message_and_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            profiles = (
+                TargetProfile(
+                    "declared",
+                    "https://fw.invalid",
+                    "key",
+                    syslog_sources=("198.51.100.1",),
+                ),
+            )
+            cfg = make_config(output_dir, target_profiles=profiles)
+            router = MultiTargetRouter(cfg)
+            router.controllers["declared"].trigger = Mock()
+            protocol = SyslogProtocol(cfg, router)
+
+            protocol.datagram_received(
+                b"PBP_SYSLOG_SOURCE=198.51.100.1 PBP Packet Drop(8507)",
+                ("192.0.2.3", 514),
+            )
+
+            record = json.loads(
+                (output_dir / "syslog-received.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertNotIn("suppressed", record)
+            self.assertIn("PBP Packet Drop(8507)", record["message"])
+            self.assertEqual(record["metadata"]["threat_id"], 8507)
+            self.assertEqual(record["target_names"], ["declared"])
+
+    def test_allowlisted_but_unattributed_sender_keeps_its_message(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            shared = ("198.51.100.1",)
+            profiles = (
+                TargetProfile("first", "https://a.invalid", "key", syslog_sources=shared),
+                TargetProfile("second", "https://b.invalid", "key", syslog_sources=shared),
+            )
+            cfg = make_config(output_dir, target_profiles=profiles)
+            router = MultiTargetRouter(cfg)
+            router._probe_and_dispatch = AsyncMock()
+            protocol = SyslogProtocol(cfg, router)
+
+            protocol.datagram_received(
+                b"PBP_SYSLOG_SOURCE=198.51.100.1 ordinary system log",
+                ("192.0.2.3", 514),
+            )
+
+            record = json.loads(
+                (output_dir / "syslog-received.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertNotIn("suppressed", record)
+            self.assertIn("ordinary system log", record["message"])
+            self.assertEqual(record["target_names"], [])
+
+    def test_single_target_deployment_still_stores_every_message(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            controller = Mock(spec=["trigger"])
+            protocol = SyslogProtocol(
+                make_config(output_dir, target_name="solo"), controller
+            )
+
+            protocol.datagram_received(b"ordinary system log", ("192.0.2.10", 514))
+
+            record = json.loads(
+                (output_dir / "syslog-received.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertNotIn("suppressed", record)
+            self.assertEqual(record["message"], "ordinary system log")
+
     def test_single_inventory_target_routes_without_probe(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             profiles = (

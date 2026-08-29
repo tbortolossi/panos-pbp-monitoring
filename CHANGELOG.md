@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.13.0] - 2026-08-29
+
+### Changed
+
+- The Syslog reception journal no longer stores the content of a message sent by
+  a host that is not a declared Syslog source of any enabled firewall. Such a
+  record keeps its timestamp, transport peer, observed source address, trigger
+  flag and `target_names: []`, is marked `suppressed: "source_not_registered"`,
+  and carries neither the message text nor the metadata extracted from it. The
+  reception stays visible, so pointing a new firewall at the collector is still
+  diagnosable from the journal and the dashboard, which renders those rows as
+  *not stored: source is not a registered firewall*. A registered source, and a
+  deployment configured with a single target from the environment, keep the full
+  record unchanged. Routing is untouched: the allowlist rejection in the
+  multi-target router still refuses to start a monitor for an undeclared source.
+  Refs #84.
+
 ## [0.12.0] - 2026-08-29
 
 ### Added

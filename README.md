@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring & Diagnostic Collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.12.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.12.0)
+[![Version](https://img.shields.io/badge/version-0.13.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/tag/v0.13.0)
 [![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
 
 PBP Monitoring is an event-driven, read-only diagnostic collector for PAN-OS
@@ -462,6 +462,13 @@ digests for transfer to another workstation or a support case. It also contains:
 - `support/syslog-triggers.jsonl`: trigger records matching the run ID;
 - `support/syslog-received.jsonl`: retained Syslog messages attributed to the
   target between the first and last run timestamps.
+
+The reception journal records every datagram the collector receives, but it
+stores the text of a message only when the sender is a declared Syslog source of
+a firewall. A log from an unregistered host is kept as a bounded trace marked
+`suppressed: "source_not_registered"`, carrying its source address so the
+firewall can be recognized and added in the admin UI, and nothing else. The
+dashboard shows those rows as *not stored: source is not a registered firewall*.
 
 The reception journal is intentionally bounded, so the second file contains the
 matching messages still retained when the ZIP is downloaded. The authoritative

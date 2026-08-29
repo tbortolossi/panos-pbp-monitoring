@@ -3045,6 +3045,18 @@ class MultiTargetRouter:
             return [serial_target]
         return list(candidates) if len(candidates) == 1 else []
 
+    def is_registered_source(
+        self, message: str, transport_source_ip: str | None
+    ) -> bool:
+        """Report whether the emitter is a declared Syslog source of a target.
+
+        An allowlisted source that cannot yet be attributed to a single
+        firewall is still registered: its message stays evidence.
+        """
+        metadata = extract_trigger_metadata(message)
+        source = metadata.get("syslog_source_ip") or transport_source_ip
+        return isinstance(source, str) and source in self.by_source
+
     def _dispatch(
         self,
         target_names: list[str],
@@ -3333,6 +3345,16 @@ class ManagedRouter:
             else []
         )
 
+    def is_registered_source(
+        self, message: str, transport_source_ip: str | None
+    ) -> bool:
+        self._reload_if_needed()
+        return (
+            self.router.is_registered_source(message, transport_source_ip)
+            if self.router is not None
+            else False
+        )
+
     def trigger(
         self,
         message: str,
@@ -3364,6 +3386,38 @@ class SyslogProtocol(asyncio.DatagramProtocol):
         self.cfg = cfg
         self.controller = controller
 
+    def _reception_record(
+        self,
+        message: str,
+        addr: tuple[str, int],
+        is_trigger: bool,
+        target_names: list[str],
+    ) -> dict[str, Any]:
+        """Build the journal entry, without the payload of an unknown sender."""
+        metadata = extract_trigger_metadata(message)
+        record: dict[str, Any] = {
+            "timestamp": utc_now(),
+            "peer": f"{addr[0]}:{addr[1]}",
+            "transport_source_ip": addr[0],
+            "trigger": is_trigger,
+            "target_names": target_names,
+        }
+        checker = getattr(type(self.controller), "is_registered_source", None)
+        registered = (
+            checker(self.controller, message, addr[0]) if callable(checker) else True
+        )
+        if registered:
+            record["metadata"] = metadata
+            record["message"] = message
+            return record
+        # A host nobody declared must stay visible enough to be registered, but
+        # its text is never persisted. Only the source address the gateway
+        # observed survives, and it is already validated as an IP address.
+        source = metadata.get("syslog_source_ip")
+        record["metadata"] = {"syslog_source_ip": source} if source else {}
+        record["suppressed"] = "source_not_registered"
+        return record
+
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         message = data.decode("utf-8", errors="replace").strip()
         is_trigger = TRIGGER_REGEX.search(message) is not None
@@ -3376,15 +3430,7 @@ class SyslogProtocol(asyncio.DatagramProtocol):
         try:
             append_recent_syslog(
                 self.cfg.output_dir / "syslog-received.jsonl",
-                {
-                    "timestamp": utc_now(),
-                    "peer": f"{addr[0]}:{addr[1]}",
-                    "transport_source_ip": addr[0],
-                    "trigger": is_trigger,
-                    "target_names": target_names,
-                    "metadata": extract_trigger_metadata(message),
-                    "message": message,
-                },
+                self._reception_record(message, addr, is_trigger, target_names),
             )
         except Exception:
             LOG.exception("Unable to record Syslog reception status")

@@ -247,4 +247,10 @@ address: the gateway prepends `PBP_SYSLOG_SOURCE=<ip>` so the collector can
 attribute a message to a registered target. `target_names: []` means the sender
 is not registered as a target in the admin UI yet.
 
+A sender that is not a declared Syslog source of any firewall is journalled as
+`suppressed: "source_not_registered"`, with no `message` field and no extracted
+metadata other than that source address. The reception is still visible, so the
+check above still proves the transport, but the text of the log is not stored.
+Register the firewall in the admin UI to record its messages.
+
 Never generate a real packet-buffer flood to test the collector.
