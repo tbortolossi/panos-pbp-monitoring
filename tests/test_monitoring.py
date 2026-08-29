@@ -1239,6 +1239,76 @@ class WebhookNotificationTests(unittest.TestCase):
             self.assertTrue(incident_capture_path(output_dir, run_id).exists())
 
 
+class InterfaceCounterTests(unittest.TestCase):
+    """Evidence-named ingress interfaces get bounded counter snapshots."""
+
+    class InterfaceClient(FakeClient):
+        def op_response(self, command: str) -> PanOSResponse:
+            if "<show><counter><interface>" in command:
+                with self.lock:
+                    self.commands.append(command)
+                return response(
+                    "<result><hw><entry><name>ethernet1/1</name><port>"
+                    "<rx-bytes>163042446082</rx-bytes>"
+                    "<rx-unicast>139446754</rx-unicast>"
+                    "<rx-discards>0</rx-discards><rx-error>0</rx-error>"
+                    "<tx-bytes>5</tx-bytes><link-down>0</link-down>"
+                    "</port></entry></hw></result>"
+                )
+            return super().op_response(command)
+
+    def test_trigger_named_interface_is_sampled_and_parsed(self):
+        async def scenario(cfg):
+            client = self.InterfaceClient()
+            controller = MonitorController(cfg, client)
+            controller.trigger_interfaces = {"ethernet1/1"}
+            await controller._monitor("fixture-run")
+            await controller.wait_for_reports()
+            return client
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            client = asyncio.run(scenario(make_config(output_dir)))
+
+            counter_commands = [
+                command
+                for command in client.commands
+                if "<show><counter><interface>" in command
+            ]
+            self.assertTrue(counter_commands)
+            self.assertIn("ethernet1/1", counter_commands[0])
+            capture = incident_capture_path(output_dir, "fixture-run")
+            records = [
+                json.loads(line)
+                for line in capture.read_text(encoding="utf-8").splitlines()
+            ]
+            first_cycle = next(record for record in records if "cycle" in record)
+            parsed = first_cycle["interface_counters"]["ethernet1/1"]
+            self.assertEqual(parsed["name"], "ethernet1/1")
+            self.assertEqual(parsed["counters"]["rx_bytes"], 163042446082)
+            self.assertEqual(parsed["counters"]["rx_discards"], 0)
+
+    def test_an_invalid_interface_name_is_never_sent_to_the_firewall(self):
+        async def scenario(cfg):
+            client = self.InterfaceClient()
+            controller = MonitorController(cfg, client)
+            controller.trigger_interfaces = {"bad name<>&"}
+            await controller._monitor("fixture-run")
+            await controller.wait_for_reports()
+            return client
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            client = asyncio.run(scenario(make_config(Path(temporary_directory))))
+
+            self.assertFalse(
+                [
+                    command
+                    for command in client.commands
+                    if "<show><counter><interface>" in command
+                ]
+            )
+
+
 class OffenderSessionListingTests(unittest.TestCase):
     """A source with live sessions gets one bounded filtered listing at stop."""
 
