@@ -384,9 +384,15 @@ key must be backed up and restored together.
     by source address in a top-sources table, and a pressure chart plots
     packet-buffer, descriptor, and session-table utilization per batch.
 
+46. When a webhook URL is configured in the settings, the collector POSTs a
+    JSON notification at incident start (run, firewall, trigger metadata) and
+    at incident stop (stop reason, batches, top ranked sources, report path).
+    The call is best effort with a bounded timeout; a failing endpoint is
+    logged and never delays or blocks collection. An empty URL disables the
+    feature, and a non-HTTP(S) value is rejected at save time.
+
 ## 12. Possible enhancements
 
-- HTTP webhook endpoint in addition to Syslog.
 - Native TCP/TLS Syslog reception.
 - Prometheus export and Grafana correlation.
 - Slack or email notification with an incident summary.

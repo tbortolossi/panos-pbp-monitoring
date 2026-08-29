@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -36,6 +37,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "generate_text_export": "true",
     "syslog_fresh_seconds": "300",
     "target_check_hours": "24",
+    "webhook_url": "",
 }
 
 
@@ -306,6 +308,11 @@ class ConfigStore:
         for key in ("generate_html_report", "generate_text_export"):
             if merged[key].lower() not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
                 raise ValueError(f"{key} must be true or false")
+        webhook = merged.get("webhook_url", "").strip()
+        if webhook:
+            parsed = urlsplit(webhook)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("webhook_url must be an http(s) URL, or empty to disable")
         now = _utc_now()
         with self._connect() as connection:
             connection.executemany(

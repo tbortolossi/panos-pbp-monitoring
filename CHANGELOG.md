@@ -7,6 +7,11 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Optional webhook notifications: a **Webhook URL** setting makes the
+  collector POST a JSON payload when an incident opens (run, firewall,
+  trigger metadata with the extracted flow) and when it closes (stop reason,
+  batches, top ranked sources, report path). Best effort with a five-second
+  timeout; a failing endpoint never delays collection. Empty disables it.
 - The HTML report opens with a **Probable cause** block composing the
   verdicts that were previously scattered (peak buffer usage, strongest
   offender with its flow, denied-traffic correlation, session-table

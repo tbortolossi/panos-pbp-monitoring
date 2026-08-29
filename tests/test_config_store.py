@@ -66,6 +66,22 @@ class ConfigStoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.update_settings({"poll_seconds": "0"})
 
+    def test_webhook_url_accepts_https_and_empty_but_rejects_garbage(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = ConfigStore(Path(temporary_directory) / "config.db")
+            store.initialize()
+            store.update_settings({"webhook_url": "https://hooks.example.test/pbp"})
+            self.assertEqual(
+                store.get_settings()["webhook_url"],
+                "https://hooks.example.test/pbp",
+            )
+            store.update_settings({"webhook_url": ""})
+            self.assertEqual(store.get_settings()["webhook_url"], "")
+            with self.assertRaisesRegex(ValueError, "webhook_url"):
+                store.update_settings({"webhook_url": "ftp://nope"})
+            with self.assertRaisesRegex(ValueError, "webhook_url"):
+                store.update_settings({"webhook_url": "not a url"})
+
     def test_invalid_source_and_empty_new_key_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             store = ConfigStore(Path(temporary_directory) / "config.db")

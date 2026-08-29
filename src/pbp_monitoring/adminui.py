@@ -365,7 +365,7 @@ collector cannot be claimed by whoever reaches this port first.</p>
 {self._target_form(csrf, edit_target)}
 {self._syslog_card(syslog or self._syslog_options(None), targets)}
 <section class="card"><h2>Collector settings</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
-{''.join(f'<div><label>{_e(key.replace("_", " ").title())}</label><input name="{_e(key)}" value="{_e(value)}" required></div>' for key, value in settings.items())}
+{''.join(f'<div><label>{_e(key.replace("_", " ").title())}</label><input name="{_e(key)}" value="{_e(value)}"{"" if DEFAULT_SETTINGS.get(key) == "" else " required"}></div>' for key, value in settings.items())}
 </div><button type="submit">Save settings</button></form></section>""", refresh_seconds)
 
     def _syslog_options(self, handler: Any, query: dict[str, list[str]] | None = None) -> dict[str, str]:

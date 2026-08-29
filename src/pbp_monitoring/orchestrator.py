@@ -130,6 +130,7 @@ OFFENDER_LOG_SOURCE_LIMIT = 3
 OFFENDER_LOG_NLOGS = 20
 OFFENDER_LOG_TIMEOUT_SECONDS = 20.0
 OFFENDER_LOG_POLL_SECONDS = 0.5
+WEBHOOK_TIMEOUT_SECONDS = 5.0
 
 
 def utc_now() -> str:
@@ -350,6 +351,7 @@ class Config:
     config_revision: int | None = None
     dp_core_functions: tuple[dict[str, Any], ...] = ()
     dp_core_functions_identity: str | None = None
+    webhook_url: str = ""
 
     def __post_init__(self) -> None:
         numeric_rules = (
@@ -446,6 +448,7 @@ class Config:
             generate_html_report=env_bool("GENERATE_HTML_REPORT", True),
             generate_text_export=env_bool("GENERATE_TEXT_EXPORT", True),
             target_profiles=target_profiles,
+            webhook_url=os.getenv("WEBHOOK_URL", "").strip(),
         )
 
     @classmethod
@@ -501,6 +504,7 @@ class Config:
             generate_text_export=values["generate_text_export"].lower() in {"1", "true", "yes", "on"},
             target_profiles=tuple(profiles),
             config_revision=store.revision(),
+            webhook_url=values.get("webhook_url", "").strip(),
         )
 
     def for_target(self, profile: TargetProfile) -> "Config":
@@ -2810,6 +2814,39 @@ class MonitorController:
         self.trigger_source_ips: set[str] = set()
         self.report_tasks: set[asyncio.Task[None]] = set()
         self.run_starts: deque[float] = deque()
+        self.webhook_tasks: set[asyncio.Task[None]] = set()
+
+    def _post_webhook(self, payload: dict[str, Any]) -> None:
+        request = Request(
+            self.cfg.webhook_url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with build_opener().open(request, timeout=WEBHOOK_TIMEOUT_SECONDS):
+            pass
+
+    async def _notify_webhook(self, event: str, details: dict[str, Any]) -> None:
+        payload = {
+            "event": event,
+            "timestamp": utc_now(),
+            "target_name": self.cfg.target_name,
+            "collector_version": __version__,
+            **details,
+        }
+        try:
+            await asyncio.to_thread(self._post_webhook, payload)
+        except Exception:
+            # Notification is best effort: the operator still has the
+            # dashboard and the capture, and the monitor must never wait.
+            LOG.warning("Webhook notification failed for %s", event, exc_info=True)
+
+    def _schedule_webhook(self, event: str, details: dict[str, Any]) -> None:
+        if not self.cfg.webhook_url:
+            return
+        task = asyncio.create_task(self._notify_webhook(event, details))
+        self.webhook_tasks.add(task)
+        task.add_done_callback(self.webhook_tasks.discard)
 
     def _may_start_run(self) -> bool:
         now = time.monotonic()
@@ -2894,6 +2931,14 @@ class MonitorController:
         if starts_monitor:
             self.monitor_task = asyncio.create_task(self._monitor(self.run_id))
             LOG.warning("Trigger received from %s; starting monitor %s", peer, self.run_id)
+            self._schedule_webhook(
+                "incident_started",
+                {
+                    "run_id": self.run_id,
+                    "peer": peer,
+                    "trigger_metadata": metadata,
+                },
+            )
         else:
             LOG.info("Additional trigger received; monitor %s is already active", self.run_id)
 
@@ -3107,8 +3152,9 @@ class MonitorController:
         task.add_done_callback(self.report_tasks.discard)
 
     async def wait_for_reports(self) -> None:
-        if self.report_tasks:
-            await asyncio.gather(*tuple(self.report_tasks), return_exceptions=True)
+        pending = tuple(self.report_tasks) + tuple(self.webhook_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def _write_text_export(
         self,
@@ -3380,6 +3426,22 @@ class MonitorController:
                 # captured, even when the stop marker cannot be written.
                 LOG.exception("Unable to write the stop record for run %s", run_id)
             self._schedule_report(output_file)
+            if stop_reason != "cancelled":
+                self._schedule_webhook(
+                    "incident_stopped",
+                    {
+                        "run_id": run_id,
+                        "reason": stop_reason,
+                        "cycles": cycle_number,
+                        "elapsed_seconds": round(time.monotonic() - start, 3),
+                        "top_sources": sorted(
+                            offender_sources,
+                            key=lambda ip: offender_sources[ip],
+                            reverse=True,
+                        )[:OFFENDER_LOG_SOURCE_LIMIT],
+                        "report_path": str(output_file.with_name("report.html")),
+                    },
+                )
 
 
 class MultiTargetRouter:
