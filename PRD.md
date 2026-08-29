@@ -206,7 +206,14 @@ command-by-command exports, including result, error, exact raw XML response, and
 session lookups. The startup export also states the dataplane
 core-to-function-group map and its source, which an incident reusing the stored
 map does not carry as a command payload. `syslog-received.jsonl` is a compacted status journal for the
-dashboard, not a replacement for incident evidence.
+dashboard, not a replacement for incident evidence. A message from a host that
+is not a declared Syslog source of any enabled firewall is journalled without
+its payload: the timestamp, the transport peer, the observed source address, the
+trigger flag and `target_names: []` are kept, the record is marked
+`suppressed: "source_not_registered"`, and neither the message text nor the
+metadata extracted from it is persisted. The reception stays visible so a new
+firewall can be identified and registered, and the collector never stores the
+content of a log nobody expected.
 The Web UI streams a ZIP support export containing these run artifacts and a
 versioned checksum manifest.
 
