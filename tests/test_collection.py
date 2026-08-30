@@ -26,6 +26,11 @@ from pbp_monitoring.orchestrator import (
     extract_trigger_metadata,
     extract_log_job_status,
     extract_traffic_log_entries,
+    extract_buffer_latency,
+    extract_pbp_settings,
+    extract_pbp_threat_log_entries,
+    firewall_clock_query_time,
+    pbp_threat_log_query,
 )
 
 
@@ -1037,6 +1042,103 @@ packet descriptor (on-chip):
                     expected,
                 )
                 self.assertNotIn("sw-version", parsed)
+
+
+class PbpEvidenceParsingTests(unittest.TestCase):
+    """Parsers for the configured thresholds, the latency and the threat logs."""
+
+    def test_configured_thresholds_are_read_and_absent_ones_stay_none(self):
+        settings = extract_pbp_settings(
+            "<result><session>"
+            "<packet-buffer-protection-enable>yes</packet-buffer-protection-enable>"
+            "<packet-buffer-protection-alert>50</packet-buffer-protection-alert>"
+            "<packet-buffer-protection-activate>80</packet-buffer-protection-activate>"
+            "<packet-buffer-protection-latency-alert>50</packet-buffer-protection-latency-alert>"
+            "<packet-buffer-protection-latency-activate>200</packet-buffer-protection-latency-activate>"
+            "<packet-buffer-protection-latency-max-tolerate>500</packet-buffer-protection-latency-max-tolerate>"
+            "<packet-buffer-protection-latency-block-countdown>500</packet-buffer-protection-latency-block-countdown>"
+            "<dhcp-bcast-session-on>yes</dhcp-bcast-session-on>"
+            "</session></result>"
+        )
+
+        self.assertEqual(settings["status"], "parsed")
+        self.assertTrue(settings["enabled"])
+        self.assertEqual(settings["alert_percent"], 50.0)
+        self.assertEqual(settings["activate_percent"], 80.0)
+        self.assertEqual(settings["latency_activate_ms"], 200.0)
+        self.assertEqual(settings["latency_max_tolerate_ms"], 500.0)
+        # A threshold left at its default is absent from the running config.
+        partial = extract_pbp_settings("<result><session><packet-buffer-protection-enable>no</packet-buffer-protection-enable></session></result>")
+        self.assertFalse(partial["enabled"])
+        self.assertIsNone(partial["alert_percent"])
+        self.assertEqual(extract_pbp_settings("not xml")["status"], "unparsed")
+        self.assertEqual(extract_pbp_settings("<result/>")["status"], "unparsed")
+
+    def test_buffer_latency_report_is_read_per_dataplane(self):
+        latency = extract_buffer_latency(
+            "<result><sw.comm.s1.dp0.packet-buffer-latency-report>"
+            "<buffer-latency-enabled>True</buffer-latency-enabled>"
+            "<latest>104</latest>"
+            "<last-max><member>110</member><member>105</member></last-max>"
+            "<last-avg><member>108</member><member>44</member></last-avg>"
+            "</sw.comm.s1.dp0.packet-buffer-latency-report>"
+            "<sw.comm.s1.dp1.packet-buffer-latency-report>"
+            "<buffer-latency-enabled>True</buffer-latency-enabled>"
+            "<latest>2</latest><last-max><member>3</member></last-max>"
+            "<last-avg><member>1</member></last-avg>"
+            "</sw.comm.s1.dp1.packet-buffer-latency-report></result>"
+        )
+
+        self.assertEqual(latency["status"], "parsed")
+        self.assertEqual([dp["dataplane"] for dp in latency["dataplanes"]], ["s1.dp0", "s1.dp1"])
+        self.assertEqual(latency["dataplanes"][0]["last_max_ms"], [110.0, 105.0])
+        self.assertEqual(latency["latest_ms"], 104.0)
+        self.assertEqual(latency["peak_ms"], 110.0)
+        self.assertEqual(
+            extract_buffer_latency("<result>Buffer latency measurement is disabled.</result>")["status"],
+            "disabled",
+        )
+        self.assertEqual(extract_buffer_latency("<result/>")["status"], "unparsed")
+
+    def test_pbp_threat_log_entries_keep_the_id_and_the_designated_source(self):
+        entries = extract_pbp_threat_log_entries(
+            "<result><job><status>FIN</status></job><log><logs count=\"1\">"
+            "<entry logid=\"1\"><receive_time>2026/08/30 12:15:26</receive_time>"
+            "<src>203.0.113.7</src><dst>0.0.0.0</dst><sport>0</sport><dport>0</dport>"
+            "<proto>tcp</proto><app>not-applicable</app><from>LAN</from>"
+            "<action>drop</action><sessionid>0</sessionid><repeatcnt>1</repeatcnt>"
+            "<threatid>PBP Packet Drop</threatid><tid>8507</tid>"
+            "<threat_name>PBP Packet Drop</threat_name></entry></logs></log></result>"
+        )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["threat_id"], 8507)
+        self.assertEqual(entries[0]["threat_name"], "PBP Packet Drop")
+        self.assertEqual(entries[0]["source_ip"], "203.0.113.7")
+        self.assertEqual(entries[0]["from_zone"], "LAN")
+        self.assertEqual(entries[0]["action"], "drop")
+        self.assertEqual(extract_pbp_threat_log_entries("not xml"), [])
+
+    def test_the_threat_query_window_follows_the_firewall_clock(self):
+        self.assertEqual(
+            firewall_clock_query_time("Sun Aug 30 12:05:20 CEST 2026"),
+            "2026/08/30 12:04:20",
+        )
+        self.assertEqual(
+            firewall_clock_query_time("Thu Aug 27 10:00:00 UTC 2026", margin_seconds=0),
+            "2026/08/27 10:00:00",
+        )
+        self.assertIsNone(firewall_clock_query_time("garbage"))
+        self.assertIsNone(firewall_clock_query_time(None))
+        self.assertEqual(
+            pbp_threat_log_query("2026/08/30 12:04:20"),
+            "((threatid eq 8507) or (threatid eq 8508) or (threatid eq 8509))"
+            " and (receive_time geq '2026/08/30 12:04:20')",
+        )
+        self.assertEqual(
+            pbp_threat_log_query(None),
+            "((threatid eq 8507) or (threatid eq 8508) or (threatid eq 8509))",
+        )
 
 
 if __name__ == "__main__":

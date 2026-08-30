@@ -3,6 +3,35 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.35.0] - 2026-08-30
+
+### Added
+
+- **The configured PBP thresholds, the buffer latency and the PBP threat logs
+  are captured.** Step 1 of the diagnosis judged the pressure against the
+  PAN-OS defaults and could only guess the activate threshold from the
+  utilization at which PBP was seen mitigating; the latency case (descriptors
+  exhausted while buffers stay low, and latency-based PBP since PAN-OS 10.0)
+  was inferred from percentages; and whether the firewall actually blocked a
+  source was not in the capture at all.
+
+  The monitor now reads the PBP settings of the running configuration once at
+  start (`show config running xpath devices/entry/deviceconfig/setting/session`
+  — the collector's only configuration read, declared in the PRD; it changes
+  nothing), collects `show session packet-buffer-protection buffer-latency`
+  every batch, and runs one bounded threat-log query at stop for threat IDs
+  8507, 8508 and 8509 over the incident window on the firewall clock. The
+  diagnosis states the configured alert and activate thresholds, reads the
+  latency against the latency thresholds and names the latency case for a
+  buffer-based or a latency-based PBP, and lets the threat logs confirm the
+  entries marked for RED, name the sources placed in the block table and the
+  sessions discarded, or designate on their own when no batch caught a RED
+  entry — always as the firewall's own list, not as proof. The Pressure
+  section tabulates the latency per batch, a **PBP threat logs** section lists
+  the entries, and the API check proves the administrator can run every new
+  command. Both commands are replayable and the JSONL additions are backward
+  compatible. Validated read-only on the lab PA-440 (PAN-OS 12.2.2). Refs #182.
+
 ## [0.34.0] - 2026-08-30
 
 ### Changed

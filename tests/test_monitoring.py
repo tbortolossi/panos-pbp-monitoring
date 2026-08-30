@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from pbp_monitoring import __version__
 from pbp_monitoring.config_store import ConfigStore
 from pbp_monitoring.orchestrator import (
+    PBP_SETTINGS_COMMAND,
     CLOCK_COMMAND,
     DP_CORE_FUNCTIONS_COMMAND,
     OP_COMMANDS,
@@ -122,6 +123,25 @@ class FakeClient:
             )
         if command == OP_COMMANDS["packet_buffer_protection"]:
             return response("<result>Congestion: 10/100 (10%)</result>")
+        if command == PBP_SETTINGS_COMMAND:
+            return response(
+                "<result><session>"
+                "<packet-buffer-protection-enable>yes</packet-buffer-protection-enable>"
+                "<packet-buffer-protection-alert>40</packet-buffer-protection-alert>"
+                "<packet-buffer-protection-activate>60</packet-buffer-protection-activate>"
+                "<packet-buffer-protection-latency-activate>200"
+                "</packet-buffer-protection-latency-activate>"
+                "</session></result>"
+            )
+        if command == OP_COMMANDS["buffer_latency"]:
+            return response(
+                "<result><sw.comm.s1.dp0.packet-buffer-latency-report>"
+                "<buffer-latency-enabled>True</buffer-latency-enabled>"
+                "<latest>3</latest>"
+                "<last-max><member>7</member><member>4</member></last-max>"
+                "<last-avg><member>2</member><member>1</member></last-avg>"
+                "</sw.comm.s1.dp0.packet-buffer-latency-report></result>"
+            )
         if command == OP_COMMANDS["session_info"]:
             return response(
                 "<result><num-max>200000</num-max><num-active>421</num-active>"
@@ -1965,6 +1985,113 @@ class FirewallCheckTests(unittest.TestCase):
 
             self.assertTrue(captured_urls)
             self.assertEqual(set(captured_urls), {"https://192.0.2.20"})
+
+class PbpEvidenceTests(unittest.TestCase):
+    """The configured thresholds, the buffer latency and the PBP threat logs
+    reach the capture, read-only, without delaying the batches."""
+
+    class LogClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.queries = []
+
+        def log_query_job(self, log_type, query, nlogs):
+            self.queries.append((log_type, query, nlogs))
+            return "60"
+
+        def log_query_result(self, job_id):
+            return PanOSResponse(
+                result_xml=(
+                    "<result><job><status>FIN</status></job>"
+                    '<log><logs count="2"><entry>'
+                    "<receive_time>2026/08/27 10:00:20</receive_time>"
+                    "<src>203.0.113.9</src><dst>0.0.0.0</dst>"
+                    "<sport>0</sport><dport>0</dport><proto>udp</proto>"
+                    "<app>not-applicable</app><from>outside</from>"
+                    "<action>block-ip</action><sessionid>0</sessionid>"
+                    "<repeatcnt>1</repeatcnt>"
+                    "<threatid>PBP IP Blocked</threatid><tid>8509</tid>"
+                    "<threat_name>PBP IP Blocked</threat_name>"
+                    "</entry><entry>"
+                    "<receive_time>2026/08/27 10:00:10</receive_time>"
+                    "<src>203.0.113.7</src><dst>198.51.100.5</dst>"
+                    "<sport>514</sport><dport>514</dport><proto>udp</proto>"
+                    "<app>syslog</app><from>outside</from>"
+                    "<action>drop</action><sessionid>38492</sessionid>"
+                    "<repeatcnt>3</repeatcnt><tid>8507</tid>"
+                    "<threat_name>PBP Packet Drop</threat_name>"
+                    "</entry></logs></log></result>"
+                ),
+                raw_response='<response status="success"/>',
+            )
+
+    def test_the_capture_carries_settings_latency_and_threat_logs(self):
+        async def scenario(cfg):
+            client = self.LogClient()
+            controller = MonitorController(cfg, client)
+            await controller._monitor("fixture-run")
+            return client, incident_capture_path(cfg.output_dir, "fixture-run")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            client, output_file = asyncio.run(
+                scenario(make_config(Path(temporary_directory)))
+            )
+            records = [
+                json.loads(line)
+                for line in output_file.read_text(encoding="utf-8").splitlines()
+            ]
+            started = next(r for r in records if r.get("event") == "monitor_started")
+            cycle = next(r for r in records if r.get("cycle") == 1)
+            threat = next(r for r in records if r.get("event") == "pbp_threat_logs")
+            stopped = records[-1]
+
+            self.assertIn(PBP_SETTINGS_COMMAND, client.commands)
+            self.assertEqual(started["pbp_settings"]["alert_percent"], 40.0)
+            self.assertEqual(started["pbp_settings"]["activate_percent"], 60.0)
+            self.assertTrue(started["pbp_settings"]["enabled"])
+            self.assertIn("pbp_settings", started["commands"])
+            self.assertEqual(cycle["buffer_latency"]["peak_ms"], 7.0)
+            self.assertEqual(cycle["buffer_latency"]["dataplanes"][0]["dataplane"], "s1.dp0")
+            self.assertIn("buffer_latency", cycle["commands"])
+            # One bounded threat query, windowed on the firewall clock of the
+            # first batch (UTC 10:00:00 minus a one-minute margin).
+            self.assertEqual(
+                client.queries,
+                [
+                    (
+                        "threat",
+                        "((threatid eq 8507) or (threatid eq 8508) or (threatid eq 8509))"
+                        " and (receive_time geq '2026/08/27 09:59:00')",
+                        50,
+                    )
+                ],
+            )
+            self.assertTrue(threat["ok"])
+            self.assertEqual(threat["since_firewall_time"], "2026/08/27 09:59:00")
+            self.assertEqual(threat["entries"][0]["threat_id"], 8509)
+            self.assertEqual(threat["entries"][0]["source_ip"], "203.0.113.9")
+            self.assertEqual(threat["entries"][1]["threat_id"], 8507)
+            self.assertEqual(threat["entries"][1]["session_id"], "38492")
+            self.assertEqual(stopped["event"], "monitor_stopped")
+
+    def test_a_failed_threat_query_never_blocks_the_stop_marker(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())  # no log query method
+            await controller._monitor("fixture-run")
+            return incident_capture_path(cfg.output_dir, "fixture-run")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_file = asyncio.run(scenario(make_config(Path(temporary_directory))))
+            records = [
+                json.loads(line)
+                for line in output_file.read_text(encoding="utf-8").splitlines()
+            ]
+            threat = next(r for r in records if r.get("event") == "pbp_threat_logs")
+
+            self.assertFalse(threat["ok"])
+            self.assertIn("AttributeError", threat["error"])
+            self.assertEqual(records[-1]["event"], "monitor_stopped")
+
 
 if __name__ == "__main__":
     unittest.main()

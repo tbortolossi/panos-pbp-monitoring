@@ -86,10 +86,18 @@ PAN-OS version, PBP mode, and the thresholds the firewall itself reported.
 **Step 1 — How much pressure, on which resource?** The packet-buffer peak, the
 on-chip packet-descriptor peak on a Cavium chassis (an x86 platform never
 returns that pool, and the report says so instead of showing "Not collected"),
-the packet-descriptor and SW-tag peaks, and the thresholds. The alert
-threshold is read from the firewall's own congestion log (`alert threshold is
-N%`) when a trigger carried it; the lowest utilization at which PBP was seen
-mitigating bounds the activate threshold. Pressure is judged against the
+the packet-descriptor and SW-tag peaks, the buffer latency peak, and the
+thresholds. The alert and activate thresholds come from the PBP settings read
+from the running configuration at monitor start; when a capture predates that
+read, the alert threshold is taken from the firewall's own congestion log
+(`alert threshold is N%`) if a trigger carried it, and the lowest utilization
+at which PBP was seen mitigating bounds the activate threshold. The buffer
+latency (`show session packet-buffer-protection buffer-latency`, per batch)
+is read against the latency thresholds: latency at or above the activate
+threshold with low buffers is the latency case, and the step says whether this
+firewall runs latency-based PBP, which acts on it, or buffer-based PBP, which
+does not see it. A disabled measurement is stated. The Pressure section
+tabulates the latency per batch and dataplane. Pressure is judged against the
 PAN-OS levels: buffers at or above 80% are *exhausted*, descriptors at or
 above 80% with low buffers are *the latency case* the PBP TOI describes,
 buffers between 50% and 80% are *elevated*, and anything below 50% is *low
@@ -104,10 +112,15 @@ logs 8507, 8508 and 8509 report: the firewall's own designation and the place
 to start, not a proof by itself. A session is named with its tuple,
 application, rule and zone from `show session id`; a source address alone is
 slowpath work, traffic that never completed session setup, and the traffic log
-recovered at monitor stop says whether it was denied and by which rule. When
-PBP never activated (alert only) the step says no offender was learned; when it
-activated but marked nothing for RED, the work was spread over many small
-entries.
+recovered at monitor stop says whether it was denied and by which rule. The
+PBP threat logs of the incident window, queried once at stop, confirm the
+list: the step counts them by ID, names the sources placed in the block table
+(8509) and the sessions discarded (8508), and designates from them alone when
+no batch caught an entry marked for RED, because PBP had acted before or
+between the batches. They appear in full in a **PBP threat logs** section under
+step 2, and a failed query is stated. When PBP never activated (alert only) and
+logged nothing, the step says no offender was learned; when it activated but
+marked nothing for RED, the work was spread over many small entries.
 
 **Step 3 — Does the ingress backlog hold a session?** The sessions holding at
 least 2% of the work queue in `show running resource-monitor

@@ -163,6 +163,63 @@ def _configured_alert_percent(events: Sequence[dict[str, Any]]) -> float | None:
     return max(values) if values else None
 
 
+DEFAULT_LATENCY_ALERT_MS = 50.0
+DEFAULT_LATENCY_ACTIVATE_MS = 200.0
+DEFAULT_LATENCY_MAX_TOLERATE_MS = 500.0
+
+
+def _configured_settings(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """The PBP settings read from the running configuration at monitor start."""
+    for record in events:
+        if str(record.get("event", "")).lower() != "monitor_started":
+            continue
+        settings = record.get("pbp_settings")
+        if isinstance(settings, dict) and settings.get("status") == "parsed":
+            return settings
+    return {}
+
+
+def _threat_log_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Count the PBP threat logs captured at monitor stop, per ID and source."""
+    record = next(
+        (
+            item
+            for item in reversed(events)
+            if str(item.get("event", "")).lower() == "pbp_threat_logs"
+        ),
+        None,
+    )
+    summary: dict[str, Any] = {
+        "collected": record is not None,
+        "ok": bool(record and record.get("ok") is True),
+        "error": record.get("error") if record else None,
+        "counts": {},
+        "sources": {},
+        "entries": [],
+    }
+    if not summary["ok"] or not isinstance(record.get("entries"), list):
+        return summary
+    for entry in record["entries"]:
+        if not isinstance(entry, dict):
+            continue
+        threat_id = entry.get("threat_id")
+        try:
+            threat_id = int(threat_id)
+        except (TypeError, ValueError):
+            continue
+        summary["counts"][threat_id] = summary["counts"].get(threat_id, 0) + 1
+        source = entry.get("source_ip")
+        if source:
+            item = summary["sources"].setdefault(str(source), {"ids": set(), "count": 0})
+            item["ids"].add(threat_id)
+            item["count"] += 1
+        summary["entries"].append(entry)
+    return summary
+
+
+_THREAT_LABELS = {8507: "PBP Packet Drop", 8508: "PBP Session Discarded", 8509: "PBP IP Blocked"}
+
+
 def _pbp_statuses(cycles: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         record["pbp_status"]
@@ -349,7 +406,33 @@ def _context(
         if status.get("active") is True
         and (value := _first_number(status.get("congestion_percentage"))) is not None
     ]
-    alert = _configured_alert_percent(events)
+    settings = _configured_settings(events)
+    configured_alert = _first_number(settings.get("alert_percent"))
+    configured_activate = _first_number(settings.get("activate_percent"))
+    syslog_alert = _configured_alert_percent(events)
+    if settings:
+        alert = configured_alert if configured_alert is not None else DEFAULT_ALERT_PERCENT
+        activate = configured_activate if configured_activate is not None else DEFAULT_ACTIVATE_PERCENT
+        alert_source = "configuration"
+    elif syslog_alert is not None:
+        alert, activate, alert_source = syslog_alert, None, "firewall"
+    else:
+        alert, activate, alert_source = None, None, "default"
+    latency_values = [
+        value
+        for record in cycles
+        if isinstance(record.get("buffer_latency"), dict)
+        and (value := _first_number(record["buffer_latency"].get("peak_ms"))) is not None
+    ]
+    latency_status = next(
+        (
+            str(record["buffer_latency"].get("status"))
+            for record in cycles
+            if isinstance(record.get("buffer_latency"), dict)
+            and record["buffer_latency"].get("status")
+        ),
+        None,
+    )
     return {
         "model": str(model or "—"),
         "generation": hardware_generation(model),
@@ -362,7 +445,15 @@ def _context(
         "pbp_active_observed": any(status.get("active") is True for status in statuses),
         "mitigating_from_percent": min(active_congestions) if active_congestions else None,
         "alert_percent": alert,
-        "alert_source": "firewall" if alert is not None else "default",
+        "activate_percent": activate,
+        "alert_source": alert_source,
+        "configured_enabled": settings.get("enabled") if settings else None,
+        "latency_alert_ms": _first_number(settings.get("latency_alert_ms")) if settings else None,
+        "latency_activate_ms": _first_number(settings.get("latency_activate_ms")) if settings else None,
+        "latency_max_tolerate_ms": _first_number(settings.get("latency_max_tolerate_ms")) if settings else None,
+        "latency_peak_ms": max(latency_values) if latency_values else None,
+        "latency_status": latency_status,
+        "threat_logs": _threat_log_summary(events),
     }
 
 
@@ -377,6 +468,8 @@ def _step_pressure(cycles: Sequence[dict[str, Any]], context: dict[str, Any]) ->
     sw_tags_peak = _metric_peak(cycles, "resource_monitor_sw_tags_descriptor")
     alert = context["alert_percent"] if context["alert_percent"] is not None else DEFAULT_ALERT_PERCENT
     generation = context["generation"]
+    latency_peak = context["latency_peak_ms"]
+    latency_activate = context["latency_activate_ms"] or DEFAULT_LATENCY_ACTIVATE_MS
     mitigating_from = context["mitigating_from_percent"]
 
     facts: list[tuple[str, str, str]] = [
@@ -402,25 +495,56 @@ def _step_pressure(cycles: Sequence[dict[str, Any]], context: dict[str, Any]) ->
     )
     if sw_tags_peak is not None:
         facts.append(("SW tag descriptors", _pct(sw_tags_peak), _level(sw_tags_peak, alert)))
-    threshold_text = (
-        f"alert {_fmt(alert)}% as printed by the firewall's own congestion log"
-        if context["alert_source"] == "firewall"
-        else f"PAN-OS defaults, alert {_fmt(DEFAULT_ALERT_PERCENT)}% and activate "
-        f"{_fmt(DEFAULT_ACTIVATE_PERCENT)}%, because no trigger carried the configured value"
-    )
+    if context["alert_source"] == "configuration":
+        threshold_text = (
+            f"alert {_fmt(alert)}% and activate {_fmt(context['activate_percent'])}%, "
+            "read from the running configuration"
+        )
+        if context["configured_enabled"] is False:
+            threshold_text += "; PBP is disabled in the configuration"
+    elif context["alert_source"] == "firewall":
+        threshold_text = f"alert {_fmt(alert)}% as printed by the firewall's own congestion log"
+    else:
+        threshold_text = (
+            f"PAN-OS defaults, alert {_fmt(DEFAULT_ALERT_PERCENT)}% and activate "
+            f"{_fmt(DEFAULT_ACTIVATE_PERCENT)}%, because neither the configuration "
+            "nor a trigger carried the configured value"
+        )
     if mitigating_from is not None:
         threshold_text += (
-            f"; PBP was observed mitigating from {_fmt(mitigating_from)}%, so the "
-            "activate threshold is at or below that value"
+            f"; PBP was observed mitigating from {_fmt(mitigating_from)}%"
+            + (
+                ""
+                if context["alert_source"] == "configuration"
+                else ", so the activate threshold is at or below that value"
+            )
         )
     facts.append(("Thresholds", threshold_text, "none"))
+    latency_alert = context["latency_alert_ms"] or DEFAULT_LATENCY_ALERT_MS
+    latency_level = "none"
+    if latency_peak is not None:
+        latency_level = (
+            "bad" if latency_peak >= latency_activate
+            else "warn" if latency_peak >= latency_alert
+            else "ok"
+        )
+        facts.append(
+            (
+                "Buffer latency peak",
+                f"{_fmt(latency_peak)} ms (latency alert {_fmt(latency_alert)} ms, "
+                f"activate {_fmt(latency_activate)} ms)",
+                latency_level,
+            )
+        )
+    elif context["latency_status"] == "disabled":
+        facts.append(("Buffer latency", "measurement disabled on the firewall", "none"))
 
     descriptor_worst = max(
         (value for value in (on_chip_peak, descriptor_peak) if value is not None),
         default=None,
     )
     low_significance = False
-    if buffer_peak is None and descriptor_worst is None:
+    if buffer_peak is None and descriptor_worst is None and latency_peak is None:
         state, level = "unavailable", "none"
         verdict = (
             "No packet-buffer or packet-descriptor percentage was collected, so the "
@@ -439,11 +563,32 @@ def _step_pressure(cycles: Sequence[dict[str, Any]], context: dict[str, Any]) ->
         state, level = "positive", "bad"
         verdict = (
             f"<strong>Packet descriptors were exhausted while the buffers stayed at "
-            f"{_pct(buffer_peak)}.</strong> Descriptors peaked at {_fmt(descriptor_worst)}%. "
-            "That is the latency case: the queue in front of the dataplane cores "
+            f"{_pct(buffer_peak)}.</strong> Descriptors peaked at {_fmt(descriptor_worst)}%"
+            + (
+                f" and the buffer latency at {_fmt(latency_peak)} ms"
+                if latency_peak is not None
+                else ""
+            )
+            + ". That is the latency case: the queue in front of the dataplane cores "
             "fills before the buffers do, so buffer-based PBP may never activate and "
             "the culprit has to come from the ingress backlogs or from a single "
             "session pinned to one core."
+        )
+    elif latency_peak is not None and latency_peak >= latency_activate:
+        state, level = "positive", "bad"
+        verdict = (
+            f"<strong>Dataplane latency reached {_fmt(latency_peak)} ms while the "
+            f"buffers stayed at {_pct(buffer_peak)}.</strong> That is above the "
+            f"{_fmt(latency_activate)} ms latency activate threshold"
+            + (
+                ", and this firewall runs latency-based PBP, so it was mitigating on "
+                "latency rather than on buffer utilization"
+                if "latency" in context["pbp_modes"]
+                else ", the level at which latency-based PBP would act; this firewall "
+                "runs buffer-based PBP, which does not see it"
+            )
+            + ". Packets waited in front of the dataplane cores; the culprit has to "
+            "come from the ingress backlogs or from a single session pinned to one core."
         )
     elif buffer_peak is not None and buffer_peak >= DEFAULT_ALERT_PERCENT:
         state, level = "positive", "warn"
@@ -480,7 +625,12 @@ def _step_pressure(cycles: Sequence[dict[str, Any]], context: dict[str, Any]) ->
             + (
                 f" although above the {_fmt(alert)}% alert threshold configured on "
                 "this firewall"
-                if context["alert_source"] == "firewall" and buffer_peak is not None and buffer_peak >= alert
+                if context["alert_source"] != "default" and buffer_peak is not None and buffer_peak >= alert
+                else ""
+            )
+            + (
+                f" and the buffer latency stayed at {_fmt(latency_peak)} ms"
+                if latency_peak is not None
                 else ""
             )
             + ". "
@@ -491,6 +641,11 @@ def _step_pressure(cycles: Sequence[dict[str, Any]], context: dict[str, Any]) ->
                 + (
                     f" from {_fmt(mitigating_from)}%"
                     if mitigating_from is not None
+                    else ""
+                )
+                + (
+                    f" with the activate threshold configured at {_fmt(context['activate_percent'])}%"
+                    if context["activate_percent"] is not None
                     else ""
                 )
                 + f", far below the {_fmt(DEFAULT_ACTIVATE_PERCENT)}% default: the "
@@ -536,6 +691,7 @@ def _step_pbp_named(
     low_significance: bool,
 ) -> dict[str, Any]:
     statuses = _pbp_statuses(cycles)
+    threat_logs = _threat_log_summary(events)
     pbp_seen = any("packet_buffer_protection" in item.get("evidence_sources", []) for item in attribution)
     activated = any(status.get("active") is True for status in statuses) or pbp_seen
     learned = [
@@ -552,8 +708,57 @@ def _step_pbp_named(
         ("Entries learned", _fmt(len(learned)), "none"),
         ("Marked for RED", _fmt(len(marked)), "none"),
     ]
+    if threat_logs["collected"]:
+        if threat_logs["ok"]:
+            facts.append(
+                (
+                    "PBP threat logs",
+                    ", ".join(
+                        f"{count} × {threat_id} {_THREAT_LABELS.get(threat_id, '')}".strip()
+                        for threat_id, count in sorted(threat_logs["counts"].items())
+                    )
+                    or "none in the window",
+                    "bad" if threat_logs["counts"] else "ok",
+                )
+            )
+        else:
+            facts.append(("PBP threat logs", f"query failed: {threat_logs['error'] or 'unknown'}", "none"))
     named: list[str] = []
-    if not activated:
+    blocked = sorted(
+        (source for source, item in threat_logs["sources"].items() if 8509 in item["ids"]),
+        key=lambda source: -threat_logs["sources"][source]["count"],
+    )
+    discarded = sorted(
+        (source for source, item in threat_logs["sources"].items() if 8508 in item["ids"]),
+        key=lambda source: -threat_logs["sources"][source]["count"],
+    )
+    threat_text = ""
+    if threat_logs["ok"] and threat_logs["counts"]:
+        threat_text = (
+            " The firewall's own threat log confirms it: "
+            + ", ".join(
+                f"{count} × {_THREAT_LABELS.get(threat_id, threat_id)} ({threat_id})"
+                for threat_id, count in sorted(threat_logs["counts"].items())
+            )
+            + (
+                "; source address"
+                + ("es " if len(blocked) != 1 else " ")
+                + ", ".join(f"<code>{_escape(source)}</code>" for source in blocked[:_MAX_NAMED])
+                + (" were" if len(blocked) != 1 else " was")
+                + " placed in the block table (8509)"
+                if blocked
+                else ""
+            )
+            + (
+                "; a session of "
+                + ", ".join(f"<code>{_escape(source)}</code>" for source in discarded[:_MAX_NAMED])
+                + " was discarded (8508)"
+                if discarded
+                else ""
+            )
+            + "."
+        )
+    if not activated and not threat_logs["counts"]:
         state, level = "negative", "ok"
         verdict = (
             "<strong>PBP never activated, so it learned no offender.</strong> An "
@@ -561,13 +766,32 @@ def _step_pbp_named(
             "log, no RED, no ranked session. The culprit has to come from the "
             "ingress backlogs or from the wider evidence."
         )
-    elif not marked:
+    elif not marked and not threat_logs["counts"]:
         state, level = "negative", "ok"
         verdict = (
             f"<strong>PBP activated and learned {len(learned)} entries, but marked "
             "none for RED.</strong> The work was spread over many small entries "
             "rather than concentrated on one session or source, which points away "
             "from a single offender and towards a burst or aggregate load."
+        )
+    elif not marked:
+        state = "positive"
+        level = "warn" if low_significance else "bad"
+        for source in [*blocked, *[item for item in discarded if item not in blocked]][:_MAX_NAMED]:
+            item = threat_logs["sources"][source]
+            named.append(
+                f"source IP <code>{_escape(source)}</code> — "
+                + ", ".join(_THREAT_LABELS.get(threat_id, str(threat_id)) for threat_id in sorted(item["ids"]))
+            )
+        if not named:
+            for source, item in sorted(threat_logs["sources"].items(), key=lambda pair: -pair[1]["count"])[:_MAX_NAMED]:
+                named.append(f"source IP <code>{_escape(source)}</code> — {item['count']} PBP Packet Drop log(s)")
+        verdict = (
+            "<strong>No batch caught an entry marked for RED, but the firewall's "
+            "threat log did.</strong> PBP had already acted before or between the "
+            "batches; the designations below come from the threat log captured at "
+            "monitor stop, with the same caveat: the firewall's own list, not a proof."
+            + threat_text
         )
     else:
         state = "positive"
@@ -607,6 +831,8 @@ def _step_pbp_named(
                 "typically a burst denied by policy or a scan; the traffic log recovered "
                 "at monitor stop says what it was."
             )
+        if threat_text:
+            parts.append(threat_text.strip())
         if low_significance:
             parts.append(
                 "Read this list with the low pressure of step 1 in mind: at that level "
@@ -1298,7 +1524,10 @@ def _conclusion(
         else ""
     )
     alert_text = (
-        f"the {_fmt(context['alert_percent'])}% alert threshold configured on the firewall"
+        f"the alert {_fmt(context['alert_percent'])}% / activate "
+        f"{_fmt(context['activate_percent'])}% thresholds configured on the firewall"
+        if context["alert_source"] == "configuration"
+        else f"the {_fmt(context['alert_percent'])}% alert threshold configured on the firewall"
         if context["alert_source"] == "firewall"
         else f"the {_fmt(DEFAULT_ALERT_PERCENT)}% default alert threshold"
     )
@@ -1381,8 +1610,15 @@ def render_diagnosis(diagnosis: dict[str, Any]) -> str:
         + (f" · {', '.join(context['pbp_modes'])}" if context["pbp_modes"] else "")
         + (" · monitor only" if context["monitor_only"] else ""),
     ]
-    if context["alert_percent"] is not None:
+    if context["alert_source"] == "configuration":
+        chips.append(
+            f"configured alert {_fmt(context['alert_percent'])}% · activate "
+            f"{_fmt(context['activate_percent'])}%"
+        )
+    elif context["alert_percent"] is not None:
         chips.append(f"alert threshold {_fmt(context['alert_percent'])}% (from the firewall)")
+    if context["latency_peak_ms"] is not None:
+        chips.append(f"buffer latency peak {_fmt(context['latency_peak_ms'])} ms")
     if context["mitigating_from_percent"] is not None:
         chips.append(f"PBP mitigating from {_fmt(context['mitigating_from_percent'])}%")
     context_html = '<p class="chart-legend diagnosis-context">' + "".join(

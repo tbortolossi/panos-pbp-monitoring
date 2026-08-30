@@ -1400,6 +1400,131 @@ def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
     )
 
 
+def _render_buffer_latency(cycles: list[tuple[int, dict[str, Any]]]) -> str:
+    """Tabulate the buffer latency per batch, the measurement latency PBP acts on."""
+    rows: list[str] = []
+    status = None
+    for batch_number, (_, record) in enumerate(cycles, 1):
+        latency = record.get("buffer_latency")
+        if not isinstance(latency, dict):
+            continue
+        status = latency.get("status") or status
+        for dataplane in latency.get("dataplanes") or []:
+            if not isinstance(dataplane, dict):
+                continue
+            averages = list(_numbers(dataplane.get("last_avg_ms")))
+            maxima = list(_numbers(dataplane.get("last_max_ms")))
+            rows.append(
+                "<tr>"
+                f'<td class="number">{_escape(batch_number)}</td>'
+                f'<td>{_escape(dataplane.get("dataplane") or "—")}</td>'
+                f'<td class="number">{_escape(_format_number(next(iter(_numbers(dataplane.get("latest_ms"))), None)))}</td>'
+                f'<td class="number">{_escape(_format_number(max(averages) if averages else None))}</td>'
+                f'<td class="number">{_escape(_format_number(max(maxima) if maxima else None))}</td>'
+                "</tr>"
+            )
+    if status is None:
+        return ""
+    if status == "disabled":
+        return (
+            "<h3>Buffer latency</h3>"
+            '<p class="muted">Buffer latency measurement is disabled on this '
+            "firewall (<code>set session packet-buffer-latency-measurement</code>), "
+            "so latency-based PBP cannot act and no reading is available.</p>"
+        )
+    if not rows:
+        return (
+            "<h3>Buffer latency</h3>"
+            '<p class="muted">The buffer latency command answered but no '
+            "per-dataplane report could be parsed; the raw response is in the "
+            "batch details.</p>"
+        )
+    return (
+        "<h3>Buffer latency</h3>"
+        '<p class="muted">The dataplane processing latency PAN-OS measures every '
+        "millisecond, in ms: the latest reading and the average and maximum of "
+        "the last ten seconds at the time of each batch. Latency-based PBP acts "
+        "on this figure; buffer-based PBP does not see it.</p>"
+        '<div class="table-wrap"><table><thead><tr><th>Batch</th><th>Dataplane</th>'
+        "<th>Latest ms</th><th>10 s avg ms (max)</th><th>10 s max ms</th>"
+        f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _render_pbp_threat_logs(events: list[tuple[int, dict[str, Any]]]) -> str:
+    """Render the PBP threat logs captured at monitor stop."""
+    record = next(
+        (
+            item
+            for _, item in reversed(events)
+            if str(item.get("event", "")).lower() == "pbp_threat_logs"
+        ),
+        None,
+    )
+    if record is None:
+        return ""
+    if record.get("ok") is not True:
+        body = (
+            '<p class="muted">The threat log query failed: '
+            f"{_escape(record.get('error') or 'unknown error')}.</p>"
+        )
+    else:
+        entries = record.get("entries") if isinstance(record.get("entries"), list) else []
+        since = record.get("since_firewall_time")
+        window = (
+            f" since {_escape(since)} on the firewall clock"
+            if since
+            else " (most recent entries, no time filter: the firewall clock could not be read)"
+        )
+        if not entries:
+            body = (
+                f'<p class="muted">No PBP threat log (8507, 8508, 8509){window}. '
+                "PBP either never reached the RED stage or logged nothing in the "
+                "window.</p>"
+            )
+        else:
+            rows = "".join(
+                "<tr>"
+                f'<td>{_escape(entry.get("receive_time") or "—")}</td>'
+                f'<td>{_escape(entry.get("threat_id") or "—")} '
+                f'<span class="muted">{_escape(entry.get("threat_name") or "")}</span></td>'
+                f'<td><code>{_escape(entry.get("source_ip") or "—")}</code>'
+                + (f':{_escape(entry.get("source_port"))}' if entry.get("source_port") not in (None, "", "0") else "")
+                + "</td>"
+                f'<td><code>{_escape(entry.get("destination_ip") or "—")}</code>'
+                + (f':{_escape(entry.get("destination_port"))}' if entry.get("destination_port") not in (None, "", "0") else "")
+                + "</td>"
+                f'<td>{_escape(entry.get("protocol") or "—")}</td>'
+                f'<td>{_escape(entry.get("application") or "—")}</td>'
+                f'<td>{_escape(entry.get("from_zone") or "—")}</td>'
+                f'<td>{_escape(entry.get("action") or "—")}</td>'
+                f'<td class="number">{_escape(entry.get("session_id") or "—")}</td>'
+                f'<td class="number">{_escape(entry.get("repeat_count") or "—")}</td>'
+                "</tr>"
+                for entry in entries
+                if isinstance(entry, dict)
+            )
+            body = (
+                f'<p class="muted">{len(entries)} entries{window}, bounded to the '
+                "most recent 50. 8507 is a RED drop, 8508 a session discarded, 8509 "
+                "a source placed in the block table; a monitor-only PBP logs the "
+                "same IDs with the action <code>alert</code>.</p>"
+                '<div class="table-wrap"><table><thead><tr><th>Firewall time</th>'
+                "<th>Threat</th><th>Source</th><th>Destination</th><th>Proto</th>"
+                "<th>Application</th><th>Zone</th><th>Action</th><th>Session</th>"
+                f"<th>Repeat</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            )
+    return _render_section(
+        "pbp-threat-logs-title",
+        "Step 2 · PBP threat logs",
+        body,
+        intro="What the firewall itself logged when PBP acted: its RED drops, "
+        "session discards and source blocks, queried read-only once at monitor "
+        "stop so the designations are captured even when the threat log is not "
+        "forwarded to the collector.",
+    )
+
+
 def _render_ingress_backlogs(
     cycles: list[tuple[int, dict[str, Any]]],
     attribution: list[dict[str, Any]],
@@ -2647,6 +2772,8 @@ def _render_html(
     cpu_tracking_html = _render_cpu_tracking(cycles, core_functions)
     large_sessions_html = _render_large_sessions(large_session_summary)
     ingress_html = _render_ingress_backlogs(cycles, attribution)
+    buffer_latency_html = _render_buffer_latency(cycles)
+    pbp_threat_logs_html = _render_pbp_threat_logs(events)
     cpu_needs_attention = any(
         marker in cpu_charts_html for marker in ("verdict-isolated", "verdict-mixed")
     )
@@ -3042,6 +3169,8 @@ def _render_html(
         ("cycles-title", "Batches"),
         ("events-title", "Events"),
     ]
+    if pbp_threat_logs_html:
+        nav_items.insert(2, ("pbp-threat-logs-title", "Threat logs"))
     if glance_html:
         nav_items.insert(0, ("glance-title", "Diagnosis"))
     nav_html = '<nav class="toc" aria-label="Sections">' + "".join(
@@ -3071,7 +3200,8 @@ def _render_html(
                     "the pressure curve.</p>"
                 )
                 + '<h3>Peak resource utilization</h3>'
-                f'<div class="metric-families">{metric_groups_html}</div>',
+                f'<div class="metric-families">{metric_groups_html}</div>'
+                + buffer_latency_html,
                 intro="How much pressure there was, on which resource, and when: "
                 "the curve batch by batch with the syslog triggers, then the peak "
                 "of every resource the firewall reported. Cards turn amber above "
@@ -3086,6 +3216,7 @@ def _render_html(
                 "for the buffer usage, with their flows and rates. RED drop "
                 "<strong>Yes</strong> is the firewall's own designation.",
             ),
+            pbp_threat_logs_html,
             offender_logs_html,
             _render_section(
                 "ingress-title",
