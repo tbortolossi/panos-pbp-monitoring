@@ -933,6 +933,7 @@ def handler_factory(
     config_db: Path | None = None,
     *,
     tls_enabled: bool = False,
+    tls_cert: Path | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     config_store = ConfigStore(config_db) if config_db else None
     admin = (
@@ -945,6 +946,7 @@ def handler_factory(
                 diagnostics.default_log_dir(data_dir),
                 diagnostics.default_log_dir(config_db.parent),
             ),
+            tls_cert=tls_cert,
         )
         if config_store
         else None
@@ -1225,6 +1227,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.fresh_seconds,
             args.config_db,
             tls_enabled=tls_enabled,
+            tls_cert=args.tls_cert,
         ),
         context,
     )

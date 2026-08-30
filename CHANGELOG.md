@@ -3,6 +3,54 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.23.0] - 2026-08-30
+
+### Added
+
+- **Host layer in the support bundle.** `pbp-support.sh`, at the root of the
+  checkout, runs on the Docker host and folds into the bundle what the
+  container cannot see: `docker compose ps -a` with health and restart counts,
+  the effective `docker compose config` and the published ports, the listeners
+  found on 514, 1514 and 5514, the container output of the Syslog gateway, the
+  collector and the dashboard, the image digest and labels, and the Docker and
+  host versions. It streams that layer into the new `pbp-support
+  --host-evidence` option so one archive leaves the site, falls back to a
+  one-off container on the same volumes when the collector is not running, and
+  to a host-only `.tar.gz` when the image is absent. It runs read-only commands
+  only and changes nothing in the stack. An empty reception journal is now
+  diagnosable: a firewall that does not send, a blocked host port, a dead
+  gateway and a gateway forwarding to the wrong port each leave a different
+  trace. Refs #146.
+- **Recent incidents in the bundle.** The three most recent incident runs of
+  each firewall travel under `incidents/`, capture and raw PAN-OS XML without
+  the HTML report, newest first within a 64 MB budget; a run that does not fit
+  is left out whole so what travels stays replayable. `runs.json` flags each
+  run with `bundled`. An incident diagnosis no longer needs a second file from
+  the right dashboard row. Refs #146.
+- **Web certificate facts.** `environment.json` gains `web_tls`: whether a
+  custom certificate is configured, and for the certificate served its
+  subject, names, validity window, days remaining, self-signed flag and SHA-256
+  fingerprint — never its key. Refs #146.
+- **Reception summary.** `syslog/summary.json` counts the reception journal by
+  outcome, refusal slug, firewall and sender, so a forwarding profile that
+  sends every log, or a serial that was never registered, reads in one line.
+  Refs #146.
+
+### Changed
+
+- The bundle `format_version` is now `2`. Host evidence is accepted only as
+  regular files with plain relative names, bounded to 64 files, 4 MB each and
+  12 MB in total, and goes through the same credential scrub and anonymizer as
+  the rest.
+- The credential scrub applied to exported logs and host evidence now also
+  redacts any variable named like a secret (`PANOS_API_KEY`, `*_PASSWORD`,
+  `*_TOKEN`, …) written as `KEY=value` or `KEY: value`, which is how a legacy
+  environment-configured deployment shows up in `docker compose config`.
+- An anonymized export now also tokenizes the dashboard's own hostnames, from
+  `WEB_TLS_HOSTNAMES` and from the served certificate; they were previously
+  left readable in `environment.json`. `localhost` and addresses of the host
+  itself keep the existing loopback exception.
+
 ## [0.22.0] - 2026-08-30
 
 ### Added

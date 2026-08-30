@@ -10,8 +10,13 @@ This module closes it with two pieces:
 * :func:`configure_file_logging` mirrors the process log into a size-bounded
   rotating file inside a volume, so the history survives ``docker logs``.
 * :func:`write_support_bundle` packages those logs together with an environment
-  fingerprint, the redacted configuration, the run inventory and the recent
-  Syslog journals into one archive an operator can send.
+  fingerprint, the redacted configuration, the run inventory, the most recent
+  incidents and the recent Syslog journals into one archive an operator can
+  send.
+* :func:`read_host_evidence` accepts what the container cannot see — the state
+  of the three services, the published ports, the gateway's output — gathered
+  by ``pbp-support.sh`` on the host and streamed in as a tar archive, so the
+  operator still sends one file.
 
 The bundle is evidence, not a secret store. PAN-OS API keys, the administrator
 password material, the recovery key and the one-time setup code never enter it.
@@ -34,10 +39,11 @@ import platform
 import re
 import secrets
 import sys
+import tarfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, BinaryIO, Iterable
 from urllib.parse import urlsplit
 
 from . import __version__
@@ -57,7 +63,20 @@ SENSITIVE_ATTRIBUTE = "pbp_sensitive"
 #: Only these three journals are exported, and only their tail.
 SYSLOG_JOURNAL_TAIL_BYTES = 512 * 1024
 LOG_TAIL_BYTES = 2 * 1024 * 1024
-BUNDLE_FORMAT_VERSION = 1
+#: The reception journal is compacted by the collector well below this, so the
+#: summary reads it whole; the cap only guards against a foreign file.
+SYSLOG_SUMMARY_MAX_BYTES = 8 * 1024 * 1024
+SYSLOG_SUMMARY_TOP_SOURCES = 20
+#: Incident runs travel newest first: this many per firewall, within one
+#: overall budget, without their HTML report, which the capture regenerates.
+INCIDENT_EXPORT_PER_TARGET = 3
+INCIDENT_EXPORT_BUDGET_BYTES = 64 * 1024 * 1024
+#: Evidence gathered on the host by pbp-support.sh: small text files only.
+HOST_EVIDENCE_MAX_FILES = 64
+HOST_EVIDENCE_MAX_FILE_BYTES = 4 * 1024 * 1024
+HOST_EVIDENCE_MAX_TOTAL_BYTES = 12 * 1024 * 1024
+#: Format 2 adds incidents/, syslog/summary.json, host/ and web_tls facts.
+BUNDLE_FORMAT_VERSION = 2
 
 SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
@@ -68,6 +87,15 @@ _SCRUB_PATTERNS = (
     (re.compile(r"(?i)\b(key|api_key|apikey)=([^\s&\"']+)"), r"\1=<redacted>"),
     (re.compile(r"(?i)(x-pan-key\s*[:=]\s*)([^\s\"']+)"), r"\1<redacted>"),
     (re.compile(r"(?i)(setup code[^:]*:\s*)(\S+)"), r"\1<redacted>"),
+    # Host evidence can carry the effective Compose environment. A deployment
+    # configured through PANOS_API_KEY, or any variable named like a secret,
+    # is redacted whether it is written KEY=value or `KEY: value`.
+    (
+        re.compile(
+            r"(?i)(\b[A-Za-z_]*(?:api_key|apikey|password|secret|token)[A-Za-z_]*\s*[:=]\s*)(\S+)"
+        ),
+        r"\1<redacted>",
+    ),
 )
 
 
@@ -186,19 +214,59 @@ class Anonymizer:
         return output.getvalue().encode("utf-8-sig")
 
 
-def build_anonymizer(config_store: Any) -> Anonymizer:
-    """Build an anonymizer seeded with what this deployment knows about itself."""
+#: Names that identify nobody: the dashboard's own default certificate names.
+GENERIC_HOSTNAMES = frozenset({"localhost", "localhost.localdomain"})
+
+
+def web_hostnames(tls_cert: Path | None = None) -> list[str]:
+    """Hostnames under which the dashboard is reached, from the environment
+    and from the certificate it serves. They name the customer's host, so an
+    anonymized export must tokenize them like a firewall name."""
+    names: list[str] = []
+    for value in os.environ.get("WEB_TLS_HOSTNAMES", "").split(","):
+        names.append(value.strip())
+    facts = web_certificate_facts(tls_cert) if tls_cert else None
+    if facts and facts.get("certificate"):
+        names.extend(facts["certificate"].get("dns_names") or ())
+        subject = facts["certificate"].get("subject") or ""
+        names.append(subject)
+    seen: set[str] = set()
+    kept: list[str] = []
+    for name in names:
+        text = name.strip().lower()
+        if not text or text in seen or text in GENERIC_HOSTNAMES:
+            continue
+        try:
+            ipaddress.ip_address(text)
+            continue  # addresses are handled by the address patterns
+        except ValueError:
+            pass
+        seen.add(text)
+        kept.append(name.strip())
+    return kept
+
+
+def build_anonymizer(
+    config_store: Any, hostnames: Iterable[str] = ()
+) -> Anonymizer:
+    """Build an anonymizer seeded with what this deployment knows about itself.
+
+    `hostnames` adds the names of the dashboard host itself, which appear in
+    the environment snapshot and in the host evidence, and are as identifying
+    as a firewall name.
+    """
+    host_literals = [(name, "host") for name in hostnames]
     if config_store is None:
         # No configuration means no known identifiers and no persisted salt.
         # Addresses are still tokenized, under a salt valid for this export
         # only, so the operator can still send something.
-        return Anonymizer(secrets.token_hex(32))
+        return Anonymizer(secrets.token_hex(32), host_literals)
     try:
         salt = config_store.anonymization_salt()
         targets = config_store.list_targets()
     except Exception as exc:
         LOG.warning("Anonymization falls back to a temporary salt: %s", exc)
-        return Anonymizer(secrets.token_hex(32))
+        return Anonymizer(secrets.token_hex(32), host_literals)
     models = {
         str(target.get("model") or "").strip()
         for target in targets
@@ -218,6 +286,7 @@ def build_anonymizer(config_store: Any) -> Anonymizer:
             text = str(serial or "").strip()
             if text:
                 literals.append((text, "serial"))
+    literals.extend(host_literals)
     return Anonymizer(salt, literals)
 
 
@@ -276,7 +345,80 @@ def _dependency_versions() -> dict[str, str]:
     return versions
 
 
-def environment_snapshot(now: datetime | None = None) -> dict[str, Any]:
+def web_certificate_facts(path: Path | None) -> dict[str, Any]:
+    """Describe the certificate the dashboard serves, without its key.
+
+    A browser that refuses the page is diagnosed from exactly this: who issued
+    the certificate, which names it carries, and whether it has expired. The
+    fingerprint lets the maintainer confirm the operator looks at the same one.
+    """
+    facts: dict[str, Any] = {
+        "custom_certificate": bool(
+            os.environ.get("WEB_TLS_CERT", "").strip()
+            or os.environ.get("WEB_TLS_KEY", "").strip()
+        ),
+        "certificate_path": str(path) if path else None,
+        "certificate": None,
+    }
+    if not path:
+        return facts
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.x509.oid import ExtensionOID, NameOID
+
+        certificate = x509.load_pem_x509_certificate(Path(path).read_bytes())
+    except FileNotFoundError:
+        facts["error"] = "certificate file is absent"
+        return facts
+    except Exception as exc:  # unreadable or not PEM: still report why
+        facts["error"] = f"{type(exc).__name__}: {exc}"
+        return facts
+
+    def _common_name(name: Any) -> str:
+        try:
+            attributes = name.get_attributes_for_oid(NameOID.COMMON_NAME)
+        except Exception:
+            return ""
+        return str(attributes[0].value) if attributes else name.rfc4514_string()
+
+    def _utc(attribute: str) -> datetime:
+        value = getattr(certificate, attribute + "_utc", None)
+        if value is None:
+            value = getattr(certificate, attribute).replace(tzinfo=timezone.utc)
+        return value
+
+    dns_names: list[str] = []
+    ip_names: list[str] = []
+    try:
+        extension = certificate.extensions.get_extension_for_oid(
+            ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+        )
+        dns_names = list(extension.value.get_values_for_type(x509.DNSName))
+        ip_names = [str(item) for item in extension.value.get_values_for_type(x509.IPAddress)]
+    except Exception:
+        pass
+    now = datetime.now(timezone.utc)
+    not_before = _utc("not_valid_before")
+    not_after = _utc("not_valid_after")
+    facts["certificate"] = {
+        "subject": _common_name(certificate.subject),
+        "issuer": _common_name(certificate.issuer),
+        "self_signed": certificate.subject == certificate.issuer,
+        "dns_names": dns_names,
+        "ip_addresses": ip_names,
+        "not_valid_before": not_before.isoformat(),
+        "not_valid_after": not_after.isoformat(),
+        "days_remaining": (not_after - now).days,
+        "expired": now > not_after,
+        "sha256_fingerprint": certificate.fingerprint(hashes.SHA256()).hex(),
+    }
+    return facts
+
+
+def environment_snapshot(
+    now: datetime | None = None, tls_cert: Path | None = None
+) -> dict[str, Any]:
     """Describe the runtime the collector is actually executing in."""
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     local = datetime.now().astimezone()
@@ -313,6 +455,7 @@ def environment_snapshot(now: datetime | None = None) -> dict[str, Any]:
                 "WEB_TLS_HOSTNAMES",
             )
         },
+        "web_tls": web_certificate_facts(tls_cert),
     }
 
 
@@ -540,6 +683,186 @@ def _latest_api_check(root: Path) -> Path | None:
     return max(candidates, key=lambda directory: directory.name)
 
 
+def syslog_summary(path: Path, limit: int = SYSLOG_SUMMARY_MAX_BYTES) -> dict[str, Any]:
+    """Count the reception journal by outcome, firewall and sender.
+
+    A forwarding profile that sends every log instead of the PBP ones, or a
+    firewall whose serial was never registered, reads here in one line instead
+    of two hundred: which refusal slug dominates, from which source.
+    """
+    payload = tail_bytes(path, limit)
+    summary: dict[str, Any] = {
+        "journal": Path(path).name,
+        "records": 0,
+        "invalid_lines": 0,
+        "triggers": 0,
+        "accepted": 0,
+        "refused": 0,
+        "by_suppressed": {},
+        "by_target": {},
+        "by_source": {},
+        "first_timestamp": None,
+        "last_timestamp": None,
+    }
+    sources: dict[str, int] = {}
+    for line in payload.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            summary["invalid_lines"] += 1
+            continue
+        if not isinstance(record, dict):
+            summary["invalid_lines"] += 1
+            continue
+        summary["records"] += 1
+        timestamp = record.get("timestamp")
+        if isinstance(timestamp, str):
+            if summary["first_timestamp"] is None:
+                summary["first_timestamp"] = timestamp
+            summary["last_timestamp"] = timestamp
+        if record.get("trigger"):
+            summary["triggers"] += 1
+        slug = record.get("suppressed")
+        if slug:
+            summary["refused"] += 1
+            summary["by_suppressed"][str(slug)] = summary["by_suppressed"].get(str(slug), 0) + 1
+        else:
+            summary["accepted"] += 1
+        for target in record.get("target_names") or ():
+            summary["by_target"][str(target)] = summary["by_target"].get(str(target), 0) + 1
+        metadata = record.get("metadata")
+        source = None
+        if isinstance(metadata, dict):
+            source = metadata.get("syslog_source_ip")
+        source = source or record.get("transport_source_ip")
+        if source:
+            sources[str(source)] = sources.get(str(source), 0) + 1
+    summary["by_source"] = dict(
+        sorted(sources.items(), key=lambda item: (-item[1], item[0]))[
+            :SYSLOG_SUMMARY_TOP_SOURCES
+        ]
+    )
+    summary["distinct_sources"] = len(sources)
+    return summary
+
+
+def _run_files(directory: Path) -> list[tuple[Path, int]]:
+    """Files of one run worth exporting: everything but the HTML report."""
+    files: list[tuple[Path, int]] = []
+    for path in sorted(directory.rglob("*")):
+        if not path.is_file() or path.is_symlink() or path.name == "report.html":
+            continue
+        try:
+            files.append((path, path.stat().st_size))
+        except OSError:
+            continue
+    return files
+
+
+def select_recent_incidents(
+    data_dir: Path,
+    *,
+    per_target: int = INCIDENT_EXPORT_PER_TARGET,
+    budget_bytes: int = INCIDENT_EXPORT_BUDGET_BYTES,
+) -> list[tuple[str, Path, list[tuple[Path, int]]]]:
+    """Choose the incident runs that travel in the bundle, newest first.
+
+    Each firewall contributes at most `per_target` runs, and the whole
+    selection stays under `budget_bytes`. A run that does not fit is skipped
+    whole rather than truncated, so what travels is always replayable.
+    """
+    candidates: list[tuple[str, str, Path, list[tuple[Path, int]]]] = []
+    for target, root in _target_roots(Path(data_dir)):
+        container = root / "incidents"
+        if not container.is_dir():
+            continue
+        runs = sorted(
+            (
+                directory
+                for directory in container.iterdir()
+                if directory.is_dir()
+                and SAFE_COMPONENT.fullmatch(directory.name)
+                and (directory / "incident.jsonl").is_file()
+            ),
+            key=lambda directory: directory.name,
+            reverse=True,
+        )
+        for directory in runs[: max(0, per_target)]:
+            candidates.append((directory.name, target, directory, _run_files(directory)))
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    selected: list[tuple[str, Path, list[tuple[Path, int]]]] = []
+    used = 0
+    for _run_id, target, directory, files in candidates:
+        size = sum(item[1] for item in files)
+        if used + size > budget_bytes:
+            continue
+        used += size
+        selected.append((target, directory, files))
+    return selected
+
+
+def read_host_evidence(source: BinaryIO | Path) -> list[tuple[str, bytes]]:
+    """Read the host-side evidence pbp-support.sh streams in as a tar archive.
+
+    The archive comes from the operator's own host, but it is still parsed at
+    a boundary: only regular files with plain relative names are accepted, each
+    bounded in size and the whole bounded in count and bytes. Text goes through
+    the same credential scrub as the process logs.
+    """
+    entries: list[tuple[str, bytes]] = []
+    total = 0
+    seen: set[str] = set()
+    handle: Any
+    if isinstance(source, (str, Path)):
+        handle = Path(source).open("rb")
+        close = True
+    else:
+        handle = source
+        close = False
+    try:
+        with tarfile.open(fileobj=handle, mode="r|*") as archive:
+            for member in archive:
+                if not member.isfile():
+                    continue
+                name = member.name.replace("\\", "/")
+                while name.startswith("./"):
+                    name = name[2:]
+                parts = [part for part in name.split("/") if part not in ("", ".")]
+                if (
+                    not parts
+                    or name.startswith("/")
+                    or any(not SAFE_COMPONENT.fullmatch(part) for part in parts)
+                ):
+                    LOG.warning("Host evidence entry ignored, unsafe name: %r", member.name)
+                    continue
+                relative = "/".join(parts)
+                if relative in seen:
+                    continue
+                if member.size > HOST_EVIDENCE_MAX_FILE_BYTES:
+                    LOG.warning("Host evidence entry ignored, too large: %s", relative)
+                    continue
+                if len(entries) >= HOST_EVIDENCE_MAX_FILES or total + member.size > HOST_EVIDENCE_MAX_TOTAL_BYTES:
+                    LOG.warning("Host evidence truncated at %s", relative)
+                    break
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    continue
+                payload = extracted.read(HOST_EVIDENCE_MAX_FILE_BYTES + 1)
+                if len(payload) > HOST_EVIDENCE_MAX_FILE_BYTES:
+                    continue
+                text = scrub_log_text(payload.decode("utf-8", errors="replace"))
+                payload = text.encode("utf-8")
+                seen.add(relative)
+                total += len(payload)
+                entries.append((relative, payload))
+    finally:
+        if close:
+            handle.close()
+    return entries
+
+
 BUNDLE_README = """PBP Monitoring support bundle
 =============================
 
@@ -551,13 +874,22 @@ environment.json     the runtime actually executing: application, Python and
                      cryptography versions, platform, timezone, container flag
 configuration.json   every collector setting and every registered firewall,
                      without any credential
-runs.json            the inventory of stored incident and API-check runs
+runs.json            the inventory of stored incident and API-check runs,
+                     stating which runs travel in this archive
 storage.json         what the capture volume holds and how full it is
 logs/                the collector and web UI process logs, most recent last
 syslog/              the tail of the Syslog reception, routing and trigger
-                     journals, including messages the collector refused
+                     journals, including messages the collector refused, and
+                     summary.json counting them by outcome, firewall and sender
 api-checks/          the most recent read-only API validation of each firewall,
                      with the raw PAN-OS XML of every command
+incidents/           the most recent incident runs of each firewall, capture
+                     and raw PAN-OS XML, without the HTML report
+host/                only when produced with pbp-support.sh: the state of the
+                     three services, the effective Compose configuration, the
+                     published ports, the container output including the
+                     Syslog gateway, the image digest, the Docker and host
+                     versions
 manifest.json        SHA-256 of every file above
 
 What it never contains
@@ -594,22 +926,34 @@ def write_support_bundle(
     log_tail_bytes: int = LOG_TAIL_BYTES,
     journal_tail_bytes: int = SYSLOG_JOURNAL_TAIL_BYTES,
     anonymizer: Anonymizer | None = None,
+    tls_cert: Path | None = None,
+    incidents_per_target: int = INCIDENT_EXPORT_PER_TARGET,
+    incident_budget_bytes: int = INCIDENT_EXPORT_BUDGET_BYTES,
+    host_evidence: Iterable[tuple[str, bytes]] = (),
 ) -> dict[str, Any]:
     """Write a deployment-wide diagnostic archive and return its manifest.
 
     With an `anonymizer`, every exported path and payload goes through it, so
     the archive names no address, MAC address, serial or firewall of the site
-    it came from.
+    it came from. `host_evidence` is what pbp-support.sh gathered outside the
+    container; it lands under ``host/`` and is anonymized with the rest.
     """
     root = Path(data_dir)
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     stamp = current.strftime("%Y%m%dT%H%M%SZ")
     prefix = f"pbp-support-{stamp}"
+    incidents = select_recent_incidents(
+        root, per_target=incidents_per_target, budget_bytes=incident_budget_bytes
+    )
+    bundled = {(target, directory.name) for target, directory, _files in incidents}
+    inventory = run_inventory(root)
+    for run in inventory:
+        run["bundled"] = run["kind"] == "incident" and (run["target"], run["run_id"]) in bundled
     entries: list[tuple[str, bytes, str]] = [
         ("README.txt", BUNDLE_README.encode("utf-8"), "generated"),
         (
             "environment.json",
-            _json_bytes(environment_snapshot(current)),
+            _json_bytes(environment_snapshot(current, tls_cert)),
             "generated",
         ),
         (
@@ -617,7 +961,7 @@ def write_support_bundle(
             _json_bytes(redacted_configuration(config_store)),
             "generated",
         ),
-        ("runs.json", _json_bytes(run_inventory(root)), "generated"),
+        ("runs.json", _json_bytes(inventory), "generated"),
         ("storage.json", _json_bytes(storage_usage(root)), "generated"),
     ]
 
@@ -635,6 +979,14 @@ def write_support_bundle(
         payload = tail_bytes(journal, journal_tail_bytes)
         if payload:
             entries.append((f"syslog/{name}.jsonl", payload, "tail"))
+    if (root / "syslog-received.jsonl").is_file():
+        entries.append(
+            (
+                "syslog/summary.json",
+                _json_bytes(syslog_summary(root / "syslog-received.jsonl")),
+                "generated",
+            )
+        )
 
     for target, target_root in _target_roots(root):
         payload = tail_bytes(target_root / "syslog-triggers.jsonl", journal_tail_bytes)
@@ -657,6 +1009,23 @@ def write_support_bundle(
                 )
             except OSError:
                 continue
+
+    for target, directory, files in incidents:
+        for path, _size in files:
+            try:
+                entries.append(
+                    (
+                        f"incidents/{target}/{directory.name}/"
+                        f"{path.relative_to(directory).as_posix()}",
+                        path.read_bytes(),
+                        "capture",
+                    )
+                )
+            except OSError:
+                continue
+
+    for relative, payload in host_evidence:
+        entries.append((f"host/{relative}", payload, "host"))
 
     if anonymizer is not None:
         entries = [
@@ -741,6 +1110,19 @@ def main(argv: list[str] | None = None) -> int:
         help="with --anonymize, write the token mapping here; keep this file,"
         " it is the one thing that must never be sent",
     )
+    parser.add_argument(
+        "--tls-cert",
+        type=Path,
+        default=None,
+        help="certificate the dashboard serves, to describe it in"
+        " environment.json (default: WEB_TLS_CERT or <config dir>/web-tls.crt)",
+    )
+    parser.add_argument(
+        "--host-evidence",
+        default=None,
+        help="tar archive of host-side evidence gathered by pbp-support.sh,"
+        " or - to read it from standard input; its files land under host/",
+    )
     args = parser.parse_args(argv)
     if args.mapping and not args.anonymize:
         parser.error("--mapping requires --anonymize")
@@ -756,27 +1138,42 @@ def main(argv: list[str] | None = None) -> int:
             LOG.warning("Configuration is not readable: %s", exc)
 
     log_dirs = [default_log_dir(args.data_dir), default_log_dir(args.config_db.parent)]
-    anonymizer = build_anonymizer(store) if args.anonymize else None
+    tls_cert = args.tls_cert or Path(
+        os.getenv("WEB_TLS_CERT", "").strip() or args.config_db.parent / "web-tls.crt"
+    )
+    host_evidence: list[tuple[str, bytes]] = []
+    if args.host_evidence is not None:
+        try:
+            if args.host_evidence == "-":
+                host_evidence = read_host_evidence(getattr(sys.stdin, "buffer", sys.stdin))
+            else:
+                host_evidence = read_host_evidence(Path(args.host_evidence))
+        except Exception as exc:
+            # The host layer is an addition; losing it must not lose the bundle,
+            # but the maintainer must see that it was expected and failed.
+            LOG.warning("Host evidence is not readable: %s", exc)
+            host_evidence = [
+                ("error.txt", f"host evidence not readable: {type(exc).__name__}: {exc}\n".encode("utf-8"))
+            ]
+    anonymizer = (
+        build_anonymizer(store, web_hostnames(tls_cert)) if args.anonymize else None
+    )
+    options: dict[str, Any] = {
+        "data_dir": args.data_dir,
+        "config_store": store,
+        "log_dirs": log_dirs,
+        "anonymizer": anonymizer,
+        "tls_cert": tls_cert,
+        "host_evidence": host_evidence,
+    }
     if args.output == "-":
         buffer = getattr(sys.stdout, "buffer", sys.stdout)
-        manifest = write_support_bundle(
-            buffer,
-            data_dir=args.data_dir,
-            config_store=store,
-            log_dirs=log_dirs,
-            anonymizer=anonymizer,
-        )
+        manifest = write_support_bundle(buffer, **options)
     else:
         target = Path(args.output)
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("wb") as handle:
-            manifest = write_support_bundle(
-                handle,
-                data_dir=args.data_dir,
-                config_store=store,
-                log_dirs=log_dirs,
-                anonymizer=anonymizer,
-            )
+            manifest = write_support_bundle(handle, **options)
         LOG.warning("Support bundle written to %s", target)
     if args.mapping and anonymizer is not None:
         args.mapping.parent.mkdir(parents=True, exist_ok=True)

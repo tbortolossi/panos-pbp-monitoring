@@ -65,8 +65,9 @@ accordingly:
     same change: a new PAN-OS command needs an entry in
     `tools/replay_capture.py`; a new journal, log file or persisted artifact
     needs to be exported by `write_support_bundle`; a new setting needs to
-    appear in the redacted configuration; and any new identifying value needs
-    to be anonymized. Two tests enforce the first two mechanically and will
+    appear in the redacted configuration; anything only visible from the
+    Docker host needs to be gathered by `pbp-support.sh`; and any new
+    identifying value needs to be anonymized. Two tests enforce the first two mechanically and will
     fail on drift; the rest is on review. Never let a value that identifies the
     customer's network reach an anonymized export, and never let a credential
     reach either form.

@@ -510,3 +510,344 @@ class AnonymizedBundleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _Incidents:
+    """Several incident runs across two firewalls, with raw XML and reports."""
+
+    def __init__(self, root: Path):
+        self.data = root / "data"
+        for target, runs in (
+            ("fw-a", ("20260830T090000Z", "20260830T100000Z", "20260830T110000Z", "20260830T120000Z")),
+            ("fw-b", ("20260829T090000Z",)),
+        ):
+            for run_id in runs:
+                directory = self.data / "targets" / target / "incidents" / run_id
+                (directory / "raw").mkdir(parents=True)
+                (directory / "incident.jsonl").write_text(
+                    json.dumps({"event": "monitor_started", "run_id": run_id, "peer": "192.0.2.77"})
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (directory / "raw" / "batch-0001.txt").write_text(
+                    "=== COMMAND: packet_buffer_protection ===\n<response status=\"success\"/>\n",
+                    encoding="utf-8",
+                )
+                (directory / "report.html").write_text("<html>report</html>", encoding="utf-8")
+
+    def bundle(self, **kwargs):
+        buffer = io.BytesIO()
+        manifest = diagnostics.write_support_bundle(
+            buffer,
+            data_dir=self.data,
+            now=datetime(2026, 8, 30, 13, 0, tzinfo=timezone.utc),
+            **kwargs,
+        )
+        buffer.seek(0)
+        return manifest, zipfile.ZipFile(buffer)
+
+
+class RecentIncidentExportTests(unittest.TestCase):
+    PREFIX = "pbp-support-20260830T130000Z/"
+
+    def test_the_newest_incidents_travel_with_their_raw_xml_but_not_their_report(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deployment = _Incidents(Path(temporary_directory))
+            _manifest, archive = deployment.bundle()
+            with archive:
+                names = set(archive.namelist())
+                runs = json.loads(archive.read(self.PREFIX + "runs.json"))
+            incidents = self.PREFIX + "incidents/"
+            self.assertIn(incidents + "fw-a/20260830T120000Z/incident.jsonl", names)
+            self.assertIn(incidents + "fw-a/20260830T120000Z/raw/batch-0001.txt", names)
+            self.assertIn(incidents + "fw-a/20260830T100000Z/incident.jsonl", names)
+            self.assertIn(incidents + "fw-b/20260829T090000Z/incident.jsonl", names)
+            # The fourth, oldest run of fw-a stays behind the per-firewall limit.
+            self.assertNotIn(incidents + "fw-a/20260830T090000Z/incident.jsonl", names)
+            self.assertFalse(any(name.endswith("report.html") for name in names))
+            bundled = {(run["target"], run["run_id"]) for run in runs if run["bundled"]}
+            self.assertEqual(
+                bundled,
+                {
+                    ("fw-a", "20260830T120000Z"),
+                    ("fw-a", "20260830T110000Z"),
+                    ("fw-a", "20260830T100000Z"),
+                    ("fw-b", "20260829T090000Z"),
+                },
+            )
+            self.assertTrue(
+                all(not run["bundled"] for run in runs if run["run_id"] == "20260830T090000Z")
+            )
+
+    def test_the_size_budget_keeps_whole_runs_and_drops_the_oldest_first(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deployment = _Incidents(Path(temporary_directory))
+            newest = deployment.data / "targets" / "fw-a" / "incidents" / "20260830T120000Z"
+            size = sum(
+                path.stat().st_size
+                for path in newest.rglob("*")
+                if path.is_file() and path.name != "report.html"
+            )
+            _manifest, archive = deployment.bundle(incident_budget_bytes=size * 2 + 1)
+            with archive:
+                exported = [
+                    name for name in archive.namelist() if "/incidents/" in name and name.endswith("incident.jsonl")
+                ]
+            self.assertEqual(
+                sorted(exported),
+                [
+                    self.PREFIX + "incidents/fw-a/20260830T110000Z/incident.jsonl",
+                    self.PREFIX + "incidents/fw-a/20260830T120000Z/incident.jsonl",
+                ],
+            )
+
+    def test_incident_evidence_is_anonymized_with_the_rest(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deployment = _Incidents(Path(temporary_directory))
+            _manifest, archive = deployment.bundle(anonymizer=Anonymizer("salt"))
+            with archive:
+                blob = b"".join(archive.read(name) for name in archive.namelist())
+            self.assertNotIn(b"192.0.2.77", blob)
+
+
+class SyslogSummaryTests(unittest.TestCase):
+    def test_the_reception_journal_is_counted_by_outcome_firewall_and_sender(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            journal = Path(temporary_directory) / "syslog-received.jsonl"
+            records = [
+                {"timestamp": "2026-08-30T09:00:00+00:00", "trigger": True, "target_names": ["fw-a"], "metadata": {"syslog_source_ip": "192.0.2.10"}},
+                {"timestamp": "2026-08-30T09:00:01+00:00", "trigger": False, "target_names": [], "suppressed": "source_not_registered", "metadata": {"syslog_source_ip": "192.0.2.99"}},
+                {"timestamp": "2026-08-30T09:00:02+00:00", "trigger": False, "target_names": [], "suppressed": "source_not_registered", "metadata": {"syslog_source_ip": "192.0.2.99"}},
+                {"timestamp": "2026-08-30T09:00:03+00:00", "trigger": False, "target_names": [], "suppressed": "device_serial_missing", "metadata": {}, "transport_source_ip": "192.0.2.5"},
+            ]
+            journal.write_text(
+                "\n".join(json.dumps(record) for record in records) + "\nnot json\n",
+                encoding="utf-8",
+            )
+            summary = diagnostics.syslog_summary(journal)
+        self.assertEqual(summary["records"], 4)
+        self.assertEqual(summary["invalid_lines"], 1)
+        self.assertEqual(summary["triggers"], 1)
+        self.assertEqual(summary["accepted"], 1)
+        self.assertEqual(summary["refused"], 3)
+        self.assertEqual(
+            summary["by_suppressed"], {"source_not_registered": 2, "device_serial_missing": 1}
+        )
+        self.assertEqual(summary["by_target"], {"fw-a": 1})
+        self.assertEqual(list(summary["by_source"].items())[0], ("192.0.2.99", 2))
+        self.assertEqual(summary["distinct_sources"], 3)
+        self.assertEqual(summary["first_timestamp"], "2026-08-30T09:00:00+00:00")
+        self.assertEqual(summary["last_timestamp"], "2026-08-30T09:00:03+00:00")
+
+    def test_the_summary_travels_in_the_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deployment = _Deployment(Path(temporary_directory))
+            _manifest, archive = deployment.bundle()
+            with archive:
+                summary = json.loads(
+                    archive.read(SupportBundleTests.PREFIX + "syslog/summary.json")
+                )
+        self.assertEqual(summary["by_suppressed"], {"device_serial_not_registered": 1})
+
+
+class WebCertificateFactsTests(unittest.TestCase):
+    def test_the_served_certificate_is_described_without_its_key(self):
+        from pbp_monitoring.web_tls import ensure_self_signed_certificate
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            ensure_self_signed_certificate(
+                root / "web-tls.crt", root / "web-tls.key", ["pbp.example.net", "192.0.2.20"]
+            )
+            facts = diagnostics.web_certificate_facts(root / "web-tls.crt")
+            deployment = _Deployment(root / "deployment") if (root / "deployment").mkdir() is None else None
+            _manifest, archive = deployment.bundle(tls_cert=root / "web-tls.crt")
+            with archive:
+                environment = json.loads(
+                    archive.read(SupportBundleTests.PREFIX + "environment.json")
+                )
+                blob = b"".join(archive.read(name) for name in archive.namelist())
+        certificate = facts["certificate"]
+        self.assertTrue(certificate["self_signed"])
+        self.assertIn("pbp.example.net", certificate["dns_names"])
+        self.assertIn("192.0.2.20", certificate["ip_addresses"])
+        self.assertFalse(certificate["expired"])
+        self.assertGreater(certificate["days_remaining"], 0)
+        self.assertEqual(len(certificate["sha256_fingerprint"]), 64)
+        self.assertEqual(environment["web_tls"]["certificate"]["subject"], certificate["subject"])
+        self.assertNotIn(b"PRIVATE KEY", blob)
+
+    def test_an_absent_certificate_is_reported_not_fatal(self):
+        facts = diagnostics.web_certificate_facts(Path("/nonexistent/web-tls.crt"))
+        self.assertIsNone(facts["certificate"])
+        self.assertIn("absent", facts["error"])
+
+    def test_the_dashboard_hostnames_are_tokenized_in_an_anonymized_bundle(self):
+        from unittest import mock
+
+        from pbp_monitoring.web_tls import ensure_self_signed_certificate
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            ensure_self_signed_certificate(
+                root / "web-tls.crt", root / "web-tls.key", ["pbp.customer.example", "localhost"]
+            )
+            with mock.patch.dict(
+                "os.environ", {"WEB_TLS_HOSTNAMES": "pbp.customer.example,localhost,127.0.0.1"}
+            ):
+                hostnames = diagnostics.web_hostnames(root / "web-tls.crt")
+                self.assertEqual(hostnames, ["pbp.customer.example"])
+                (root / "deployment").mkdir()
+                deployment = _Deployment(root / "deployment")
+                anonymizer = build_anonymizer(deployment.store, hostnames)
+                _manifest, archive = deployment.bundle(
+                    tls_cert=root / "web-tls.crt", anonymizer=anonymizer
+                )
+                with archive:
+                    blob = b"".join(archive.read(name) for name in archive.namelist())
+        self.assertNotIn(b"pbp.customer.example", blob)
+        self.assertIn(b"localhost", blob)
+        self.assertIn("pbp.customer.example", anonymizer.mapping)
+
+
+def _tar(members: dict[str, bytes], *, directory: str | None = None) -> io.BytesIO:
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        if directory:
+            info = tarfile.TarInfo(directory)
+            info.type = tarfile.DIRTYPE
+            archive.addfile(info)
+        for name, payload in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+    buffer.seek(0)
+    return buffer
+
+
+class HostEvidenceTests(unittest.TestCase):
+    def test_host_files_land_under_host_and_are_listed_in_the_manifest(self):
+        evidence = diagnostics.read_host_evidence(
+            _tar(
+                {
+                    "./compose-ps.txt": b"NAME  STATUS\ncollector  Up 3 hours (healthy)\n",
+                    "./syslog-gateway.log": b"syslog-ng starting up; version='3.38'\n",
+                },
+                directory="./",
+            )
+        )
+        self.assertEqual([name for name, _payload in evidence], ["compose-ps.txt", "syslog-gateway.log"])
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deployment = _Deployment(Path(temporary_directory))
+            manifest, archive = deployment.bundle(host_evidence=evidence)
+            with archive:
+                names = set(archive.namelist())
+                gateway = archive.read(SupportBundleTests.PREFIX + "host/syslog-gateway.log")
+        self.assertIn(SupportBundleTests.PREFIX + "host/compose-ps.txt", names)
+        self.assertIn(b"syslog-ng starting up", gateway)
+        sources = {entry["path"]: entry["source"] for entry in manifest["files"]}
+        self.assertEqual(sources["host/compose-ps.txt"], "host")
+
+    def test_unsafe_names_directories_and_oversized_files_are_ignored(self):
+        evidence = diagnostics.read_host_evidence(
+            _tar(
+                {
+                    "../etc/passwd": b"root:x:0:0\n",
+                    "/absolute.txt": b"absolute\n",
+                    "nested/ok.txt": b"nested is fine\n",
+                    "huge.txt": b"x" * (diagnostics.HOST_EVIDENCE_MAX_FILE_BYTES + 1),
+                    "fine.txt": b"fine\n",
+                },
+                directory="nested",
+            )
+        )
+        self.assertEqual(sorted(name for name, _payload in evidence), ["fine.txt", "nested/ok.txt"])
+
+    def test_host_evidence_is_scrubbed_and_anonymized_like_the_rest(self):
+        evidence = diagnostics.read_host_evidence(
+            _tar(
+                {
+                    "compose-config.yaml": b"environment:\n  PANOS_API_KEY=LUFRPT-secret\nhost: 198.51.100.7\n",
+                }
+            )
+        )
+        self.assertNotIn(b"LUFRPT-secret", evidence[0][1])
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deployment = _Deployment(Path(temporary_directory))
+            _manifest, archive = deployment.bundle(
+                host_evidence=evidence, anonymizer=Anonymizer("salt")
+            )
+            with archive:
+                payload = archive.read(SupportBundleTests.PREFIX + "host/compose-config.yaml")
+        self.assertNotIn(b"198.51.100.7", payload)
+        self.assertIn(b"ip-", payload)
+
+    def test_the_command_reads_host_evidence_from_a_file(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "host.tar").write_bytes(_tar({"compose-ps.txt": b"collector Up\n"}).getvalue())
+            output = root / "bundle.zip"
+            code = diagnostics.main(
+                [
+                    "--data-dir",
+                    str(root / "data"),
+                    "--config-db",
+                    str(root / "absent.db"),
+                    "--output",
+                    str(output),
+                    "--host-evidence",
+                    str(root / "host.tar"),
+                ]
+            )
+            self.assertEqual(code, 0)
+            with zipfile.ZipFile(output) as archive:
+                names = archive.namelist()
+        self.assertTrue(any(name.endswith("host/compose-ps.txt") for name in names))
+
+    def test_unreadable_host_evidence_still_yields_a_bundle_that_says_so(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "host.tar").write_bytes(b"this is not a tar archive")
+            output = root / "bundle.zip"
+            code = diagnostics.main(
+                [
+                    "--data-dir",
+                    str(root / "data"),
+                    "--config-db",
+                    str(root / "absent.db"),
+                    "--output",
+                    str(output),
+                    "--host-evidence",
+                    str(root / "host.tar"),
+                ]
+            )
+            self.assertEqual(code, 0)
+            with zipfile.ZipFile(output) as archive:
+                error = next(name for name in archive.namelist() if name.endswith("host/error.txt"))
+                self.assertIn(b"not readable", archive.read(error))
+
+
+class HostScriptTests(unittest.TestCase):
+    SCRIPT = Path(__file__).resolve().parent.parent / "pbp-support.sh"
+
+    def test_the_host_script_is_executable_and_parses(self):
+        import shutil
+        import subprocess
+
+        self.assertTrue(self.SCRIPT.is_file())
+        self.assertTrue(self.SCRIPT.stat().st_mode & 0o111, "pbp-support.sh must be executable")
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is not available")
+        completed = subprocess.run([bash, "-n", str(self.SCRIPT)], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_the_host_script_feeds_the_collector_and_stays_read_only(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("pbp-support $anonymize --host-evidence -", text)
+        self.assertIn("compose logs --no-color --timestamps --tail 500 syslog-gateway", text)
+        self.assertIn("compose run --rm --no-deps -T collector", text)
+        for forbidden in ("compose down", "compose restart", "compose up", "docker rm ", "volume rm"):
+            self.assertNotIn(forbidden, text)

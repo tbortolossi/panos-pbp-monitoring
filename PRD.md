@@ -287,13 +287,27 @@ An authenticated **support bundle**, downloadable from the admin page or with
 `pbp-support` from a shell, packages the deployment rather than one run: the
 process logs, the environment fingerprint, the redacted settings and firewall
 inventory, the run inventory, the capture-volume usage, the tail of the Syslog
-reception, routing and trigger journals including refused messages, and the most
-recent read-only API validation of each firewall with its raw PAN-OS XML. It
-carries a checksum manifest, makes no call to any firewall, and must never
-contain a PAN-OS API key, the administrator password or its verifier, the
-installation recovery key, or the setup code. It does contain management
-addresses, hostnames, serials and offender source addresses; the documentation
-states so where the action is offered.
+reception, routing and trigger journals including refused messages with a
+summary by outcome, firewall and sender, the most recent read-only API
+validation of each firewall with its raw PAN-OS XML, the most recent incident
+runs of each firewall (capture and raw XML, without the HTML report) newest
+first under a per-firewall count and a global size budget, and a description of
+the web certificate actually served. It carries a checksum manifest, makes no
+call to any firewall, and must never contain a PAN-OS API key, the
+administrator password or its verifier, the installation recovery key, or the
+setup code. It does contain management addresses, hostnames, serials and
+offender source addresses; the documentation states so where the action is
+offered.
+
+A host-side script, `pbp-support.sh`, gathers what the container cannot see —
+service state and restart counts, the effective Compose configuration and
+published ports, the container output including the Syslog gateway, the image
+digest, the Docker and host versions — and streams it into `pbp-support
+--host-evidence` so it lands under `host/` in the same archive, bounded in count
+and size, scrubbed of credential-shaped values and anonymized with the rest.
+The script runs read-only commands only, falls back to a one-off container when
+the collector is not running, and to a host-only archive when the image is
+absent.
 
 Every support export, bundle and run archive alike, is also offered in an
 anonymized form. Addresses, MAC addresses, serial numbers and firewall names are
@@ -508,11 +522,17 @@ key must be backed up and restored together.
 50. A deployment can be diagnosed remotely from artifacts alone. The support
     bundle carries the collector and dashboard process logs, the versions
     actually running, every setting, the firewall and run inventories, the
-    Syslog journals including refused messages, and the latest read-only API
-    validation with its raw XML; it carries no credential of any kind, and
-    building it issues no firewall command. Read-only API validation runs export
-    as a run archive like incidents do, and every run archive states the
-    environment and the redacted configuration it was produced under.
+    Syslog journals including refused messages and their summary, the latest
+    read-only API validation with its raw XML, the most recent incident runs
+    with their raw XML under a size budget, and the facts of the served web
+    certificate; it carries no credential of any kind, and building it issues
+    no firewall command. Read-only API validation runs export as a run archive
+    like incidents do, and every run archive states the environment and the
+    redacted configuration it was produced under. `pbp-support.sh` adds the
+    Docker layer from the host — service state, published ports, gateway
+    output, image digest — into the same archive, so a deployment whose Syslog
+    never reaches the collector is diagnosable without walking the operator
+    through Docker commands.
 51. An operator whose policy forbids disclosing addresses can still obtain a
     diagnosable export. The anonymized bundle and the anonymized run archive
     carry the same evidence with every address, MAC address, serial and
