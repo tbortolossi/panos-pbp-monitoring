@@ -650,6 +650,18 @@ key must be backed up and restored together.
     failed query is stated. Every new command is replayable and exported with
     the capture.
 
+58. The report is two-part: the Diagnosis is the only section open by
+    default, and every evidence section starts folded under a visible
+    "Going further" heading, its one-line verdict readable on the folded
+    summary, with the appendix (summary cards, timeline, batch details,
+    events) under its own heading. The step numbering appears only in the
+    diagnosis; the evidence sections carry plain names. The report's single
+    hash-pinned script additionally opens the section a followed hash link
+    targets, so the diagnosis evidence links and the navigation land on an
+    open section; without the script the sections open by hand and nothing
+    else changes. Expand all remains the way to unfold everything, including
+    before printing.
+
 ## 12. Possible enhancements
 
 - Native TCP/TLS Syslog reception.

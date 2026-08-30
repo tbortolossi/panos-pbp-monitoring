@@ -458,7 +458,7 @@ class CapturedEvidenceTests(unittest.TestCase):
         self.assertIn("<h3>Buffer latency</h3>", html)
         self.assertIn("<td>s1.dp0</td>", html)
         self.assertIn('href="#pbp-threat-logs-title"', html)
-        self.assertIn("Step 2 · PBP threat logs", html)
+        self.assertIn("PBP threat logs", html)
         self.assertIn("1 entries since 2026/08/30 12:04:06 on the firewall clock", html)
         self.assertIn("8507 <span class=\"muted\">PBP Packet Drop</span>", html)
         self.assertIn("buffer latency peak 7 ms", html)
