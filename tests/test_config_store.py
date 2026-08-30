@@ -294,3 +294,52 @@ class ConfigStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunDeletionQueueTests(unittest.TestCase):
+    """The Web UI records deletions; the collector is what removes evidence."""
+
+    def _store(self, root: Path) -> ConfigStore:
+        store = ConfigStore(root / "config.db")
+        store.initialize()
+        return store
+
+    def test_a_queued_deletion_is_idempotent_and_cleared_by_the_collector(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = self._store(Path(temporary_directory))
+
+            store.request_run_deletion("fw-a", "20260101T000000Z")
+            store.request_run_deletion("fw-a", "20260101T000000Z")
+
+            pending = store.pending_run_deletions()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0].target, "fw-a")
+            self.assertEqual(pending[0].run_id, "20260101T000000Z")
+            self.assertFalse(pending[0].deletes_everything)
+
+            store.request_all_runs_deletion()
+            pending = store.pending_run_deletions()
+            self.assertEqual(len(pending), 2)
+            self.assertTrue(pending[1].deletes_everything)
+
+            for request in pending:
+                store.clear_run_deletion(request.deletion_id)
+            self.assertEqual(store.pending_run_deletions(), [])
+
+    def test_a_traversing_or_empty_run_name_is_refused_before_it_is_stored(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = self._store(Path(temporary_directory))
+
+            for target, run_id in (
+                ("..", "run-1"),
+                ("fw-a", ".."),
+                ("fw-a", "../../etc"),
+                ("fw a", "run-1"),
+                ("", "run-1"),
+                ("fw-a", ""),
+                ("*", "run-1"),
+            ):
+                with self.assertRaises(ValueError):
+                    store.request_run_deletion(target, run_id)
+
+            self.assertEqual(store.pending_run_deletions(), [])

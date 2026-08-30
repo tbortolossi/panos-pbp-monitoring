@@ -252,7 +252,7 @@ class AdminController:
         handler.end_headers()
 
     @staticmethod
-    def _form(handler: Any) -> dict[str, str]:
+    def read_form(handler: Any) -> dict[str, str]:
         try:
             length = int(handler.headers.get("Content-Length", "0"))
         except ValueError as exc:
@@ -274,6 +274,15 @@ class AdminController:
         except Exception:
             LOG.exception("Unable to evaluate the administrator session")
             return False
+
+    def session_csrf(self, handler: Any) -> str | None:
+        """Return the CSRF token of the live session, or ``None`` without one.
+
+        The dashboard carries destructive controls of its own, so it needs the
+        same per-session token the administration forms use.
+        """
+        session = self._session(handler)
+        return session[1] if session else None
 
     def _session(self, handler: Any) -> tuple[str, str] | None:
         cookie = SimpleCookie(handler.headers.get("Cookie", ""))
@@ -628,7 +637,7 @@ generated on the firewall CLI, or enable TLS verification first.</p></div>
                     if self._throttled(source):
                         self._throttle_page(handler)
                         return True
-                    form = self._form(handler)
+                    form = self.read_form(handler)
                     if not secrets.compare_digest(form.get("csrf", ""), self.setup_token):
                         raise ValueError("invalid setup token")
                     if not secrets.compare_digest(
@@ -659,7 +668,7 @@ generated on the firewall CLI, or enable TLS verification first.</p></div>
                     if self._throttled(source):
                         self._throttle_page(handler)
                         return True
-                    form = self._form(handler)
+                    form = self.read_form(handler)
                     if not self.verify_slots.acquire(blocking=False):
                         # Password hashing is deliberately expensive; refuse to
                         # stack unlimited concurrent derivations.
@@ -723,7 +732,7 @@ generated on the firewall CLI, or enable TLS verification first.</p></div>
                 edit_id = int(query["edit"][-1]) if query.get("edit") else None
                 self._send(handler, self._dashboard(csrf, edit_id=edit_id, syslog=syslog))
                 return True
-            form = self._form(handler)
+            form = self.read_form(handler)
             if not secrets.compare_digest(form.get("csrf", ""), csrf):
                 raise ValueError("invalid CSRF token")
             if path == "/admin/logout":

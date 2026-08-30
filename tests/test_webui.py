@@ -32,7 +32,7 @@ from pbp_monitoring.webui import (
     write_run_archive,
 )
 from pbp_monitoring import __version__
-from pbp_monitoring.config_store import ConfigStore
+from pbp_monitoring.config_store import ALL_RUNS, ConfigStore
 from tests.support import (
     SERVER_POLL_INTERVAL,
     start_fast_password_hashing,
@@ -474,3 +474,230 @@ class WebUITests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunDeletionUITests(unittest.TestCase):
+    """Deleting evidence is an authenticated, CSRF-protected operator action."""
+
+    def _state(self, runs, pending=(), total=None):
+        return {
+            "syslog_healthy": True,
+            "syslog_age_seconds": 1,
+            "logs": [],
+            "runs": runs,
+            "runs_total": len(runs) if total is None else total,
+            "firewalls": [],
+            "pending_deletions": list(pending),
+        }
+
+    def _run(self, run_id, status="completed"):
+        return {
+            "target": "fw-a",
+            "run_id": run_id,
+            "started_at": "2026-01-01T00:00:00Z",
+            "status": status,
+            "stop_reason": "resources_recovered" if status == "completed" else None,
+            "cycles": 3,
+            "peak_packet_buffer_pct": 42,
+            "top_sources": [],
+            "updated_at": "2026-01-01T00:01:00Z",
+            "report": False,
+            "jsonl": True,
+            "text_files": 0,
+        }
+
+    def test_a_completed_run_offers_delete_while_an_active_one_does_not(self):
+        page = render_dashboard(
+            self._state([self._run("run-done"), self._run("run-live", "active")]),
+            csrf="token-value",
+        )
+
+        self.assertIn('action="/runs/delete"', page)
+        self.assertIn('name="run_id" value="run-done"', page)
+        self.assertNotIn('name="run_id" value="run-live"', page)
+        self.assertIn('name="csrf" value="token-value"', page)
+
+    def test_delete_all_counts_every_stored_run_not_only_the_listed_page(self):
+        page = render_dashboard(
+            self._state([self._run("run-done")], total=29), csrf="token-value"
+        )
+
+        self.assertIn('action="/runs/delete-all"', page)
+        self.assertIn("Delete all 29 runs", page)
+
+        single = render_dashboard(
+            self._state([self._run("run-done")]), csrf="token-value"
+        )
+        self.assertIn("Delete all 1 run<", single)
+
+    def test_a_queued_deletion_replaces_the_button_with_its_pending_state(self):
+        page = render_dashboard(
+            self._state(
+                [self._run("run-done")],
+                pending=[{"target": "fw-a", "run_id": "run-done"}],
+            ),
+            csrf="token-value",
+        )
+        self.assertNotIn('action="/runs/delete"', page)
+        self.assertIn("Deleting", page)
+
+        everything = render_dashboard(
+            self._state(
+                [self._run("run-done"), self._run("run-other")],
+                pending=[{"target": ALL_RUNS, "run_id": ALL_RUNS}],
+            ),
+            csrf="token-value",
+        )
+        self.assertNotIn('action="/runs/delete"', everything)
+        self.assertNotIn('action="/runs/delete-all"', everything)
+        self.assertIn("Deleting every run", everything)
+
+    def test_without_a_session_token_no_deletion_control_is_rendered(self):
+        page = render_dashboard(self._state([self._run("run-done")]))
+
+        self.assertNotIn("/runs/delete", page)
+        self.assertNotIn("<button", page)
+
+
+class RunDeletionRequestTests(unittest.TestCase):
+    """The read-only Web UI records the intent; it never touches the volume."""
+
+    def _server(self, root: Path):
+        catcher = _SetupCodeCatcher()
+        logger = logging.getLogger("pbp-adminui")
+        logger.addHandler(catcher)
+        try:
+            server = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                handler_factory(root / "data", 300, root / "config" / "config.db"),
+            )
+        finally:
+            logger.removeHandler(catcher)
+        thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": SERVER_POLL_INTERVAL},
+            daemon=True,
+        )
+        thread.start()
+        return server, thread, catcher.code
+
+    def _sign_in(self, base: str, setup_code: str):
+        opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        setup = opener.open(base + "/admin").read().decode()
+        csrf = re.search(r'name="csrf" value="([^"]+)"', setup).group(1)
+        signed_in = opener.open(
+            Request(
+                base + "/admin/setup",
+                data=urlencode(
+                    {
+                        "csrf": csrf,
+                        "setup_code": setup_code,
+                        "password": "long-test-password",
+                        "confirm": "long-test-password",
+                    }
+                ).encode(),
+            )
+        ).read().decode()
+        csrf = re.search(r'name="csrf" value="([^"]+)"', signed_in).group(1)
+        opener.open(
+            Request(
+                base + "/admin/login",
+                data=urlencode({"csrf": csrf, "password": "long-test-password"}).encode(),
+            )
+        )
+        dashboard = opener.open(base + "/").read().decode()
+        return opener, re.search(r'name="csrf" value="([^"]+)"', dashboard).group(1)
+
+    def test_signed_in_delete_requests_are_queued_for_the_collector(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            run_dir = root / "data" / "targets" / "fw-a" / "incidents" / "run-1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "incident.jsonl").write_text('{"event":"x"}\n', encoding="utf-8")
+            server, thread, setup_code = self._server(root)
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                opener, csrf = self._sign_in(base, setup_code)
+                opener.open(
+                    Request(
+                        base + "/runs/delete",
+                        data=urlencode(
+                            {"csrf": csrf, "target": "fw-a", "run_id": "run-1"}
+                        ).encode(),
+                    )
+                )
+                opener.open(
+                    Request(
+                        base + "/runs/delete-all",
+                        data=urlencode({"csrf": csrf}).encode(),
+                    )
+                )
+
+                store = ConfigStore(root / "config" / "config.db")
+                queued = {
+                    (item.target, item.run_id) for item in store.pending_run_deletions()
+                }
+                self.assertEqual(
+                    queued, {("fw-a", "run-1"), (ALL_RUNS, ALL_RUNS)}
+                )
+                # The Web UI mounts the volume read-only: nothing is removed here.
+                self.assertTrue((run_dir / "incident.jsonl").is_file())
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_a_wrong_token_or_no_session_queues_nothing(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            run_dir = root / "data" / "targets" / "fw-a" / "incidents" / "run-1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "incident.jsonl").write_text('{"event":"x"}\n', encoding="utf-8")
+            server, thread, setup_code = self._server(root)
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                anonymous = build_opener(_NoRedirect())
+                with self.assertRaises(HTTPError) as context:
+                    anonymous.open(
+                        Request(
+                            base + "/runs/delete-all",
+                            data=urlencode({"csrf": "guessed"}).encode(),
+                        )
+                    )
+                self.assertEqual(context.exception.code, 303)
+                self.assertEqual(context.exception.headers["Location"], "/admin")
+
+                opener, _ = self._sign_in(base, setup_code)
+                with self.assertRaises(HTTPError) as context:
+                    opener.open(
+                        Request(
+                            base + "/runs/delete",
+                            data=urlencode(
+                                {"csrf": "wrong", "target": "fw-a", "run_id": "run-1"}
+                            ).encode(),
+                        )
+                    )
+                self.assertEqual(context.exception.code, 403)
+
+                with self.assertRaises(HTTPError) as context:
+                    opener.open(
+                        Request(
+                            base + "/runs/delete",
+                            data=urlencode(
+                                {"csrf": _dashboard_token(opener, base), "target": "fw-a", "run_id": "../etc"}
+                            ).encode(),
+                        )
+                    )
+                self.assertEqual(context.exception.code, 400)
+
+                store = ConfigStore(root / "config" / "config.db")
+                self.assertEqual(store.pending_run_deletions(), [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+
+def _dashboard_token(opener, base: str) -> str:
+    page = opener.open(base + "/").read().decode()
+    return re.search(r'name="csrf" value="([^"]+)"', page).group(1)

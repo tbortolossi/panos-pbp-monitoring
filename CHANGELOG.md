@@ -3,6 +3,44 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.18.0] - 2026-08-30
+
+### Added
+
+- The dashboard can delete stored incident runs. Each completed run in the
+  **Recent runs** table carries a **Delete** button, and the section header
+  carries **Delete all N runs**, which removes every run of every firewall,
+  not only the twenty the page lists. Both are POST forms gated by the
+  administrator session and its CSRF token. Refs #134.
+- A `run_deletions` queue in the configuration database, carrying the
+  operator's request from the Web UI to the collector. The Web service mounts
+  the evidence volume read-only and the collector exposes no port, so this is
+  the same path the per-firewall **Test** button already uses. Configuration
+  schema version 5 becomes 6; the table is created on first start and older
+  databases keep their content.
+
+### Changed
+
+- The collector runs the queued deletions on its existing ten-second check
+  tick, off the event loop so a large capture tree never delays the Syslog
+  listener. A run being collected or reported is never removed: its request
+  stays queued and is retried until the run is complete. The dashboard shows
+  such a run as *Deleting…* instead of offering the button again.
+- Deletion covers `incidents/<run_id>/` only. Validation artifacts under
+  `api-checks/`, the reception journal, and the trigger journal are untouched.
+- The dashboard's Content-Security-Policy moves from `form-action 'none'` to
+  `form-action 'self'` and gains `frame-ancestors 'none'`, because the page now
+  posts to itself.
+
+### Security
+
+- Deletion is manual and authenticated. No automatic retention, age-based
+  purge, or size cap is introduced; every removal is an explicit operator
+  action, logged by the collector with the run and firewall it removed.
+- Requested run and firewall names are validated before being stored and again
+  before the collector touches the filesystem, so no request can name a path
+  outside `targets/<firewall>/incidents/`.
+
 ## [0.17.0] - 2026-08-30
 
 ### Added

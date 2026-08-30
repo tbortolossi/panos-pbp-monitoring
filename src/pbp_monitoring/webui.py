@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import ssl
 import threading
 import zipfile
@@ -21,7 +22,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__
 from .adminui import AdminController
-from .config_store import ConfigStore
+from .config_store import ALL_RUNS, ConfigStore
 from .web_tls import ensure_self_signed_certificate
 
 
@@ -507,13 +508,24 @@ def collect_dashboard_state(
                     "check_requested_at": target.get("check_requested_at"),
                 }
             )
+    pending_deletions: list[dict[str, str]] = []
+    if config_store is not None and config_store.path.is_file():
+        try:
+            pending_deletions = [
+                {"target": item.target, "run_id": item.run_id}
+                for item in config_store.pending_run_deletions()
+            ]
+        except Exception:  # a broken queue must never blank the dashboard
+            LOG.exception("Unable to read the queued incident-run deletions")
     return {
         "generated_at": current.isoformat(),
         "syslog_healthy": syslog_healthy,
         "syslog_age_seconds": age_seconds,
         "logs": list(reversed(logs)),
         "runs": runs[:run_limit],
+        "runs_total": len(runs),
         "firewalls": firewall_statuses,
+        "pending_deletions": pending_deletions,
     }
 
 
@@ -539,7 +551,36 @@ def _check_line(firewall: dict[str, Any]) -> str:
     return f"{line} - {detail}" if detail else line
 
 
-def render_dashboard(state: dict[str, Any], refresh_seconds: int = 5) -> str:
+def _delete_cell(csrf: str | None, run: dict[str, Any], queued: bool) -> str:
+    """Render the per-run deletion control.
+
+    A run still being collected keeps its evidence: the collector refuses to
+    remove a directory it is writing, so the button is not offered at all.
+    """
+    if queued:
+        return '<span class="muted">Deleting&hellip;</span>'
+    if not csrf or run.get("status") == "active":
+        return "&mdash;"
+    return (
+        '<form class="inline" method="post" action="/runs/delete">'
+        f'<input type="hidden" name="csrf" value="{_escape(csrf)}">'
+        f'<input type="hidden" name="target" value="{_escape(run.get("target"))}">'
+        f'<input type="hidden" name="run_id" value="{_escape(run.get("run_id"))}">'
+        '<button class="danger" type="submit">Delete</button></form>'
+    )
+
+
+def render_dashboard(
+    state: dict[str, Any],
+    refresh_seconds: int = 5,
+    csrf: str | None = None,
+) -> str:
+    """Render the dashboard.
+
+    ``csrf`` carries the administrator session token. Without it the
+    deletion controls are omitted rather than rendered inert, so the page
+    never offers an action the request could not authorise.
+    """
     healthy = bool(state.get("syslog_healthy"))
     age = state.get("syslog_age_seconds")
     status_class = "ok" if healthy else "bad"
@@ -576,10 +617,21 @@ def render_dashboard(state: dict[str, Any], refresh_seconds: int = 5) -> str:
     if not log_rows:
         log_rows.append('<tr><td colspan="4" class="muted">No log observed.</td></tr>')
 
+    queued_deletions = {
+        (str(item.get("target")), str(item.get("run_id")))
+        for item in state.get("pending_deletions", [])
+        if isinstance(item, dict)
+    }
+    deleting_everything = (ALL_RUNS, ALL_RUNS) in queued_deletions
+
     run_rows: list[str] = []
     for run in state.get("runs", []):
         target = quote(str(run.get("target", "")), safe="")
         run_id = quote(str(run.get("run_id", "")), safe="")
+        queued = deleting_everything or (
+            str(run.get("target")),
+            str(run.get("run_id")),
+        ) in queued_deletions
         links: list[str] = []
         if run.get("report"):
             links.append(f'<a href="/reports/{target}/{run_id}/report.html">HTML report</a>')
@@ -607,10 +659,11 @@ def render_dashboard(state: dict[str, Any], refresh_seconds: int = 5) -> str:
             f"<td><code>{_escape(top_text)}</code></td>"
             f"<td>{_escape(run.get('stop_reason'))}</td>"
             f"<td>{' &middot; '.join(links) or '&mdash;'}</td>"
+            f"<td>{_delete_cell(csrf, run, queued)}</td>"
             "</tr>"
         )
     if not run_rows:
-        run_rows.append('<tr><td colspan="9" class="muted">No run recorded.</td></tr>')
+        run_rows.append('<tr><td colspan="10" class="muted">No run recorded.</td></tr>')
 
     firewall_cards: list[str] = []
     for firewall in state.get("firewalls", []):
@@ -643,6 +696,20 @@ def render_dashboard(state: dict[str, Any], refresh_seconds: int = 5) -> str:
             "</div></div>"
         )
 
+    total_runs = int(state.get("runs_total") or len(state.get("runs", [])))
+    if not csrf or not total_runs:
+        delete_all_control = ""
+    elif deleting_everything:
+        delete_all_control = '<span class="muted">Deleting every run&hellip;</span>'
+    else:
+        delete_all_control = (
+            '<form class="inline" method="post" action="/runs/delete-all">'
+            f'<input type="hidden" name="csrf" value="{_escape(csrf)}">'
+            f'<button class="danger" type="submit">Delete all {total_runs}'
+            f' run{"" if total_runs == 1 else "s"}</button>'
+            "</form>"
+        )
+
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="{max(2, int(refresh_seconds))}">
@@ -660,12 +727,14 @@ h1{{margin:0;font-size:clamp(25px,4vw,40px)}}header p{{margin:5px 0 0;color:#d9f
 .table-wrap{{overflow:auto;max-height:55vh;border:1px solid var(--line);border-radius:12px;background:#fff;scrollbar-gutter:stable}}table{{width:100%;border-collapse:collapse;white-space:nowrap}}
 th,td{{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}th{{position:sticky;top:0;background:#eef3f8;font-size:12px;text-transform:uppercase}}
 .message{{max-width:680px;white-space:normal;overflow-wrap:anywhere;font:12px/1.45 ui-monospace,Consolas,monospace}}.badge{{display:inline-block;padding:2px 8px;border-radius:999px;background:#e2e8f0;font-size:11px;font-weight:700}}
+.section-head{{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}}.section-head h2{{margin:0}}
+button.danger{{padding:5px 11px;border:1px solid #fca5a5;border-radius:8px;background:#fff;color:var(--bad);font:inherit;font-weight:650;cursor:pointer}}button.danger:hover{{background:#fef2f2}}form.inline{{display:inline}}
 .badge.trigger,.badge.active{{background:#fef3c7;color:#92400e}}.badge.done{{background:#dcfce7;color:#166534}}a{{color:#0369a1;font-weight:650}}code{{color:#075985}}
 </style></head><body><header><h1>PBP Monitoring <small style="font-size:14px;font-weight:600">v{_escape(__version__)}</small></h1><p>Dashboard &middot; refreshes every {max(2, int(refresh_seconds))} seconds &middot; <a style="color:white" href="/admin">Admin</a></p></header><main>
 <div class="status {status_class}"><span class="dot"></span><div><strong>{_escape(status_text)}</strong><span>{_escape(age_text)}</span></div></div>
 <div class="status-grid">{''.join(firewall_cards)}</div>
 <section><h2>20 most recent received logs</h2><div class="table-wrap"><table><thead><tr><th>Time (UTC)</th><th>Observed source</th><th>Type</th><th>Message</th></tr></thead><tbody>{''.join(log_rows)}</tbody></table></div></section>
-<section><h2>Recent runs</h2><div class="table-wrap"><table><thead><tr><th>Target</th><th>Run ID</th><th>Start time (UTC)</th><th>Status</th><th>Batches</th><th>Peak buffer</th><th>Top sources</th><th>Stop reason</th><th>Artifacts</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table></div></section>
+<section><div class="section-head"><h2>Recent runs</h2>{delete_all_control}</div><div class="table-wrap"><table><thead><tr><th>Target</th><th>Run ID</th><th>Start time (UTC)</th><th>Status</th><th>Batches</th><th>Peak buffer</th><th>Top sources</th><th>Stop reason</th><th>Artifacts</th><th>Delete</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table></div></section>
 </main></body></html>"""
 
 
@@ -709,7 +778,7 @@ def handler_factory(
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'")
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
             if tls_enabled:
                 self.send_header("Strict-Transport-Security", "max-age=31536000")
             if length is not None:
@@ -762,9 +831,62 @@ def handler_factory(
         def do_HEAD(self) -> None:
             self.do_GET()
 
+        def _see_other(self, location: str) -> None:
+            self.send_response(303)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+        def _queue_run_deletion(self, path: str) -> None:
+            """Record the operator's deletion request for the collector.
+
+            The evidence volume is mounted read-only here, so the Web UI never
+            removes a capture itself: it writes the intent to the shared
+            database and the collector performs the removal.
+            """
+            if admin is None or config_store is None:
+                self.send_error(404)
+                return
+            if not admin.is_authenticated(self):
+                self._see_other("/admin")
+                return
+            token = admin.session_csrf(self)
+            try:
+                form = admin.read_form(self)
+            except ValueError:
+                self.send_error(400)
+                return
+            if not token or not secrets.compare_digest(form.get("csrf", ""), token):
+                self.send_error(403)
+                return
+            try:
+                if path == "/runs/delete-all":
+                    config_store.request_all_runs_deletion()
+                    LOG.warning("Deletion of every incident run requested by the operator")
+                else:
+                    target = form.get("target", "")
+                    run_id = form.get("run_id", "")
+                    config_store.request_run_deletion(target, run_id)
+                    LOG.warning(
+                        "Deletion of incident run %s on %s requested by the operator",
+                        run_id,
+                        target,
+                    )
+            except ValueError:
+                self.send_error(400)
+                return
+            except OSError:
+                LOG.exception("Unable to queue the incident-run deletion")
+                self.send_error(503)
+                return
+            self._see_other("/")
+
         def do_POST(self) -> None:
             path = unquote(urlsplit(self.path).path)
             if admin is not None and admin.handle(self, path):
+                return
+            if path in ("/runs/delete", "/runs/delete-all"):
+                self._queue_run_deletion(path)
                 return
             self.send_error(404)
 
@@ -797,7 +919,11 @@ def handler_factory(
                     freshness_seconds=effective_freshness,
                     config_store=config_store,
                 )
-                self._send_bytes(render_dashboard(state).encode("utf-8"), "text/html; charset=utf-8")
+                page = render_dashboard(
+                    state,
+                    csrf=admin.session_csrf(self) if admin is not None else None,
+                )
+                self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
                 return
             parts = [part for part in path.split("/") if part]
             if len(parts) == 4 and parts[0] == "reports" and parts[3] == "report.html":

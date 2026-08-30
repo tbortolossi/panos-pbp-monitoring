@@ -80,6 +80,36 @@ digests for transfer to another workstation or a support case. It also contains:
 - `support/syslog-received.jsonl`: retained Syslog messages attributed to the
   target between the first and last run timestamps.
 
+### Deleting stored runs
+
+Incident evidence is never removed on its own: there is no retention window, no
+age limit, and no size cap. A run leaves the volume only when a signed-in
+operator asks for it, from the **Recent runs** table on the dashboard:
+
+- **Delete** on a row removes that one run directory, with its JSONL, its HTML
+  report and its TXT exports;
+- **Delete all N runs** in the section header removes every run of every
+  firewall, including those beyond the twenty the table lists.
+
+The Web service mounts the evidence volume read-only, so it records the request
+in the configuration database and the collector performs the removal on its next
+ten-second tick — the same path the per-firewall **Test** button already uses.
+Until then the row shows *Deleting…* instead of the button. A run that is still
+being collected or whose report is still being written is skipped and retried,
+so a monitor in progress can never lose its evidence mid-write; that is also why
+an active run offers no **Delete** button at all.
+
+Deletion covers `incidents/<run_id>/` only. The `api-checks/` validation
+artifacts, `syslog-triggers.jsonl` and `syslog-received.jsonl` are left alone.
+The collector logs each removal with the run ID and the firewall:
+
+```bash
+docker compose logs collector | grep "at operator request"
+```
+
+Deleting a run is irreversible and destroys TAC evidence. Download the ZIP
+support archive first if the incident may still be needed.
+
 The reception journal records every datagram the collector receives, but it
 stores the text of a message only when the sender passes two gates: the source
 address must be a declared Syslog source of a firewall, and the device serial the

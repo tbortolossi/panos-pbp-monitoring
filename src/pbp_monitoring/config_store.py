@@ -22,6 +22,12 @@ from cryptography.fernet import Fernet, InvalidToken
 
 
 TARGET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+# Directory names below the evidence volume. Matches the Web UI component
+# pattern so a queued deletion can never name a path the dashboard cannot serve.
+SAFE_RUN_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+# Sentinel for "every firewall" / "every run". It cannot collide with a real
+# directory name because SAFE_RUN_COMPONENT rejects it.
+ALL_RUNS = "*"
 PBKDF2_ITERATIONS = 600_000
 
 DEFAULT_SETTINGS: dict[str, str] = {
@@ -69,6 +75,21 @@ def _decode_core_functions(payload: Any) -> tuple[dict[str, Any], ...]:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+
+@dataclass(frozen=True)
+class RunDeletion:
+    """One queued removal of stored incident evidence."""
+
+    deletion_id: int
+    target: str
+    run_id: str
+    requested_at: str
+
+    @property
+    def deletes_everything(self) -> bool:
+        return self.target == ALL_RUNS and self.run_id == ALL_RUNS
 
 
 @dataclass(frozen=True)
@@ -150,6 +171,13 @@ class ConfigStore:
                     iterations INTEGER NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS run_deletions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    UNIQUE (target, run_id)
+                );
                 """
             )
             columns = {
@@ -191,8 +219,8 @@ class ConfigStore:
                 "INSERT OR IGNORE INTO meta(key,value) VALUES('revision','1')"
             )
             connection.execute(
-                """INSERT INTO meta(key,value) VALUES('schema_version','5')
-                   ON CONFLICT(key) DO UPDATE SET value='5'"""
+                """INSERT INTO meta(key,value) VALUES('schema_version','6')
+                   ON CONFLICT(key) DO UPDATE SET value='6'"""
             )
         self._chmod_private(self.path)
 
@@ -495,6 +523,56 @@ class ConfigStore:
                        last_check_status=?,last_check_detail=? WHERE id=?""",
                     (_utc_now(), kind, status, detail, target_id),
                 )
+
+    def request_run_deletion(self, target: str, run_id: str) -> None:
+        """Queue the removal of one stored incident run.
+
+        The Web UI mounts the evidence volume read-only, so the request travels
+        through the shared database and the collector performs the deletion.
+        Re-requesting a run already queued is a no-op rather than an error, so a
+        double click cannot pile up work.
+        """
+        if not SAFE_RUN_COMPONENT.fullmatch(target):
+            raise ValueError("invalid firewall name")
+        if not SAFE_RUN_COMPONENT.fullmatch(run_id):
+            raise ValueError("invalid run identifier")
+        self._queue_run_deletion(target, run_id)
+
+    def request_all_runs_deletion(self) -> None:
+        """Queue the removal of every stored incident run, for every firewall."""
+        self._queue_run_deletion(ALL_RUNS, ALL_RUNS)
+
+    def _queue_run_deletion(self, target: str, run_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO run_deletions(target,run_id,requested_at)
+                   VALUES(?,?,?)
+                   ON CONFLICT(target,run_id) DO UPDATE SET requested_at=excluded.requested_at""",
+                (target, run_id, _utc_now()),
+            )
+
+    def pending_run_deletions(self) -> list[RunDeletion]:
+        """Return the queued deletions, oldest first."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id,target,run_id,requested_at FROM run_deletions ORDER BY id"
+            ).fetchall()
+        return [
+            RunDeletion(
+                deletion_id=int(row["id"]),
+                target=str(row["target"]),
+                run_id=str(row["run_id"]),
+                requested_at=str(row["requested_at"]),
+            )
+            for row in rows
+        ]
+
+    def clear_run_deletion(self, deletion_id: int) -> None:
+        """Drop one queued deletion once the collector has acted on it."""
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM run_deletions WHERE id=?", (deletion_id,)
+            )
 
     def refresh_target_device(
         self,
