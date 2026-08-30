@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.33.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.34.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -262,12 +262,15 @@ never included in an archive: it is the one file that must never be sent.
 
 ### The incident report
 
-The report opens with an **At a glance** block — severity read against the
-PAN-OS PBP defaults, key figures, and probable-cause sentences ready for a
-support case — then ranks the offender sources, plots pressure over time,
-aggregates denied and dropped traffic, follows the session table, and charts
-per-dataplane CPU. The section-by-section reading guide is in
-[docs/reporting.md](docs/reporting.md).
+The report opens with a **Diagnosis** block that walks the PBP investigation
+in order — how much pressure and on which resource, against the thresholds the
+firewall itself reported; whether PBP already named the offender; whether the
+ingress backlog holds a session; and if not, which of the wider hypotheses
+(elephant session, burst of denied sessions, storm of new sessions, interface
+errors, aggregate load) the capture supports — and closes with a conclusion
+composed only from the steps that were reached. The evidence sections follow
+in the same order and the appendices start folded. The section-by-section
+reading guide is in [docs/reporting.md](docs/reporting.md).
 
 The dashboard, the reports, and every evidence download require the
 administrator sign-in: captures contain device serials, addresses, session

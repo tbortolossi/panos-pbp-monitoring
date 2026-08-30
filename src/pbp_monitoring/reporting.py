@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from . import __version__
+from .diagnosis import build_diagnosis, render_diagnosis
 
 _COMMAND_RESULT_KEYS = ("error", "result", "raw_response")
 _COMMAND_METADATA_KEYS = ("ok", "started_at", "finished_at", "duration_seconds")
@@ -305,41 +306,6 @@ def _level(value: float | int | None) -> str:
     if float(value) >= _PBP_ALERT_PERCENT:
         return "warn"
     return "ok"
-
-
-def _severity(peak: float | None) -> tuple[str, str, str]:
-    """Name the incident severity from the peak packet-buffer pressure."""
-    if peak is None:
-        return (
-            "unknown",
-            "Pressure unknown",
-            "No packet-buffer percentage was collected, so the pressure level "
-            "cannot be stated; read the batch details for the raw responses.",
-        )
-    if peak >= _PBP_ACTIVATE_PERCENT:
-        return (
-            "bad",
-            "Critical pressure",
-            f"Packet buffers peaked at {_format_number(peak)}%, at or above the "
-            f"{_format_number(_PBP_ACTIVATE_PERCENT)}% PBP activate level: the "
-            "firewall was discarding packets to protect itself.",
-        )
-    if peak >= _PBP_ALERT_PERCENT:
-        return (
-            "warn",
-            "Elevated pressure",
-            f"Packet buffers peaked at {_format_number(peak)}%, between the "
-            f"{_format_number(_PBP_ALERT_PERCENT)}% alert and the "
-            f"{_format_number(_PBP_ACTIVATE_PERCENT)}% activate levels: PAN-OS "
-            "raised alerts without discarding packets by itself.",
-        )
-    return (
-        "ok",
-        "Low pressure",
-        f"Packet buffers peaked at {_format_number(peak)}%, below the "
-        f"{_format_number(_PBP_ALERT_PERCENT)}% PBP alert level. If PBP still "
-        "engaged, its thresholds are set lower than the PAN-OS defaults.",
-    )
 
 
 def _resource_cpu_samples(record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -706,13 +672,27 @@ def _dataplane_verdict(
     comparable: Sequence[str],
     peaks: dict[tuple[str, str], dict[int, float]],
     labelled: bool,
-) -> str:
-    """State whether the load rose on every comparable core or on a few of them."""
+) -> dict[str, Any] | None:
+    """State whether the load rose on every comparable core or on a few of them.
+
+    Returns the verdict as data (``state``, the hottest core, its peak and the
+    median of its peers) so the diagnosis block and the CPU section say the
+    same thing; ``_render_dataplane_verdict`` turns it into HTML.
+    """
     if len(comparable) < 2:
-        return (
-            '<p class="muted">Only one comparable core was sampled on '
-            f"{_escape(dataplane)}, so a hot core cannot be told apart from overall load.</p>"
-        )
+        return {
+            "dataplane": dataplane,
+            "state": "single",
+            "batch": None,
+            "hottest_core": comparable[0] if comparable else None,
+            "hottest_value": None,
+            "median": None,
+            "text": (
+                f"Only one comparable core was sampled on {dataplane}, so a hot "
+                "core cannot be told apart from overall load."
+            ),
+            "labelled": labelled,
+        }
 
     hottest_batch = None
     hottest_value = -1.0
@@ -723,7 +703,7 @@ def _dataplane_verdict(
             if value is not None and value > hottest_value:
                 hottest_value, hottest_batch, hottest_core = value, batch_number, core_id
     if hottest_batch is None:
-        return ""
+        return None
 
     values = [
         peaks[(dataplane, core_id)][hottest_batch]
@@ -763,18 +743,67 @@ def _dataplane_verdict(
         )
         state = "mixed"
 
+    return {
+        "dataplane": dataplane,
+        "state": state,
+        "batch": hottest_batch,
+        "hottest_core": hottest_core,
+        "hottest_value": hottest_value,
+        "median": median,
+        "text": verdict,
+        "labelled": labelled,
+    }
+
+
+def _render_dataplane_verdict(verdict: dict[str, Any] | None) -> str:
+    if verdict is None:
+        return ""
+    if verdict["state"] == "single":
+        return f'<p class="muted">{_escape(verdict["text"])}</p>'
     note = (
         ""
-        if labelled
+        if verdict["labelled"]
         else (
             " Core function groups were not collected, so every sampled core is compared, "
             "including any that never forward traffic."
         )
     )
     return (
-        f'<p class="verdict verdict-{state}"><strong>{_escape(dataplane)} · batch '
-        f"{_escape(hottest_batch)}</strong> — {verdict}{note}</p>"
+        f'<p class="verdict verdict-{verdict["state"]}"><strong>'
+        f'{_escape(verdict["dataplane"])} · batch {_escape(verdict["batch"])}</strong> — '
+        f'{verdict["text"]}{note}</p>'
     )
+
+
+def _cpu_verdicts(
+    cycles: Sequence[tuple[int, dict[str, Any]]],
+    core_functions: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """One verdict per dataplane, the same ones the CPU section renders."""
+    batches, peaks = _cpu_series(cycles)
+    if not batches or not peaks:
+        return []
+    roles = _core_roles(core_functions)
+    dataplanes: dict[str, list[str]] = {}
+    for dataplane, core_id in peaks:
+        dataplanes.setdefault(dataplane, []).append(core_id)
+    verdicts: list[dict[str, Any]] = []
+    for dataplane in sorted(dataplanes):
+        cores = sorted(
+            dataplanes[dataplane],
+            key=lambda core_id: _core_sort_key((dataplane, core_id)),
+        )
+        forwarding = [
+            core_id
+            for core_id in cores
+            if roles.get((dataplane, core_id), {}).get("forwards_traffic")
+        ]
+        verdict = _dataplane_verdict(
+            dataplane, batches, forwarding or cores, peaks, bool(forwarding)
+        )
+        if verdict is not None:
+            verdicts.append(verdict)
+    return verdicts
 
 
 def _render_cpu_charts(
@@ -812,7 +841,9 @@ def _render_cpu_charts(
             )
             + "</span></h3>"
             + _core_roles_recall(dataplane, cores, roles)
-            + _dataplane_verdict(dataplane, batches, comparable, peaks, labelled)
+            + _render_dataplane_verdict(
+                _dataplane_verdict(dataplane, batches, comparable, peaks, labelled)
+            )
             + _line_chart(dataplane, batches, cores, peaks, comparable)
             + _heatmap(dataplane, batches, cores, peaks)
         )
@@ -1369,6 +1400,114 @@ def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
     )
 
 
+def _render_ingress_backlogs(
+    cycles: list[tuple[int, dict[str, Any]]],
+    attribution: list[dict[str, Any]],
+) -> str:
+    """List the sessions the ingress work queue named, and the queue itself."""
+    collected = [
+        record for _, record in cycles if isinstance(record.get("ingress_backlogs"), dict)
+    ]
+    queue_rows: list[str] = []
+    for batch_number, (_, record) in enumerate(cycles, 1):
+        ingress = record.get("ingress_backlogs")
+        if not isinstance(ingress, dict):
+            continue
+        for dataplane in ingress.get("dataplanes") or []:
+            if not isinstance(dataplane, dict):
+                continue
+            atomic = next(iter(_numbers(dataplane.get("atomic_percentage"))), None)
+            total = next(iter(_numbers(dataplane.get("total_percentage"))), None)
+            if atomic is None and total is None:
+                continue
+            queue_rows.append(
+                (
+                    batch_number,
+                    f"slot {dataplane.get('slot') or '—'} / dp {dataplane.get('dp') or '—'}",
+                    atomic,
+                    total,
+                )
+            )
+    peaks: dict[str, tuple[float | None, float | None, int]] = {}
+    for batch_number, label, atomic, total in queue_rows:
+        current = peaks.get(label)
+        if current is None:
+            peaks[label] = (atomic, total, batch_number)
+            continue
+        best_atomic, best_total, best_batch = current
+        if (atomic or 0.0) > (best_atomic or 0.0) or (total or 0.0) > (best_total or 0.0):
+            peaks[label] = (
+                max(atomic or 0.0, best_atomic or 0.0),
+                max(total or 0.0, best_total or 0.0),
+                batch_number,
+            )
+    queue_html = ""
+    if peaks:
+        queue_html = (
+            '<div class="table-wrap"><table><thead><tr><th>Dataplane</th>'
+            "<th>Peak ATOMIC %</th><th>Peak TOTAL %</th><th>Peak batch</th>"
+            "</tr></thead><tbody>"
+            + "".join(
+                "<tr>"
+                f"<td>{_escape(label)}</td>"
+                f'<td class="number" data-level="{_level(atomic)}">{_escape(_format_number(atomic))}</td>'
+                f'<td class="number" data-level="{_level(total)}">{_escape(_format_number(total))}</td>'
+                f'<td class="number">{_escape(batch)}</td>'
+                "</tr>"
+                for label, (atomic, total, batch) in sorted(peaks.items())
+            )
+            + "</tbody></table></div>"
+        )
+    candidates = [
+        item
+        for item in attribution
+        if item.get("entity_type") == "session"
+        and (
+            "ingress_backlogs" in item.get("evidence_sources", [])
+            or item.get("ingress_percentage") is not None
+        )
+    ]
+    candidates.sort(key=lambda item: -(float(item.get("ingress_percentage") or 0.0)))
+    if not candidates and not collected:
+        return (
+            '<p class="muted">The ingress backlogs were not collected in this '
+            "capture.</p>"
+        )
+    if not candidates:
+        return (
+            f'<p class="muted">No session held 2% of the work queue in any of the '
+            f"{len(collected)} batches that ran the command.</p>" + queue_html
+        )
+    rows = []
+    for item in candidates[:_MAX_RENDERED_ATTRIBUTION_ROWS]:
+        tuple_text, context = _flow_description(item)
+        detail = item.get("ingress_detail") if isinstance(item.get("ingress_detail"), dict) else {}
+        interfaces = " → ".join(
+            str(value)
+            for value in (detail.get("ingress_interface"), detail.get("egress_interface"))
+            if value
+        ) or "—"
+        rows.append(
+            "<tr>"
+            f'<td><code>{_escape(item.get("identifier"))}</code></td>'
+            f'<td class="number">{_escape(_format_number(item.get("ingress_percentage")))}</td>'
+            f'<td class="number">{_escape(_format_number(item.get("ingress_count")))}</td>'
+            f'<td class="wrap"><code>{_escape(tuple_text)}</code><br><span class="muted">{_escape(context)}</span></td>'
+            f'<td>{_escape(interfaces)}</td>'
+            f'<td>{_escape("Yes" if item.get("drop_state") else "No")}</td>'
+            f'<td>{_escape(item.get("first_seen") or "—")}<br>{_escape(item.get("last_seen") or "—")}</td>'
+            "</tr>"
+        )
+    return (
+        '<div class="table-wrap"><table><thead><tr><th>Session</th>'
+        "<th>Queue %</th><th>Packets</th><th>5-tuple / application</th>"
+        "<th>Interfaces</th><th>Also RED by PBP</th><th>First / last seen</th>"
+        f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+        + _hidden_rows_note(len(candidates) - _MAX_RENDERED_ATTRIBUTION_ROWS, "sessions")
+        + queue_html
+    )
+
+
 _MAX_RENDERED_DROP_COUNTERS = 30
 
 
@@ -1851,90 +1990,6 @@ def _render_pressure_chart(
         '<p class="muted chart-caption">Horizontal axis: batch number. Vertical axis: '
         f"window peak utilization, scaled to {_format_number(ceiling)}% to fit the data. "
         "Each triangle marks a syslog trigger received during the capture.</p>"
-    )
-
-
-def _render_probable_cause(
-    attribution: list[dict[str, Any]],
-    drop_counter_summary: dict[str, Any],
-    session_series: list[dict[str, Any]],
-    cycles: list[tuple[int, dict[str, Any]]],
-    events: list[tuple[int, dict[str, Any]]] | None = None,
-) -> str:
-    """Compose the scattered verdicts into a few sentences an engineer can paste."""
-    if not cycles:
-        return ""
-    sentences: list[str] = []
-    buffer_values = [
-        value
-        for _, record in cycles
-        for key in ("packet_buffer_congestion", "resource_monitor_packet_buffer")
-        if (value := _metric_max(record, key)) is not None
-    ]
-    if buffer_values:
-        sentences.append(
-            f"Packet buffer usage peaked at {_format_number(max(buffer_values))}% "
-            f"over {len(cycles)} collected batches."
-        )
-    top = attribution[0] if attribution else None
-    if top is not None:
-        tuple_text, context = _flow_description(top)
-        entity_label = (
-            f"session <code>{_escape(top.get('identifier'))}</code>"
-            if top.get("entity_type") == "session"
-            else f"source IP <code>{_escape(top.get('identifier'))}</code>"
-        )
-        detail = ""
-        if tuple_text != "—":
-            detail = f" ({_escape(tuple_text)}"
-            if context != "—":
-                detail += f", {_escape(context)}"
-            detail += ")"
-        drop_text = (
-            ", which reached the RED drop state" if top.get("drop_state") else ""
-        )
-        peak_rate = top.get("peak_bits_per_second_total")
-        rate_text = (
-            f" and peaked at {_format_number(float(peak_rate) / 1_000_000.0)} Mbit/s"
-            if isinstance(peak_rate, (int, float))
-            else ""
-        )
-        sentences.append(
-            f"The strongest evidence points to {entity_label}{detail}"
-            f"{drop_text}{rate_text}."
-        )
-    corroborations = [
-        record
-        for _, record in (events or [])
-        if str(record.get("event", "")).lower() == "flood_corroboration"
-    ]
-    if corroborations:
-        destinations = sorted(
-            {
-                str(metadata["destination_ip"])
-                for record in corroborations
-                if isinstance(metadata := record.get("metadata"), dict)
-                and metadata.get("destination_ip")
-            }
-        )
-        destination_text = (
-            f" targeting {_escape(', '.join(destinations))}" if destinations else ""
-        )
-        sentences.append(
-            f"{len(corroborations)} zone-protection or DoS flood log(s) "
-            f"corroborated the incident{destination_text}."
-        )
-    if drop_counter_summary.get("items"):
-        sentences.append(_drop_counter_verdict(drop_counter_summary, attribution)[1])
-    if session_series:
-        sentences.append(_session_verdict(session_series)[1])
-    if not sentences:
-        return ""
-    return (
-        '<div class="probable-cause">'
-        '<h3 id="probable-cause-title">Probable cause</h3>'
-        + "".join(f"<p>{sentence}</p>" for sentence in sentences)
-        + "</div>"
     )
 
 
@@ -2574,12 +2629,9 @@ def _render_html(
         events
     ) + _render_offender_traffic_logs(events)
     session_series = _session_series(cycles)
-    probable_cause_html = _render_probable_cause(
-        attribution, drop_counter_summary, session_series, cycles, events
-    )
     pressure_chart_html = _render_pressure_chart(cycles, events)
     session_table_html = _render_session_table(session_series)
-    large_sessions_html = _render_large_sessions(_aggregate_large_sessions(cycles))
+    large_sessions_html = ""
     core_functions = next(
         (
             record["dp_core_functions"]
@@ -2590,7 +2642,11 @@ def _render_html(
         [],
     )
     cpu_charts_html = _render_cpu_charts(cycles, core_functions)
+    cpu_verdict_data = _cpu_verdicts(cycles, core_functions)
+    large_session_summary = _aggregate_large_sessions(cycles)
     cpu_tracking_html = _render_cpu_tracking(cycles, core_functions)
+    large_sessions_html = _render_large_sessions(large_session_summary)
+    ingress_html = _render_ingress_backlogs(cycles, attribution)
     cpu_needs_attention = any(
         marker in cpu_charts_html for marker in ("verdict-isolated", "verdict-mixed")
     )
@@ -2807,8 +2863,6 @@ def _render_html(
         f'<div class="cards">{capture_cards}</div></div>'
         '<div class="summary-group"><h3>Incident state</h3>'
         f'<div class="cards state-cards">{state_cards}</div></div>'
-        '<div class="summary-group"><h3>Peak resource utilization</h3>'
-        f'<div class="metric-families">{metric_groups_html}</div></div>'
     )
 
     # Only chart the metrics the firewall actually returned: a column of dashes
@@ -2955,61 +3009,41 @@ def _render_html(
         f"<th>{_escape(label)} %</th>" for _, label in timeline_metrics
     )
 
-    buffer_peak_values = [
-        value
-        for key in ("packet_buffer_congestion", "resource_monitor_packet_buffer")
-        if (value := metric_maxima.get(key)) is not None
-    ]
-    buffer_peak = max(buffer_peak_values) if buffer_peak_values else None
     glance_html = ""
     if cycles:
-        severity_state, severity_label, severity_text = _severity(buffer_peak)
-        top = attribution[0] if attribution else None
-        if top is not None:
-            top_kind = "session" if top.get("entity_type") == "session" else "source IP"
-            top_html = (
-                f"{_escape(top_kind)} <code>{_escape(top.get('identifier'))}</code>"
-            )
-        else:
-            top_html = '<span class="muted">none identified</span>'
-        facts = (
-            ("Peak packet buffer", f"{_escape(_format_number(buffer_peak))}"
-             f"{'%' if buffer_peak is not None else ''}"),
-            ("Observed duration", _escape(_human_duration(duration))),
-            ("Batches", _escape(len(cycles))),
-            ("Triggers received", _escape(len(trigger_events))),
-            ("Top offender", top_html),
-            ("Denied packets", _escape(_format_number(drop_counter_summary["denied_total"]))),
-            ("PBP engaged", _escape(pbp_active)),
-            ("Stop reason", _escape(_stop_reason_label(stop_reason)) if stop_reason else "No stop marker"),
-        )
-        facts_html = "".join(
-            f"<div><dt>{label}</dt><dd>{value}</dd></div>" for label, value in facts
+        diagnosis = build_diagnosis(
+            cycles=[record for _, record in cycles],
+            events=[record for _, record in events],
+            attribution=attribution,
+            drop_summary=drop_counter_summary,
+            session_series=session_series,
+            large_sessions=large_session_summary,
+            cpu_verdicts=cpu_verdict_data,
+            device=device,
         )
         glance_html = _render_section(
             "glance-title",
-            "At a glance",
-            f'<p class="headline"><strong>{_escape(severity_label)}.</strong> '
-            f"{_escape(severity_text)}</p>"
-            f'<dl class="key-facts">{facts_html}</dl>'
-            f"{probable_cause_html}",
+            "Diagnosis",
+            render_diagnosis(diagnosis),
             section_class="glance",
-            data_level=severity_state,
+            data_level=diagnosis["headline"]["level"],
         )
 
     nav_items = [
-        ("summary-title", "Summary"),
-        ("pressure-title", "Pressure"),
-        ("attribution-title", "Offenders"),
+        ("pressure-title", "1 · Pressure"),
+        ("attribution-title", "2 · PBP offenders"),
+        ("ingress-title", "3 · Ingress backlog"),
+        ("cpu-tracking-title", "4 · CPU"),
+        ("large-sessions-title", "Largest sessions"),
         ("drop-counters-title", "Drops"),
-        ("session-table-title", "Sessions"),
-        ("cpu-tracking-title", "CPU"),
+        ("session-table-title", "Session table"),
+        ("summary-title", "Summary"),
         ("timeline-title", "Timeline"),
         ("cycles-title", "Batches"),
         ("events-title", "Events"),
     ]
     if glance_html:
-        nav_items.insert(0, ("glance-title", "At a glance"))
+        nav_items.insert(0, ("glance-title", "Diagnosis"))
     nav_html = '<nav class="toc" aria-label="Sections">' + "".join(
         f'<a href="#{anchor}">{label}</a>' for anchor, label in nav_items
     ) + "</nav>"
@@ -3019,52 +3053,59 @@ def _render_html(
 
     alert_text = _escape(_format_number(_PBP_ALERT_PERCENT))
     activate_text = _escape(_format_number(_PBP_ACTIVATE_PERCENT))
+    timeline_html = (
+        timeline_note
+        + '<div class="table-wrap timeline-wrap"><table class="timeline">'
+        "<thead><tr><th>Batch</th><th>Collector time</th><th>Firewall time</th>"
+        f"<th>Elapsed (s)</th>{metric_headers}<th>Candidate sessions</th><th>Errors</th>"
+        f"</tr></thead><tbody>{timeline_body}</tbody></table></div>"
+    )
     sections_html = "".join(
         [
             _render_section(
-                "summary-title",
-                "Summary",
-                summary_groups,
-                intro="How much was collected, what state PBP was in, and the "
-                "highest value each resource reached. Cards turn amber above the "
-                f"{alert_text}% alert level and red above the {activate_text}% "
+                "pressure-title",
+                "Step 1 · Pressure over time",
+                (
+                    pressure_chart_html
+                    or '<p class="muted">At least two batches are required to draw '
+                    "the pressure curve.</p>"
+                )
+                + '<h3>Peak resource utilization</h3>'
+                f'<div class="metric-families">{metric_groups_html}</div>',
+                intro="How much pressure there was, on which resource, and when: "
+                "the curve batch by batch with the syslog triggers, then the peak "
+                "of every resource the firewall reported. Cards turn amber above "
+                f"the {alert_text}% alert level and red above the {activate_text}% "
                 "activate level.",
             ),
             _render_section(
-                "pressure-title",
-                "Pressure over time",
-                pressure_chart_html
-                or '<p class="muted">At least two batches are required to draw '
-                "the pressure curve.</p>",
-                intro="When the pressure rose and fell, batch by batch, and when "
-                "the syslog triggers arrived relative to it.",
-            ),
-            _render_section(
                 "attribution-title",
-                "Offender attribution",
+                "Step 2 · Offenders named by PBP",
                 attribution_html,
                 intro="Which sessions and source addresses PAN-OS itself blamed "
-                "for the buffer usage, with their flows and rates.",
-            ),
-            _render_section(
-                "drop-counters-title",
-                "Denied and dropped traffic",
-                drop_counters_html,
-                intro="What the dataplane discarded, and whether it was denied "
-                "before a session existed (a flood the policy blocks) or dropped "
-                "afterwards.",
+                "for the buffer usage, with their flows and rates. RED drop "
+                "<strong>Yes</strong> is the firewall's own designation.",
             ),
             offender_logs_html,
             _render_section(
-                "session-table-title",
-                "Session table",
-                session_table_html,
-                intro="Whether new sessions followed the load, or packets arrived "
-                "without creating any.",
+                "ingress-title",
+                "Step 3 · Ingress backlog",
+                ingress_html,
+                intro="Which sessions held at least 2% of the work queue in front "
+                "of the dataplane cores (<code>show running resource-monitor "
+                "ingress-backlogs</code>). Independent of the PBP learning: the "
+                "queue is where the on-chip descriptors are consumed.",
+            ),
+            _render_section(
+                "cpu-tracking-title",
+                "Step 4 · Dataplane CPU core tracking",
+                cpu_charts_html + cpu_tracking_html,
+                intro="Whether every core rose together (aggregate load) or one "
+                "core ran hot alone (a single high-rate flow pinned to it).",
             ),
             _render_section(
                 "large-sessions-title",
-                "Largest sessions",
+                "Step 4 · Largest sessions",
                 large_sessions_html,
                 intro="Whether one long-lived high-volume transfer was consuming "
                 "the link while the buffers filled. Such a session writes no "
@@ -3072,22 +3113,34 @@ def _render_html(
                 "ranking.",
             ),
             _render_section(
-                "cpu-tracking-title",
-                "Dataplane CPU core tracking",
-                cpu_charts_html + cpu_tracking_html,
-                intro="Whether every core rose together (aggregate load) or one "
-                "core ran hot alone (a single high-rate flow pinned to it).",
+                "drop-counters-title",
+                "Step 4 · Denied and dropped traffic",
+                drop_counters_html,
+                intro="What the dataplane discarded, and whether it was denied "
+                "before a session existed (a burst the policy refuses) or dropped "
+                "afterwards.",
+            ),
+            _render_section(
+                "session-table-title",
+                "Step 4 · Session table",
+                session_table_html,
+                intro="Whether new sessions followed the load, or packets arrived "
+                "without creating any.",
+            ),
+            _render_section(
+                "summary-title",
+                "Summary",
+                summary_groups,
+                intro="How much was collected and what state PBP was in.",
+                open=False,
             ),
             _render_section(
                 "timeline-title",
                 "Timeline",
-                timeline_note
-                + '<div class="table-wrap timeline-wrap"><table class="timeline">'
-                "<thead><tr><th>Batch</th><th>Collector time</th><th>Firewall time</th>"
-                f"<th>Elapsed (s)</th>{metric_headers}<th>Candidate sessions</th><th>Errors</th>"
-                f"</tr></thead><tbody>{timeline_body}</tbody></table></div>",
+                timeline_html,
                 intro="One row per batch with every collected percentage. Hover a "
                 "time for its full timestamp.",
+                open=False,
             ),
             _render_section(
                 "cycles-title",
@@ -3096,6 +3149,7 @@ def _render_html(
                 intro="The raw evidence for TAC: every command response of every "
                 "batch, exactly as the firewall returned it.",
                 pill=f"{_escape(len(cycles))} batches",
+                open=False,
             ),
             _render_section(
                 "events-title",
@@ -3241,6 +3295,34 @@ def _render_html(
     .key-facts div {{ padding:9px 11px; border-radius:8px; background:var(--soft); }}
     .key-facts dd {{ font-size:17px; font-weight:700; }}
     .probable-cause {{ margin-top:14px; padding-top:10px; border-top:1px solid var(--line); }}
+    .diagnosis-context {{ margin:0 0 14px; }}
+    .diagnosis-context .key {{ padding:2px 9px; border-radius:999px; background:var(--soft); }}
+    ol.steps {{ margin:0; padding:0; list-style:none; display:grid; gap:10px; }}
+    .step {{ padding:12px 14px; border:1px solid var(--line); border-left:5px solid #94a3b8; border-radius:10px; background:#fff; }}
+    .step[data-level="ok"] {{ border-left-color:#047857; }}
+    .step[data-level="warn"] {{ border-left-color:#d97706; }}
+    .step[data-level="bad"] {{ border-left-color:var(--danger); }}
+    .step-head {{ display:flex; align-items:center; gap:10px; }}
+    .step-head h3 {{ margin:0; font-size:15px; }}
+    .step-number {{ display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px; border-radius:50%; background:#0f172a; color:#fff; font-weight:800; font-size:13px; }}
+    .step-evidence {{ margin-left:auto; color:var(--accent); font-size:12px; font-weight:700; text-decoration:none; }}
+    .step-evidence:hover,.step-evidence:focus {{ text-decoration:underline; }}
+    .step-verdict {{ margin:8px 0 6px; }}
+    .step-unavailable .step-verdict {{ color:var(--muted); }}
+    .step-facts {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:8px; margin:8px 0 0; }}
+    .step-facts div {{ padding:7px 10px; border-radius:8px; background:var(--soft); }}
+    .step-facts div[data-level="warn"] {{ background:#fffbeb; }}
+    .step-facts div[data-level="bad"] {{ background:#fee4e2; }}
+    .step-facts dd {{ font-weight:700; }}
+    ol.step-named {{ margin:6px 0 4px; padding-left:22px; }}
+    ol.step-named li {{ margin:3px 0; }}
+    ul.hypotheses {{ margin:6px 0 0; padding:0; list-style:none; display:grid; gap:6px; }}
+    .hypothesis {{ position:relative; padding:8px 10px 8px 30px; border-radius:8px; background:var(--soft); }}
+    .hypothesis-mark {{ position:absolute; left:10px; top:11px; width:12px; height:12px; border-radius:50%; background:#94a3b8; }}
+    .hypothesis-positive {{ background:#fef2f2; }}
+    .hypothesis-positive .hypothesis-mark {{ background:var(--danger); }}
+    .hypothesis-negative .hypothesis-mark {{ background:#047857; }}
+    .hypothesis-unavailable {{ color:var(--muted); }}
     .probable-cause h3 {{ margin:0 0 6px; }}
     .probable-cause p {{ margin:6px 0; }}
     .not-collected {{ color:var(--muted); font-size:15px; font-weight:600; }}

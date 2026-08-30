@@ -167,8 +167,8 @@ than create a concurrent one.
 10. After the stop marker is written, a standalone HTML report is generated in
    the background from the JSONL file. Its offender ranking and top-sources
    tables are bounded to 50 rows each and state what was left out, and every
-   section, At a glance included, can be folded from its heading without
-   script.
+   section, Diagnosis included, can be folded from its heading without
+   script. The report opens with the investigation itself (FR 56).
 11. Each completed batch also writes an atomic TXT view of its command and
     session outputs. A Web UI displays bounded Syslog reception status and
     read-only artifact links. A report served by the Web UI is shown with an
@@ -510,7 +510,7 @@ key must be backed up and restored together.
     static file whose only active content is its own Collapse all control: one
     inline script, pinned by SHA-256 in the report's own Content-Security-Policy
     and in the policy the Web UI serves it with, that folds every section except
-    At a glance and reopens them. It builds its own button, so a report whose
+    Diagnosis and reopens them. It builds its own button, so a report whose
     script is stripped or blocked shows the page unchanged rather than a dead
     control, and it reads nothing, stores nothing, and sends nothing.
 
@@ -583,6 +583,31 @@ key must be backed up and restored together.
     is declared. Creating the administrator with the one-time setup code opens
     the session directly, so the first run continues into the recovery key and
     the first firewall without a second authentication.
+
+56. The report is organised as the PBP investigation rather than by data
+    source. It opens with a Diagnosis block of four steps, each answered from
+    the capture and each stating what it found or that it found nothing:
+    (1) the pressure level and the exhausted resource, judged against the
+    PAN-OS levels (buffers exhausted from 80%, descriptors exhausted from 80%
+    with low buffers, elevated from 50%, low below) and read together with the
+    alert threshold the firewall printed in its own congestion log and the
+    lowest utilization at which PBP was seen mitigating, with the hardware
+    family derived from the model so an x86 platform's missing on-chip
+    descriptor pool is stated rather than shown as not collected; (2) the
+    entries PBP marked for RED, sessions with their flow from `show session
+    id` and source addresses with their recovered traffic log, presented as
+    the firewall's designation and not as proof; (3) the sessions holding at
+    least 2% of the ingress backlog, calling out unidentified applications and
+    the `flow_slowpath` + `Bad Key` policy-deny signature; (4) five wider
+    hypotheses — elephant session, burst of denied sessions, storm of new
+    sessions, interface errors, aggregate load — each with its own verdict. At
+    low pressure the later steps are read as the ordinary traffic mix and
+    nothing is blamed; when the pressure is real and no step names a cause, the
+    conclusion points at the software-defect scenario and a Tech Support File.
+    The conclusion is composed only from the steps reached, the evidence
+    sections follow the same order, and the summary cards, timeline, batch
+    details and events become folded appendices. Collection, the JSONL, the
+    commands and the exports do not change.
 
 ## 12. Possible enhancements
 

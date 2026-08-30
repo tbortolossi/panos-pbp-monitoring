@@ -3,6 +3,38 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.34.0] - 2026-08-30
+
+### Changed
+
+- **The report is organised as the PBP investigation.** It used to be laid out
+  by data source — the PBP table, the counters, the session table, the CPU —
+  with thirteen sections of equal weight and a probable cause whose sentences
+  were composed independently, so a capture at 4% could still read "consistent
+  with a UDP or GRE flood" because 71 packets had been denied over ten minutes.
+  The report now opens with a **Diagnosis** block that asks, in order, the
+  questions an engineer asks when a customer's PBP fires: how much pressure and
+  on which resource, judged against the PAN-OS levels and read with the alert
+  threshold the firewall printed in its own log and the utilization at which
+  PBP was seen mitigating; whether PBP already marked an offender for RED,
+  presented as the firewall's designation rather than proof; whether the
+  ingress backlog holds a session, with the `flow_slowpath` + `Bad Key`
+  policy-deny signature and unidentified applications called out; and if not,
+  which of five wider hypotheses the capture supports — elephant session,
+  burst of denied sessions, storm of new sessions, interface errors, aggregate
+  load. Each step states what it found or that it found nothing; at low
+  pressure the later signals are listed but not blamed; and when the pressure
+  is real and nothing names a cause, the conclusion points at the
+  software-defect scenario and a Tech Support File. The conclusion for the
+  case is composed only from the steps that were reached.
+
+  The hardware family is derived from the model, so a PA-400 or PA-5400 no
+  longer shows its on-chip descriptor pool as "Not collected": an x86 platform
+  never has one. The evidence sections follow the same order as the steps, a
+  new **Ingress backlog** section lists the queue and its sessions, and the
+  summary cards, timeline, batch details and events become folded appendices.
+  Collection, the JSONL, the commands and the exports do not change. Refs #180.
+
 ## [0.33.0] - 2026-08-30
 
 ### Added
