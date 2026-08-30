@@ -33,6 +33,15 @@ follows [Semantic Versioning](https://semver.org/).
   and the per-firewall cards keep reading the whole journal, so a filtered
   dashboard cannot hide a reception outage.
 
+### Changed
+
+- **Core functions recalled once in the CPU charts.** The dataplane CPU
+  section lists what each core does under its heading, then names cores by
+  number in the line-chart legend, the heatmap rows and the verdict. The row
+  labels no longer carry a function list wide enough to squeeze the heatmap
+  cells, and the per-core summary table still shows the full function groups.
+  Refs #159.
+
 ### Fixed
 
 - **Timeline session column named as a candidate list.** The Timeline table of
@@ -45,6 +54,15 @@ follows [Semantic Versioning](https://semver.org/).
   IDs the firewall ranked for that batch — not a total — and points at the
   session-table section for the device-wide count. No change to collection: the
   same `candidate_session_ids` are rendered.
+
+- **Support bundle buttons were clipped.** The three download links of the
+  Support bundle card shared the compact button row of the firewall table,
+  which pinned every button to the width of "Edit". Their labels overflowed and
+  overlapped, hiding which link produced the anonymized bundle and which one
+  the token mapping the operator must keep on site. The row now sizes each
+  button to its label, wraps on a narrow window instead of overflowing the
+  card, and keeps its spacing below the explanatory text. Display only: no
+  change to the archives, to what they redact, or to any firewall call.
 
 ## [0.24.0] - 2026-08-30
 
@@ -59,12 +77,6 @@ follows [Semantic Versioning](https://semver.org/).
   unchanged: the stop marker, the probable cause and the rollup still work
   from the full attribution, and the JSONL capture keeps every ranked entity.
   Refs #150.
-- **Core functions recalled once in the CPU charts.** The dataplane CPU
-  section lists what each core does under its heading, then names cores by
-  number in the line-chart legend, the heatmap rows and the verdict. The row
-  labels no longer carry a function list wide enough to squeeze the heatmap
-  cells, and the per-core summary table still shows the full function groups.
-  Refs #159.
 - **Collapsible report sections.** Every section of the report can be folded
   from its heading with a native disclosure, open by default except the events
   section which stays collapsed as before. The report remains a single file
@@ -81,15 +93,6 @@ follows [Semantic Versioning](https://semver.org/).
   denied by a Security policy rule. They now form a "PBP RED drops" family,
   reported in the drop verdict and the probable cause without joining the
   denied total. Refs #151.
-
-- **Support bundle buttons were clipped.** The three download links of the
-  Support bundle card shared the compact button row of the firewall table,
-  which pinned every button to the width of "Edit". Their labels overflowed and
-  overlapped, hiding which link produced the anonymized bundle and which one
-  the token mapping the operator must keep on site. The row now sizes each
-  button to its label, wraps on a narrow window instead of overflowing the
-  card, and keeps its spacing below the explanatory text. Display only: no
-  change to the archives, to what they redact, or to any firewall call.
 
 ## [0.23.0] - 2026-08-30
 
