@@ -1260,6 +1260,17 @@ class ReadabilityTests(unittest.TestCase):
         self.assertIn("<th>PBP congestion %</th>", html)
         self.assertIn("Not collected", html)
 
+    def test_timeline_session_column_is_named_as_a_candidate_list(self):
+        html = self._render(self._capture([4.0, 4.1]))
+
+        self.assertIn("<th>Candidate sessions</th>", html)
+        self.assertNotIn("<th>Sessions</th><th>Errors</th>", html)
+        self.assertIn(
+            "lists the session IDs the firewall ranked for that batch, "
+            "not a session total",
+            html,
+        )
+
     def test_batch_summaries_show_their_buffer_reading_and_clock_time(self):
         html = self._render(self._capture([4.0, 87.0]))
 

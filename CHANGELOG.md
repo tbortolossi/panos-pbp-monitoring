@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
-## [0.24.0] - 2026-08-30
+## [0.25.0] - 2026-08-30
 
 ### Added
 
@@ -18,6 +18,21 @@ follows [Semantic Versioning](https://semver.org/).
   unfiltered table. The filter is a view over the table only — global freshness
   and the per-firewall cards keep reading the whole journal, so a filtered
   dashboard cannot hide a reception outage.
+
+### Fixed
+
+- **Timeline session column named as a candidate list.** The Timeline table of
+  the HTML report labelled its last-but-one column `Sessions`, while the
+  top-sources rollup uses the same word for an actual per-source count. An
+  operator reading a calm capture saw a different list of five to eight IDs on
+  every batch and read it as a session total that made no sense. The column is
+  now `Candidate sessions`, matching the wording the batch-details panel
+  already used, and a note under the table states that these are the session
+  IDs the firewall ranked for that batch — not a total — and points at the
+  session-table section for the device-wide count. No change to collection: the
+  same `candidate_session_ids` are rendered.
+
+## [0.24.0] - 2026-08-30
 
 ### Changed
 
