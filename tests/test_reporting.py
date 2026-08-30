@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import io
 import json
@@ -10,7 +11,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pbp_monitoring import __version__
-from pbp_monitoring.reporting import generate_html_report, main
+from pbp_monitoring.reporting import (
+    REPORT_SCRIPT,
+    REPORT_SCRIPT_CSP_HASH,
+    generate_html_report,
+    main,
+)
 
 
 class ReportingTests(unittest.TestCase):
@@ -172,7 +178,10 @@ class ReportingTests(unittest.TestCase):
             self.assertIn(
                 "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;&amp;", rendered
             )
-            self.assertNotIn("<script>", rendered.lower())
+            # The report carries exactly one script, its own folding control,
+            # and never anything the capture supplied.
+            self.assertEqual(rendered.count("<script>"), 1)
+            self.assertIn(f"<script>{REPORT_SCRIPT}</script>", rendered)
             self.assertNotIn("must-not-leak", rendered)
             self.assertIn(hashlib.sha256(source_bytes).hexdigest(), rendered)
             self.assertIn("resources_recovered", rendered)
@@ -689,7 +698,7 @@ class CpuChartTests(unittest.TestCase):
         self.assertEqual(html.count('<svg class="chart"'), 4)
         self.assertIn("An isolated hot core", html)
         self.assertIn("aggregate load rather than one session", html)
-        self.assertNotIn("<script", html.lower())
+        self.assertEqual(html.lower().count("<script"), 1)
 
     def test_cores_are_labelled_and_non_forwarding_cores_are_not_compared(self):
         html = self._render(
@@ -1239,7 +1248,30 @@ class ReadabilityTests(unittest.TestCase):
             '<summary><h2 id="events-title">',
             html,
         )
-        self.assertNotIn("<script", html)
+        self.assertEqual(html.lower().count("<script"), 1)
+
+    def test_the_only_script_the_report_runs_is_its_own_folding_control(self):
+        """The report is handed to a TAC case, so its active content is pinned.
+
+        The page allows exactly one script by hash, in its own meta policy, so
+        a report altered on the way to a support case cannot run anything, and
+        a reader who opens the file from disk is protected by the same rule as
+        one reading it through the Web UI.
+        """
+        html = self._render(self._capture([4.0, 85.0]))
+
+        expected = "sha256-" + base64.b64encode(
+            hashlib.sha256(REPORT_SCRIPT.encode("utf-8")).digest()
+        ).decode("ascii")
+        self.assertEqual(REPORT_SCRIPT_CSP_HASH, expected)
+        self.assertIn(f"script-src '{expected}';", html)
+        self.assertEqual(html.count("<script"), 1)
+        self.assertIn(f"<script>{REPORT_SCRIPT}</script>", html)
+        # Nothing is fetched, stored or sent: the control only folds sections.
+        for forbidden in ("fetch(", "XMLHttpRequest", "localStorage", "src="):
+            self.assertNotIn(forbidden, REPORT_SCRIPT)
+        # At a glance is the verdict block and stays out of the fold.
+        self.assertIn("section:not(.glance)>details.section-fold", REPORT_SCRIPT)
 
     def test_the_glance_fold_keeps_its_severity_styling(self):
         html = self._render(self._capture([4.0, 85.0]))

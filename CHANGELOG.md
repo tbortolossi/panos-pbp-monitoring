@@ -3,6 +3,29 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.32.0] - 2026-08-30
+
+### Added
+
+- **Collapse all folds the whole report at once.** A report of a real incident
+  is long, and reducing it to its section headings meant folding nine sections
+  by hand. The section navigation now carries a **Collapse all** control that
+  folds every section except **At a glance**, the verdict block, which stays
+  open; it then reads **Expand all** and reopens them, and each heading keeps
+  working on its own.
+
+  This is the report's first script, and the only one it will run: fourteen
+  lines, inline, allowed by their SHA-256 hash in the report's own
+  Content-Security-Policy and in the policy the Web UI serves the page with, so
+  a report altered on its way to a TAC case can run nothing. The script creates
+  the button itself, so a report whose script is stripped by a mail gateway or
+  refused by a reader's policy shows exactly the page it did before, every
+  section unfolded and no dead control. It reads nothing, stores nothing and
+  sends nothing: `default-src 'none'` still forbids every request the page
+  could make. Pure CSS was tried first and cannot do it — a closed `<details>`
+  cannot be reopened by author styles in Firefox — so the behavior was verified
+  by rendering a report in Chromium 151 and Firefox 140 ESR. Refs #175.
+
 ## [0.31.1] - 2026-08-30
 
 ### Fixed

@@ -2,8 +2,9 @@
 
 What the standalone HTML report contains, section by section, and how to read
 each one during a packet-buffer incident. Every report is a single
-self-contained file: no script, no external asset, and the SHA-256 digest of
-the JSONL capture it was built from.
+self-contained file: no external asset, the SHA-256 digest of the JSONL
+capture it was built from, and a single hash-pinned script that does nothing
+but fold the report's own sections.
 
 Related pages: [Installation](installation.md) · [Operations](operations.md) ·
 [Troubleshooting](troubleshooting.md) · [Back to the README](../README.md)
@@ -49,8 +50,18 @@ default. Command status and timing fields are presented as compact metadata,
 the summary separates capture facts, incident state, and peak utilization, and
 its peak metrics are grouped into packet buffers, packet descriptors, and
 system load. Every section folds from its heading — At a glance included, a
-native disclosure, no script — so a section already read can be put away; all
-open by default except the lower-level event metadata, which is collapsed.
+native disclosure — so a section already read can be put away; all open by
+default except the lower-level event metadata, which is collapsed.
+
+**Collapse all** sits at the right of the section navigation and folds every
+section at once, except At a glance, which is the verdict block and stays open.
+The same control then reads **Expand all** and reopens them; each heading keeps
+working individually. It is the report's only script, allowed by its SHA-256
+hash in the report's own Content-Security-Policy and in the one the Web UI
+serves the page with, so nothing else can run in that page. The button is
+created by that script, so a report whose script a mail gateway strips, or a
+reader's policy blocks, shows exactly the page it always did, with every
+section unfolded and no dead control.
 
 ## At a glance and probable cause
 
@@ -188,7 +199,8 @@ dataplanes produces one set of charts per DP. Each section states whether the
 load rose on every comparable core or on only a few of them, then shows a
 heatmap of core by batch, which stays readable at 64 cores, and a line chart of
 the hottest cores against the median of their peers. Both are inline SVG: the
-report stays a single self-contained file with no script and no external asset.
+report stays a single self-contained file with no external asset, and no script
+beyond the hash-pinned folding control.
 The per-core summary table and the batch imbalance timeline remain underneath as
 the detailed evidence.
 
