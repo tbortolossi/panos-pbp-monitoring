@@ -847,6 +847,15 @@ class SupportEvidenceArchiveTests(unittest.TestCase):
                     archive.read(prefix + "api-check.jsonl").decode(),
                 )
 
+    def test_a_run_lookup_cannot_escape_the_capture_directory(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data = Path(temporary_directory)
+            self._deployment(data)
+            self.assertIsNone(_run_root(data, "..", "20260830T080000Z"))
+            self.assertIsNone(_run_root(data, "fw-a", ".."))
+            self.assertIsNone(_run_root(data, "fw-a", "absent-run"))
+            self.assertIsNone(_run_root(data, "absent-firewall", "20260830T080000Z"))
+
     def test_archive_carries_the_environment_and_the_redacted_configuration(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

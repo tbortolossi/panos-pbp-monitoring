@@ -879,10 +879,27 @@ def _run_root(data_dir: Path, target: str, run_id: str) -> tuple[Path, str] | No
     """
     if not SAFE_COMPONENT.fullmatch(target) or not SAFE_COMPONENT.fullmatch(run_id):
         return None
+    # The requested names select an existing directory entry; they are never
+    # joined into a path. Nothing the request carries can therefore reach the
+    # filesystem, whatever a future change does to the validation above.
+    target_root = _matching_child(data_dir / "targets", target)
+    if target_root is None:
+        return None
     for folder, capture in RUN_FAMILIES:
-        root = (data_dir / "targets" / target / folder / run_id).resolve()
-        if (root / capture).is_file():
-            return root, capture
+        run_dir = _matching_child(target_root / folder, run_id)
+        if run_dir is not None and (run_dir / capture).is_file():
+            return run_dir, capture
+    return None
+
+
+def _matching_child(parent: Path, name: str) -> Path | None:
+    """Return the child of `parent` literally named `name`, or None."""
+    try:
+        for child in parent.iterdir():
+            if child.name == name and child.is_dir() and not child.is_symlink():
+                return child
+    except OSError:
+        return None
     return None
 
 

@@ -204,7 +204,7 @@ def redacted_configuration(store: Any) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "available": True,
             "revision": store.revision(),
-            "admin_password_configured": store.has_admin_password(),
+            "setup_completed": store.has_admin_password(),
             "recovery_key_acknowledged": store.recovery_key_acknowledged(),
             "settings": {
                 key: value
