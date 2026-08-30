@@ -90,7 +90,58 @@ digests for transfer to another workstation or a support case. It also contains:
 
 - `support/syslog-triggers.jsonl`: trigger records matching the run ID;
 - `support/syslog-received.jsonl`: retained Syslog messages attributed to the
-  target between the first and last run timestamps.
+  target between the first and last run timestamps, plus every message the
+  collector refused in that window — the evidence behind a report that nothing
+  ever triggered;
+- `support/environment.json`: the application, Python and `cryptography`
+  versions, the platform and the timezone the collector actually ran on;
+- `support/configuration.json`: every collector setting and every registered
+  firewall, without any credential.
+
+Read-only API validation runs export the same way, at
+`/artifacts/<firewall>/<run_id>/run.zip` under `api-checks/`. That is where a
+credential, TLS or unsupported-command problem shows first, and it is
+downloadable even when no incident was ever collected.
+
+### Support bundle for a remote deployment
+
+A run archive explains what the firewall answered. It cannot explain a failure
+that never reached a capture: an exception in the Syslog listener, a TLS error,
+a crash at startup, a firewall that cannot be saved, or a dashboard nobody can
+sign in to.
+
+Both services therefore keep a rotating log file inside a volume, beyond what
+`docker logs` retains — `/data/logs/collector.log` for the collector and
+`/config/logs/webui.log` for the dashboard, each capped at 2 MB with three
+generations. Set `PBP_LOG_DIR` to move them. The one-time administrator setup
+code is deliberately kept out of those files.
+
+The **Support bundle** card on the admin page downloads one archive describing
+the deployment:
+
+| Entry | Content |
+|---|---|
+| `logs/*.log` | The tail of the collector and dashboard log files |
+| `environment.json` | Application, Python and `cryptography` versions, platform, timezone, container flag |
+| `configuration.json` | Every collector setting and every registered firewall, without credentials |
+| `runs.json` | Inventory of stored incident and API-check runs |
+| `storage.json` | What the capture volume holds and how full it is |
+| `syslog/` | Tail of the reception, routing and trigger journals, refused messages included |
+| `api-checks/` | The most recent read-only API validation of each firewall, with its raw PAN-OS XML |
+| `manifest.json` | SHA-256 of every file above |
+
+When the dashboard is itself the problem, the same archive comes from a shell:
+
+```bash
+docker compose exec -T collector pbp-support > pbp-support.zip
+```
+
+The bundle never carries PAN-OS API keys, the administrator password or its
+hash, the installation recovery key, or the one-time setup code. It does carry
+firewall management addresses, hostnames, serial numbers, PAN-OS releases and
+the source addresses recorded as offenders during an incident: that is the
+evidence. Review the archive before sending it if your policy requires it.
+Producing it makes no call to any firewall.
 
 ### Deleting stored runs
 

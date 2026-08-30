@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from . import __version__
+from . import __version__, diagnostics
 from .adminui import AdminController
 from .config_store import ALL_RUNS, DEFAULT_SETTINGS, ConfigStore
 from .web_tls import ensure_self_signed_certificate
@@ -144,7 +144,11 @@ def _filtered_jsonl(path: Path, predicate: Any) -> bytes:
 
 
 def _run_syslog_exports(run_dir: Path, target: str, run_id: str) -> dict[str, bytes]:
-    if run_dir.parent.name != "incidents":
+    capture = next(
+        (name for folder, name in RUN_FAMILIES if run_dir.parent.name == folder),
+        None,
+    )
+    if capture is None:
         return {}
     target_root = run_dir.parent.parent
     data_root = (
@@ -152,8 +156,8 @@ def _run_syslog_exports(run_dir: Path, target: str, run_id: str) -> dict[str, by
         if target_root.parent.name == "targets"
         else target_root
     )
-    first = _first_json_record(run_dir / "incident.jsonl")
-    tail = _tail_json_records(run_dir / "incident.jsonl", 1)
+    first = _first_json_record(run_dir / capture)
+    tail = _tail_json_records(run_dir / capture, 1)
     started_at = _parse_time(first.get("timestamp"))
     ended_at = _parse_time(tail[-1].get("timestamp")) if tail else None
 
@@ -164,15 +168,19 @@ def _run_syslog_exports(run_dir: Path, target: str, run_id: str) -> dict[str, by
 
     def received_during_run(record: dict[str, Any]) -> bool:
         timestamp = _parse_time(record.get("timestamp"))
+        if not (started_at and ended_at and timestamp):
+            return False
+        if not started_at <= timestamp <= ended_at:
+            return False
+        # A refused message carries no target attribution by design, and it is
+        # exactly the evidence behind "the collector never reacted". Keeping it
+        # costs one line per refusal and answers the most common report.
+        if record.get("suppressed"):
+            return True
         target_names = record.get("target_names")
-        return bool(
-            started_at
-            and ended_at
-            and timestamp
-            and started_at <= timestamp <= ended_at
-            and isinstance(target_names, list)
-            and target in {str(name) for name in target_names}
-        )
+        return isinstance(target_names, list) and target in {
+            str(name) for name in target_names
+        }
 
     received = _filtered_jsonl(
         data_root / "syslog-received.jsonl",
@@ -190,8 +198,15 @@ def write_run_archive(
     *,
     target: str,
     run_id: str,
+    config_store: ConfigStore | None = None,
 ) -> None:
-    """Write a portable ZIP containing one run and a checksummed manifest."""
+    """Write a portable ZIP containing one run and a checksummed manifest.
+
+    The capture explains what the firewall answered. The environment and the
+    redacted configuration explain what the collector was, and how it was set
+    up, when it asked; a run archive that omits them cannot settle why a
+    customer deployment behaves differently from the lab.
+    """
     root = Path(run_dir).resolve()
     files = sorted(
         path
@@ -221,13 +236,33 @@ def write_run_archive(
                 }
             )
             archive.write(path, f"{prefix}/{relative}")
-        for relative, payload in _run_syslog_exports(root, target, run_id).items():
+        support_context = {
+            "support/environment.json": _support_json(
+                diagnostics.environment_snapshot()
+            ),
+            "support/configuration.json": _support_json(
+                diagnostics.redacted_configuration(config_store)
+            ),
+        }
+        generated = {
+            **{
+                relative: (payload, "filtered support export")
+                for relative, payload in _run_syslog_exports(
+                    root, target, run_id
+                ).items()
+            },
+            **{
+                relative: (payload, "generated support context")
+                for relative, payload in support_context.items()
+            },
+        }
+        for relative, (payload, source) in generated.items():
             manifest_files.append(
                 {
                     "path": relative,
                     "size_bytes": len(payload),
                     "sha256": hashlib.sha256(payload).hexdigest(),
-                    "source": "filtered support export",
+                    "source": source,
                 }
             )
             archive.writestr(f"{prefix}/{relative}", payload)
@@ -244,6 +279,12 @@ def write_run_archive(
             f"{prefix}/manifest.json",
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         )
+
+
+def _support_json(payload: Any) -> bytes:
+    return (
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n"
+    ).encode("utf-8")
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -811,6 +852,11 @@ button.danger{{padding:5px 11px;border:1px solid #fca5a5;border-radius:8px;backg
 </main></body></html>"""
 
 
+#: The two run families a capture directory can belong to, and the JSONL each
+#: one is identified by.
+RUN_FAMILIES = (("incidents", "incident.jsonl"), ("api-checks", "api-check.jsonl"))
+
+
 def _artifact_path(data_dir: Path, target: str, run_id: str, *parts: str) -> Path | None:
     components = (target, run_id, *parts)
     if any(not SAFE_COMPONENT.fullmatch(component) for component in components):
@@ -822,6 +868,22 @@ def _artifact_path(data_dir: Path, target: str, run_id: str, *parts: str) -> Pat
     except ValueError:
         return None
     return candidate
+
+
+def _run_root(data_dir: Path, target: str, run_id: str) -> tuple[Path, str] | None:
+    """Locate a run directory whichever family it belongs to.
+
+    A read-only API validation is where a credential, TLS or unsupported
+    command problem shows first, so it must be exportable exactly like an
+    incident.
+    """
+    if not SAFE_COMPONENT.fullmatch(target) or not SAFE_COMPONENT.fullmatch(run_id):
+        return None
+    for folder, capture in RUN_FAMILIES:
+        root = (data_dir / "targets" / target / folder / run_id).resolve()
+        if (root / capture).is_file():
+            return root, capture
+    return None
 
 
 def handler_factory(
@@ -837,6 +899,11 @@ def handler_factory(
             config_store,
             allow_remote=True,
             secure_cookie=tls_enabled,
+            data_dir=data_dir,
+            log_dirs=(
+                diagnostics.default_log_dir(data_dir),
+                diagnostics.default_log_dir(config_db.parent),
+            ),
         )
         if config_store
         else None
@@ -899,6 +966,7 @@ def handler_factory(
                     run_dir,
                     target=target,
                     run_id=run_id,
+                    config_store=config_store,
                 )
 
         def do_HEAD(self) -> None:
@@ -1008,11 +1076,11 @@ def handler_factory(
                 self._serve_file(artifact, "application/x-ndjson", attachment=True) if artifact else self.send_error(404)
                 return
             if len(parts) == 4 and parts[0] == "artifacts" and parts[3] == "run.zip":
-                capture = _artifact_path(data_dir, parts[1], parts[2], "incident.jsonl")
-                if capture is None or not capture.is_file():
+                located = _run_root(data_dir, parts[1], parts[2])
+                if located is None:
                     self.send_error(404)
                 else:
-                    self._serve_run_archive(capture.parent, parts[1], parts[2])
+                    self._serve_run_archive(located[0], parts[1], parts[2])
                 return
             if len(parts) == 4 and parts[0] == "artifacts" and parts[3] == "raw":
                 raw_dir = _artifact_path(data_dir, parts[1], parts[2], "raw")
@@ -1064,7 +1132,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         or args.fresh_seconds <= 0
     ):
         parser.error("ports and fresh-seconds must be positive, valid, and distinct")
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format=diagnostics.LOG_FORMAT)
+    # The dashboard mounts the capture volume read-only, so its own log
+    # lives beside the configuration database instead.
+    configured_log_dir = os.getenv("PBP_LOG_DIR", "").strip()
+    diagnostics.configure_file_logging(
+        Path(configured_log_dir)
+        if configured_log_dir
+        else diagnostics.default_log_dir(args.config_db.parent),
+        "webui",
+    )
     configured_certificate = bool(
         os.getenv("WEB_TLS_CERT", "").strip() or os.getenv("WEB_TLS_KEY", "").strip()
     )

@@ -16,10 +16,10 @@ import time
 from collections import deque
 from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from . import __version__
+from . import __version__, diagnostics
 from .config_store import ConfigStore, DEFAULT_SETTINGS, TARGET_NAME
 from .panos_keygen import (
     PanOSAdminError,
@@ -166,11 +166,15 @@ class AdminController:
         trust_loopback_proxy: bool = False,
         allow_remote: bool = True,
         secure_cookie: bool = False,
+        data_dir: Path | None = None,
+        log_dirs: Sequence[Path] = (),
     ):
         self.store = store
         self.trust_loopback_proxy = trust_loopback_proxy
         self.allow_remote = allow_remote
         self.secure_cookie = secure_cookie
+        self.data_dir = Path(data_dir) if data_dir is not None else None
+        self.log_dirs = tuple(Path(directory) for directory in log_dirs)
         self.store.initialize()
         self.sessions: dict[str, tuple[float, str]] = {}
         self.setup_token = secrets.token_urlsafe(32)
@@ -186,6 +190,10 @@ class AdminController:
             LOG.warning(
                 "Initial administrator setup requires the one-time setup code: %s",
                 self.setup_code,
+                # Shown once in the container log an operator must already be
+                # able to read. A persistent file that later travels inside a
+                # support bundle is not that place.
+                extra={diagnostics.SENSITIVE_ATTRIBUTE: True},
             )
 
     def _throttled(self, source: str) -> bool:
@@ -403,9 +411,28 @@ collector cannot be claimed by whoever reaches this port first.</p>
 <section class="card"><h2>Firewalls</h2><table><thead><tr><th>Name</th><th>Device</th><th>Firewall IP</th><th>Serial</th><th>State</th><th>Last check</th><th>Actions</th></tr></thead><tbody>{target_rows}</tbody></table></section>
 {self._target_form(csrf, edit_target)}
 {self._syslog_card(syslog or self._syslog_options(None), targets)}
+<section class="card"><h2>Support bundle</h2>
+<p class="muted">One archive describing this deployment, for remote diagnosis. It carries the collector and dashboard logs, the running versions, every setting, the run inventory and the recent Syslog journals including refused messages. It never carries PAN-OS API keys, the administrator password or the recovery key. It does carry firewall management addresses, hostnames, serial numbers and the source addresses recorded during an incident. Producing it makes no call to any firewall.</p>
+<a class="button" href="/admin/support-bundle.zip">Download support bundle</a></section>
 <section class="card"><h2>Collector settings</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
 {''.join(f'<div><label>{_e(setting_label(key))}</label><input name="{_e(key)}" value="{_e(value)}"{"" if DEFAULT_SETTINGS.get(key) == "" else " required"}></div>' for key, value in settings.items())}
 </div><button type="submit">Save settings</button></form></section>""", refresh_seconds)
+
+    def _support_bundle(self) -> bytes:
+        """Build the deployment diagnostic archive for the maintainer.
+
+        The archive is bounded by construction: only tails of the journals and
+        logs, the most recent read-only API validation per firewall, and small
+        generated summaries. Building it makes no call to any firewall.
+        """
+        buffer = io.BytesIO()
+        diagnostics.write_support_bundle(
+            buffer,
+            data_dir=self.data_dir if self.data_dir is not None else Path("/data"),
+            config_store=self.store,
+            log_dirs=self.log_dirs,
+        )
+        return buffer.getvalue()
 
     def _syslog_options(self, handler: Any, query: dict[str, list[str]] | None = None) -> dict[str, str]:
         """Resolve the values the PAN-OS Syslog commands are rendered with.
@@ -742,6 +769,14 @@ generated on the firewall CLI, or enable TLS verification first.</p></div>
                         output.getvalue().encode("utf-8-sig"),
                         "text/csv; charset=utf-8",
                         f"pbp-monitoring-recovery-key-v{__version__}.csv",
+                    )
+                    return True
+                if path == "/admin/support-bundle.zip":
+                    self._send_download(
+                        handler,
+                        self._support_bundle(),
+                        "application/zip",
+                        f"pbp-support-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.zip",
                     )
                     return True
                 if path == "/admin/syslog-commands.txt":

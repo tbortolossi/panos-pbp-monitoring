@@ -32,7 +32,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
-from . import __version__
+from . import __version__, diagnostics
 from .config_store import (
     SAFE_RUN_COMPONENT,
     ConfigStore,
@@ -5175,9 +5175,24 @@ def main(argv: list[str] | None = None) -> int:
     """Configure process logging and run the command-line interface."""
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        format=diagnostics.LOG_FORMAT,
     )
+    # The syslog listener and the PAN-OS client fail in ways that never reach a
+    # capture file. Keeping that history in the volume is what makes a customer
+    # deployment diagnosable without access to its host.
+    configure_diagnostic_logging()
     return cli(argv)
+
+
+def configure_diagnostic_logging() -> Path | None:
+    """Enable the rotating collector log inside the capture volume."""
+    configured = os.getenv("PBP_LOG_DIR", "").strip()
+    directory = (
+        Path(configured)
+        if configured
+        else diagnostics.default_log_dir(Path(os.getenv("OUTPUT_DIR", "/data")))
+    )
+    return diagnostics.configure_file_logging(directory, "collector")
 
 
 if __name__ == "__main__":

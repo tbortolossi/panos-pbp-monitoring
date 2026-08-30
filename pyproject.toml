@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "panos-pbp-monitoring"
-version = "0.20.0"
+version = "0.21.0"
 description = "Event-driven PAN-OS packet-buffer incident collector"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,7 @@ pbp-report = "pbp_monitoring.reporting:main"
 pbp-export-text = "pbp_monitoring.text_export:main"
 pbp-web = "pbp_monitoring.webui:main"
 pbp-config = "pbp_monitoring.config_cli:main"
+pbp-support = "pbp_monitoring.diagnostics:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

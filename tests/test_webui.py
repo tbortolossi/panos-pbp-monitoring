@@ -23,6 +23,7 @@ from urllib.request import (
 from pbp_monitoring.webui import (
     handler_factory,
     _artifact_path,
+    _run_root,
     _https_redirect_location,
     collect_dashboard_state,
     collect_text_exports,
@@ -764,3 +765,149 @@ class RunDeletionRequestTests(unittest.TestCase):
 def _dashboard_token(opener, base: str) -> str:
     page = opener.open(base + "/").read().decode()
     return re.search(r'name="csrf" value="([^"]+)"', page).group(1)
+
+
+class SupportEvidenceArchiveTests(unittest.TestCase):
+    """An archive must explain the deployment, not only the firewall."""
+
+    def _deployment(self, root: Path) -> Path:
+        check = root / "targets" / "fw-a" / "api-checks" / "20260830T080000Z"
+        (check / "raw").mkdir(parents=True)
+        (check / "api-check.jsonl").write_text(
+            json.dumps(
+                {
+                    "timestamp": "2026-08-30T08:00:00+00:00",
+                    "event": "monitor_started",
+                    "mode": "api_check",
+                    "commands": {
+                        "system_info": {
+                            "ok": False,
+                            "error": "PanOSAPIError: Invalid credential",
+                        }
+                    },
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "timestamp": "2026-08-30T08:00:05+00:00",
+                    "event": "monitor_stopped",
+                    "reason": "api_check_complete",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (check / "raw" / "batch-0001.txt").write_text(
+            "=== COMMAND: system_info ===\nStatus: FAILED\n", encoding="utf-8"
+        )
+        (root / "syslog-received.jsonl").write_text(
+            json.dumps(
+                {
+                    "timestamp": "2026-08-30T08:00:01+00:00",
+                    "target_names": [],
+                    "suppressed": "device_serial_not_registered",
+                    "metadata": {"syslog_source_ip": "192.0.2.10"},
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "timestamp": "2026-08-30T08:00:02+00:00",
+                    "target_names": ["fw-b"],
+                    "message": "belongs to another firewall",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return check
+
+    def test_api_check_run_is_exported_like_an_incident(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data = Path(temporary_directory)
+            check = self._deployment(data)
+            located = _run_root(data, "fw-a", "20260830T080000Z")
+            self.assertIsNotNone(located)
+            self.assertEqual(located[0], check.resolve())
+            self.assertEqual(located[1], "api-check.jsonl")
+
+            buffer = io.BytesIO()
+            write_run_archive(
+                buffer, check, target="fw-a", run_id="20260830T080000Z"
+            )
+            buffer.seek(0)
+            with zipfile.ZipFile(buffer) as archive:
+                prefix = "pbp-run-fw-a-20260830T080000Z/"
+                names = archive.namelist()
+                self.assertIn(prefix + "api-check.jsonl", names)
+                self.assertIn(prefix + "raw/batch-0001.txt", names)
+                self.assertIn(
+                    "Invalid credential",
+                    archive.read(prefix + "api-check.jsonl").decode(),
+                )
+
+    def test_archive_carries_the_environment_and_the_redacted_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            data = root / "data"
+            data.mkdir()
+            check = self._deployment(data)
+            store = ConfigStore(root / "config.db")
+            store.initialize()
+            store.save_target(
+                name="fw-a",
+                panos_url="https://192.0.2.10",
+                api_key="super-secret-api-key",
+                target_serial=None,
+                serials=["001122334455"],
+                syslog_sources=["192.0.2.10"],
+            )
+            buffer = io.BytesIO()
+            write_run_archive(
+                buffer,
+                check,
+                target="fw-a",
+                run_id="20260830T080000Z",
+                config_store=store,
+            )
+            buffer.seek(0)
+            with zipfile.ZipFile(buffer) as archive:
+                prefix = "pbp-run-fw-a-20260830T080000Z/"
+                environment = json.loads(
+                    archive.read(prefix + "support/environment.json")
+                )
+                configuration = json.loads(
+                    archive.read(prefix + "support/configuration.json")
+                )
+                blob = b"".join(archive.read(name) for name in archive.namelist())
+                manifest = json.loads(archive.read(prefix + "manifest.json"))
+            self.assertEqual(environment["application_version"], __version__)
+            self.assertEqual(configuration["targets"][0]["mode"], "direct")
+            self.assertNotIn(b"super-secret-api-key", blob)
+            self.assertIn(
+                "support/environment.json",
+                {entry["path"] for entry in manifest["files"]},
+            )
+
+    def test_refused_syslog_message_is_kept_in_the_run_export(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data = Path(temporary_directory)
+            check = self._deployment(data)
+            buffer = io.BytesIO()
+            write_run_archive(
+                buffer, check, target="fw-a", run_id="20260830T080000Z"
+            )
+            buffer.seek(0)
+            with zipfile.ZipFile(buffer) as archive:
+                received = archive.read(
+                    "pbp-run-fw-a-20260830T080000Z/support/syslog-received.jsonl"
+                ).decode()
+            # The refusal is the evidence behind "nothing ever triggered"; a
+            # message belonging to another firewall still must not leak here.
+            self.assertIn("device_serial_not_registered", received)
+            self.assertNotIn("belongs to another firewall", received)
+
+
+if __name__ == "__main__":
+    unittest.main()

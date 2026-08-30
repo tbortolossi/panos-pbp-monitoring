@@ -3,6 +3,50 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.21.0] - 2026-08-30
+
+### Added
+
+- **Support bundle.** The admin page offers a **Download support bundle**
+  action packaging the whole deployment for remote diagnosis: the collector and
+  dashboard log files, the application, Python and `cryptography` versions
+  actually running, every collector setting and every registered firewall
+  without credentials, the inventory of stored runs, the capture-volume usage,
+  the tail of the Syslog reception, routing and trigger journals including the
+  messages the collector refused, and the most recent read-only API validation
+  of each firewall with its raw PAN-OS XML. A checksum manifest lists every
+  file. Building the bundle issues no firewall command. The same archive is
+  available from a shell with `docker compose exec -T collector pbp-support`,
+  for the case where the dashboard is itself the problem. Refs #141.
+- **Persistent process logs.** The collector writes `/data/logs/collector.log`
+  and the dashboard `/config/logs/webui.log`, each capped at 2 MB with three
+  generations and relocatable with `PBP_LOG_DIR`. A failure that never reaches a
+  capture — an exception in the Syslog listener, a TLS error, a crash at startup
+  — is now readable after a container restart. The one-time administrator setup
+  code is excluded from those files by construction. A log directory that cannot
+  be written disables the file and never stops collection. Refs #141.
+- **Read-only API validation runs export as run archives.** `run.zip` now
+  resolves under `api-checks/` as well as `incidents/`, so a credential, TLS or
+  unsupported-command problem is exportable even when no incident was ever
+  collected. Refs #141.
+- `tools/replay_capture.py` replays the raw XML preserved in a capture, a run
+  archive or a support bundle through the shipped parsers, reporting which
+  command fails to parse. A customer archive becomes a fixture and a regression
+  test without access to the firewall it came from. Refs #141.
+
+### Changed
+
+- Every run archive now also contains `support/environment.json` and
+  `support/configuration.json`: the versions and platform the run executed on,
+  and the collector settings and firewall inventory with every credential
+  removed. Behaviour that differs from the lab can be explained from the archive
+  alone. Refs #141.
+- The per-run Syslog export keeps the messages the collector refused during the
+  run window, alongside those attributed to the firewall. A refusal carries no
+  target attribution by design and was therefore dropped, removing the only
+  evidence behind the report that nothing ever triggered. Collection, PAN-OS
+  calls and persisted data are unchanged. Refs #141.
+
 ## [0.20.0] - 2026-08-30
 
 ### Added
