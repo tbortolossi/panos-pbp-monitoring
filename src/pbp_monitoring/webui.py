@@ -460,57 +460,115 @@ REPORT_ANNOTATION_MAX_BYTES = 8 * 1024 * 1024
 _BODY_TAG = re.compile(r"<body[^>]*>", re.IGNORECASE)
 
 
+def _human_size(size_bytes: int) -> str:
+    """Render a byte count the way an operator reads a file listing."""
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MiB"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.0f} KiB"
+    return f"{size_bytes} B"
+
+
+def _export_link(
+    href: str,
+    label: str,
+    detail: str,
+    title: str,
+    *,
+    secondary: bool = False,
+) -> str:
+    """One export offered by the report bar, named by format and by size."""
+    css = ' class="secondary"' if secondary else ""
+    return (
+        f'<a{css} href="{href}" title="{_escape(title)}">{_escape(label)}'
+        f'<span class="pbp-bar-meta">{_escape(detail)}</span></a>'
+    )
+
+
 def render_report_evidence_bar(target: str, run_id: str, run_dir: Path) -> str:
     """Build the evidence bar shown above a report served by the Web UI.
 
     The report is where an operator decides that a case needs the raw evidence,
     so the run's artifacts belong on that page rather than only in the dashboard
-    row. The bar is added when the page is served, never written to disk: a
-    report copied out for a TAC case must carry neither links that resolve only
-    inside this deployment nor a button offering a bundle that names the
-    customer's network.
+    row. Each one is named by its format and its weight, because the choice
+    being made there is which file to attach to a TAC case. The bar is added
+    when the page is served, never written to disk: a report copied out for a
+    TAC case must carry neither links that resolve only inside this deployment
+    nor a button offering a bundle that names the customer's network.
     """
     target_url = quote(target, safe="")
     run_url = quote(run_id, safe="")
     raw_dir = run_dir / "raw"
     text_files = len(list(raw_dir.glob("*.txt"))) if raw_dir.is_dir() else 0
+    jsonl = run_dir / "incident.jsonl"
     links: list[str] = []
-    if (run_dir / "incident.jsonl").is_file():
+    if jsonl.is_file():
         links.append(
-            f'<a href="/artifacts/{target_url}/{run_url}/incident.jsonl">JSONL</a>'
+            _export_link(
+                f"/artifacts/{target_url}/{run_url}/incident.jsonl",
+                "JSONL",
+                _human_size(jsonl.stat().st_size),
+                "Structured records and the exact raw command output of the run",
+            )
         )
     if text_files:
         links.append(
-            f'<a href="/artifacts/{target_url}/{run_url}/raw/">TXT ({text_files})</a>'
+            _export_link(
+                f"/artifacts/{target_url}/{run_url}/raw/",
+                "TXT",
+                f"{text_files} file{'' if text_files == 1 else 's'}",
+                "Human-readable export of every command and its response, one file per batch",
+            )
         )
-    if (run_dir / "incident.jsonl").is_file():
-        links.append(f'<a href="/artifacts/{target_url}/{run_url}/run.zip">ZIP support</a>')
+    if jsonl.is_file():
         links.append(
-            f'<a class="secondary" href="/artifacts/{target_url}/{run_url}/run.zip'
-            '?anonymize=1">ZIP anonymized</a>'
+            _export_link(
+                f"/artifacts/{target_url}/{run_url}/run.zip",
+                "ZIP",
+                "support archive",
+                "Every artifact of this run, the deployment environment and a manifest, for a TAC case",
+            )
         )
-    links_html = (
-        "".join(links)
-        if links
-        else '<span class="pbp-bar-note">No stored evidence for this run.</span>'
-    )
+        links.append(
+            _export_link(
+                f"/artifacts/{target_url}/{run_url}/run.zip?anonymize=1",
+                "ZIP",
+                "anonymized",
+                "The same archive with addresses, hostnames and serials replaced by tokens",
+                secondary=True,
+            )
+        )
+    if links:
+        exports_html = '<span class="pbp-bar-label">Exports</span>' + "".join(links)
+        note = (
+            "This page is the standalone HTML report: keep the file as it is, or "
+            "print it from the browser to obtain a PDF."
+        )
+    else:
+        exports_html = '<span class="pbp-bar-note">No stored evidence for this run.</span>'
+        note = ""
+    note_html = f'<span class="pbp-bar-note">{note}</span>' if note else ""
     return (
         "<style>"
         ".pbp-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;"
         "padding:10px max(20px,calc((100vw - 1200px)/2));background:#0b1220;"
         "color:#e2e8f0;font:13px/1.4 system-ui,-apple-system,'Segoe UI',sans-serif}"
-        ".pbp-bar a{padding:5px 10px;border-radius:7px;background:#155e75;color:#fff;"
-        "text-decoration:none;font-weight:700}"
+        ".pbp-bar a{display:inline-flex;align-items:baseline;gap:6px;padding:5px 10px;"
+        "border-radius:7px;background:#155e75;color:#fff;text-decoration:none;font-weight:700}"
         ".pbp-bar a.secondary{background:#f0f9ff;color:#0369a1}"
-        ".pbp-bar a.back{background:transparent;color:#7dd3fc;padding:5px 0}"
+        ".pbp-bar a.back{background:#1e293b;border:1px solid #64748b;color:#e2e8f0}"
         ".pbp-bar .pbp-bar-run{margin-right:auto;color:#94a3b8}"
-        ".pbp-bar .pbp-bar-note{color:#94a3b8}"
+        ".pbp-bar .pbp-bar-label{color:#94a3b8;font-size:11px;font-weight:700;"
+        "letter-spacing:.06em;text-transform:uppercase}"
+        ".pbp-bar .pbp-bar-meta{color:#cbd5e1;font-size:11px;font-weight:400}"
+        ".pbp-bar a.secondary .pbp-bar-meta{color:#0c4a6e}"
+        ".pbp-bar .pbp-bar-note{flex-basis:100%;color:#94a3b8}"
         "@media print{.pbp-bar{display:none}}"
         "</style>"
         '<div class="pbp-bar">'
         '<a class="back" href="/">&larr; Back to dashboard</a>'
         f'<span class="pbp-bar-run">{_escape(target)} &middot; run {_escape(run_id)}</span>'
-        f"{links_html}</div>"
+        f"{exports_html}{note_html}</div>"
     )
 
 
@@ -806,6 +864,23 @@ def _firewall_headline(
     return "ok", "healthy"
 
 
+def _run_cell(content: str, report_url: str | None) -> str:
+    """Render a run cell that opens the run's report when it is clicked.
+
+    The report is what the row is read for, so the whole row leads to it rather
+    than only the small link at its end. The anchor fills the cell and inherits
+    its type, so the table still reads as a table. A run whose report does not
+    exist yet, an active monitor, keeps a plain cell.
+    """
+    if report_url is None:
+        return f"<td>{content}</td>"
+    return (
+        f'<td><a class="rowlink" href="{report_url}"'
+        ' title="Open the HTML report of this run">'
+        f"{content}</a></td>"
+    )
+
+
 def _delete_cell(csrf: str | None, run: dict[str, Any], queued: bool) -> str:
     """Render the per-run deletion control.
 
@@ -905,6 +980,7 @@ def render_dashboard(
     deleting_everything = (ALL_RUNS, ALL_RUNS) in queued_deletions
 
     run_rows: list[str] = []
+    rows_open_a_report = False
     for run in state.get("runs", []):
         target = quote(str(run.get("target", "")), safe="")
         run_id = quote(str(run.get("run_id", "")), safe="")
@@ -912,9 +988,12 @@ def render_dashboard(
             str(run.get("target")),
             str(run.get("run_id")),
         ) in queued_deletions
+        report_url = (
+            f"/reports/{target}/{run_id}/report.html" if run.get("report") else None
+        )
         links: list[str] = []
-        if run.get("report"):
-            links.append(f'<a href="/reports/{target}/{run_id}/report.html">HTML report</a>')
+        if report_url:
+            links.append(f'<a href="{report_url}">HTML report</a>')
         if run.get("jsonl"):
             links.append(f'<a href="/artifacts/{target}/{run_id}/incident.jsonl">JSONL</a>')
         if run.get("text_files"):
@@ -931,20 +1010,27 @@ def render_dashboard(
         )
         top_sources = run.get("top_sources") or []
         top_text = ", ".join(str(source) for source in top_sources[:3]) or "—"
-        run_rows.append(
-            "<tr>"
-            f"<td>{_escape(run.get('target'))}</td>"
-            f"<td><code>{_escape(run.get('run_id'))}</code></td>"
-            f"<td>{_escape(run.get('started_at'))}</td>"
-            f"<td><span class=\"badge {'active' if active else 'done'}\">{'Active' if active else 'Completed'}</span></td>"
-            f"<td>{_escape(run.get('cycles'))}</td>"
-            f"<td>{_escape(peak_text)}</td>"
-            f"<td><code>{_escape(top_text)}</code></td>"
-            f"<td>{_escape(run.get('stop_reason'))}</td>"
-            f"<td>{' &middot; '.join(links) or '&mdash;'}</td>"
-            f"<td>{_delete_cell(csrf, run, queued)}</td>"
-            "</tr>"
+        badge = (
+            f"<span class=\"badge {'active' if active else 'done'}\">"
+            f"{'Active' if active else 'Completed'}</span>"
         )
+        row_open = '<tr class="linked">' if report_url else "<tr>"
+        run_rows.append(
+            row_open
+            + _run_cell(_escape(run.get("target")), report_url)
+            + _run_cell(f"<code>{_escape(run.get('run_id'))}</code>", report_url)
+            + _run_cell(_escape(run.get("started_at")), report_url)
+            + _run_cell(badge, report_url)
+            + _run_cell(_escape(run.get("cycles")), report_url)
+            + _run_cell(_escape(peak_text), report_url)
+            + _run_cell(f"<code>{_escape(top_text)}</code>", report_url)
+            + _run_cell(_escape(run.get("stop_reason")), report_url)
+            + f"<td>{' &middot; '.join(links) or '&mdash;'}</td>"
+            + f"<td>{_delete_cell(csrf, run, queued)}</td>"
+            + "</tr>"
+        )
+        if report_url:
+            rows_open_a_report = True
     if not run_rows:
         run_rows.append('<tr><td colspan="10" class="muted">No run recorded.</td></tr>')
 
@@ -980,6 +1066,11 @@ def render_dashboard(
             "</div></div>"
         )
 
+    runs_hint = (
+        '<span class="muted">Click a row to open its report</span>'
+        if rows_open_a_report
+        else ""
+    )
     total_runs = int(state.get("runs_total") or len(state.get("runs", [])))
     if not csrf or not total_runs:
         delete_all_control = ""
@@ -1013,8 +1104,11 @@ h1{{margin:0;font-size:clamp(25px,4vw,40px)}}header p{{margin:5px 0 0;color:#d9f
 .signals li.ok .mark{{background:var(--ok);box-shadow:0 0 0 2px #dcfce7}}.signals li.warn .mark{{background:var(--busy);box-shadow:0 0 0 2px #fef3c7}}
 .table-wrap{{overflow:auto;max-height:55vh;border:1px solid var(--line);border-radius:12px;background:#fff;scrollbar-gutter:stable}}table{{width:100%;border-collapse:collapse;white-space:nowrap}}
 th,td{{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}th{{position:sticky;top:0;background:#eef3f8;font-size:12px;text-transform:uppercase}}
+td a.rowlink{{display:block;margin:-10px -12px;padding:10px 12px;color:inherit;font-weight:inherit;text-decoration:none}}
+tr.linked:hover td{{background:#eff6ff}}tr.linked:focus-within td{{background:#e0f2fe}}
 .message{{max-width:680px;white-space:normal;overflow-wrap:anywhere;font:12px/1.45 ui-monospace,Consolas,monospace}}.badge{{display:inline-block;padding:2px 8px;border-radius:999px;background:#e2e8f0;font-size:11px;font-weight:700}}
 .section-head{{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}}.section-head h2{{margin:0}}
+.section-head .muted{{margin-right:auto}}
 .chips{{display:flex;flex-wrap:wrap;gap:6px}}.chip{{padding:3px 11px;border:1px solid var(--line);border-radius:999px;background:#fff;color:var(--muted);font-size:12px;font-weight:650;text-decoration:none}}
 .chip:hover{{border-color:var(--accent)}}.chip.on{{border-color:var(--accent);background:#e0f2fe;color:var(--accent)}}
 button.danger{{padding:5px 11px;border:1px solid #fca5a5;border-radius:8px;background:#fff;color:var(--bad);font:inherit;font-weight:650;cursor:pointer}}button.danger:hover{{background:#fef2f2}}form.inline{{display:inline}}
@@ -1022,7 +1116,7 @@ button.danger{{padding:5px 11px;border:1px solid #fca5a5;border-radius:8px;backg
 </style></head><body><header><h1>PBP Monitoring <small style="font-size:14px;font-weight:600">v{_escape(__version__)}</small></h1><p>Dashboard &middot; refreshes every {max(2, int(refresh_seconds))} seconds &middot; <a style="color:white" href="/admin">Admin</a></p></header><main>
 {status_panel}
 <section><div class="section-head"><h2>20 most recent received logs</h2>{log_filters}</div><div class="table-wrap"><table><thead><tr><th>Time (UTC)</th><th>Observed source</th><th>Firewall</th><th>Type</th><th>Message</th></tr></thead><tbody>{''.join(log_rows)}</tbody></table></div></section>
-<section><div class="section-head"><h2>Recent runs</h2>{delete_all_control}</div><div class="table-wrap"><table><thead><tr><th>Target</th><th>Run ID</th><th>Start time (UTC)</th><th>Status</th><th>Batches</th><th>Peak buffer</th><th>Top sources</th><th>Stop reason</th><th>Artifacts</th><th>Delete</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table></div></section>
+<section><div class="section-head"><h2>Recent runs</h2>{runs_hint}{delete_all_control}</div><div class="table-wrap"><table><thead><tr><th>Target</th><th>Run ID</th><th>Start time (UTC)</th><th>Status</th><th>Batches</th><th>Peak buffer</th><th>Top sources</th><th>Stop reason</th><th>Artifacts</th><th>Delete</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table></div></section>
 </main></body></html>"""
 
 

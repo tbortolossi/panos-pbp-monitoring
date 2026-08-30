@@ -171,7 +171,8 @@ than create a concurrent one.
 11. Each completed batch also writes an atomic TXT view of its command and
     session outputs. A Web UI displays bounded Syslog reception status and
     read-only artifact links. A report served by the Web UI is shown with an
-    evidence bar offering the same run artifacts as the dashboard row; the bar
+    evidence bar offering the same run artifacts as the dashboard row, each
+    named by its format and its weight; the bar
     is added when the page is served, so the stored file stays standalone and a
     copy sent outside the deployment carries neither dead links nor an offer to
     download a bundle that names the network. The dashboard and every artifact route require
@@ -559,6 +560,11 @@ key must be backed up and restored together.
     reading past the ordinary traffic of the other firewalls. The filter is
     carried by the URL, so it survives the page refresh, and it never applies
     to the per-firewall cards.
+54. A completed run's dashboard row opens that run's HTML report wherever it is
+    clicked, its **Artifacts** and **Delete** cells keeping their own actions,
+    and the report's evidence bar carries a button back to the dashboard. A run
+    whose report does not exist yet, an active monitor, keeps a plain row. Both
+    are plain HTML and CSS: the Web UI serves `script-src 'none'`.
 
 ## 12. Possible enhancements
 

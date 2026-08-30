@@ -18,10 +18,18 @@ raw batch details](images/incident-report.png)
 
 ## Opening a report from the dashboard
 
-The **HTML report** link of a run adds an evidence bar above the report: back to
-the dashboard, then the same artifacts the **Recent runs** row offers for that
-run — **JSONL**, **TXT**, **ZIP support** and **ZIP anonymized**. It is where
-you decide, having read the report, that the case needs its raw evidence.
+Clicking anywhere on a completed run's row in **Recent runs** opens that run's
+report, and the **HTML report** link in the row's **Artifacts** cell does the
+same. A run still being collected has no report yet, so its row stays plain.
+
+The report opened that way carries an evidence bar above it: a **Back to
+dashboard** button, the firewall and the run the page belongs to, then the
+run's exports, each named by format and by weight — **JSONL** with its size,
+**TXT** with its number of batch files, **ZIP** as the support archive and
+**ZIP** anonymized. The report itself is the fourth format: it is a standalone
+HTML file, so keep it as it is, or print it from the browser to obtain a PDF.
+The bar is where you decide, having read the report, that the case needs its
+raw evidence.
 
 The bar is added while the page is served. The `report.html` file stored beside
 the capture never contains it, so a report attached to a TAC case stays a single
