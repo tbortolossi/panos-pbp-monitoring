@@ -3,6 +3,45 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.19.0] - 2026-08-30
+
+### Added
+
+- Every diagnostic batch now lists the largest, longest-lived sessions with
+  `show session all filter min-kb <threshold> min-age <seconds>`, and tracks
+  for each one how long it has been open and how much bandwidth it consumes.
+  This is the only evidence path for a single high-volume transfer: PAN-OS
+  writes no traffic log while such a session is open, an offloaded session
+  shows little on the management plane, and the session is never named as a
+  packet-buffer offender, so the offender ranking cannot see it. Refs #136.
+- Two collector settings, `large_session_min_kb` (default `1048576`, that is
+  one gibibyte of cumulative traffic, `0` disables the query) and
+  `large_session_min_age_seconds` (default `600`). Both filters are applied by
+  the firewall and are what keep the management-plane session-table walk
+  affordable during an incident. They appear in the admin settings form and in
+  `incident.jsonl` beside the sessions they selected. Older configuration
+  databases pick up the defaults with no migration.
+- A **Largest sessions** section in the HTML report, listing each session with
+  its flow, application, zones, ingress and egress interfaces, age, cumulative
+  volume, average rate since it started, and the fastest rate measured between
+  two batches. A capture taken before this release renders as such instead of
+  as an empty table.
+- A *Hunting a large session by hand* procedure in `docs/troubleshooting.md`
+  for the same query at the CLI and through the XML API.
+
+### Changed
+
+- A session age is measured against the firewall clock collected in the same
+  batch, never the collector clock, and a session index PAN-OS recycled during
+  an incident is detected by its start time so it never inherits the volume of
+  its predecessor.
+
+### Security
+
+- The volume threshold is validated at both the store and the configuration
+  boundary: it is either `0` or at least 1000 kilobytes, so no setting can turn
+  the query into a full session-table dump on a loaded firewall.
+
 ## [0.18.0] - 2026-08-30
 
 ### Added

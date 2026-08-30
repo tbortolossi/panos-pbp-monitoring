@@ -39,6 +39,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "request_timeout": "15",
     "max_session_lookups": "10",
     "session_retry_seconds": "5",
+    "large_session_min_kb": "1048576",
+    "large_session_min_age_seconds": "600",
     "generate_html_report": "true",
     "generate_text_export": "true",
     "syslog_fresh_seconds": "300",
@@ -320,11 +322,22 @@ class ConfigStore:
             "recovery_threshold": (0, 100),
             "low_samples_to_stop": (1, 1_000_000),
             "max_session_lookups": (0, 1_000_000),
+            "large_session_min_age_seconds": (0, 31_536_000),
         }
         for key, (minimum, maximum) in integer_ranges.items():
             value = int(merged[key])
             if not minimum <= value <= maximum:
                 raise ValueError(f"{key} must be between {minimum} and {maximum}")
+        # The largest-sessions query walks the session table on the management
+        # plane. A low volume threshold would match most of the table during an
+        # incident, so only 0 (collection disabled) or a real threshold is
+        # accepted. Mirrors LARGE_SESSION_MIN_KB_FLOOR in the orchestrator.
+        min_kb = int(merged["large_session_min_kb"])
+        if min_kb != 0 and not 1000 <= min_kb <= 1_000_000_000:
+            raise ValueError(
+                "large_session_min_kb must be 0 (disabled) or between 1000 and "
+                "1000000000 kilobytes"
+            )
         fresh = float(merged["syslog_fresh_seconds"])
         if not (fresh > 0 and fresh < float("inf")):
             raise ValueError("syslog_fresh_seconds must be a positive finite number")

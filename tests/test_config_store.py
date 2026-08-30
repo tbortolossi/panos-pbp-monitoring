@@ -83,6 +83,22 @@ class ConfigStoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.update_settings({"poll_seconds": "0"})
 
+    def test_large_session_thresholds_keep_the_session_table_walk_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = ConfigStore(Path(temporary_directory) / "config.db")
+            store.initialize()
+            settings = store.get_settings()
+            self.assertEqual(settings["large_session_min_kb"], "1048576")
+            self.assertEqual(settings["large_session_min_age_seconds"], "600")
+            store.update_settings(
+                {"large_session_min_kb": "0", "large_session_min_age_seconds": "0"}
+            )
+            self.assertEqual(store.get_settings()["large_session_min_kb"], "0")
+            with self.assertRaisesRegex(ValueError, "large_session_min_kb"):
+                store.update_settings({"large_session_min_kb": "10"})
+            with self.assertRaisesRegex(ValueError, "large_session_min_age_seconds"):
+                store.update_settings({"large_session_min_age_seconds": "-1"})
+
     def test_webhook_url_accepts_https_and_empty_but_rejects_garbage(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             store = ConfigStore(Path(temporary_directory) / "config.db")

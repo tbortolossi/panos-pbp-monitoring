@@ -112,7 +112,9 @@ than create a concurrent one.
    - `show running resource-monitor ingress-backlogs`;
    - `show running resource-monitor`;
    - `debug dataplane pool statistics`;
-   - `show counter global filter delta yes`.
+   - `show counter global filter delta yes`;
+   - `show session all filter min-kb <threshold> min-age <seconds>`, unless the
+     volume threshold is set to `0`.
 6. The PBP table is structured without losing rows or directions: session or
    source-IP type, zone, rank, samples, percentage, `Drop State`, packets, and
    time until discard. Both output forms are accepted: the pipe-delimited CLI
@@ -132,6 +134,17 @@ than create a concurrent one.
    total bit rates while detecting reset counters and reused session IDs. A
    source IP alone remains valid attribution evidence but does not cause a
    session command.
+7bis. Every batch also lists the largest, longest-lived sessions. The
+   `min-kb` and `min-age` filters are what keep the query affordable: they are
+   applied by the firewall, so the management plane returns a short list
+   instead of the session table. Each returned session already carries its
+   index, start time, cumulative byte counter, state, application, zones, and
+   ingress and egress interfaces, so no per-session follow-up call is made. The
+   collector keeps the largest ones, measures each session's age against the
+   firewall clock collected in the same batch, and derives its current
+   throughput from the delta of the cumulative counter between two batches. A
+   session index PAN-OS recycled is detected by its start time and never
+   inherits the volume of its predecessor.
 8. The complete cycle, raw XML API responses, and partial errors are written to
    a JSONL file. The ingress interfaces the evidence itself names (THREAT
    trigger fields, enriched sessions) additionally get hardware counter
@@ -438,6 +451,19 @@ key must be backed up and restored together.
     `api-checks/` artifacts and the trigger and reception journals are kept.
     Requested names are validated on both sides, so no request can reach a path
     outside `targets/<firewall>/incidents/`, and each removal is logged.
+
+49. Every batch lists the sessions above a cumulative-volume and a minimum-age
+    threshold, and the report ranks them with their age, their cumulative
+    volume, their average rate since the session started, and the fastest rate
+    measured between two batches. This is the only evidence path for a single
+    high-volume transfer: while such a session is open PAN-OS writes no traffic
+    log, an offloaded session shows little on the management plane, and the
+    session is never named as a PBP offender, so the offender ranking cannot
+    see it. Both thresholds are operator settings; the volume threshold accepts
+    `0` to switch the query off entirely, and any other value must stay above
+    the floor that keeps the session-table walk bounded on a loaded firewall.
+    A capture taken before this feature renders as such rather than as an empty
+    table.
 
 ## 12. Possible enhancements
 

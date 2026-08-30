@@ -111,6 +111,37 @@ the offender attribution table instead. PAN-OS prints the utilization truncated
 to a whole percent, so the report derives it from allocated over supported to
 keep the movement of a lightly loaded table visible.
 
+## Largest sessions
+
+The **Largest sessions** section answers a question no other section can: was
+one very large transfer occupying the link while the buffers filled? It follows
+`show session all filter min-kb <threshold> min-age <seconds>`, issued once per
+batch, and lists what matched with its flow, its application, its zones, its
+ingress and egress interfaces, and four figures:
+
+- **Open for** — the session age, measured against the firewall clock collected
+  in the same batch, never against the collector clock.
+- **Volume** — the cumulative byte counter PAN-OS reports for the session.
+- **Avg Mbit/s** — that volume spread over the whole life of the session.
+- **Peak Mbit/s** — the fastest interval measured between two consecutive
+  batches, which is the only figure that describes what the session was doing
+  during the incident.
+
+Read the two rates together. A session that moved 40 GB but has been open since
+yesterday shows a low average, and a low peak means it was idle while the
+buffers filled: it is volume, not a cause. A high peak on a session whose
+average is far lower is a transfer that started with the incident. A session
+listed in every batch with a peak comparable to the link speed is the elephant.
+
+This section exists because such a session is invisible everywhere else. PAN-OS
+writes the traffic log when a session closes, so nothing appears in the log
+while the transfer runs; an offloaded session is barely visible on the
+management plane; and PAN-OS never names it as a packet-buffer offender, so the
+offender ranking cannot rank it. The section states instead of showing an empty
+table when nothing matched, when the query is disabled, or when the capture
+predates the feature. A session index PAN-OS recycled during the incident
+appears as a separate row rather than inheriting the volume of its predecessor.
+
 ## Dataplane CPU
 
 Each batch requests `show running resource-monitor second last N`, where `N` is
