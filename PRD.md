@@ -228,7 +228,7 @@ section 11 the acceptance criteria a release is validated against.
   send HSTS. Never expose the generated private key in the UI,
   logs, support archives, or evidence volume.
 - Initial administrator setup requires a one-time setup code printed in the
-  webui container log. Failed sign-in and setup attempts are throttled per
+  webui container log, and that code is what opens the first session. Failed sign-in and setup attempts are throttled per
   source address, and concurrent password verifications are capped.
 - Persisted process logs and support bundles are subject to the same rule as
   evidence: no API key, administrator password material, recovery key or
@@ -433,9 +433,9 @@ key must be backed up and restored together.
     or exception messages.
 33. Global reception may be green while a configured firewall with no recent
     attributable log is independently red.
-34. The first authenticated administrator can retrieve the installation
-    recovery key and acknowledge its secure backup; subsequent pages no longer
-    render the key.
+34. The first administrator can retrieve the installation recovery key and
+    acknowledge its secure backup on the page that follows setup; subsequent
+    pages no longer render the key.
 35. A support ZIP contains the complete run and a manifest with application
     version, sizes, valid SHA-256 hashes, run triggers, and retained Syslog
     messages attributed to that target during the run.
@@ -565,6 +565,12 @@ key must be backed up and restored together.
     and the report's evidence bar carries a button back to the dashboard. A run
     whose report does not exist yet, an active monitor, keeps a plain row. Both
     are plain HTML and CSS: the Web UI serves `script-src 'none'`.
+55. An unauthenticated request lands on the authentication page. A successful
+    sign-in opens the dashboard once the installation is complete, and the
+    configuration page while the recovery key is unacknowledged or no firewall
+    is declared. Creating the administrator with the one-time setup code opens
+    the session directly, so the first run continues into the recovery key and
+    the first firewall without a second authentication.
 
 ## 12. Possible enhancements
 

@@ -324,6 +324,36 @@ class AdminController:
         session = self._session(handler)
         return session[1] if session else None
 
+    def _post_sign_in_location(self) -> str:
+        """Return the page a fresh administrator session must land on.
+
+        A finished installation opens on the dashboard, the page an operator
+        watches day to day. One that still has no firewall declared, or whose
+        installation recovery key has not been saved, opens on the
+        configuration page instead: the dashboard has nothing to show until a
+        firewall forwards its logs, and the recovery key is displayed only
+        until it is acknowledged. Fails towards the configuration page, which
+        is where an unfinished installation is completed.
+        """
+        try:
+            if not self.store.recovery_key_acknowledged() or not self.store.list_targets():
+                return "/admin"
+        except (OSError, sqlite3.Error):
+            LOG.exception("Unable to evaluate the installation state after sign-in")
+            return "/admin"
+        return "/"
+
+    def _open_session(self, handler: Any) -> None:
+        """Start an administrator session and land on the right page."""
+        token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+        self.sessions[token] = (time.monotonic() + SESSION_SECONDS, csrf)
+        secure = "; Secure" if self.secure_cookie else ""
+        self._redirect(
+            handler,
+            self._post_sign_in_location(),
+            f"PBPADMIN={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS}{secure}",
+        )
+
     def _session(self, handler: Any) -> tuple[str, str] | None:
         cookie = SimpleCookie(handler.headers.get("Cookie", ""))
         token = cookie.get("PBPADMIN")
@@ -730,7 +760,10 @@ generated on the firewall CLI, or enable TLS verification first.</p></div>
                     self.store.set_admin_password(form.get("password", ""))
                     self.setup_token = secrets.token_urlsafe(32)
                     self.setup_code = None
-                    self._redirect(handler, "/admin")
+                    # The setup code proved the operator runs this host and the
+                    # password is the one they just chose: sending them back to
+                    # the sign-in form would only interrupt the first run.
+                    self._open_session(handler)
                 else:
                     self._send(handler, self._setup_page())
                 return True
@@ -761,14 +794,17 @@ generated on the firewall CLI, or enable TLS verification first.</p></div>
                         self._record_auth_failure(source)
                         self._send(handler, self._login_page("Invalid password."), 401)
                     else:
-                        token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-                        self.sessions[token] = (time.monotonic() + SESSION_SECONDS, csrf)
-                        secure = "; Secure" if self.secure_cookie else ""
-                        self._redirect(handler, "/admin", f"PBPADMIN={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS}{secure}")
+                        self._open_session(handler)
                 else:
                     self._send(handler, self._login_page())
                 return True
             token, csrf = session
+            if path in ("/admin/login", "/admin/setup"):
+                # Reaching the authentication forms with a live session, from a
+                # bookmark or a stale tab, is a navigation, not a credential
+                # submission: send the operator to the page they belong on.
+                self._redirect(handler, self._post_sign_in_location())
+                return True
             query = parse_qs(urlsplit(handler.path).query)
             syslog = self._syslog_options(handler, query)
             if handler.command == "GET":
