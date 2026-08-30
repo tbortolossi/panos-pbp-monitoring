@@ -192,9 +192,13 @@ already polled every few seconds while under packet-buffer pressure, and the
 check must not compete with the diagnostic batches.
 
 Each firewall card on the dashboard states the result of that check beside its
-Syslog freshness, and turns amber while a monitoring run is in progress on that
-firewall. The run state is read from the run files the collector already writes;
-nothing polls the firewall to determine it.
+Syslog freshness and its incident state, one coloured dot per signal. A check is
+green when it passed, amber while a validation is queued, when no check has run
+yet, or when the schedule is more than twice its interval late, and red when it
+failed. The card itself turns red when Syslog reception or the API signal is
+red, and amber while a monitoring run is in progress on that firewall. The run
+state is read from the run files the collector already writes; nothing polls the
+firewall to determine it.
 
 The **Test** button beside each firewall runs the full read-only validation for
 that firewall instead: every collection command and every parser, writing a
