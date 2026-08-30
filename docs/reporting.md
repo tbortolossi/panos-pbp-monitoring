@@ -178,10 +178,13 @@ responsible, so it must be read alongside session rates, PBP offenders, and
 ingress backlogs.
 
 Dataplane cores are not interchangeable, so the comparison is restricted to
-cores that actually forward traffic. Cores are labelled by what distinguishes
-them from their peers, such as `flow_mgmt`, `flow_ctrl`, or `pan_timer`, and
-only cores carrying `flow_fastpath` are compared: a timer core sitting
-permanently at 0% is not a sign of imbalance.
+cores that actually forward traffic. What distinguishes each core from its
+peers, such as `flow_mgmt`, `flow_ctrl`, or `pan_timer`, is recalled once under
+the dataplane heading; the charts and the verdict then name a core by its
+number alone, which keeps the legend and the heatmap rows short. Only cores
+carrying `flow_fastpath` are compared: a timer core sitting permanently at 0%
+is not a sign of imbalance. The per-core summary table underneath still lists
+the complete function groups of every core.
 
 ## Where the dataplane core map comes from
 

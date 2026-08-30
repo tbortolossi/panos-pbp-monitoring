@@ -496,12 +496,31 @@ def _core_label(dataplane: str, core_id: str, roles: dict[tuple[str, str], dict[
     return f"core {core_id}"
 
 
+def _core_roles_recall(
+    dataplane: str,
+    cores: Sequence[str],
+    roles: dict[tuple[str, str], dict[str, Any]],
+) -> str:
+    """State once what each core does, so the charts can label by number alone."""
+    chips = [
+        f'<span class="key">{_escape(_core_label(dataplane, core_id, roles))}</span>'
+        for core_id in cores
+        if roles.get((dataplane, core_id))
+    ]
+    if not chips:
+        return ""
+    return (
+        '<p class="chart-legend core-roles">'
+        '<span class="key core-roles-title">Core functions:</span>'
+        f'{"".join(chips)}</p>'
+    )
+
+
 def _line_chart(
     dataplane: str,
     batches: Sequence[tuple[int, str]],
     cores: Sequence[str],
     peaks: dict[tuple[str, str], dict[int, float]],
-    roles: dict[tuple[str, str], dict[str, Any]],
     comparable: Sequence[str],
 ) -> str:
     """Plot every core, highlighting the hottest, against the median of its peers."""
@@ -594,7 +613,7 @@ def _line_chart(
             )
         legend.append(
             f'<span class="key"><i style="background:{colour}"></i>'
-            f'{_escape(_core_label(dataplane, core_id, roles))}</span>'
+            f'core {_escape(core_id)}</span>'
         )
     if len(comparable) > 2:
         legend.append(
@@ -618,10 +637,9 @@ def _heatmap(
     batches: Sequence[tuple[int, str]],
     cores: Sequence[str],
     peaks: dict[tuple[str, str], dict[int, float]],
-    roles: dict[tuple[str, str], dict[str, Any]],
 ) -> str:
     """Draw core by batch as coloured cells, which stays readable at 64 cores."""
-    label_width = 196
+    label_width = 88
     value_width = 46
     cell_height = 15
     columns = len(batches)
@@ -635,7 +653,7 @@ def _heatmap(
         series = peaks.get((dataplane, core_id), {})
         parts.append(
             f'<text x="0" y="{y + 11}" class="axis heat-label">'
-            f'{_escape(_core_label(dataplane, core_id, roles))}</text>'
+            f'core {_escape(core_id)}</text>'
         )
         for column, (batch_number, timestamp) in enumerate(batches):
             x = label_width + column * cell_width
@@ -686,7 +704,6 @@ def _dataplane_verdict(
     batches: Sequence[tuple[int, str]],
     comparable: Sequence[str],
     peaks: dict[tuple[str, str], dict[int, float]],
-    roles: dict[tuple[str, str], dict[str, Any]],
     labelled: bool,
 ) -> str:
     """State whether the load rose on every comparable core or on a few of them."""
@@ -721,7 +738,7 @@ def _dataplane_verdict(
         state = "calm"
     elif spread >= 40 and above_half <= max(1, len(values) // 4):
         verdict = (
-            f"{_escape(_core_label(dataplane, hottest_core, roles))} peaked at "
+            f"Core {_escape(hottest_core)} peaked at "
             f"{_escape(_format_number(hottest_value))}% while the median comparable core "
             f"stayed at {_escape(_format_number(median))}%. An isolated hot core is what "
             "flow-hash concentration looks like, so a single high-rate session is worth "
@@ -738,7 +755,7 @@ def _dataplane_verdict(
         state = "collective"
     else:
         verdict = (
-            f"{_escape(_core_label(dataplane, hottest_core, roles))} led at "
+            f"Core {_escape(hottest_core)} led at "
             f"{_escape(_format_number(hottest_value))}% with a median of "
             f"{_escape(_format_number(median))}%. Several cores are loaded and the pattern "
             "is not conclusive on its own."
@@ -793,9 +810,10 @@ def _render_cpu_charts(
                 else ", function groups unavailable"
             )
             + "</span></h3>"
-            + _dataplane_verdict(dataplane, batches, comparable, peaks, roles, labelled)
-            + _line_chart(dataplane, batches, cores, peaks, roles, comparable)
-            + _heatmap(dataplane, batches, cores, peaks, roles)
+            + _core_roles_recall(dataplane, cores, roles)
+            + _dataplane_verdict(dataplane, batches, comparable, peaks, labelled)
+            + _line_chart(dataplane, batches, cores, peaks, comparable)
+            + _heatmap(dataplane, batches, cores, peaks)
         )
     return "".join(sections)
 
@@ -3131,6 +3149,9 @@ def _render_html(
     .chart text.heat-label {{ font-size:10.5px; }}
     .chart-legend {{ display:flex; flex-wrap:wrap; gap:6px 14px; margin:2px 0 4px; color:#475569; font-size:12px; }}
     .chart-legend .key {{ display:inline-flex; align-items:center; gap:6px; }}
+    .core-roles {{ gap:6px 8px; margin:6px 0 8px; }}
+    .core-roles .key {{ padding:2px 9px; border-radius:999px; background:var(--soft); }}
+    .core-roles .core-roles-title {{ padding:0; background:none; color:#64748b; }}
     .chart-legend i {{ width:13px; height:11px; border:1px solid #94a3b8; border-radius:3px; }}
     .chart-legend i.dashed {{ height:0; border:0; border-top:2px dashed #0f172a; border-radius:0; }}
     .chart-caption {{ margin:0 0 14px; font-size:12px; }}
