@@ -52,10 +52,13 @@ A dedicated least-privilege XML API administrator is all it needs.
 - [What is included](#what-is-included)
 - [What starts a diagnostic run](#what-starts-a-diagnostic-run)
 - [What you get out of it](#what-you-get-out-of-it)
+  - [Deployment support bundle](#deployment-support-bundle)
+  - [Anonymized exports](#anonymized-exports)
 - [Documentation](#documentation)
 - [Security model](#security-model)
 - [Development](#development)
 - [Limitations](#limitations)
+- [License](#license)
 
 ## Quick start
 
@@ -196,8 +199,9 @@ Read-only API validation runs, under `api-checks/<run_id>/`, export the same
 way: a credential, TLS or unsupported-command problem is diagnosable from an
 archive even when no incident was ever collected.
 
-**Deployment support bundle.** The admin page offers a **Download support
-bundle** action that packages the whole deployment rather than one run: the
+### Deployment support bundle
+
+The admin page offers a **Download support bundle** action that packages the whole deployment rather than one run: the
 collector and dashboard log files, the running application, Python and
 `cryptography` versions, every collector setting and every registered firewall
 without credentials, the run inventory and storage usage, and the tail of the
@@ -228,7 +232,9 @@ The bundle never carries PAN-OS API keys, the administrator password or its
 hash, the installation recovery key, or the one-time setup code. Producing it
 makes no call to any firewall, and the script changes nothing in the stack.
 
-**Anonymized exports.** The complete bundle names your firewalls: management
+### Anonymized exports
+
+The complete bundle names your firewalls: management
 addresses, hostnames, serial numbers and the source addresses recorded as
 offenders. An anonymized variant is offered beside it — on the admin card, on
 every run in the dashboard, and as `pbp-support --anonymize` — replacing each of
@@ -243,6 +249,8 @@ model is left alone so the model stays legible in command output.
 *Download token mapping* on the admin card, or `pbp-support --anonymize
 --mapping mapping.csv`, produces the CSV translating each token back. It is
 never included in an archive: it is the one file that must never be sent.
+
+### The incident report
 
 The report opens with an **At a glance** block — severity read against the
 PAN-OS PBP defaults, key figures, and probable-cause sentences ready for a
@@ -267,9 +275,9 @@ collected is never touched.
 | Page | What it covers |
 |---|---|
 | [docs/installation.md](docs/installation.md) | Host preparation, TLS certificate, administrator creation, adding a firewall, PAN-OS Syslog forwarding, host firewall rules, validation, controlled lab trigger |
-| [docs/operations.md](docs/operations.md) | Collector settings, webhook notifications, persistent volumes and evidence layout, Syslog acceptance and trust model, backup and recovery, updates, legacy migration |
+| [docs/operations.md](docs/operations.md) | Collector settings, webhook notifications, persistent volumes and evidence layout, run archives, support bundle and `pbp-support.sh`, anonymized exports, Syslog acceptance and trust model, run deletion, backup and recovery, updates, legacy migration |
 | [docs/reporting.md](docs/reporting.md) | Anatomy of the HTML incident report, section by section |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | Symptom-driven checks for Syslog, attribution, API, and admin access |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Symptom-driven checks for Syslog, attribution, API, and admin access; remote diagnosis of a deployment from its support bundle and replaying a capture through the parsers |
 | [PRD.md](PRD.md) | Authoritative product behavior and acceptance criteria |
 | [CHANGELOG.md](CHANGELOG.md) | Version history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md) | Change validation and confidential vulnerability reporting |

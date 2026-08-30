@@ -6,6 +6,11 @@ and what the result means; none of them changes firewall state.
 Related pages: [Installation](installation.md) · [Operations](operations.md) ·
 [Incident report anatomy](reporting.md) · [Back to the README](../README.md)
 
+Before working through the symptoms below, produce a support bundle: one
+command on the Docker host gathers the logs, the settings, the Syslog journals
+and the service state that every check here reads one by one. See
+[Reporting a problem in a deployment you do not administer](#reporting-a-problem-in-a-deployment-you-do-not-administer).
+
 
 ## Global Syslog is red
 
@@ -30,10 +35,17 @@ Check:
 - device serial configuration;
 - shared relay ambiguity.
 
-## `source not allowlisted`
+## Latest logs show *not stored: source is not a registered firewall*
 
-Use the source printed in the warning only after verifying it belongs to the
-firewall or trusted relay. Never broadly allowlist arbitrary client networks.
+The reception journal marks the message `source_not_registered`: the sending
+address is not the **Firewall IP** of any saved firewall. Register that source
+only after verifying it belongs to the firewall or to a trusted relay; never
+register an arbitrary client network. The two other refusal slugs,
+`device_serial_missing` and `device_serial_not_registered`, mean the source is
+known but the serial in the message is not the one read when the firewall was
+saved: re-save the firewall so the serial is read again. The three slugs are
+described in [Operations](operations.md#persistent-data-and-artifacts), and
+`syslog/summary.json` in the support bundle counts them by sender.
 
 ## PAN-OS API failure
 
