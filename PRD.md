@@ -295,6 +295,17 @@ installation recovery key, or the setup code. It does contain management
 addresses, hostnames, serials and offender source addresses; the documentation
 states so where the action is offered.
 
+Every support export, bundle and run archive alike, is also offered in an
+anonymized form. Addresses, MAC addresses, serial numbers and firewall names are
+replaced by tokens in the contents, the archive paths and the manifest, which
+records which form it describes. Tokens derive from a salt generated once per
+installation and held in the configuration volume, so a value keeps one token
+within an export and across successive exports, and the recipient cannot invert
+it. Loopback and unspecified addresses, and a name equal to the platform model,
+are left readable because tokenizing them would remove diagnostic value without
+concealing anyone. The token mapping is available to the operator alone and is
+never placed inside an archive.
+
 Stored runs are retained until an operator deletes them. The dashboard offers a
 per-run deletion and a delete-all across every firewall, both requiring the
 administrator session and its CSRF token. No automatic retention, age limit or
@@ -502,7 +513,13 @@ key must be backed up and restored together.
     building it issues no firewall command. Read-only API validation runs export
     as a run archive like incidents do, and every run archive states the
     environment and the redacted configuration it was produced under.
-51. The raw XML preserved in any capture can be replayed through the shipped
+51. An operator whose policy forbids disclosing addresses can still obtain a
+    diagnosable export. The anonymized bundle and the anonymized run archive
+    carry the same evidence with every address, MAC address, serial and
+    firewall name replaced by a token that is stable within the export and
+    across successive exports, irreversible without the installation's salt,
+    and translatable by the operator through a mapping no archive contains.
+52. The raw XML preserved in any capture can be replayed through the shipped
     parsers offline, reporting which command a parser fails on, so a customer
     archive becomes a fixture and a regression test without access to the
     firewall it came from.

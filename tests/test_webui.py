@@ -32,7 +32,7 @@ from pbp_monitoring.webui import (
     redirect_handler_factory,
     write_run_archive,
 )
-from pbp_monitoring import __version__
+from pbp_monitoring import __version__, diagnostics
 from pbp_monitoring.config_store import ALL_RUNS, ConfigStore
 from tests.support import (
     SERVER_POLL_INTERVAL,
@@ -898,6 +898,54 @@ class SupportEvidenceArchiveTests(unittest.TestCase):
                 "support/environment.json",
                 {entry["path"] for entry in manifest["files"]},
             )
+
+    def test_an_anonymized_run_archive_names_no_address_or_firewall(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            data = root / "data"
+            data.mkdir()
+            check = self._deployment(data)
+            store = ConfigStore(root / "config.db")
+            store.initialize()
+            store.save_target(
+                name="paris-edge",
+                panos_url="https://192.0.2.10",
+                api_key="key",
+                target_serial=None,
+                serials=["001122334455"],
+                syslog_sources=["192.0.2.10"],
+            )
+            anonymizer = diagnostics.build_anonymizer(store)
+            buffer = io.BytesIO()
+            write_run_archive(
+                buffer,
+                check,
+                target="paris-edge",
+                run_id="20260830T080000Z",
+                config_store=store,
+                anonymizer=anonymizer,
+            )
+            buffer.seek(0)
+            with zipfile.ZipFile(buffer) as archive:
+                names = archive.namelist()
+                blob = b"".join(archive.read(name) for name in names)
+                manifest = json.loads(
+                    archive.read(next(n for n in names if n.endswith("manifest.json")))
+                )
+            self.assertTrue(manifest["anonymized"])
+            for original in anonymizer.mapping:
+                self.assertNotIn(original.encode(), blob)
+            # The firewall name is part of the archive prefix as well.
+            self.assertFalse(any("paris-edge" in name for name in names))
+            # The manifest digest must describe what the archive actually holds.
+            entry = next(
+                item for item in manifest["files"] if item["path"] == "api-check.jsonl"
+            )
+            with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as archive:
+                stored = archive.read(
+                    next(n for n in names if n.endswith("api-check.jsonl"))
+                )
+            self.assertEqual(entry["sha256"], hashlib.sha256(stored).hexdigest())
 
     def test_refused_syslog_message_is_kept_in_the_run_export(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

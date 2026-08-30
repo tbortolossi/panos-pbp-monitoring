@@ -124,7 +124,16 @@ password, no recovery key and no setup code. Producing it makes no call to any
 firewall.
 
 If the problem is tied to one incident, ask for that run's **ZIP support**
-archive as well: it holds the full raw XML of every command of every batch.
+archive as well: it holds the full raw XML of every command of every batch. Two
+files, then: the bundle explains the collector, the run archive explains the
+firewall.
+
+If their policy forbids sending addresses and serial numbers, ask for the
+anonymized forms instead — **Download anonymized bundle** and **ZIP
+anonymized** — which carry the same evidence under stable tokens. Diagnosis
+works the same way: an offender is followed by its token, and the operator
+translates it back on their side with **Download token mapping** when a real
+address is finally needed.
 
 ### Reproducing a parsing problem from an archive
 

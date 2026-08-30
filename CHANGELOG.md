@@ -3,6 +3,37 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.22.0] - 2026-08-30
+
+### Added
+
+- **Anonymized support exports.** The admin card and the dashboard's run table
+  each offer an anonymized variant beside the complete one, and `pbp-support`
+  gains `--anonymize`. Every address, MAC address, serial number and firewall
+  name is replaced by a token such as `ip-3f2c1a9b4d`, in the file contents, in
+  the archive paths and in the manifest. The token is derived from a salt
+  generated once per installation and kept in the configuration volume, so the
+  same address reads as the same token across every export a deployment
+  produces — an offender seen during two incidents stays recognizable as one
+  offender — while the recipient cannot recover the address. `manifest.json`
+  carries an `anonymized` flag stating which kind of archive it is. Refs #143.
+- **Token mapping.** *Download token mapping* on the admin card, and
+  `pbp-support --anonymize --mapping <file>`, produce the CSV translating each
+  token back. It is written with owner-only permissions, it is never included
+  in any archive, and the UI, the CLI and the bundle's own README all state
+  that it is the one file that must never be sent.
+- Two exceptions keep an anonymized export diagnosable: loopback and
+  unspecified addresses are left readable, because they identify nobody and
+  name the collector's own sockets, and a firewall name or hostname equal to
+  the platform model is left alone, because tokenizing it would erase the model
+  from every command output that reports one.
+
+### Changed
+
+- The configuration database gains an `anonymization_salt` entry, created on
+  first use. The addition is backward compatible and needs no migration; the
+  schema version is unchanged.
+
 ## [0.21.0] - 2026-08-30
 
 ### Added

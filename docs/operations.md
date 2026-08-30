@@ -137,11 +137,48 @@ docker compose exec -T collector pbp-support > pbp-support.zip
 ```
 
 The bundle never carries PAN-OS API keys, the administrator password or its
-hash, the installation recovery key, or the one-time setup code. It does carry
-firewall management addresses, hostnames, serial numbers, PAN-OS releases and
-the source addresses recorded as offenders during an incident: that is the
-evidence. Review the archive before sending it if your policy requires it.
-Producing it makes no call to any firewall.
+hash, the installation recovery key, or the one-time setup code. Producing it
+makes no call to any firewall.
+
+#### Anonymized exports
+
+The complete archives name your firewalls: management addresses, hostnames,
+serial numbers, PAN-OS releases and the source addresses recorded as offenders
+during an incident. That is the evidence, and it is why the complete form
+exists. When policy forbids sending it, take the anonymized form instead:
+
+- **Download anonymized bundle** on the admin card;
+- **ZIP anonymized** beside **ZIP support** on every row of the dashboard's run
+  table;
+- `docker compose exec -T collector pbp-support --anonymize > pbp-support.zip`.
+
+Every address, MAC address, serial number and firewall name becomes a token such
+as `ip-3f2c1a9b4d` — in the file contents, in the archive paths and in the
+manifest, whose `anonymized` field states which form you are holding. The token
+is derived from a salt generated once per installation and kept in the
+configuration volume, so:
+
+- the same address reads as the same token everywhere in an export, and across
+  every export this deployment produces, which is what lets an offender seen
+  during two incidents be recognized as one offender;
+- whoever receives the archive cannot recover the address, because the salt
+  never leaves the site.
+
+Two values are deliberately left readable, because tokenizing them would cost
+diagnosis and hide nobody: loopback and unspecified addresses, which name the
+collector's own sockets, and a firewall name or hostname equal to the platform
+model, which would otherwise erase the model from every command output that
+reports one.
+
+To translate a token back, use **Download token mapping** on the admin card, or:
+
+```bash
+docker compose exec -T collector pbp-support --anonymize \
+  --output /data/pbp-support.zip --mapping /data/pbp-support-mapping.csv
+```
+
+The mapping is written owner-only and is never placed inside any archive. Keep
+it: it is the one file that must never be sent.
 
 ### Deleting stored runs
 

@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.21.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.22.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -211,10 +211,24 @@ docker compose exec -T collector pbp-support > pbp-support.zip
 ```
 
 The bundle never carries PAN-OS API keys, the administrator password or its
-hash, the installation recovery key, or the one-time setup code. It does carry
-firewall management addresses, hostnames, serial numbers and the source
-addresses recorded as offenders; review it before sending it if that matters.
-Producing it makes no call to any firewall.
+hash, the installation recovery key, or the one-time setup code. Producing it
+makes no call to any firewall.
+
+**Anonymized exports.** The complete bundle names your firewalls: management
+addresses, hostnames, serial numbers and the source addresses recorded as
+offenders. An anonymized variant is offered beside it — on the admin card, on
+every run in the dashboard, and as `pbp-support --anonymize` — replacing each of
+those with a token such as `ip-3f2c1a9b4d`, in the contents, the archive paths
+and the manifest. The token comes from a salt generated once per installation
+and kept on site, so the same address reads as the same token across every
+export, and an offender seen in two incidents is still recognizable as one
+offender, while the recipient cannot recover the address. Loopback and
+unspecified addresses stay readable, and a firewall name equal to the platform
+model is left alone so the model stays legible in command output.
+
+*Download token mapping* on the admin card, or `pbp-support --anonymize
+--mapping mapping.csv`, produces the CSV translating each token back. It is
+never included in an archive: it is the one file that must never be sent.
 
 The report opens with an **At a glance** block — severity read against the
 PAN-OS PBP defaults, key figures, and probable-cause sentences ready for a

@@ -359,3 +359,31 @@ class RunDeletionQueueTests(unittest.TestCase):
                     store.request_run_deletion(target, run_id)
 
             self.assertEqual(store.pending_run_deletions(), [])
+
+
+class AnonymizationSaltTests(unittest.TestCase):
+    """A token is only stable while the salt behind it is."""
+
+    def test_the_salt_is_generated_once_and_survives_reopening(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "config.db"
+            store = ConfigStore(path)
+            store.initialize()
+            first = store.anonymization_salt()
+            self.assertGreaterEqual(len(first), 32)
+            self.assertEqual(first, store.anonymization_salt())
+            self.assertEqual(first, ConfigStore(path).anonymization_salt())
+
+    def test_two_installations_do_not_share_a_salt(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            salts = []
+            for name in ("a", "b"):
+                store = ConfigStore(root / name / "config.db")
+                store.initialize()
+                salts.append(store.anonymization_salt())
+            self.assertNotEqual(*salts)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -21,13 +21,18 @@ are the evidence itself, and the documentation states so plainly.
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import hmac
+import io
+import ipaddress
 import json
 import logging
 import logging.handlers
 import os
 import platform
 import re
+import secrets
 import sys
 import zipfile
 from datetime import datetime, timezone
@@ -78,6 +83,142 @@ def scrub_log_text(text: str) -> str:
     for pattern, replacement in _SCRUB_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+# The trailing boundary rejects a further dotted number, which would mean a
+# longer numeric string, but not an ordinary sentence-ending period: PAN-OS
+# writes "authenticated for user 'x'. From: 10.0.0.1." and that address must
+# still be replaced.
+IPV4_CANDIDATE = re.compile(r"(?<![0-9A-Za-z.])\d{1,3}(?:\.\d{1,3}){3}(?![0-9A-Za-z])(?!\.\d)")
+IPV6_CANDIDATE = re.compile(r"(?<![0-9A-Za-z:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?:/\d{1,3})?(?![0-9A-Za-z:])")
+MAC_CANDIDATE = re.compile(r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f:])")
+
+#: Values below this length are never treated as literal identifiers: a short
+#: firewall name would match fragments of unrelated words.
+MINIMUM_LITERAL_LENGTH = 3
+
+
+class Anonymizer:
+    """Replace identifying values with tokens that stay stable across exports.
+
+    Addresses, MAC addresses, serial numbers, firewall names and hostnames are
+    replaced by a token derived from a per-installation salt kept in the
+    configuration volume. The same address therefore reads as the same token
+    everywhere in an export and across successive exports — an offender seen in
+    two incidents is still recognizable as one offender — while whoever
+    receives the export cannot recover the address: the salt never leaves the
+    site, and the operator can list the mapping locally whenever a token has to
+    be translated back.
+
+    Two deliberate exceptions keep the export diagnosable: loopback and
+    unspecified addresses are left alone, because they identify nobody and name
+    the collector's own sockets, and a firewall name or hostname equal to the
+    platform model is left alone, because tokenizing it would erase the model
+    from every command output that reports it.
+    """
+
+    def __init__(self, salt: str, literals: Iterable[tuple[str, str]] = ()):
+        self._salt = (salt or "").encode("utf-8")
+        self.mapping: dict[str, str] = {}
+        self._literals: list[tuple[re.Pattern[str], str]] = []
+        seen: set[str] = set()
+        for value, kind in sorted(literals, key=lambda item: len(item[0]), reverse=True):
+            text = str(value or "").strip()
+            if len(text) < MINIMUM_LITERAL_LENGTH or text in seen:
+                continue
+            seen.add(text)
+            # The boundary excludes alphanumerics only. Dots, dashes and
+            # underscores are exactly what separates an identifier from its
+            # context — `triggers-fw-a`, `fw-a.example`, and the serial inside
+            # a PAN-OS filename such as `PA_0212...._dt_12.2.2.tgz` — so
+            # treating them as part of the value let it through untouched.
+            self._literals.append(
+                (
+                    re.compile(rf"(?<![0-9A-Za-z]){re.escape(text)}(?![0-9A-Za-z])"),
+                    kind,
+                )
+            )
+            # Registering it now keeps the mapping complete even when a value
+            # never appears in the exported text.
+            self.token(text, kind)
+
+    def token(self, value: str, kind: str) -> str:
+        existing = self.mapping.get(value)
+        if existing is not None:
+            return existing
+        digest = hmac.new(
+            self._salt, f"{kind}:{value}".encode("utf-8"), hashlib.sha256
+        ).hexdigest()[:10]
+        token = f"{kind}-{digest}"
+        self.mapping[value] = token
+        return token
+
+    def _address(self, match: re.Match[str], kind: str) -> str:
+        text = match.group(0)
+        candidate, _, prefix = text.partition("/")
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            return text
+        if address.is_loopback or address.is_unspecified:
+            return text
+        token = self.token(candidate, kind)
+        return f"{token}/{prefix}" if prefix else token
+
+    def apply(self, text: str) -> str:
+        for pattern, kind in self._literals:
+            text = pattern.sub(lambda match, kind=kind: self.token(match.group(0), kind), text)
+        text = MAC_CANDIDATE.sub(lambda match: self.token(match.group(0), "mac"), text)
+        text = IPV4_CANDIDATE.sub(lambda match: self._address(match, "ip"), text)
+        text = IPV6_CANDIDATE.sub(lambda match: self._address(match, "ip6"), text)
+        return text
+
+    def apply_bytes(self, payload: bytes) -> bytes:
+        return self.apply(payload.decode("utf-8", errors="replace")).encode("utf-8")
+
+    def mapping_csv(self) -> bytes:
+        """Render the token mapping the operator keeps, and never sends."""
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow(("token", "original_value"))
+        for value, token in sorted(self.mapping.items(), key=lambda item: item[1]):
+            writer.writerow((token, value))
+        return output.getvalue().encode("utf-8-sig")
+
+
+def build_anonymizer(config_store: Any) -> Anonymizer:
+    """Build an anonymizer seeded with what this deployment knows about itself."""
+    if config_store is None:
+        # No configuration means no known identifiers and no persisted salt.
+        # Addresses are still tokenized, under a salt valid for this export
+        # only, so the operator can still send something.
+        return Anonymizer(secrets.token_hex(32))
+    try:
+        salt = config_store.anonymization_salt()
+        targets = config_store.list_targets()
+    except Exception as exc:
+        LOG.warning("Anonymization falls back to a temporary salt: %s", exc)
+        return Anonymizer(secrets.token_hex(32))
+    models = {
+        str(target.get("model") or "").strip()
+        for target in targets
+        if isinstance(target, dict)
+    }
+    literals: list[tuple[str, str]] = []
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        for value in (target.get("name"), target.get("hostname")):
+            text = str(value or "").strip()
+            # A name equal to the platform model would take the model down with
+            # it, in every command output that reports one.
+            if text and text not in models:
+                literals.append((text, "fw"))
+        for serial in (*(target.get("serials") or ()), target.get("target_serial")):
+            text = str(serial or "").strip()
+            if text:
+                literals.append((text, "serial"))
+    return Anonymizer(salt, literals)
 
 
 def default_log_dir(base: Path) -> Path:
@@ -430,6 +571,15 @@ Firewall management addresses, hostnames, serial numbers, PAN-OS releases, and
 the source addresses and session identifiers recorded as offenders during an
 incident. Review the archive before sending it if that is a concern.
 
+An anonymized bundle is available instead, from the same admin card or with
+`pbp-support --anonymize`. It replaces every address, MAC address, serial and
+firewall name with a token such as `ip-3f2c1a9b4d`, stable across exports so an
+offender stays recognizable, and irreversible for whoever receives it. Check
+`manifest.json`: `"anonymized": true` says which kind you are holding. To
+translate a token back, list the mapping on your own installation with
+`pbp-support --anonymize --mapping mapping.csv`, and keep that file: it is the
+one thing that must never be sent.
+
 No part of producing this bundle contacts the firewall.
 """
 
@@ -443,8 +593,14 @@ def write_support_bundle(
     now: datetime | None = None,
     log_tail_bytes: int = LOG_TAIL_BYTES,
     journal_tail_bytes: int = SYSLOG_JOURNAL_TAIL_BYTES,
+    anonymizer: Anonymizer | None = None,
 ) -> dict[str, Any]:
-    """Write a deployment-wide diagnostic archive and return its manifest."""
+    """Write a deployment-wide diagnostic archive and return its manifest.
+
+    With an `anonymizer`, every exported path and payload goes through it, so
+    the archive names no address, MAC address, serial or firewall of the site
+    it came from.
+    """
     root = Path(data_dir)
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     stamp = current.strftime("%Y%m%dT%H%M%SZ")
@@ -502,6 +658,12 @@ def write_support_bundle(
             except OSError:
                 continue
 
+    if anonymizer is not None:
+        entries = [
+            (anonymizer.apply(relative), anonymizer.apply_bytes(payload), source)
+            for relative, payload, source in entries
+        ]
+
     manifest_files: list[dict[str, Any]] = []
     with zipfile.ZipFile(
         destination,
@@ -526,6 +688,7 @@ def write_support_bundle(
             "application_version": __version__,
             "bundle": prefix,
             "generated_at": current.isoformat(),
+            "anonymized": anonymizer is not None,
             "files": manifest_files,
         }
         archive.writestr(f"{prefix}/manifest.json", _json_bytes(manifest))
@@ -566,7 +729,21 @@ def main(argv: list[str] | None = None) -> int:
         default="-",
         help="archive path, or - for standard output (default: -)",
     )
+    parser.add_argument(
+        "--anonymize",
+        action="store_true",
+        help="replace every address, MAC address, serial and firewall name with"
+        " a token that is stable across exports",
+    )
+    parser.add_argument(
+        "--mapping",
+        type=Path,
+        help="with --anonymize, write the token mapping here; keep this file,"
+        " it is the one thing that must never be sent",
+    )
     args = parser.parse_args(argv)
+    if args.mapping and not args.anonymize:
+        parser.error("--mapping requires --anonymize")
     logging.basicConfig(level="WARNING", format=LOG_FORMAT)
 
     store = None
@@ -579,6 +756,7 @@ def main(argv: list[str] | None = None) -> int:
             LOG.warning("Configuration is not readable: %s", exc)
 
     log_dirs = [default_log_dir(args.data_dir), default_log_dir(args.config_db.parent)]
+    anonymizer = build_anonymizer(store) if args.anonymize else None
     if args.output == "-":
         buffer = getattr(sys.stdout, "buffer", sys.stdout)
         manifest = write_support_bundle(
@@ -586,6 +764,7 @@ def main(argv: list[str] | None = None) -> int:
             data_dir=args.data_dir,
             config_store=store,
             log_dirs=log_dirs,
+            anonymizer=anonymizer,
         )
     else:
         target = Path(args.output)
@@ -596,9 +775,25 @@ def main(argv: list[str] | None = None) -> int:
                 data_dir=args.data_dir,
                 config_store=store,
                 log_dirs=log_dirs,
+                anonymizer=anonymizer,
             )
         LOG.warning("Support bundle written to %s", target)
-    LOG.warning("Support bundle contains %d files", len(manifest["files"]))
+    if args.mapping and anonymizer is not None:
+        args.mapping.parent.mkdir(parents=True, exist_ok=True)
+        args.mapping.write_bytes(anonymizer.mapping_csv())
+        try:
+            os.chmod(args.mapping, 0o600)
+        except OSError:
+            pass
+        LOG.warning(
+            "Token mapping written to %s. Keep it: it must never be sent.",
+            args.mapping,
+        )
+    LOG.warning(
+        "Support bundle contains %d files%s",
+        len(manifest["files"]),
+        " (anonymized)" if anonymizer is not None else "",
+    )
     return 0
 
 

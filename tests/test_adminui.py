@@ -774,6 +774,50 @@ class SettingLabelTests(unittest.TestCase):
     def test_unknown_setting_falls_back_to_sentence_case(self):
         self.assertEqual(setting_label("future_knob_seconds"), "Future knob seconds")
 
+    def test_the_anonymized_bundle_and_its_mapping_are_offered_together(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "data").mkdir()
+            (root / "config").mkdir()
+            store = ConfigStore(root / "config" / "config.db")
+            store.initialize()
+            store.save_target(
+                name="paris-edge",
+                panos_url="https://192.0.2.10",
+                api_key="super-secret-api-key",
+                target_serial=None,
+                serials=["001122334455"],
+                syslog_sources=["192.0.2.10"],
+            )
+            with signed_in_admin(root) as (opener, base, _csrf, page):
+                self.assertIn("Download anonymized bundle", page)
+                self.assertIn("Download token mapping", page)
+                payload = opener.open(
+                    base + "/admin/support-bundle-anonymized.zip"
+                ).read()
+                mapping = opener.open(
+                    base + "/admin/support-token-mapping.csv"
+                ).read().decode("utf-8-sig")
+            with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                names = archive.namelist()
+                blob = b"".join(archive.read(name) for name in names)
+                manifest = json.loads(
+                    archive.read(next(n for n in names if n.endswith("manifest.json")))
+                )
+            self.assertTrue(manifest["anonymized"])
+            self.assertNotIn(b"192.0.2.10", blob)
+            self.assertNotIn(b"paris-edge", blob)
+            self.assertNotIn(b"super-secret-api-key", blob)
+            # The mapping is what the operator keeps; it must translate the
+            # tokens the bundle they just downloaded actually uses.
+            self.assertIn("192.0.2.10", mapping)
+            self.assertIn("paris-edge", mapping)
+            self.assertNotIn("super-secret-api-key", mapping)
+            for line in mapping.splitlines()[1:]:
+                token = line.split(",")[0]
+                if token.startswith(("ip-", "fw-", "serial-")):
+                    self.assertIn(token.encode(), blob)
+
 
 if __name__ == "__main__":
     unittest.main()
