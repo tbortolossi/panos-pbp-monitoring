@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.16.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.17.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -18,6 +18,20 @@ evidence you can attach to a Palo Alto Networks TAC case.
 It answers the question a packet-buffer incident always raises and that nobody
 can answer after the fact: **what was flooding the firewall while the buffers
 were full, and where did it enter?**
+
+![The dashboard, showing Syslog freshness, one card per firewall, the latest
+received logs, and the completed incident runs](docs/images/dashboard.png)
+
+> Every screenshot in this repository is generated from a fictitious
+> incident by `tools/generate_demo_stack.py`. No firewall, address, or
+> serial shown is real.
+
+More captures: the [incident report](docs/images/incident-report.png), the
+[configuration page](docs/images/admin-configuration.png), the
+[firewall form](docs/images/admin-firewall-form.png), the
+[first-run setup](docs/images/admin-setup.png), the
+[sign-in page](docs/images/admin-sign-in.png), and the
+[TXT export index](docs/images/text-exports.png).
 
 ## Safety guarantees
 
@@ -247,6 +261,25 @@ pbp-export-text
 pbp-web
 pbp-config
 ```
+
+### Regenerating the documentation screenshots
+
+The images under `docs/images/` are not taken from a running deployment. They
+are rendered from a fictitious incident, so no real serial, address, or
+hostname can reach the repository. Regenerate them after any change to the
+dashboard, the administration pages, or the HTML report, then review the
+result before committing:
+
+```bash
+PYTHONPATH=src python3 tools/generate_demo_stack.py
+```
+
+The tool builds the demo capture, serves it with the real web server on the
+loopback interface, and captures each page with a headless Chromium found on
+the host. It contacts no firewall. `--check` builds and verifies every page
+without rendering, which is what CI runs: images are reviewed by eye, never
+compared pixel by pixel, because headless rendering differs between
+distributions.
 
 ## Limitations
 
