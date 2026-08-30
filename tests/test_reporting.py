@@ -1218,6 +1218,7 @@ class ReadabilityTests(unittest.TestCase):
         html = self._render(self._capture([4.0, 4.1]))
 
         for anchor in (
+            "glance-title",
             "summary-title",
             "pressure-title",
             "attribution-title",
@@ -1239,6 +1240,16 @@ class ReadabilityTests(unittest.TestCase):
             html,
         )
         self.assertNotIn("<script", html)
+
+    def test_the_glance_fold_keeps_its_severity_styling(self):
+        html = self._render(self._capture([4.0, 85.0]))
+
+        self.assertIn(
+            '<section class="glance" data-level="bad" '
+            'aria-labelledby="glance-title">',
+            html,
+        )
+        self.assertIn("At a glance", html)
 
     def test_pressure_axis_fits_the_data_and_marks_received_triggers(self):
         quiet = self._render(self._capture([4.0, 4.5, 4.2], triggers=2))
