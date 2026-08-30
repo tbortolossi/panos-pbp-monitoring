@@ -389,7 +389,9 @@ key must be backed up and restored together.
     or a run in progress. The card's general dot is red when Syslog or the API
     signal is red, amber while a run is in progress, and green otherwise. The run
     state is derived from the run files already written; no additional firewall
-    call is made to determine it.
+    call is made to determine it. Reception is reported by these cards only. A
+    single global reception card replaces them while no firewall is registered,
+    so a fresh installation still sees whether messages arrive.
     `show statistics` runs once per firewall at save time, is not called during
     an incident whose stored map still matches the running release, and is
     always called by `--check-api`.
@@ -555,8 +557,8 @@ key must be backed up and restored together.
     attributed to and can be filtered to one declared firewall, or to the
     messages no firewall claims, so a refused sender is diagnosed without
     reading past the ordinary traffic of the other firewalls. The filter is
-    carried by the URL, so it survives the page refresh, and it never applies to
-    the global reception state or to the per-firewall cards.
+    carried by the URL, so it survives the page refresh, and it never applies
+    to the per-firewall cards.
 
 ## 12. Possible enhancements
 

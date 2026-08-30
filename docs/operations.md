@@ -262,8 +262,7 @@ recent messages no firewall claims. That last one is the commissioning view — 
 refused message never reaches a firewall card, so this is where a firewall
 declared with the wrong Syslog source or the wrong serial becomes visible. The
 filter is a link, so it survives the automatic refresh of the page, and it
-changes nothing else: the global reception state and each firewall card keep
-reading the whole journal.
+changes nothing else: each firewall card keeps reading the whole journal.
 
 The same rule gates monitoring: a refused message starts no incident and causes
 no API call, so a spoofed or stray sender cannot make the collector fill the

@@ -429,7 +429,7 @@ class WebUITests(unittest.TestCase):
             self.assertIn("Unattributed (1)", rendered)
             self.assertIn("not stored: source is not a registered firewall", rendered)
 
-    def test_dashboard_has_global_and_per_firewall_reception_state(self):
+    def test_reception_state_is_reported_per_firewall_not_globally(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             data = Path(temporary_directory)
             store = ConfigStore(data / "configuration" / "config.db")
@@ -472,6 +472,29 @@ class WebUITests(unittest.TestCase):
             self.assertIn("Syslog: no attributed log received", rendered)
             self.assertIn("API check: never run", rendered)
             self.assertIn("Incident: no run in progress", rendered)
+            self.assertNotIn("Syslog reception is active", rendered)
+
+    def test_without_a_registered_firewall_reception_is_still_reported(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data = Path(temporary_directory)
+            received = {
+                "timestamp": "2026-08-28T12:00:00+00:00",
+                "transport_source_ip": "192.0.2.10",
+                "target_names": [],
+                "trigger": False,
+                "metadata": {},
+                "message": "system log",
+            }
+            (data / "syslog-received.jsonl").write_text(
+                json.dumps(received) + "\n", encoding="utf-8"
+            )
+            state = collect_dashboard_state(
+                data, now=datetime(2026, 8, 28, 12, 1, tzinfo=timezone.utc)
+            )
+            rendered = render_dashboard(state)
+            self.assertEqual(state["firewalls"], [])
+            self.assertIn("Syslog reception is active", rendered)
+            self.assertIn("No firewall is registered yet", rendered)
 
     def test_a_firewall_card_shows_a_run_in_progress_and_the_last_api_check(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
