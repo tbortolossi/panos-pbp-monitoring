@@ -55,14 +55,22 @@ default. Command status and timing fields are presented as compact metadata,
 the summary separates capture facts, incident state, and peak utilization, and
 its peak metrics are grouped into packet buffers, packet descriptors, and
 system load. Every section folds from its heading — Diagnosis included, a
-native disclosure — so a section already read can be put away; the evidence
-sections open by default and the appendices (summary, timeline, batches,
-events) collapsed.
+native disclosure. The Diagnosis is the only part open by default: the
+evidence sections sit folded under a **Going further — the evidence** heading,
+each stating its one-line verdict on its summary ("buffers peaked at 4.5%",
+"6 sessions + 9 sources RED", "no session at 2%", "no hot core"), and the
+appendices (summary, timeline, batches, events) sit folded under
+**Appendix — the complete capture**. The step numbering lives only in the
+diagnosis; the sections carry plain names. Following an evidence link or a
+navigation entry opens the targeted section: that is the report's single
+hash-pinned script at work, and a report whose script is stripped simply
+leaves the section to be opened by hand.
 
 **Collapse all** sits at the right of the section navigation and folds every
 section at once, except Diagnosis, which is the verdict block and stays open.
-The same control then reads **Expand all** and reopens them; each heading keeps
-working individually. It is the report's only script, allowed by its SHA-256
+The same control then reads **Expand all** and opens them all — the way to
+unfold the whole report, including before printing it, since a folded section
+prints folded; each heading keeps working individually. It is the report's only script, allowed by its SHA-256
 hash in the report's own Content-Security-Policy and in the one the Web UI
 serves the page with, so nothing else can run in that page. The button is
 created by that script, so a report whose script a mail gateway strips, or a

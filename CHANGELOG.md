@@ -3,6 +3,26 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.36.0] - 2026-08-30
+
+### Changed
+
+- **The report is two-part: the diagnosis, then the evidence folded.** Even
+  organised as the investigation, a 70-batch run still rendered ten open
+  evidence sections — a 70-row latency table, two 50-row offender tables, a
+  50-row threat-log table, CPU charts — and the step numbers appeared twice,
+  in the diagnosis and again as section titles. The Diagnosis is now the only
+  part open by default. The evidence sections sit folded under a **Going
+  further — the evidence** heading, each stating its one-line verdict on its
+  folded summary ("buffers peaked at 4.5%", "6 sessions + 9 sources RED",
+  "no session at 2% of the queue", "no hot core"), and drop the "Step N"
+  prefix from their titles; the appendix keeps its own heading. The report's
+  single hash-pinned script now also opens the section a followed link
+  targets, so the diagnosis evidence links and the navigation land on an open
+  section; a report whose script is stripped shows the same page with the
+  sections to open by hand. Expand all unfolds everything, including before
+  printing. Content, collection and exports are unchanged. Refs #185.
+
 ## [0.35.1] - 2026-08-30
 
 ### Fixed

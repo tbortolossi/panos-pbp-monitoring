@@ -1514,10 +1514,17 @@ def _render_pbp_threat_logs(events: list[tuple[int, dict[str, Any]]]) -> str:
                 "<th>Application</th><th>Zone</th><th>Action</th><th>Session</th>"
                 f"<th>Repeat</th></tr></thead><tbody>{rows}</tbody></table></div>"
             )
+    if record.get("ok") is not True:
+        pill = "query failed"
+    else:
+        count = len(record.get("entries") or [])
+        pill = f"{count} log(s)" if count else "none in the window"
     return _render_section(
         "pbp-threat-logs-title",
-        "Step 2 · PBP threat logs",
+        "PBP threat logs",
         body,
+        pill=pill,
+        open=False,
         intro="What the firewall itself logged when PBP acted: its RED drops, "
         "session discards and source blocks, queried read-only once at monitor "
         "stop so the designations are captured even when the threat log is not "
@@ -1583,16 +1590,7 @@ def _render_ingress_backlogs(
             )
             + "</tbody></table></div>"
         )
-    candidates = [
-        item
-        for item in attribution
-        if item.get("entity_type") == "session"
-        and (
-            "ingress_backlogs" in item.get("evidence_sources", [])
-            or item.get("ingress_percentage") is not None
-        )
-    ]
-    candidates.sort(key=lambda item: -(float(item.get("ingress_percentage") or 0.0)))
+    candidates = _ingress_candidate_entities(attribution)
     if not candidates and not collected:
         return (
             '<p class="muted">The ingress backlogs were not collected in this '
@@ -2139,6 +2137,19 @@ for(i=0;i<sections.length;i++){sections[i].open=!collapse;}
 button.textContent=collapse?"Expand all":"Collapse all";
 });
 nav.appendChild(button);
+function reveal(){
+var id=window.location.hash.replace("#","");
+if(!id){return;}
+var heading=document.getElementById(id);
+var element=heading;
+while(element){
+if(element.tagName==="DETAILS"){element.open=true;}
+element=element.parentElement;
+}
+if(heading){heading.scrollIntoView();}
+}
+window.addEventListener("hashchange",reveal);
+reveal();
 })();"""
 
 #: The Content-Security-Policy source expression the Web UI must allow for a
@@ -2146,6 +2157,30 @@ nav.appendChild(button);
 REPORT_SCRIPT_CSP_HASH = "sha256-" + base64.b64encode(
     hashlib.sha256(REPORT_SCRIPT.encode("utf-8")).digest()
 ).decode("ascii")
+
+
+def _part_heading(title: str, subtitle: str) -> str:
+    """A visible divider between the diagnosis, the evidence, and the appendix."""
+    return (
+        '<div class="part-head"><h2 class="part-title">'
+        f"{_escape(title)}</h2>"
+        f'<p class="muted">{_escape(subtitle)}</p></div>'
+    )
+
+
+def _ingress_candidate_entities(attribution: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The sessions the ingress work queue named, in queue-share order."""
+    candidates = [
+        item
+        for item in attribution
+        if item.get("entity_type") == "session"
+        and (
+            "ingress_backlogs" in item.get("evidence_sources", [])
+            or item.get("ingress_percentage") is not None
+        )
+    ]
+    candidates.sort(key=lambda item: -(float(item.get("ingress_percentage") or 0.0)))
+    return candidates
 
 
 def _render_section(
@@ -2245,6 +2280,8 @@ def _render_offender_live_sessions(events: list[tuple[int, dict[str, Any]]]) -> 
         "".join(blocks),
         intro="Sessions still open for the top ranked sources when the monitor "
         "stopped, from one bounded filtered query per source.",
+        pill=f"{len(blocks)} source{'s' if len(blocks) != 1 else ''}",
+        open=False,
     )
 
 
@@ -2311,6 +2348,8 @@ def _render_offender_traffic_logs(events: list[tuple[int, dict[str, Any]]]) -> s
         "inspect (traffic denied before session setup, or a RED-blocked source). "
         "The flows below come from the firewall's own traffic log, queried "
         "read-only once at monitor stop.",
+        pill=f"{len(blocks)} source{'s' if len(blocks) != 1 else ''}",
+        open=False,
     )
 
 
@@ -3157,10 +3196,10 @@ def _render_html(
         )
 
     nav_items = [
-        ("pressure-title", "1 · Pressure"),
-        ("attribution-title", "2 · PBP offenders"),
-        ("ingress-title", "3 · Ingress backlog"),
-        ("cpu-tracking-title", "4 · CPU"),
+        ("pressure-title", "Pressure"),
+        ("attribution-title", "Offenders"),
+        ("ingress-title", "Backlog"),
+        ("cpu-tracking-title", "CPU"),
         ("large-sessions-title", "Largest sessions"),
         ("drop-counters-title", "Drops"),
         ("session-table-title", "Session table"),
@@ -3189,11 +3228,87 @@ def _render_html(
         f"<th>Elapsed (s)</th>{metric_headers}<th>Candidate sessions</th><th>Errors</th>"
         f"</tr></thead><tbody>{timeline_body}</tbody></table></div>"
     )
+    buffer_pill_values = [
+        value
+        for key in ("packet_buffer_congestion", "resource_monitor_packet_buffer")
+        if (value := metric_maxima.get(key)) is not None
+    ]
+    pressure_pill = (
+        f"buffers peaked at {_format_number(max(buffer_pill_values))}%"
+        if buffer_pill_values
+        else "no buffer reading"
+    )
+    red_sessions = sum(
+        1
+        for item in attribution
+        if item.get("drop_state") and item.get("entity_type") == "session"
+    )
+    red_sources = sum(
+        1
+        for item in attribution
+        if item.get("drop_state") and item.get("entity_type") != "session"
+    )
+    if red_sessions or red_sources:
+        attribution_pill = (
+            f"{red_sessions} session{'s' if red_sessions != 1 else ''} + "
+            f"{red_sources} source{'s' if red_sources != 1 else ''} RED"
+        )
+    elif attribution:
+        attribution_pill = "ranked, none RED"
+    else:
+        attribution_pill = "no offender learned"
+    ingress_candidate_count = len(_ingress_candidate_entities(attribution))
+    ingress_pill = (
+        f"{ingress_candidate_count} session{'s' if ingress_candidate_count != 1 else ''} in the queue"
+        if ingress_candidate_count
+        else "no session at 2%"
+    )
+    isolated_cores = [v for v in cpu_verdict_data if v.get("state") == "isolated"]
+    if not cpu_verdict_data:
+        cpu_pill = "not sampled"
+    elif isolated_cores:
+        first = isolated_cores[0]
+        cpu_pill = f"{first.get('dataplane')} core {first.get('hottest_core')} hot alone"
+    elif any(v.get("state") == "mixed" for v in cpu_verdict_data):
+        cpu_pill = "several cores loaded"
+    else:
+        cpu_pill = "no hot core"
+    top_large = next(iter(large_session_summary.get("sessions") or []), None)
+    large_peak = (
+        next(iter(_numbers(top_large.get("peak_bits_per_second"))), None)
+        if isinstance(top_large, dict)
+        else None
+    )
+    large_pill = (
+        f"top {_format_number(round(large_peak / 1_000_000, 1))} Mbit/s"
+        if large_peak is not None
+        else "none matched"
+        if large_session_summary.get("status") == "collected"
+        else "not collected"
+    )
+    drops_pill = (
+        f"{_format_number(drop_counter_summary['denied_total'])} denied packets"
+        if drop_counter_summary.get("items")
+        else "no counters"
+    )
+    table_peak = _session_peak(session_series, "utilization")
+    session_pill = (
+        f"table peaked at {_format_number(table_peak)}%"
+        if table_peak is not None
+        else "not collected"
+    )
     sections_html = "".join(
         [
+            _part_heading(
+                "Going further — the evidence",
+                "Each section below carries the detail behind one step of the "
+                "diagnosis, folded until you need it; its one-line verdict is "
+                "readable without opening it. Expand all (top right) unfolds "
+                "everything, including for printing.",
+            ),
             _render_section(
                 "pressure-title",
-                "Step 1 · Pressure over time",
+                "Pressure over time",
                 (
                     pressure_chart_html
                     or '<p class="muted">At least two batches are required to draw '
@@ -3207,56 +3322,75 @@ def _render_html(
                 "of every resource the firewall reported. Cards turn amber above "
                 f"the {alert_text}% alert level and red above the {activate_text}% "
                 "activate level.",
+                pill=pressure_pill,
+                open=False,
             ),
             _render_section(
                 "attribution-title",
-                "Step 2 · Offenders named by PBP",
+                "Offenders named by PBP",
                 attribution_html,
                 intro="Which sessions and source addresses PAN-OS itself blamed "
                 "for the buffer usage, with their flows and rates. RED drop "
                 "<strong>Yes</strong> is the firewall's own designation.",
+                pill=attribution_pill,
+                open=False,
             ),
             pbp_threat_logs_html,
             offender_logs_html,
             _render_section(
                 "ingress-title",
-                "Step 3 · Ingress backlog",
+                "Ingress backlog",
                 ingress_html,
                 intro="Which sessions held at least 2% of the work queue in front "
                 "of the dataplane cores (<code>show running resource-monitor "
                 "ingress-backlogs</code>). Independent of the PBP learning: the "
                 "queue is where the on-chip descriptors are consumed.",
+                pill=ingress_pill,
+                open=False,
             ),
             _render_section(
                 "cpu-tracking-title",
-                "Step 4 · Dataplane CPU core tracking",
+                "Dataplane CPU core tracking",
                 cpu_charts_html + cpu_tracking_html,
                 intro="Whether every core rose together (aggregate load) or one "
                 "core ran hot alone (a single high-rate flow pinned to it).",
+                pill=cpu_pill,
+                open=False,
             ),
             _render_section(
                 "large-sessions-title",
-                "Step 4 · Largest sessions",
+                "Largest sessions",
                 large_sessions_html,
                 intro="Whether one long-lived high-volume transfer was consuming "
                 "the link while the buffers filled. Such a session writes no "
                 "traffic log until it closes, so it never appears in the offender "
                 "ranking.",
+                pill=large_pill,
+                open=False,
             ),
             _render_section(
                 "drop-counters-title",
-                "Step 4 · Denied and dropped traffic",
+                "Denied and dropped traffic",
                 drop_counters_html,
                 intro="What the dataplane discarded, and whether it was denied "
                 "before a session existed (a burst the policy refuses) or dropped "
                 "afterwards.",
+                pill=drops_pill,
+                open=False,
             ),
             _render_section(
                 "session-table-title",
-                "Step 4 · Session table",
+                "Session table",
                 session_table_html,
                 intro="Whether new sessions followed the load, or packets arrived "
                 "without creating any.",
+                pill=session_pill,
+                open=False,
+            ),
+            _part_heading(
+                "Appendix — the complete capture",
+                "The capture facts, the per-batch timeline, and every raw "
+                "command response, for the TAC case.",
             ),
             _render_section(
                 "summary-title",
@@ -3413,6 +3547,9 @@ def _render_html(
     .toc button.fold-all:hover,.toc button.fold-all:focus {{ background:#e0f2f1; border-color:var(--accent); }}
     h2 {{ scroll-margin-top:56px; }}
     .section-intro {{ margin:-8px 0 14px; color:var(--muted); }}
+    .part-head {{ margin:34px 0 14px; padding-top:16px; border-top:2px solid var(--line); }}
+    .part-head h2.part-title {{ margin:0 0 4px; color:#334155; font-size:15px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; }}
+    .part-head p {{ margin:0; font-size:13px; }}
     .glance {{ padding:18px 20px; border:1px solid var(--line); border-left:6px solid #64748b; border-radius:12px; background:#fff; }}
     .glance[data-level="ok"] {{ border-left-color:#047857; }}
     .glance[data-level="warn"] {{ border-left-color:#d97706; }}

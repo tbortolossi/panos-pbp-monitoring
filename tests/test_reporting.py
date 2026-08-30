@@ -1228,11 +1228,16 @@ class ReadabilityTests(unittest.TestCase):
         self.assertLess(html.index('href="#ingress-title"'), html.index('href="#cpu-tracking-title"'))
         self.assertLess(html.index('href="#session-table-title"'), html.index('href="#summary-title"'))
 
-    def test_every_section_folds_and_the_appendices_start_folded(self):
+    def test_only_the_diagnosis_is_open_and_every_evidence_section_carries_a_verdict(self):
         html = self._render(self._capture([4.0, 4.1]))
 
+        # The diagnosis is the report; everything else is the going-further part.
+        self.assertIn(
+            '<details class="section-disclosure section-fold" open>'
+            '<summary><h2 id="glance-title">',
+            html,
+        )
         for anchor in (
-            "glance-title",
             "pressure-title",
             "attribution-title",
             "ingress-title",
@@ -1240,21 +1245,37 @@ class ReadabilityTests(unittest.TestCase):
             "session-table-title",
             "large-sessions-title",
             "cpu-tracking-title",
+            "summary-title",
+            "timeline-title",
+            "cycles-title",
+            "events-title",
         ):
-            self.assertIn(
-                '<details class="section-disclosure section-fold" open>'
-                f'<summary><h2 id="{anchor}">',
-                html,
-            )
-        # Summary cards, timeline, batches and events are the appendix: kept
-        # in full, folded until the reader asks for them.
-        for anchor in ("summary-title", "timeline-title", "cycles-title", "events-title"):
             self.assertIn(
                 '<details class="section-disclosure section-fold">'
                 f'<summary><h2 id="{anchor}">',
                 html,
             )
+        # A folded section still states its verdict on its summary line.
+        self.assertIn("buffers peaked at 4.1%", html)
+        self.assertIn("no offender learned", html)
+        self.assertIn("no session at 2%", html)
+        self.assertIn(">Going further — the evidence</h2>", html)
+        self.assertIn(">Appendix — the complete capture</h2>", html)
+        self.assertLess(
+            html.index("Going further — the evidence"),
+            html.index('id="pressure-title"'),
+        )
+        self.assertLess(
+            html.index('id="session-table-title"'),
+            html.index("Appendix — the complete capture"),
+        )
         self.assertEqual(html.lower().count("<script"), 1)
+
+    def test_the_script_reveals_the_section_a_hash_link_targets(self):
+        # The diagnosis links to folded evidence sections, so the single
+        # pinned script must open the disclosure the hash targets.
+        self.assertIn('window.addEventListener("hashchange",reveal);', REPORT_SCRIPT)
+        self.assertIn('element.tagName==="DETAILS"', REPORT_SCRIPT)
 
     def test_the_only_script_the_report_runs_is_its_own_folding_control(self):
         """The report is handed to a TAC case, so its active content is pinned.
