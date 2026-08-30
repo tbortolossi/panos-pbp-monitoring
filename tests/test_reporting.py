@@ -702,6 +702,21 @@ class CpuChartTests(unittest.TestCase):
         self.assertIn("core 2 · flow_ctrl", html)
         self.assertIn("4 cores, 3 forwarding traffic", html)
 
+    def test_core_functions_are_recalled_once_and_charts_show_only_numbers(self):
+        html = self._render(
+            {"dp0": {"0": 0.0, "1": 12.0, "2": 12.0, "3": 98.0}},
+            self.FUNCTIONS,
+        )
+        recall = html.count('<p class="chart-legend core-roles">')
+        charts = html[html.index('<p class="chart-legend core-roles">') :]
+
+        self.assertEqual(recall, 1)
+        self.assertEqual(html.count("core 2 · flow_ctrl"), 1)
+        self.assertIn('<span class="key">core 3 · fastpath only</span>', html)
+        self.assertIn('<i style="background:#b91c1c"></i>core 3</span>', charts)
+        self.assertIn('class="axis heat-label">core 3</text>', charts)
+        self.assertIn("Core 3 peaked at", charts)
+
     def test_charts_still_render_when_function_groups_are_missing(self):
         html = self._render({"dp0": {"1": 12.0, "2": 12.0, "3": 98.0}}, None)
 

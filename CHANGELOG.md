@@ -30,6 +30,12 @@ follows [Semantic Versioning](https://semver.org/).
   unchanged: the stop marker, the probable cause and the rollup still work
   from the full attribution, and the JSONL capture keeps every ranked entity.
   Refs #150.
+- **Core functions recalled once in the CPU charts.** The dataplane CPU
+  section lists what each core does under its heading, then names cores by
+  number in the line-chart legend, the heatmap rows and the verdict. The row
+  labels no longer carry a function list wide enough to squeeze the heatmap
+  cells, and the per-core summary table still shows the full function groups.
+  Refs #159.
 - **Collapsible report sections.** Every section of the report can be folded
   from its heading with a native disclosure, open by default except the events
   section which stays collapsed as before. The report remains a single file
