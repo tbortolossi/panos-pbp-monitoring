@@ -327,8 +327,13 @@ key must be backed up and restored together.
     failed check is recorded and visible without interrupting Syslog reception.
 14. Each dashboard firewall card states Syslog freshness, the outcome of the last
     read-only check, and whether a monitoring run is in progress on that
-    firewall. The run state is derived from the run files already written; no
-    additional firewall call is made to determine it.
+    firewall. Each of the three signals carries its own coloured dot: green when
+    it is nominal, amber for a check that is queued, never run, or overdue by
+    more than twice its interval, red for stale Syslog reception, a failed check,
+    or a run in progress. The card's general dot is red when Syslog or the API
+    signal is red, amber while a run is in progress, and green otherwise. The run
+    state is derived from the run files already written; no additional firewall
+    call is made to determine it.
     `show statistics` runs once per firewall at save time, is not called during
     an incident whose stored map still matches the running release, and is
     always called by `--check-api`.

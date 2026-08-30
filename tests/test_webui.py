@@ -230,10 +230,11 @@ class WebUITests(unittest.TestCase):
             data = Path(temporary_directory)
             store = ConfigStore(data / "configuration" / "config.db")
             store.initialize()
-            store.save_target(
+            target_id = store.save_target(
                 name="fw-a", panos_url="https://192.0.2.10", api_key="key-a",
                 target_serial=None, serials=[], syslog_sources=["192.0.2.10"],
             )
+            store.record_target_check(target_id, kind="keepalive", status="ok", detail="")
             store.save_target(
                 name="fw-b", panos_url="https://192.0.2.11", api_key="key-b",
                 target_serial=None, serials=[], syslog_sources=["192.0.2.11"],
@@ -258,6 +259,11 @@ class WebUITests(unittest.TestCase):
             self.assertFalse(state["firewalls"][1]["healthy"])
             self.assertIn("fw-a: healthy", rendered)
             self.assertIn("Syslog: last log 2026-08-28 12:00:00 UTC", rendered)
+            self.assertIn(
+                '<li class="ok"><span class="mark"></span>'
+                "<span>Incident: no run in progress</span></li>",
+                rendered,
+            )
             self.assertIn("fw-b: needs attention", rendered)
             self.assertIn("Syslog: no attributed log received", rendered)
             self.assertIn("API check: never run", rendered)
@@ -275,6 +281,17 @@ class WebUITests(unittest.TestCase):
             store.record_target_check(
                 target_id, kind="keepalive", status="ok",
                 detail="PAN-OS 12.2.2; 4 dataplane cores mapped",
+            )
+            received = {
+                "timestamp": "2026-08-28T12:00:00+00:00",
+                "transport_source_ip": "192.0.2.10",
+                "target_names": ["fw-a"],
+                "trigger": True,
+                "metadata": {},
+                "message": "packet buffer congestion",
+            }
+            (data / "syslog-received.jsonl").write_text(
+                json.dumps(received) + "\n", encoding="utf-8"
             )
             run_dir = data / "targets" / "fw-a" / "incidents" / "20260828T120000Z"
             run_dir.mkdir(parents=True)
@@ -301,7 +318,11 @@ class WebUITests(unittest.TestCase):
             self.assertEqual(firewall["active_run"], "20260828T120000Z")
             self.assertEqual(firewall["last_check_status"], "ok")
             self.assertIn("fw-a: monitoring run in progress", rendered)
-            self.assertIn("Incident: run 20260828T120000Z in progress", rendered)
+            self.assertIn(
+                '<li class="bad"><span class="mark"></span>'
+                "<span>Incident: run 20260828T120000Z in progress</span></li>",
+                rendered,
+            )
             self.assertIn("API check: keepalive passed at", rendered)
             self.assertIn("4 dataplane cores mapped", rendered)
             self.assertIn('class="status busy"', rendered)
@@ -340,8 +361,50 @@ class WebUITests(unittest.TestCase):
 
             self.assertTrue(state["firewalls"][0]["healthy"])
             self.assertIn("fw-a: needs attention", rendered)
+            self.assertIn('class="status bad"', rendered)
             self.assertIn("API check: keepalive FAILED at", rendered)
             self.assertIn("unable to reach the firewall", rendered)
+            self.assertIn(
+                '<li class="ok"><span class="mark"></span><span>Syslog: last log',
+                rendered,
+            )
+            self.assertIn('<li class="bad"><span class="mark"></span><span>API check:', rendered)
+
+    def test_an_overdue_scheduled_check_is_amber_rather_than_green(self):
+        state = {
+            "syslog_healthy": True,
+            "syslog_age_seconds": 12,
+            "logs": [],
+            "runs": [],
+            "runs_total": 0,
+            "check_interval_hours": 24.0,
+            "firewalls": [
+                {
+                    "name": "fw-a",
+                    "enabled": True,
+                    "healthy": True,
+                    "last_received_at": "2026-08-28T12:00:00+00:00",
+                    "age_seconds": 12,
+                    "active_run": None,
+                    "last_check_at": "2026-08-25T12:00:00+00:00",
+                    "last_check_kind": "keepalive",
+                    "last_check_status": "ok",
+                    "last_check_detail": "PAN-OS 12.2.2",
+                    "check_requested_at": None,
+                    "check_age_seconds": 3 * 86400,
+                }
+            ],
+            "pending_deletions": [],
+        }
+
+        rendered = render_dashboard(state)
+
+        self.assertIn("fw-a: check pending", rendered)
+        self.assertIn('class="status busy"', rendered)
+        self.assertIn(
+            '<li class="warn"><span class="mark"></span><span>API check:', rendered
+        )
+        self.assertIn("overdue, expected every 24 hours", rendered)
 
     def test_dashboard_reports_fresh_logs_runs_and_escaped_content(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

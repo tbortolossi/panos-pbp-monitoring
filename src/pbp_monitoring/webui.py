@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__
 from .adminui import AdminController
-from .config_store import ALL_RUNS, ConfigStore
+from .config_store import ALL_RUNS, DEFAULT_SETTINGS, ConfigStore
 from .web_tls import ensure_self_signed_certificate
 
 
@@ -460,11 +460,18 @@ def collect_dashboard_state(
             )
     runs.sort(key=lambda item: item["run_id"], reverse=True)
     firewall_statuses: list[dict[str, Any]] = []
+    check_interval_hours = float(DEFAULT_SETTINGS["target_check_hours"])
     if config_store is not None and config_store.path.is_file():
         try:
             targets = config_store.list_targets()
         except (OSError, ValueError):
             targets = []
+        try:
+            check_interval_hours = float(
+                config_store.get_settings()["target_check_hours"]
+            )
+        except (KeyError, OSError, ValueError):
+            pass
         chronological_logs = status_logs
         for target in targets:
             matching: list[dict[str, Any]] = []
@@ -493,6 +500,12 @@ def collect_dashboard_state(
                 ),
                 None,
             )
+            check_time = _parse_time(target.get("last_check_at"))
+            check_age = (
+                max(0.0, (current - check_time).total_seconds())
+                if check_time
+                else None
+            )
             firewall_statuses.append(
                 {
                     "name": target["name"],
@@ -506,6 +519,7 @@ def collect_dashboard_state(
                     "last_check_status": target.get("last_check_status"),
                     "last_check_detail": target.get("last_check_detail"),
                     "check_requested_at": target.get("check_requested_at"),
+                    "check_age_seconds": check_age,
                 }
             )
     pending_deletions: list[dict[str, str]] = []
@@ -525,6 +539,7 @@ def collect_dashboard_state(
         "runs": runs[:run_limit],
         "runs_total": len(runs),
         "firewalls": firewall_statuses,
+        "check_interval_hours": check_interval_hours,
         "pending_deletions": pending_deletions,
     }
 
@@ -536,19 +551,86 @@ SUPPRESSION_REASONS = {
 }
 
 
-def _check_line(firewall: dict[str, Any]) -> str:
-    """Summarize the last read-only firewall check for the dashboard card."""
+def _check_signal(
+    firewall: dict[str, Any], interval_hours: float
+) -> tuple[str, str]:
+    """State and text of the API signal: is the firewall still answering?
+
+    Green means the last read-only check passed. Red is kept for a check that
+    actually failed. A queued validation, a firewall never checked yet, or a
+    schedule left unhonoured for more than twice the configured interval, is
+    amber: nothing proves the firewall is unreachable, only that no recent call
+    confirmed it. A run in progress is its own proof, since the collector is
+    then polling the API every few seconds.
+    """
     if firewall.get("check_requested_at"):
-        return "API check: validation queued"
+        return "warn", "API check: validation queued"
     checked_at = firewall.get("last_check_at")
     if not checked_at:
-        return "API check: never run"
+        return "warn", "API check: never run"
     status = str(firewall.get("last_check_status") or "")
     kind = str(firewall.get("last_check_kind") or "check")
-    label = "passed" if status == "ok" else "FAILED"
+    passed = status == "ok"
+    line = f"API check: {kind} {'passed' if passed else 'FAILED'} at {_display_utc(checked_at)}"
     detail = str(firewall.get("last_check_detail") or "")
-    line = f"API check: {kind} {label} at {_display_utc(checked_at)}"
-    return f"{line} - {detail}" if detail else line
+    if detail:
+        line = f"{line} - {detail}"
+    if not passed:
+        return "bad", line
+    age = firewall.get("check_age_seconds")
+    overdue = (
+        interval_hours > 0
+        and not firewall.get("active_run")
+        and isinstance(age, (int, float))
+        and age > 2 * interval_hours * 3600
+    )
+    if overdue:
+        return "warn", f"{line} - overdue, expected every {interval_hours:g} hours"
+    return "ok", line
+
+
+def _firewall_signals(
+    firewall: dict[str, Any], interval_hours: float
+) -> list[tuple[str, str]]:
+    """The three signals of a firewall card, each with its own state."""
+    age = firewall.get("age_seconds")
+    syslog_line = (
+        f"Syslog: last log {_display_utc(firewall.get('last_received_at'))}"
+        f" ({int(age)} seconds ago)"
+        if isinstance(age, (int, float))
+        else "Syslog: no attributed log received"
+    )
+    active_run = firewall.get("active_run")
+    return [
+        ("ok" if firewall.get("healthy") else "bad", syslog_line),
+        _check_signal(firewall, interval_hours),
+        (
+            ("bad", f"Incident: run {active_run} in progress")
+            if active_run
+            else ("ok", "Incident: no run in progress")
+        ),
+    ]
+
+
+def _firewall_headline(
+    firewall: dict[str, Any], signals: list[tuple[str, str]]
+) -> tuple[str, str]:
+    """General state of a firewall card, derived from its three signals.
+
+    A run in progress colours its own signal red, because packet buffers are
+    under pressure right now, but the card stays amber: the collector is doing
+    its job. Red on the card is reserved for the two signals that mean the
+    collector itself is blind, a firewall that stopped sending logs or an API
+    that stopped answering, and it wins over a run in progress.
+    """
+    watchdog_states = [state for state, _text in signals[:2]]
+    if "bad" in watchdog_states:
+        return "bad", "needs attention"
+    if firewall.get("active_run"):
+        return "busy", "monitoring run in progress"
+    if "warn" in watchdog_states:
+        return "busy", "check pending"
+    return "ok", "healthy"
 
 
 def _delete_cell(csrf: str | None, run: dict[str, Any], queued: bool) -> str:
@@ -665,34 +747,22 @@ def render_dashboard(
     if not run_rows:
         run_rows.append('<tr><td colspan="10" class="muted">No run recorded.</td></tr>')
 
+    check_interval_hours = float(
+        state.get("check_interval_hours") or DEFAULT_SETTINGS["target_check_hours"]
+    )
     firewall_cards: list[str] = []
     for firewall in state.get("firewalls", []):
-        firewall_age = firewall.get("age_seconds")
-        syslog_line = (
-            f"Syslog: last log {_display_utc(firewall.get('last_received_at'))}"
-            f" ({int(firewall_age)} seconds ago)"
-            if isinstance(firewall_age, (int, float))
-            else "Syslog: no attributed log received"
-        )
-        active_run = firewall.get("active_run")
-        check_line = _check_line(firewall)
-        if active_run:
-            state_class, headline = "busy", "monitoring run in progress"
-        elif not firewall.get("healthy") or firewall.get("last_check_status") == "failed":
-            state_class, headline = "bad", "needs attention"
-        else:
-            state_class, headline = "ok", "healthy"
-        run_line = (
-            f"Incident: run {active_run} in progress"
-            if active_run
-            else "Incident: no run in progress"
+        signals = _firewall_signals(firewall, check_interval_hours)
+        state_class, headline = _firewall_headline(firewall, signals)
+        signal_items = "".join(
+            f'<li class="{signal_state}"><span class="mark"></span>'
+            f"<span>{_escape(text)}</span></li>"
+            for signal_state, text in signals
         )
         firewall_cards.append(
             f'<div class="status {state_class}"><span class="dot"></span><div>'
             f'<strong>{_escape(firewall.get("name"))}: {_escape(headline)}</strong>'
-            f'<span>{_escape(syslog_line)}</span>'
-            f'<span>{_escape(check_line)}</span>'
-            f'<span>{_escape(run_line)}</span>'
+            f'<ul class="signals">{signal_items}</ul>'
             "</div></div>"
         )
 
@@ -724,6 +794,9 @@ h1{{margin:0;font-size:clamp(25px,4vw,40px)}}header p{{margin:5px 0 0;color:#d9f
 .dot{{flex:0 0 auto;width:18px;height:18px;border-radius:50%;background:var(--bad);box-shadow:0 0 0 5px #fee2e2}}.status.ok .dot{{background:var(--ok);box-shadow:0 0 0 5px #dcfce7}}
 .status.busy .dot{{background:var(--busy);box-shadow:0 0 0 5px #fef3c7}}.status .dot{{margin-top:3px}}.status>div{{min-width:0}}.status span{{display:block}}
 .status strong{{display:block;font-size:17px}}.muted,.status span{{color:var(--muted)}}section{{margin-top:24px}}h2{{margin:0 0 12px}}
+.signals{{margin:5px 0 0;padding:0;list-style:none}}.signals li{{display:flex;align-items:baseline;gap:9px;padding:1px 0}}
+.signals .mark{{flex:0 0 auto;width:9px;height:9px;border-radius:50%;background:var(--bad);box-shadow:0 0 0 2px #fee2e2}}
+.signals li.ok .mark{{background:var(--ok);box-shadow:0 0 0 2px #dcfce7}}.signals li.warn .mark{{background:var(--busy);box-shadow:0 0 0 2px #fef3c7}}
 .table-wrap{{overflow:auto;max-height:55vh;border:1px solid var(--line);border-radius:12px;background:#fff;scrollbar-gutter:stable}}table{{width:100%;border-collapse:collapse;white-space:nowrap}}
 th,td{{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}th{{position:sticky;top:0;background:#eef3f8;font-size:12px;text-transform:uppercase}}
 .message{{max-width:680px;white-space:normal;overflow-wrap:anywhere;font:12px/1.45 ui-monospace,Consolas,monospace}}.badge{{display:inline-block;padding:2px 8px;border-radius:999px;background:#e2e8f0;font-size:11px;font-weight:700}}

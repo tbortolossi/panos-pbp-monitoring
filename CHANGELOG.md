@@ -3,6 +3,28 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.20.0] - 2026-08-30
+
+### Added
+
+- Every dashboard firewall card now shows one coloured dot per signal in
+  addition to its general dot: Syslog freshness, last read-only API check, and
+  incident state. Green is nominal, amber marks a check that is queued, never
+  run, or overdue by more than twice the configured `target_check_hours`, and
+  red marks stale Syslog reception, a failed check, or a monitoring run in
+  progress. Reading which signal degraded a card no longer requires reading the
+  three sentences. Refs #139.
+
+### Changed
+
+- The general state of a firewall card is now red only when the collector is
+  blind to that firewall, that is when Syslog reception is stale or the API
+  check failed, and amber while a monitoring run is in progress. A firewall
+  that has never been checked yet is amber (*check pending*) instead of green,
+  and an API check overdue by more than twice its interval is amber instead of
+  green. Display only: collection, PAN-OS calls, and persisted data are
+  unchanged.
+
 ## [0.19.1] - 2026-08-30
 
 ### Fixed
