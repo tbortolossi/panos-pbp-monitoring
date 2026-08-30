@@ -508,7 +508,21 @@ def render_report_evidence_bar(target: str, run_id: str, run_dir: Path) -> str:
     raw_dir = run_dir / "raw"
     text_files = len(list(raw_dir.glob("*.txt"))) if raw_dir.is_dir() else 0
     jsonl = run_dir / "incident.jsonl"
+    report = run_dir / "report.html"
     links: list[str] = []
+    if report.is_file():
+        # The report is the artifact a case is actually sent with, and the one
+        # the browser cannot save cleanly: "Save page as" would keep this bar
+        # and its deployment-local links. The link hands over the stored file
+        # instead, which carries none of them.
+        links.append(
+            _export_link(
+                f"/artifacts/{target_url}/{run_url}/report.html",
+                "HTML",
+                _human_size(report.stat().st_size),
+                "This report as a standalone file, without these links, to send or archive",
+            )
+        )
     if jsonl.is_file():
         links.append(
             _export_link(
@@ -548,7 +562,7 @@ def render_report_evidence_bar(target: str, run_id: str, run_dir: Path) -> str:
     if links:
         exports_html = '<span class="pbp-bar-label">Exports</span>' + "".join(links)
         note = (
-            "This page is the standalone HTML report: keep the file as it is, or "
+            "HTML downloads this page as a standalone file, without this bar; "
             "print it from the browser to obtain a PDF."
         )
     else:
@@ -1258,6 +1272,7 @@ def handler_factory(
             *,
             attachment: bool = False,
             script_src: str | None = None,
+            download_name: str | None = None,
         ) -> None:
             if not path.is_file():
                 self.send_error(404)
@@ -1271,7 +1286,11 @@ def handler_factory(
             if script_src is not None:
                 self.send_header("Content-Security-Policy", f"default-src 'none'; style-src 'unsafe-inline'; script-src {script_src}; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
             if attachment:
-                self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+                # Every run stores its report under the same name, so the file
+                # is named for the run it documents: an operator collecting
+                # three reports for one case gets three distinguishable files.
+                filename = download_name or path.name
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.end_headers()
             if self.command != "HEAD":
                 with path.open("rb") as handle:
@@ -1469,6 +1488,19 @@ def handler_factory(
                     self.send_error(404)
                     return
                 self._serve_report(run_dir, parts[1], parts[2])
+                return
+            if len(parts) == 4 and parts[0] == "artifacts" and parts[3] == "report.html":
+                artifact = _artifact_path(data_dir, parts[1], parts[2], "report.html")
+                if artifact is None:
+                    self.send_error(404)
+                    return
+                self._serve_file(
+                    artifact,
+                    "text/html; charset=utf-8",
+                    attachment=True,
+                    script_src=_REPORT_SCRIPT_SRC,
+                    download_name=f"pbp-report-{parts[1]}-{parts[2]}.html",
+                )
                 return
             if len(parts) == 4 and parts[0] == "artifacts" and parts[3] == "incident.jsonl":
                 artifact = _artifact_path(data_dir, parts[1], parts[2], "incident.jsonl")
