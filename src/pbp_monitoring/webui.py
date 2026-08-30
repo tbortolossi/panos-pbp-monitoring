@@ -22,18 +22,13 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__, diagnostics
 from .adminui import AdminController
-from .config_store import ALL_RUNS, DEFAULT_SETTINGS, TARGET_NAME, ConfigStore
+from .config_store import ALL_RUNS, DEFAULT_SETTINGS, ConfigStore
 from .web_tls import ensure_self_signed_certificate
 
 
 LOG = logging.getLogger("pbp-web")
 SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 SAFE_REDIRECT_HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\Z")
-#: Received-log filter selecting what no declared firewall claims: refused
-#: messages, and messages from a sender that is not a registered source. A
-#: target name cannot start with a dash, so the sentinel never collides with
-#: a firewall the operator declared.
-UNATTRIBUTED_LOGS = "-unattributed"
 
 
 class ThreadingTLSHTTPServer(ThreadingHTTPServer):
@@ -534,36 +529,6 @@ def _target_roots(data_dir: Path) -> list[tuple[str, Path]]:
     return found
 
 
-def _attributed_firewalls(
-    record: dict[str, Any], targets: Sequence[dict[str, Any]]
-) -> list[str]:
-    """Declared firewalls a received log belongs to.
-
-    A refused message is attributed to none of them by design: the collector
-    rejected it before it could be tied to a firewall, and that is exactly what
-    the unattributed filter has to surface. Without a configuration store the
-    record's own attribution is kept, so the column still says something.
-    """
-    if record.get("suppressed"):
-        return []
-    names = record.get("target_names")
-    claimed = [str(name) for name in names] if isinstance(names, list) else []
-    if not targets:
-        return claimed
-    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    source = metadata.get("syslog_source_ip") or record.get("transport_source_ip")
-    serial = metadata.get("device_serial")
-    return [
-        target["name"]
-        for target in targets
-        if target["name"] in claimed
-        or (
-            source in target["syslog_sources"]
-            and (not serial or str(serial) in target["serials"])
-        )
-    ]
-
-
 def collect_dashboard_state(
     data_dir: Path,
     *,
@@ -572,17 +537,11 @@ def collect_dashboard_state(
     now: datetime | None = None,
     freshness_seconds: float = 300,
     config_store: ConfigStore | None = None,
-    log_filter: str | None = None,
 ) -> dict[str, Any]:
-    """Build a bounded dashboard snapshot without loading full incident files.
-
-    ``log_filter`` restricts the received-log table to one declared firewall, or
-    to :data:`UNATTRIBUTED_LOGS` for what none of them claims. It never touches
-    the reception watchdogs: global freshness and every firewall card keep
-    reading the whole journal tail, so a filtered view cannot hide an outage.
-    """
+    """Build a bounded dashboard snapshot without loading full incident files."""
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     status_logs = _tail_json_records(data_dir / "syslog-received.jsonl", 200)
+    logs = status_logs[-log_limit:]
     latest_time = _parse_time(status_logs[-1].get("timestamp")) if status_logs else None
     age_seconds = (
         max(0.0, (current - latest_time).total_seconds()) if latest_time else None
@@ -630,7 +589,6 @@ def collect_dashboard_state(
     runs.sort(key=lambda item: item["run_id"], reverse=True)
     firewall_statuses: list[dict[str, Any]] = []
     check_interval_hours = float(DEFAULT_SETTINGS["target_check_hours"])
-    targets: list[dict[str, Any]] = []
     if config_store is not None and config_store.path.is_file():
         try:
             targets = config_store.list_targets()
@@ -642,14 +600,23 @@ def collect_dashboard_state(
             )
         except (KeyError, OSError, ValueError):
             pass
-    attribution = [_attributed_firewalls(record, targets) for record in status_logs]
-    if True:
+        chronological_logs = status_logs
         for target in targets:
-            matching = [
-                record
-                for record, names in zip(status_logs, attribution)
-                if target["name"] in names
-            ]
+            matching: list[dict[str, Any]] = []
+            for record in chronological_logs:
+                if record.get("suppressed"):
+                    continue
+                names = record.get("target_names")
+                if isinstance(names, list) and target["name"] in names:
+                    matching.append(record)
+                    continue
+                metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+                source = metadata.get("syslog_source_ip") or record.get("transport_source_ip")
+                serial = metadata.get("device_serial")
+                if source in target["syslog_sources"] and (
+                    not serial or str(serial) in target["serials"]
+                ):
+                    matching.append(record)
             last = matching[-1] if matching else None
             last_time = _parse_time(last.get("timestamp")) if last else None
             target_age = max(0.0, (current - last_time).total_seconds()) if last_time else None
