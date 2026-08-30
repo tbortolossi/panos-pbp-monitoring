@@ -21,7 +21,9 @@ from urllib.request import (
 )
 
 from pbp_monitoring.webui import (
+    annotate_report,
     handler_factory,
+    render_report_evidence_bar,
     _artifact_path,
     _run_root,
     _https_redirect_location,
@@ -112,6 +114,64 @@ class ArtifactAuthenticationTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def _sign_in(self, opener, base: str, setup_code: str) -> None:
+        setup = opener.open(base + "/admin").read().decode()
+        csrf = re.search(r'name="csrf" value="([^"]+)"', setup).group(1)
+        login = opener.open(
+            Request(
+                base + "/admin/setup",
+                data=urlencode(
+                    {
+                        "csrf": csrf,
+                        "setup_code": setup_code,
+                        "password": "long-test-password",
+                        "confirm": "long-test-password",
+                    }
+                ).encode(),
+            )
+        ).read().decode()
+        csrf = re.search(r'name="csrf" value="([^"]+)"', login).group(1)
+        opener.open(
+            Request(
+                base + "/admin/login",
+                data=urlencode({"csrf": csrf, "password": "long-test-password"}).encode(),
+            )
+        )
+
+    def test_report_page_offers_the_run_evidence_without_altering_the_file(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            run_dir = root / "data" / "targets" / "fw-a" / "incidents" / "run-1"
+            (run_dir / "raw").mkdir(parents=True)
+            stored = "<html><body><h1>Incident report</h1></body></html>"
+            (run_dir / "report.html").write_text(stored, encoding="utf-8")
+            (run_dir / "incident.jsonl").write_text(
+                json.dumps({"event": "monitor_started"}) + "\n", encoding="utf-8"
+            )
+            (run_dir / "raw" / "batch-0001.txt").write_text("output", encoding="utf-8")
+            server, thread, setup_code = self._server(root)
+            base = f"http://127.0.0.1:{server.server_port}"
+            opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            try:
+                self._sign_in(opener, base, setup_code)
+                page = opener.open(base + "/reports/fw-a/run-1/report.html").read().decode()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+            self.assertIn('href="/artifacts/fw-a/run-1/incident.jsonl"', page)
+            self.assertIn('href="/artifacts/fw-a/run-1/raw/">TXT (1)', page)
+            self.assertIn('href="/artifacts/fw-a/run-1/run.zip"', page)
+            self.assertIn('href="/artifacts/fw-a/run-1/run.zip?anonymize=1"', page)
+            self.assertIn("Back to dashboard", page)
+            self.assertIn("<h1>Incident report</h1>", page)
+            self.assertLess(page.index("pbp-bar"), page.index("<h1>Incident report</h1>"))
+            self.assertEqual(
+                (run_dir / "report.html").read_text(encoding="utf-8"),
+                stored,
+                "the stored report must stay free of deployment-local links",
+            )
+
     def test_signed_in_administrator_reaches_dashboard_and_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -158,6 +218,30 @@ class ArtifactAuthenticationTests(unittest.TestCase):
 
 
 class WebUITests(unittest.TestCase):
+    def test_a_run_without_evidence_gets_a_bar_that_promises_nothing(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            run_dir = Path(temporary_directory)
+            bar = render_report_evidence_bar("fw-a", "run-1", run_dir)
+            self.assertNotIn("/artifacts/", bar)
+            self.assertIn("No stored evidence", bar)
+            self.assertIn('href="/"', bar)
+
+    def test_an_evidence_bar_escapes_the_run_it_names(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            bar = render_report_evidence_bar(
+                "<script>", "run&1", Path(temporary_directory)
+            )
+            self.assertNotIn("<script>", bar)
+            self.assertIn("&lt;script&gt;", bar)
+            self.assertIn("run&amp;1", bar)
+
+    def test_a_report_without_a_body_tag_is_served_unchanged(self):
+        self.assertEqual(annotate_report("fixture report", "<div>bar</div>"), "fixture report")
+        self.assertEqual(
+            annotate_report('<html><BODY class="x">t</BODY></html>', "<i>bar</i>"),
+            '<html><BODY class="x"><i>bar</i>t</BODY></html>',
+        )
+
     def test_http_listener_redirects_to_same_host_https_and_rejects_bad_host(self):
         self.assertEqual(
             _https_redirect_location("pbp.example.test:8080", "/admin?x=1", 8088),

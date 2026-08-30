@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.23.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.24.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -194,6 +194,9 @@ incidents is visible without opening a single report.
 | `report.html` | Standalone human report, single file, no script, carrying the JSONL SHA-256 digest |
 | `raw/startup.txt`, `raw/batch-NNNN.txt` | Human-readable export of every command and response |
 | ZIP support archive | All of the above plus the deployment environment, the redacted configuration, the Syslog messages of the run including refused ones, and `manifest.json` with version, sizes, and digests, for a TAC case |
+
+Every one of those is reachable from the **Recent runs** row and, once the
+report exists, from the evidence bar at the top of the report itself.
 
 Read-only API validation runs, under `api-checks/<run_id>/`, export the same
 way: a credential, TLS or unsupported-command problem is diagnosable from an

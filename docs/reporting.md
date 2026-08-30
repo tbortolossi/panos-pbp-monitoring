@@ -16,6 +16,19 @@ raw batch details](images/incident-report.png)
 > incident by `tools/generate_demo_stack.py`. No firewall, address, or
 > serial shown is real.
 
+## Opening a report from the dashboard
+
+The **HTML report** link of a run adds an evidence bar above the report: back to
+the dashboard, then the same artifacts the **Recent runs** row offers for that
+run — **JSONL**, **TXT**, **ZIP support** and **ZIP anonymized**. It is where
+you decide, having read the report, that the case needs its raw evidence.
+
+The bar is added while the page is served. The `report.html` file stored beside
+the capture never contains it, so a report attached to a TAC case stays a single
+standalone file, with no link that only resolves inside your deployment and no
+button offering a support bundle that names your network. The bar is also hidden
+when the page is printed.
+
 ## Layout and conventions
 
 Reports contain a bounded two-axis timeline with sticky headers and batch

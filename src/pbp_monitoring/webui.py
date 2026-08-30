@@ -451,6 +451,72 @@ td:first-child strong,td:first-child code{{display:block}}td:first-child code{{m
 <div class="table-wrap"><table><thead><tr><th>Batch</th><th>Execution time (UTC)</th><th>Firewall time</th><th>Duration (s)</th><th>Size</th><th>Actions</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div></main></body></html>"""
 
 
+REPORT_ANNOTATION_MAX_BYTES = 8 * 1024 * 1024
+_BODY_TAG = re.compile(r"<body[^>]*>", re.IGNORECASE)
+
+
+def render_report_evidence_bar(target: str, run_id: str, run_dir: Path) -> str:
+    """Build the evidence bar shown above a report served by the Web UI.
+
+    The report is where an operator decides that a case needs the raw evidence,
+    so the run's artifacts belong on that page rather than only in the dashboard
+    row. The bar is added when the page is served, never written to disk: a
+    report copied out for a TAC case must carry neither links that resolve only
+    inside this deployment nor a button offering a bundle that names the
+    customer's network.
+    """
+    target_url = quote(target, safe="")
+    run_url = quote(run_id, safe="")
+    raw_dir = run_dir / "raw"
+    text_files = len(list(raw_dir.glob("*.txt"))) if raw_dir.is_dir() else 0
+    links: list[str] = []
+    if (run_dir / "incident.jsonl").is_file():
+        links.append(
+            f'<a href="/artifacts/{target_url}/{run_url}/incident.jsonl">JSONL</a>'
+        )
+    if text_files:
+        links.append(
+            f'<a href="/artifacts/{target_url}/{run_url}/raw/">TXT ({text_files})</a>'
+        )
+    if (run_dir / "incident.jsonl").is_file():
+        links.append(f'<a href="/artifacts/{target_url}/{run_url}/run.zip">ZIP support</a>')
+        links.append(
+            f'<a class="secondary" href="/artifacts/{target_url}/{run_url}/run.zip'
+            '?anonymize=1">ZIP anonymized</a>'
+        )
+    links_html = (
+        "".join(links)
+        if links
+        else '<span class="pbp-bar-note">No stored evidence for this run.</span>'
+    )
+    return (
+        "<style>"
+        ".pbp-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;"
+        "padding:10px max(20px,calc((100vw - 1200px)/2));background:#0b1220;"
+        "color:#e2e8f0;font:13px/1.4 system-ui,-apple-system,'Segoe UI',sans-serif}"
+        ".pbp-bar a{padding:5px 10px;border-radius:7px;background:#155e75;color:#fff;"
+        "text-decoration:none;font-weight:700}"
+        ".pbp-bar a.secondary{background:#f0f9ff;color:#0369a1}"
+        ".pbp-bar a.back{background:transparent;color:#7dd3fc;padding:5px 0}"
+        ".pbp-bar .pbp-bar-run{margin-right:auto;color:#94a3b8}"
+        ".pbp-bar .pbp-bar-note{color:#94a3b8}"
+        "@media print{.pbp-bar{display:none}}"
+        "</style>"
+        '<div class="pbp-bar">'
+        '<a class="back" href="/">&larr; Back to dashboard</a>'
+        f'<span class="pbp-bar-run">{_escape(target)} &middot; run {_escape(run_id)}</span>'
+        f"{links_html}</div>"
+    )
+
+
+def annotate_report(html_text: str, evidence_bar: str) -> str:
+    """Insert the evidence bar just after the report's opening body tag."""
+    match = _BODY_TAG.search(html_text)
+    if match is None:
+        return html_text
+    return html_text[: match.end()] + evidence_bar + html_text[match.end() :]
+
+
 def _target_roots(data_dir: Path) -> list[tuple[str, Path]]:
     targets = data_dir / "targets"
     found: list[tuple[str, Path]] = []
@@ -991,6 +1057,26 @@ def handler_factory(
                     while chunk := handle.read(1024 * 1024):
                         self.wfile.write(chunk)
 
+        def _serve_report(self, artifact: Path, target: str, run_id: str) -> None:
+            """Serve a stored report with the run's evidence links added.
+
+            A report that cannot be read as text, or one large enough that
+            holding it in memory would be unreasonable, is streamed unchanged
+            rather than withheld: the report matters more than the bar.
+            """
+            try:
+                if artifact.stat().st_size > REPORT_ANNOTATION_MAX_BYTES:
+                    raise ValueError("report too large to annotate")
+                html_text = artifact.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError, ValueError):
+                self._serve_file(artifact, "text/html; charset=utf-8")
+                return
+            page = annotate_report(
+                html_text,
+                render_report_evidence_bar(target, run_id, artifact.parent),
+            )
+            self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
+
         def _serve_run_archive(
             self,
             run_dir: Path,
@@ -1124,7 +1210,10 @@ def handler_factory(
             parts = [part for part in path.split("/") if part]
             if len(parts) == 4 and parts[0] == "reports" and parts[3] == "report.html":
                 artifact = _artifact_path(data_dir, parts[1], parts[2], "report.html")
-                self._serve_file(artifact, "text/html; charset=utf-8") if artifact else self.send_error(404)
+                if artifact is None or not artifact.is_file():
+                    self.send_error(404)
+                    return
+                self._serve_report(artifact, parts[1], parts[2])
                 return
             if len(parts) == 4 and parts[0] == "artifacts" and parts[3] == "incident.jsonl":
                 artifact = _artifact_path(data_dir, parts[1], parts[2], "incident.jsonl")

@@ -1268,6 +1268,20 @@ def _flow_description(item: dict[str, Any]) -> tuple[str, str]:
     return tuple_text, context
 
 
+_MAX_RENDERED_ATTRIBUTION_ROWS = 50
+_MAX_RENDERED_TOP_SOURCES = 50
+
+
+def _hidden_rows_note(hidden: int, noun: str) -> str:
+    """State how many table rows were left out and where they remain."""
+    if hidden <= 0:
+        return ""
+    return (
+        f'<p class="muted">{_escape(_format_number(hidden))} lower-ranked {noun} '
+        "not listed; the JSONL capture keeps every ranked entity.</p>"
+    )
+
+
 def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
     if not attribution:
         return (
@@ -1282,7 +1296,7 @@ def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
         "raw_session_id": "Raw ID",
     }
     rows = []
-    for item in attribution:
+    for item in attribution[:_MAX_RENDERED_ATTRIBUTION_ROWS]:
         entity_type = "Session" if item.get("entity_type") == "session" else "Source IP"
         sources = ", ".join(
             source_labels.get(str(source), str(source))
@@ -1330,6 +1344,9 @@ def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
         "<th>PBP %</th><th>Samples</th><th>Ingress %</th><th>Peak Mbit/s</th><th>5-tuple / application</th>"
         "<th>Session</th><th>First / last seen</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+        + _hidden_rows_note(
+            len(attribution) - _MAX_RENDERED_ATTRIBUTION_ROWS, "entries"
+        )
     )
 
 
@@ -1575,7 +1592,7 @@ def _render_top_sources(rollup: list[dict[str, Any]]) -> str:
     if not rollup:
         return ""
     rows = []
-    for group in rollup:
+    for group in rollup[:_MAX_RENDERED_TOP_SOURCES]:
         rate = group["peak_bits_per_second_total"]
         rate_text = (
             _format_number(rate / 1_000_000.0) if rate else "—"
@@ -1608,6 +1625,7 @@ def _render_top_sources(rollup: list[dict[str, Any]]) -> str:
         "<th>Aggregate peak Mbit/s</th><th>Applications</th><th>Zones</th>"
         "<th>Distinct destinations</th><th>First / last seen</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+        + _hidden_rows_note(len(rollup) - _MAX_RENDERED_TOP_SOURCES, "sources")
     )
 
 
@@ -1888,6 +1906,33 @@ def _render_probable_cause(
     )
 
 
+def _render_section(
+    anchor: str,
+    title: str,
+    body: str,
+    *,
+    intro: str = "",
+    pill: str = "",
+    open: bool = True,
+) -> str:
+    """Wrap a report section in a native disclosure so it can be folded away.
+
+    Sections open by default so the report reads top to bottom as before; the
+    disclosure is plain HTML, so the report stays a single file without script,
+    and the heading keeps its anchor for the navigation bar.
+    """
+    state = " open" if open else ""
+    pill_html = f'<span class="pill">{pill}</span>' if pill else ""
+    intro_html = f'<p class="section-intro">{intro}</p>' if intro else ""
+    return (
+        f'<section aria-labelledby="{anchor}">'
+        f'<details class="section-disclosure section-fold"{state}>'
+        f'<summary><h2 id="{anchor}">{title}</h2>{pill_html}</summary>'
+        f'<div class="section-body">{intro_html}{body}</div>'
+        "</details></section>"
+    )
+
+
 def _render_offender_live_sessions(events: list[tuple[int, dict[str, Any]]]) -> str:
     """Render the live sessions enumerated for top offender sources at stop."""
     record = next(
@@ -1948,13 +1993,12 @@ def _render_offender_live_sessions(events: list[tuple[int, dict[str, Any]]]) -> 
         )
     if not blocks:
         return ""
-    return (
-        '<section aria-labelledby="offender-sessions-title">'
-        '<h2 id="offender-sessions-title">Live sessions of top sources</h2>'
-        '<p class="muted">Sessions still open for the top ranked sources when the '
-        "monitor stopped, from one bounded filtered query per source.</p>"
-        + "".join(blocks)
-        + "</section>"
+    return _render_section(
+        "offender-sessions-title",
+        "Live sessions of top sources",
+        "".join(blocks),
+        intro="Sessions still open for the top ranked sources when the monitor "
+        "stopped, from one bounded filtered query per source.",
     )
 
 
@@ -2013,15 +2057,14 @@ def _render_offender_traffic_logs(events: list[tuple[int, dict[str, Any]]]) -> s
         )
     if not blocks:
         return ""
-    return (
-        '<section aria-labelledby="offender-logs-title">'
-        '<h2 id="offender-logs-title">Traffic log evidence for unenriched sources</h2>'
-        '<p class="muted">These sources were ranked from PBP evidence but had no '
-        "session to inspect (traffic denied before session setup, or a RED-blocked "
-        "source). The flows below come from the firewall's own traffic log, "
-        "queried read-only once at monitor stop.</p>"
-        + "".join(blocks)
-        + "</section>"
+    return _render_section(
+        "offender-logs-title",
+        "Traffic log evidence for unenriched sources",
+        "".join(blocks),
+        intro="These sources were ranked from PBP evidence but had no session to "
+        "inspect (traffic denied before session setup, or a RED-blocked source). "
+        "The flows below come from the firewall's own traffic log, queried "
+        "read-only once at monitor stop.",
     )
 
 
@@ -2957,6 +3000,15 @@ def _render_html(
     details.section-disclosure>summary {{ display:flex; align-items:center; gap:10px; padding:14px 16px; cursor:pointer; }}
     details.section-disclosure>summary h2 {{ margin:0; }}
     details.section-disclosure>.section-body {{ padding:2px 16px 16px; border-top:1px solid var(--line); }}
+    details.section-fold {{ border:0; background:transparent; overflow:visible; }}
+    details.section-fold>summary {{ padding:0; margin:0 0 14px; list-style:none; }}
+    details.section-fold>summary::-webkit-details-marker {{ display:none; }}
+    details.section-fold>summary::before {{ content:"\25BE"; width:18px; color:var(--muted); font-size:15px; transition:transform .15s; }}
+    details.section-fold:not([open])>summary::before {{ transform:rotate(-90deg); }}
+    details.section-fold:not([open])>summary {{ padding:12px 16px; border:1px solid var(--line); border-radius:12px; background:#fff; }}
+    details.section-fold>summary h2 {{ margin:0; }}
+    details.section-fold>.section-body {{ padding:0; border-top:0; }}
+    details.section-fold>.section-body>.section-intro {{ margin-top:0; }}
     .metadata {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; }}
     .metadata div {{ padding:10px; border-radius:8px; background:var(--soft); }}
     dt {{ color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; }}

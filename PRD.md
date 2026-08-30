@@ -168,7 +168,11 @@ than create a concurrent one.
    the background from the JSONL file.
 11. Each completed batch also writes an atomic TXT view of its command and
     session outputs. A Web UI displays bounded Syslog reception status and
-    read-only artifact links. The dashboard and every artifact route require
+    read-only artifact links. A report served by the Web UI is shown with an
+    evidence bar offering the same run artifacts as the dashboard row; the bar
+    is added when the page is served, so the stored file stays standalone and a
+    copy sent outside the deployment carries neither dead links nor an offer to
+    download a bundle that names the network. The dashboard and every artifact route require
     the administrator session: incident evidence carries device serials,
     addresses, and raw command output, so it is protected by the same
     authentication as the configuration and fails closed. The admin area
