@@ -3,6 +3,28 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.28.0] - 2026-08-30
+
+### Changed
+
+- **A run's dashboard row opens its report.** Clicking anywhere on a completed
+  run in **Recent runs** now opens that run's HTML report, instead of requiring
+  a precise click on the small **HTML report** link at the end of the row, past
+  the table's horizontal scrollbar. The **Artifacts** and **Delete** cells keep
+  their own actions, and a run still being collected, which has no report yet,
+  keeps a plain row. The section header says the rows are clickable. Plain HTML
+  and CSS: the Web UI still serves `script-src 'none'`.
+- **The report bar names its exports.** The bar above a report served by the
+  Web UI now introduces the run's artifacts as **Exports** and names each one
+  by format and by weight — **JSONL** with its size, **TXT** with its number of
+  batch files, **ZIP** as the support archive and **ZIP** anonymized — with a
+  description of each on hover, so the file to attach to a TAC case is chosen
+  without opening any of them. It also states that the page itself is a
+  standalone HTML report that the browser can print to PDF, and **Back to
+  dashboard** is now a button rather than a bare link. Presentation only: the
+  stored `report.html` still never carries the bar, collection, the firewall and
+  the persisted data are untouched. Refs #165.
+
 ## [0.27.0] - 2026-08-30
 
 ### Changed

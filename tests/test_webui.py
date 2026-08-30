@@ -162,7 +162,12 @@ class ArtifactAuthenticationTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
             self.assertIn('href="/artifacts/fw-a/run-1/incident.jsonl"', page)
-            self.assertIn('href="/artifacts/fw-a/run-1/raw/">TXT (1)', page)
+            self.assertIn(
+                'href="/artifacts/fw-a/run-1/raw/" title="Human-readable export'
+                ' of every command and its response, one file per batch">TXT'
+                '<span class="pbp-bar-meta">1 file</span>',
+                page,
+            )
             self.assertIn('href="/artifacts/fw-a/run-1/run.zip"', page)
             self.assertIn('href="/artifacts/fw-a/run-1/run.zip?anonymize=1"', page)
             self.assertIn("Back to dashboard", page)
@@ -241,6 +246,63 @@ class WebUITests(unittest.TestCase):
             self.assertNotIn("<script>", bar)
             self.assertIn("&lt;script&gt;", bar)
             self.assertIn("run&amp;1", bar)
+
+    def test_the_report_bar_names_every_export_with_its_format_and_weight(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            run_dir = Path(temporary_directory)
+            (run_dir / "raw").mkdir()
+            (run_dir / "incident.jsonl").write_bytes(b"x" * 4096)
+            (run_dir / "raw" / "batch-0001.txt").write_text("out", encoding="utf-8")
+            (run_dir / "raw" / "batch-0002.txt").write_text("out", encoding="utf-8")
+            bar = render_report_evidence_bar("fw-a", "run-1", run_dir)
+
+        self.assertIn(">Exports<", bar)
+        self.assertIn('>JSONL<span class="pbp-bar-meta">4 KiB</span>', bar)
+        self.assertIn('>TXT<span class="pbp-bar-meta">2 files</span>', bar)
+        self.assertIn('>ZIP<span class="pbp-bar-meta">support archive</span>', bar)
+        self.assertIn('>ZIP<span class="pbp-bar-meta">anonymized</span>', bar)
+        # The report itself is an export too: the page says how to keep it.
+        self.assertIn("print it from the browser", bar)
+        self.assertIn('<a class="back" href="/">&larr; Back to dashboard</a>', bar)
+
+    def test_a_completed_run_row_opens_its_report(self):
+        def run(run_id, status, report):
+            return {
+                "target": "PA-440",
+                "run_id": run_id,
+                "started_at": "2026-01-01T00:00:00Z",
+                "status": status,
+                "stop_reason": "resources_recovered" if report else None,
+                "cycles": 3,
+                "peak_packet_buffer_pct": 42,
+                "top_sources": ["203.0.113.7"],
+                "report": report,
+                "jsonl": True,
+                "text_files": 2,
+            }
+
+        page = render_dashboard(
+            {
+                "syslog_healthy": True,
+                "logs": [],
+                "runs": [run("run-done", "completed", True), run("run-live", "active", False)],
+            }
+        )
+        rows = re.findall(r"<tr.*?</tr>", page, re.S)
+        completed = next(row for row in rows if "run-done" in row)
+        running = next(row for row in rows if "run-live" in row)
+
+        self.assertIn('<tr class="linked">', completed)
+        self.assertEqual(completed.count('class="rowlink"'), 8)
+        self.assertIn(
+            '<a class="rowlink" href="/reports/PA-440/run-done/report.html"',
+            completed,
+        )
+        self.assertIn("Click a row to open its report", page)
+        # A monitor still running has no report yet, so its row stays plain
+        # rather than leading to another run's page.
+        self.assertNotIn("rowlink", running)
+        self.assertNotIn("run-live/report.html", page)
 
     def test_a_report_lookup_cannot_escape_the_capture_directory(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
