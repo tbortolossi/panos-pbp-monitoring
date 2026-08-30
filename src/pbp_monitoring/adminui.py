@@ -50,6 +50,36 @@ PBP_THREAT_IDS = ("8507", "8508", "8509")
 PANOS_OBJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,30}\Z")
 COLLECTOR_HOST = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,61}[A-Za-z0-9])?\Z")
 
+# Labels of the collector settings form. Deriving them from the stored key
+# turns acronyms into words ("Ttl", "Html", "Url"), so the wording is spelled
+# out here and kept identical to the settings table in docs/operations.md.
+SETTING_LABELS: dict[str, str] = {
+    "poll_seconds": "Poll seconds",
+    "max_monitor_seconds": "Maximum monitor seconds",
+    "incident_idle_ttl_seconds": "Incident idle TTL seconds",
+    "recovery_threshold": "Recovery threshold",
+    "low_samples_to_stop": "Low samples to stop",
+    "request_timeout": "Request timeout",
+    "max_session_lookups": "Maximum session lookups",
+    "session_retry_seconds": "Session retry seconds",
+    "large_session_min_kb": "Large session min KB",
+    "large_session_min_age_seconds": "Large session min age seconds",
+    "generate_html_report": "Generate HTML report",
+    "generate_text_export": "Generate text export",
+    "syslog_fresh_seconds": "Syslog fresh seconds",
+    "target_check_hours": "Target check hours",
+    "webhook_url": "Webhook URL",
+}
+
+
+def setting_label(key: str) -> str:
+    """Return the form label of a collector setting.
+
+    A setting added without an entry above still renders readably, in the
+    sentence case the rest of the form uses.
+    """
+    return SETTING_LABELS.get(key) or key.replace("_", " ").capitalize()
+
 
 def syslog_commands(
     collector_host: str,
@@ -374,7 +404,7 @@ collector cannot be claimed by whoever reaches this port first.</p>
 {self._target_form(csrf, edit_target)}
 {self._syslog_card(syslog or self._syslog_options(None), targets)}
 <section class="card"><h2>Collector settings</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
-{''.join(f'<div><label>{_e(key.replace("_", " ").title())}</label><input name="{_e(key)}" value="{_e(value)}"{"" if DEFAULT_SETTINGS.get(key) == "" else " required"}></div>' for key, value in settings.items())}
+{''.join(f'<div><label>{_e(setting_label(key))}</label><input name="{_e(key)}" value="{_e(value)}"{"" if DEFAULT_SETTINGS.get(key) == "" else " required"}></div>' for key, value in settings.items())}
 </div><button type="submit">Save settings</button></form></section>""", refresh_seconds)
 
     def _syslog_options(self, handler: Any, query: dict[str, list[str]] | None = None) -> dict[str, str]:

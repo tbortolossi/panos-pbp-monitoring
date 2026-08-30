@@ -12,9 +12,14 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
-from pbp_monitoring.adminui import AdminController, syslog_commands
+from pbp_monitoring.adminui import (
+    AdminController,
+    SETTING_LABELS,
+    setting_label,
+    syslog_commands,
+)
 from pbp_monitoring import __version__
-from pbp_monitoring.config_store import ConfigStore
+from pbp_monitoring.config_store import ConfigStore, DEFAULT_SETTINGS
 from pbp_monitoring.panos_keygen import SystemInfoError
 from pbp_monitoring.webui import handler_factory
 from tests.support import (
@@ -160,6 +165,9 @@ class AdminUITests(unittest.TestCase):
                 ).encode()
                 page = opener.open(Request(base + "/admin/login", data=login_body)).read().decode()
                 self.assertIn("Collector settings", page)
+                self.assertIn("Incident idle TTL seconds", page)
+                self.assertIn("Generate HTML report", page)
+                self.assertNotIn("Ttl", page)
                 self.assertIn("Firewalls", page)
                 self.assertIn("Save the installation recovery key", page)
                 self.assertIn("Download CSV", page)
@@ -747,6 +755,21 @@ class AdminUITests(unittest.TestCase):
                 finished = opener.open(base + "/admin").read().decode()
                 self.assertNotIn('http-equiv="refresh"', finished)
                 self.assertIn("Passed", finished)
+
+
+class SettingLabelTests(unittest.TestCase):
+    def test_every_stored_setting_has_a_spelled_out_label(self):
+        self.assertEqual(set(DEFAULT_SETTINGS), set(SETTING_LABELS))
+
+    def test_acronyms_keep_their_capitalization(self):
+        self.assertEqual(
+            setting_label("incident_idle_ttl_seconds"), "Incident idle TTL seconds"
+        )
+        self.assertEqual(setting_label("generate_html_report"), "Generate HTML report")
+        self.assertEqual(setting_label("webhook_url"), "Webhook URL")
+
+    def test_unknown_setting_falls_back_to_sentence_case(self):
+        self.assertEqual(setting_label("future_knob_seconds"), "Future knob seconds")
 
 
 if __name__ == "__main__":
