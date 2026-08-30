@@ -303,6 +303,45 @@ class WebUITests(unittest.TestCase):
         # rather than leading to another run's page.
         self.assertNotIn("rowlink", running)
         self.assertNotIn("run-live/report.html", page)
+        # It keeps a single link to the records already written, because no
+        # report page exists yet to offer them.
+        self.assertIn(
+            '<a class="evidence" href="/artifacts/PA-440/run-live/incident.jsonl"',
+            running,
+        )
+        self.assertNotIn("incident.jsonl", completed)
+
+    def test_a_run_whose_report_is_missing_still_offers_its_records(self):
+        page = render_dashboard(
+            {
+                "syslog_healthy": True,
+                "logs": [],
+                "runs": [
+                    {
+                        "target": "PA-440",
+                        "run_id": "run-stopped",
+                        "started_at": "2026-01-01T00:00:00Z",
+                        "status": "completed",
+                        "stop_reason": "resources_recovered",
+                        "cycles": 3,
+                        "peak_packet_buffer_pct": 42,
+                        "top_sources": [],
+                        "report": False,
+                        "jsonl": True,
+                        "text_files": 2,
+                    }
+                ],
+            }
+        )
+
+        # HTML report generation can be disabled, or can fail. The run is then
+        # read from its capture, so the row still leads to it.
+        self.assertNotIn('class="rowlink"', page)
+        self.assertIn(
+            '<a class="evidence" href="/artifacts/PA-440/run-stopped/incident.jsonl"',
+            page,
+        )
+        self.assertNotIn("Click a row to open its report", page)
 
     def test_a_report_lookup_cannot_escape_the_capture_directory(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -755,15 +794,19 @@ class WebUITests(unittest.TestCase):
                 "2026-08-28T12:00:01+00:00",
             )
             self.assertIn("Syslog reception is active", rendered)
-            self.assertIn("HTML report", rendered)
             self.assertIn("Start time (UTC)", rendered)
             self.assertIn("2026-08-28T12:00:01+00:00", rendered)
             self.assertLess(
                 rendered.index("20 most recent received logs"),
                 rendered.index("Recent runs"),
             )
-            self.assertIn("TXT (1)", rendered)
-            self.assertIn("ZIP support", rendered)
+            # The exports of a completed run are offered by its report,
+            # reached by clicking the row, and by nothing else on this page.
+            self.assertNotIn("Artifacts", rendered)
+            self.assertNotIn("run.zip", rendered)
+            self.assertNotIn("/raw/", rendered)
+            self.assertNotIn("incident.jsonl", rendered)
+            self.assertIn("/reports/PA-440/20260828T120000Z/report.html", rendered)
             self.assertIn("Peak buffer", rendered)
             self.assertIn("62.5%", rendered)
             self.assertIn("203.0.113.7", rendered)

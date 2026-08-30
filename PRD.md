@@ -561,10 +561,13 @@ key must be backed up and restored together.
     carried by the URL, so it survives the page refresh, and it never applies
     to the per-firewall cards.
 54. A completed run's dashboard row opens that run's HTML report wherever it is
-    clicked, its **Artifacts** and **Delete** cells keeping their own actions,
-    and the report's evidence bar carries a button back to the dashboard. A run
-    whose report does not exist yet, an active monitor, keeps a plain row. Both
-    are plain HTML and CSS: the Web UI serves `script-src 'none'`.
+    clicked, its **Delete** cell keeping its own action, and the report's
+    evidence bar carries a button back to the dashboard. The run table lists no
+    export of its own: the report page is the single place where a run's
+    evidence is chosen. A run with no report to open — an active monitor, or a
+    run whose report could not be produced — keeps a plain row and offers the
+    records collected so far as a **JSONL** link under its status. Both are
+    plain HTML and CSS: the Web UI serves `script-src 'none'`.
 55. An unauthenticated request lands on the authentication page. A successful
     sign-in opens the dashboard once the installation is complete, and the
     configuration page while the recovery key is unacknowledged or no firewall

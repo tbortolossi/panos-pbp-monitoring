@@ -83,9 +83,8 @@ Each incident contains:
   explains its own CPU charts;
 - `raw/batch-NNNN.txt`: human-readable export for every batch.
 
-The dashboard's **ZIP support** action — also offered by the evidence bar at
-the top of the report itself — downloads the complete run as one
-compressed archive. It includes the JSONL, HTML and TXT evidence plus a
+The **ZIP support** action, in the evidence bar at the top of a run's report,
+downloads the complete run as one compressed archive. It includes the JSONL, HTML and TXT evidence plus a
 `manifest.json` containing the application version, file sizes, and SHA-256
 digests for transfer to another workstation or a support case. It also contains:
 
@@ -177,8 +176,8 @@ during an incident. That is the evidence, and it is why the complete form
 exists. When policy forbids sending it, take the anonymized form instead:
 
 - **Download anonymized bundle** on the admin card;
-- **ZIP anonymized** beside **ZIP support** on every row of the dashboard's run
-  table;
+- **ZIP anonymized** beside **ZIP support** in the evidence bar of a run's
+  report, opened by clicking that run's row on the dashboard;
 - `docker compose exec -T collector pbp-support --anonymize > pbp-support.zip`.
 
 Every address, MAC address, serial number and firewall name becomes a token such

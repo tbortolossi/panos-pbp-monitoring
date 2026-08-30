@@ -867,10 +867,11 @@ def _firewall_headline(
 def _run_cell(content: str, report_url: str | None) -> str:
     """Render a run cell that opens the run's report when it is clicked.
 
-    The report is what the row is read for, so the whole row leads to it rather
-    than only the small link at its end. The anchor fills the cell and inherits
-    its type, so the table still reads as a table. A run whose report does not
-    exist yet, an active monitor, keeps a plain cell.
+    The report is what the row is read for, and it is now the only way to it:
+    the row no longer repeats the exports the report page already offers. The
+    anchor fills the cell and inherits its type, so the table still reads as a
+    table. A run whose report does not exist yet, an active monitor, keeps a
+    plain cell.
     """
     if report_url is None:
         return f"<td>{content}</td>"
@@ -991,18 +992,6 @@ def render_dashboard(
         report_url = (
             f"/reports/{target}/{run_id}/report.html" if run.get("report") else None
         )
-        links: list[str] = []
-        if report_url:
-            links.append(f'<a href="{report_url}">HTML report</a>')
-        if run.get("jsonl"):
-            links.append(f'<a href="/artifacts/{target}/{run_id}/incident.jsonl">JSONL</a>')
-        if run.get("text_files"):
-            links.append(f'<a href="/artifacts/{target}/{run_id}/raw/">TXT ({int(run["text_files"])})</a>')
-        if run.get("jsonl"):
-            links.append(f'<a href="/artifacts/{target}/{run_id}/run.zip">ZIP support</a>')
-            links.append(
-                f'<a class="secondary" href="/artifacts/{target}/{run_id}/run.zip?anonymize=1">ZIP anonymized</a>'
-            )
         active = run.get("status") == "active"
         peak = run.get("peak_packet_buffer_pct")
         peak_text = (
@@ -1014,6 +1003,16 @@ def render_dashboard(
             f"<span class=\"badge {'active' if active else 'done'}\">"
             f"{'Active' if active else 'Completed'}</span>"
         )
+        # A run being collected has no report yet, and a run whose report
+        # could not be produced never will: the row leads nowhere, so the
+        # records written so far are offered here instead. Every other run
+        # is read through its report, which carries the full set of exports.
+        if report_url is None and run.get("jsonl"):
+            badge += (
+                f'<a class="evidence" href="/artifacts/{target}/{run_id}'
+                '/incident.jsonl" title="The records of this run, as JSONL">'
+                "JSONL</a>"
+            )
         row_open = '<tr class="linked">' if report_url else "<tr>"
         run_rows.append(
             row_open
@@ -1025,14 +1024,13 @@ def render_dashboard(
             + _run_cell(_escape(peak_text), report_url)
             + _run_cell(f"<code>{_escape(top_text)}</code>", report_url)
             + _run_cell(_escape(run.get("stop_reason")), report_url)
-            + f"<td>{' &middot; '.join(links) or '&mdash;'}</td>"
             + f"<td>{_delete_cell(csrf, run, queued)}</td>"
             + "</tr>"
         )
         if report_url:
             rows_open_a_report = True
     if not run_rows:
-        run_rows.append('<tr><td colspan="10" class="muted">No run recorded.</td></tr>')
+        run_rows.append('<tr><td colspan="9" class="muted">No run recorded.</td></tr>')
 
     check_interval_hours = float(
         state.get("check_interval_hours") or DEFAULT_SETTINGS["target_check_hours"]
@@ -1106,6 +1104,7 @@ h1{{margin:0;font-size:clamp(25px,4vw,40px)}}header p{{margin:5px 0 0;color:#d9f
 th,td{{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}th{{position:sticky;top:0;background:#eef3f8;font-size:12px;text-transform:uppercase}}
 td a.rowlink{{display:block;margin:-10px -12px;padding:10px 12px;color:inherit;font-weight:inherit;text-decoration:none}}
 tr.linked:hover td{{background:#eff6ff}}tr.linked:focus-within td{{background:#e0f2fe}}
+td a.evidence{{display:inline-block;margin-top:4px;padding:0;font-size:11px}}
 .message{{max-width:680px;white-space:normal;overflow-wrap:anywhere;font:12px/1.45 ui-monospace,Consolas,monospace}}.badge{{display:inline-block;padding:2px 8px;border-radius:999px;background:#e2e8f0;font-size:11px;font-weight:700}}
 .section-head{{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}}.section-head h2{{margin:0}}
 .section-head .muted{{margin-right:auto}}
@@ -1116,7 +1115,7 @@ button.danger{{padding:5px 11px;border:1px solid #fca5a5;border-radius:8px;backg
 </style></head><body><header><h1>PBP Monitoring <small style="font-size:14px;font-weight:600">v{_escape(__version__)}</small></h1><p>Dashboard &middot; refreshes every {max(2, int(refresh_seconds))} seconds &middot; <a style="color:white" href="/admin">Admin</a></p></header><main>
 {status_panel}
 <section><div class="section-head"><h2>20 most recent received logs</h2>{log_filters}</div><div class="table-wrap"><table><thead><tr><th>Time (UTC)</th><th>Observed source</th><th>Firewall</th><th>Type</th><th>Message</th></tr></thead><tbody>{''.join(log_rows)}</tbody></table></div></section>
-<section><div class="section-head"><h2>Recent runs</h2>{runs_hint}{delete_all_control}</div><div class="table-wrap"><table><thead><tr><th>Target</th><th>Run ID</th><th>Start time (UTC)</th><th>Status</th><th>Batches</th><th>Peak buffer</th><th>Top sources</th><th>Stop reason</th><th>Artifacts</th><th>Delete</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table></div></section>
+<section><div class="section-head"><h2>Recent runs</h2>{runs_hint}{delete_all_control}</div><div class="table-wrap"><table><thead><tr><th>Target</th><th>Run ID</th><th>Start time (UTC)</th><th>Status</th><th>Batches</th><th>Peak buffer</th><th>Top sources</th><th>Stop reason</th><th>Delete</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table></div></section>
 </main></body></html>"""
 
 

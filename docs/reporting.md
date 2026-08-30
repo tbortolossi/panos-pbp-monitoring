@@ -19,8 +19,10 @@ raw batch details](images/incident-report.png)
 ## Opening a report from the dashboard
 
 Clicking anywhere on a completed run's row in **Recent runs** opens that run's
-report, and the **HTML report** link in the row's **Artifacts** cell does the
-same. A run still being collected has no report yet, so its row stays plain.
+report. That is the only way in, and it is why the row no longer carries a
+column of export links: the report page itself offers them, named by weight.
+A run still being collected has no report yet, so its row stays plain and shows
+a single **JSONL** link under its status, for the records written so far.
 
 The report opened that way carries an evidence bar above it: a **Back to
 dashboard** button, the firewall and the run the page belongs to, then the
