@@ -3,6 +3,20 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.24.0] - 2026-08-30
+
+### Fixed
+
+- **PBP RED drops no longer count as denied traffic.** The
+  `flow_dos_pbp_drop` and `flow_dos_pbp_cnt_drop` counters are packet buffer
+  protection's own RED drops, what the mitigation discarded during the
+  incident. They were classified as "DoS / zone protection" and added to the
+  **Denied packets** total, so a lab incident with 71 packets denied by policy
+  reported 1,171 and concluded that the pressure was consistent with a flood
+  denied by a Security policy rule. They now form a "PBP RED drops" family,
+  reported in the drop verdict and the probable cause without joining the
+  denied total. Refs #151.
+
 ## [0.23.0] - 2026-08-30
 
 ### Added

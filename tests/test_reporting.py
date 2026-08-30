@@ -821,6 +821,60 @@ class DropCounterTests(unittest.TestCase):
         self.assertIn("Denied packets", html)
         self.assertIn(">419200<", html)
 
+    def test_pbp_red_drops_are_not_counted_as_denied_traffic(self):
+        html = self._render(
+            [
+                {
+                    "candidate_entities": [
+                        {
+                            "rank": 1,
+                            "entity_type": "source_ip",
+                            "source_ip": "192.0.2.55",
+                            "drop_state": True,
+                            "evidence_sources": ["packet_buffer_protection"],
+                        }
+                    ],
+                    "global_counters_delta_status": "primed_interval",
+                    "global_counters_delta": {
+                        "elapsed_seconds": 5.0,
+                        "counters": [
+                            self._counter(
+                                "flow_dos_pbp_cnt_drop",
+                                550,
+                                11,
+                                "dos",
+                                "Packets dropped by packet buffer protection RED trigger by buffer",
+                            ),
+                            self._counter(
+                                "flow_dos_pbp_drop",
+                                550,
+                                11,
+                                "dos",
+                                "Packets dropped by packet buffer protection RED",
+                            ),
+                            self._counter(
+                                "flow_policy_deny",
+                                71,
+                                2,
+                                "session",
+                                "Session setup: denied by policy",
+                            ),
+                        ],
+                    },
+                }
+            ]
+        )
+
+        self.assertIn("PBP RED drops", html)
+        self.assertNotIn("DoS / zone protection", html)
+        self.assertIn("policy deny 71, DoS or zone protection 0", html)
+        self.assertIn("71 packets were dropped before session setup", html)
+        self.assertNotIn("1171", html)
+        self.assertIn("PBP itself discarded 1100 packets by RED", html)
+        self.assertIn(
+            '<span class="card-label">Denied packets</span><strong>71</strong>', html
+        )
+
     def test_untrusted_baseline_batch_is_excluded_from_the_denied_total(self):
         untrusted = {
             "global_counters_delta_status": "baseline_untrusted",

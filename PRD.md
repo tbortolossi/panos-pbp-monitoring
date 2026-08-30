@@ -451,7 +451,9 @@ key must be backed up and restored together.
     preserved across an edit.
 42. The report aggregates the `drop` severity global counters over the capture,
     groups them by counter aspect and name prefix, and excludes a batch whose
-    delta baseline was untrusted from the totals. When packets were denied
+    delta baseline was untrusted from the totals. Packet buffer protection's
+    own RED drops (`flow_dos_pbp_*`) form their own family, reported but never
+    added to the denied total. When packets were denied
     before session setup and a source IP was ranked without an enriched
     session, the report states that the pressure is consistent with traffic
     denied by policy, DoS protection, or zone protection, which creates no
