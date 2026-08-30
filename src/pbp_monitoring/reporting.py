@@ -496,12 +496,31 @@ def _core_label(dataplane: str, core_id: str, roles: dict[tuple[str, str], dict[
     return f"core {core_id}"
 
 
+def _core_roles_recall(
+    dataplane: str,
+    cores: Sequence[str],
+    roles: dict[tuple[str, str], dict[str, Any]],
+) -> str:
+    """State once what each core does, so the charts can label by number alone."""
+    chips = [
+        f'<span class="key">{_escape(_core_label(dataplane, core_id, roles))}</span>'
+        for core_id in cores
+        if roles.get((dataplane, core_id))
+    ]
+    if not chips:
+        return ""
+    return (
+        '<p class="chart-legend core-roles">'
+        '<span class="key core-roles-title">Core functions:</span>'
+        f'{"".join(chips)}</p>'
+    )
+
+
 def _line_chart(
     dataplane: str,
     batches: Sequence[tuple[int, str]],
     cores: Sequence[str],
     peaks: dict[tuple[str, str], dict[int, float]],
-    roles: dict[tuple[str, str], dict[str, Any]],
     comparable: Sequence[str],
 ) -> str:
     """Plot every core, highlighting the hottest, against the median of its peers."""
@@ -594,7 +613,7 @@ def _line_chart(
             )
         legend.append(
             f'<span class="key"><i style="background:{colour}"></i>'
-            f'{_escape(_core_label(dataplane, core_id, roles))}</span>'
+            f'core {_escape(core_id)}</span>'
         )
     if len(comparable) > 2:
         legend.append(
@@ -618,10 +637,9 @@ def _heatmap(
     batches: Sequence[tuple[int, str]],
     cores: Sequence[str],
     peaks: dict[tuple[str, str], dict[int, float]],
-    roles: dict[tuple[str, str], dict[str, Any]],
 ) -> str:
     """Draw core by batch as coloured cells, which stays readable at 64 cores."""
-    label_width = 196
+    label_width = 88
     value_width = 46
     cell_height = 15
     columns = len(batches)
@@ -635,7 +653,7 @@ def _heatmap(
         series = peaks.get((dataplane, core_id), {})
         parts.append(
             f'<text x="0" y="{y + 11}" class="axis heat-label">'
-            f'{_escape(_core_label(dataplane, core_id, roles))}</text>'
+            f'core {_escape(core_id)}</text>'
         )
         for column, (batch_number, timestamp) in enumerate(batches):
             x = label_width + column * cell_width
@@ -686,7 +704,6 @@ def _dataplane_verdict(
     batches: Sequence[tuple[int, str]],
     comparable: Sequence[str],
     peaks: dict[tuple[str, str], dict[int, float]],
-    roles: dict[tuple[str, str], dict[str, Any]],
     labelled: bool,
 ) -> str:
     """State whether the load rose on every comparable core or on a few of them."""
@@ -721,7 +738,7 @@ def _dataplane_verdict(
         state = "calm"
     elif spread >= 40 and above_half <= max(1, len(values) // 4):
         verdict = (
-            f"{_escape(_core_label(dataplane, hottest_core, roles))} peaked at "
+            f"Core {_escape(hottest_core)} peaked at "
             f"{_escape(_format_number(hottest_value))}% while the median comparable core "
             f"stayed at {_escape(_format_number(median))}%. An isolated hot core is what "
             "flow-hash concentration looks like, so a single high-rate session is worth "
@@ -738,7 +755,7 @@ def _dataplane_verdict(
         state = "collective"
     else:
         verdict = (
-            f"{_escape(_core_label(dataplane, hottest_core, roles))} led at "
+            f"Core {_escape(hottest_core)} led at "
             f"{_escape(_format_number(hottest_value))}% with a median of "
             f"{_escape(_format_number(median))}%. Several cores are loaded and the pattern "
             "is not conclusive on its own."
@@ -793,9 +810,10 @@ def _render_cpu_charts(
                 else ", function groups unavailable"
             )
             + "</span></h3>"
-            + _dataplane_verdict(dataplane, batches, comparable, peaks, roles, labelled)
-            + _line_chart(dataplane, batches, cores, peaks, roles, comparable)
-            + _heatmap(dataplane, batches, cores, peaks, roles)
+            + _core_roles_recall(dataplane, cores, roles)
+            + _dataplane_verdict(dataplane, batches, comparable, peaks, labelled)
+            + _line_chart(dataplane, batches, cores, peaks, comparable)
+            + _heatmap(dataplane, batches, cores, peaks)
         )
     return "".join(sections)
 
@@ -1268,6 +1286,20 @@ def _flow_description(item: dict[str, Any]) -> tuple[str, str]:
     return tuple_text, context
 
 
+_MAX_RENDERED_ATTRIBUTION_ROWS = 50
+_MAX_RENDERED_TOP_SOURCES = 50
+
+
+def _hidden_rows_note(hidden: int, noun: str) -> str:
+    """State how many table rows were left out and where they remain."""
+    if hidden <= 0:
+        return ""
+    return (
+        f'<p class="muted">{_escape(_format_number(hidden))} lower-ranked {noun} '
+        "not listed; the JSONL capture keeps every ranked entity.</p>"
+    )
+
+
 def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
     if not attribution:
         return (
@@ -1282,7 +1314,7 @@ def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
         "raw_session_id": "Raw ID",
     }
     rows = []
-    for item in attribution:
+    for item in attribution[:_MAX_RENDERED_ATTRIBUTION_ROWS]:
         entity_type = "Session" if item.get("entity_type") == "session" else "Source IP"
         sources = ", ".join(
             source_labels.get(str(source), str(source))
@@ -1330,6 +1362,9 @@ def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
         "<th>PBP %</th><th>Samples</th><th>Ingress %</th><th>Peak Mbit/s</th><th>5-tuple / application</th>"
         "<th>Session</th><th>First / last seen</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+        + _hidden_rows_note(
+            len(attribution) - _MAX_RENDERED_ATTRIBUTION_ROWS, "entries"
+        )
     )
 
 
@@ -1347,6 +1382,10 @@ def _drop_counter_family(counter: dict[str, Any]) -> tuple[str, str]:
     aspect = str(counter.get("aspect") or "")
     if name.startswith("flow_policy_"):
         return "policy", "Policy deny"
+    if name.startswith("flow_dos_pbp_"):
+        # Packet buffer protection's own RED drops: what PBP discarded during
+        # the incident, not traffic refused before session setup.
+        return "pbp", "PBP RED drops"
     if aspect == "dos" or name.startswith("flow_dos_"):
         return "dos", "DoS / zone protection"
     if aspect == "forward" or name.startswith("flow_fwd_"):
@@ -1455,6 +1494,14 @@ def _drop_counter_verdict(
     """Classify the denied-traffic evidence and word its verdict."""
     policy_total = summary["family_totals"].get("policy", 0.0)
     dos_total = summary["family_totals"].get("dos", 0.0)
+    pbp_total = summary["family_totals"].get("pbp", 0.0)
+    pbp_text = (
+        f" PBP itself discarded {_format_number(pbp_total)} packets by RED "
+        "(<code>flow_dos_pbp_*</code> counters); those are the mitigation, not "
+        "denied traffic, and are not counted above."
+        if pbp_total > 0
+        else ""
+    )
     source_ips = _unenriched_source_ips(attribution)
     if summary["denied_total"] > 0 and source_ips:
         return (
@@ -1466,7 +1513,7 @@ def _drop_counter_verdict(
             "That combination is consistent with a UDP or GRE flood denied by a "
             "Security policy rule: denied traffic never creates a session, so PAN-OS "
             "can attribute the buffer pressure to a source IP only and no "
-            "<code>show session id</code> can enrich it.",
+            f"<code>show session id</code> can enrich it.{pbp_text}",
         )
     if summary["denied_total"] > 0:
         return (
@@ -1474,14 +1521,15 @@ def _drop_counter_verdict(
             f"{_format_number(summary['denied_total'])} packets were dropped before "
             f"session setup (policy deny {_format_number(policy_total)}, DoS or zone "
             f"protection {_format_number(dos_total)}), and sessions were also ranked. "
-            "Both denied and permitted traffic contributed to the observed pressure.",
+            "Both denied and permitted traffic contributed to the observed "
+            f"pressure.{pbp_text}",
         )
     return (
         "collective",
         "No packet was denied by a Security policy rule, by DoS protection, or by "
         "zone protection during the counted batches. The drops below happened "
         "after session setup or outside policy evaluation, so the offender "
-        "attribution table stays the primary evidence.",
+        f"attribution table stays the primary evidence.{pbp_text}",
     )
 
 
@@ -1575,7 +1623,7 @@ def _render_top_sources(rollup: list[dict[str, Any]]) -> str:
     if not rollup:
         return ""
     rows = []
-    for group in rollup:
+    for group in rollup[:_MAX_RENDERED_TOP_SOURCES]:
         rate = group["peak_bits_per_second_total"]
         rate_text = (
             _format_number(rate / 1_000_000.0) if rate else "—"
@@ -1608,6 +1656,7 @@ def _render_top_sources(rollup: list[dict[str, Any]]) -> str:
         "<th>Aggregate peak Mbit/s</th><th>Applications</th><th>Zones</th>"
         "<th>Distinct destinations</th><th>First / last seen</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+        + _hidden_rows_note(len(rollup) - _MAX_RENDERED_TOP_SOURCES, "sources")
     )
 
 
@@ -1888,6 +1937,33 @@ def _render_probable_cause(
     )
 
 
+def _render_section(
+    anchor: str,
+    title: str,
+    body: str,
+    *,
+    intro: str = "",
+    pill: str = "",
+    open: bool = True,
+) -> str:
+    """Wrap a report section in a native disclosure so it can be folded away.
+
+    Sections open by default so the report reads top to bottom as before; the
+    disclosure is plain HTML, so the report stays a single file without script,
+    and the heading keeps its anchor for the navigation bar.
+    """
+    state = " open" if open else ""
+    pill_html = f'<span class="pill">{pill}</span>' if pill else ""
+    intro_html = f'<p class="section-intro">{intro}</p>' if intro else ""
+    return (
+        f'<section aria-labelledby="{anchor}">'
+        f'<details class="section-disclosure section-fold"{state}>'
+        f'<summary><h2 id="{anchor}">{title}</h2>{pill_html}</summary>'
+        f'<div class="section-body">{intro_html}{body}</div>'
+        "</details></section>"
+    )
+
+
 def _render_offender_live_sessions(events: list[tuple[int, dict[str, Any]]]) -> str:
     """Render the live sessions enumerated for top offender sources at stop."""
     record = next(
@@ -1948,13 +2024,12 @@ def _render_offender_live_sessions(events: list[tuple[int, dict[str, Any]]]) -> 
         )
     if not blocks:
         return ""
-    return (
-        '<section aria-labelledby="offender-sessions-title">'
-        '<h2 id="offender-sessions-title">Live sessions of top sources</h2>'
-        '<p class="muted">Sessions still open for the top ranked sources when the '
-        "monitor stopped, from one bounded filtered query per source.</p>"
-        + "".join(blocks)
-        + "</section>"
+    return _render_section(
+        "offender-sessions-title",
+        "Live sessions of top sources",
+        "".join(blocks),
+        intro="Sessions still open for the top ranked sources when the monitor "
+        "stopped, from one bounded filtered query per source.",
     )
 
 
@@ -2013,15 +2088,14 @@ def _render_offender_traffic_logs(events: list[tuple[int, dict[str, Any]]]) -> s
         )
     if not blocks:
         return ""
-    return (
-        '<section aria-labelledby="offender-logs-title">'
-        '<h2 id="offender-logs-title">Traffic log evidence for unenriched sources</h2>'
-        '<p class="muted">These sources were ranked from PBP evidence but had no '
-        "session to inspect (traffic denied before session setup, or a RED-blocked "
-        "source). The flows below come from the firewall's own traffic log, "
-        "queried read-only once at monitor stop.</p>"
-        + "".join(blocks)
-        + "</section>"
+    return _render_section(
+        "offender-logs-title",
+        "Traffic log evidence for unenriched sources",
+        "".join(blocks),
+        intro="These sources were ranked from PBP evidence but had no session to "
+        "inspect (traffic denied before session setup, or a RED-blocked source). "
+        "The flows below come from the firewall's own traffic log, queried "
+        "read-only once at monitor stop.",
     )
 
 
@@ -2740,11 +2814,22 @@ def _render_html(
         timeline_body = (
             f'<tr><td colspan="{column_count}" class="empty">No valid batch.</td></tr>'
         )
+    timeline_notes: list[str] = []
+    if hidden_metrics and cycles:
+        timeline_notes.append(
+            "Columns never returned by the firewall are hidden: "
+            f"{_escape(', '.join(hidden_metrics))}."
+        )
+    if cycles:
+        # The header used to read "Sessions", which the same report already uses
+        # for a per-source count. State that this one is a list of IDs.
+        timeline_notes.append(
+            "<strong>Candidate sessions</strong> lists the session IDs the firewall "
+            "ranked for that batch, not a session total; the device-wide count is in "
+            "the session-table section."
+        )
     timeline_note = (
-        '<p class="muted">Columns never returned by the firewall are hidden: '
-        f"{_escape(', '.join(hidden_metrics))}.</p>"
-        if hidden_metrics and cycles
-        else ""
+        f'<p class="muted">{" ".join(timeline_notes)}</p>' if timeline_notes else ""
     )
 
     cycle_details: list[str] = []
@@ -2893,6 +2978,96 @@ def _render_html(
         f'<a href="#{anchor}">{label}</a>' for anchor, label in nav_items
     ) + "</nav>"
 
+    alert_text = _escape(_format_number(_PBP_ALERT_PERCENT))
+    activate_text = _escape(_format_number(_PBP_ACTIVATE_PERCENT))
+    sections_html = "".join(
+        [
+            _render_section(
+                "summary-title",
+                "Summary",
+                summary_groups,
+                intro="How much was collected, what state PBP was in, and the "
+                "highest value each resource reached. Cards turn amber above the "
+                f"{alert_text}% alert level and red above the {activate_text}% "
+                "activate level.",
+            ),
+            _render_section(
+                "pressure-title",
+                "Pressure over time",
+                pressure_chart_html
+                or '<p class="muted">At least two batches are required to draw '
+                "the pressure curve.</p>",
+                intro="When the pressure rose and fell, batch by batch, and when "
+                "the syslog triggers arrived relative to it.",
+            ),
+            _render_section(
+                "attribution-title",
+                "Offender attribution",
+                attribution_html,
+                intro="Which sessions and source addresses PAN-OS itself blamed "
+                "for the buffer usage, with their flows and rates.",
+            ),
+            _render_section(
+                "drop-counters-title",
+                "Denied and dropped traffic",
+                drop_counters_html,
+                intro="What the dataplane discarded, and whether it was denied "
+                "before a session existed (a flood the policy blocks) or dropped "
+                "afterwards.",
+            ),
+            offender_logs_html,
+            _render_section(
+                "session-table-title",
+                "Session table",
+                session_table_html,
+                intro="Whether new sessions followed the load, or packets arrived "
+                "without creating any.",
+            ),
+            _render_section(
+                "large-sessions-title",
+                "Largest sessions",
+                large_sessions_html,
+                intro="Whether one long-lived high-volume transfer was consuming "
+                "the link while the buffers filled. Such a session writes no "
+                "traffic log until it closes, so it never appears in the offender "
+                "ranking.",
+            ),
+            _render_section(
+                "cpu-tracking-title",
+                "Dataplane CPU core tracking",
+                cpu_charts_html + cpu_tracking_html,
+                intro="Whether every core rose together (aggregate load) or one "
+                "core ran hot alone (a single high-rate flow pinned to it).",
+            ),
+            _render_section(
+                "timeline-title",
+                "Timeline",
+                timeline_note
+                + '<div class="table-wrap timeline-wrap"><table class="timeline">'
+                "<thead><tr><th>Batch</th><th>Collector time</th><th>Firewall time</th>"
+                f"<th>Elapsed (s)</th>{metric_headers}<th>Candidate sessions</th><th>Errors</th>"
+                f"</tr></thead><tbody>{timeline_body}</tbody></table></div>",
+                intro="One row per batch with every collected percentage. Hover a "
+                "time for its full timestamp.",
+            ),
+            _render_section(
+                "cycles-title",
+                "Batch details",
+                details_html,
+                intro="The raw evidence for TAC: every command response of every "
+                "batch, exactly as the firewall returned it.",
+                pill=f"{_escape(len(cycles))} batches",
+            ),
+            _render_section(
+                "events-title",
+                "Events and metadata",
+                events_html,
+                pill=f"{_escape(len(events))} records",
+                open=False,
+            ),
+        ]
+    )
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -2957,6 +3132,15 @@ def _render_html(
     details.section-disclosure>summary {{ display:flex; align-items:center; gap:10px; padding:14px 16px; cursor:pointer; }}
     details.section-disclosure>summary h2 {{ margin:0; }}
     details.section-disclosure>.section-body {{ padding:2px 16px 16px; border-top:1px solid var(--line); }}
+    details.section-fold {{ border:0; background:transparent; overflow:visible; }}
+    details.section-fold>summary {{ padding:0; margin:0 0 14px; list-style:none; }}
+    details.section-fold>summary::-webkit-details-marker {{ display:none; }}
+    details.section-fold>summary::before {{ content:"▾"; width:18px; color:var(--muted); font-size:15px; transition:transform .15s; }}
+    details.section-fold:not([open])>summary::before {{ transform:rotate(-90deg); }}
+    details.section-fold:not([open])>summary {{ padding:12px 16px; border:1px solid var(--line); border-radius:12px; background:#fff; }}
+    details.section-fold>summary h2 {{ margin:0; }}
+    details.section-fold>.section-body {{ padding:0; border-top:0; }}
+    details.section-fold>.section-body>.section-intro {{ margin-top:0; }}
     .metadata {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; }}
     .metadata div {{ padding:10px; border-radius:8px; background:var(--soft); }}
     dt {{ color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; }}
@@ -2976,6 +3160,9 @@ def _render_html(
     .chart text.heat-label {{ font-size:10.5px; }}
     .chart-legend {{ display:flex; flex-wrap:wrap; gap:6px 14px; margin:2px 0 4px; color:#475569; font-size:12px; }}
     .chart-legend .key {{ display:inline-flex; align-items:center; gap:6px; }}
+    .core-roles {{ gap:6px 8px; margin:6px 0 8px; }}
+    .core-roles .key {{ padding:2px 9px; border-radius:999px; background:var(--soft); }}
+    .core-roles .core-roles-title {{ padding:0; background:none; color:#64748b; }}
     .chart-legend i {{ width:13px; height:11px; border:1px solid #94a3b8; border-radius:3px; }}
     .chart-legend i.dashed {{ height:0; border:0; border-top:2px dashed #0f172a; border-radius:0; }}
     .chart-caption {{ margin:0 0 14px; font-size:12px; }}
@@ -3055,63 +3242,7 @@ def _render_html(
   <main>
     {warning_html}
     {glance_html}
-    <section aria-labelledby="summary-title">
-      <h2 id="summary-title">Summary</h2>
-      <p class="section-intro">How much was collected, what state PBP was in, and the highest value each resource reached. Cards turn amber above the {_escape(_format_number(_PBP_ALERT_PERCENT))}% alert level and red above the {_escape(_format_number(_PBP_ACTIVATE_PERCENT))}% activate level.</p>
-      {summary_groups}
-    </section>
-    <section aria-labelledby="pressure-title">
-      <h2 id="pressure-title">Pressure over time</h2>
-      <p class="section-intro">When the pressure rose and fell, batch by batch, and when the syslog triggers arrived relative to it.</p>
-      {pressure_chart_html or '<p class="muted">At least two batches are required to draw the pressure curve.</p>'}
-    </section>
-    <section aria-labelledby="attribution-title">
-      <h2 id="attribution-title">Offender attribution</h2>
-      <p class="section-intro">Which sessions and source addresses PAN-OS itself blamed for the buffer usage, with their flows and rates.</p>
-      {attribution_html}
-    </section>
-    <section aria-labelledby="drop-counters-title">
-      <h2 id="drop-counters-title">Denied and dropped traffic</h2>
-      <p class="section-intro">What the dataplane discarded, and whether it was denied before a session existed (a flood the policy blocks) or dropped afterwards.</p>
-      {drop_counters_html}
-    </section>
-    {offender_logs_html}
-    <section aria-labelledby="session-table-title">
-      <h2 id="session-table-title">Session table</h2>
-      <p class="section-intro">Whether new sessions followed the load, or packets arrived without creating any.</p>
-      {session_table_html}
-    </section>
-    <section aria-labelledby="large-sessions-title">
-      <h2 id="large-sessions-title">Largest sessions</h2>
-      <p class="section-intro">Whether one long-lived high-volume transfer was consuming the link while the buffers filled. Such a session writes no traffic log until it closes, so it never appears in the offender ranking.</p>
-      {large_sessions_html}
-    </section>
-    <section aria-labelledby="cpu-tracking-title">
-      <h2 id="cpu-tracking-title">Dataplane CPU core tracking</h2>
-      <p class="section-intro">Whether every core rose together (aggregate load) or one core ran hot alone (a single high-rate flow pinned to it).</p>
-      {cpu_charts_html}
-      {cpu_tracking_html}
-    </section>
-    <section aria-labelledby="timeline-title">
-      <h2 id="timeline-title">Timeline</h2>
-      <p class="section-intro">One row per batch with every collected percentage. Hover a time for its full timestamp.</p>
-      {timeline_note}
-      <div class="table-wrap timeline-wrap"><table class="timeline">
-        <thead><tr><th>Batch</th><th>Collector time</th><th>Firewall time</th><th>Elapsed (s)</th>{metric_headers}<th>Sessions</th><th>Errors</th></tr></thead>
-        <tbody>{timeline_body}</tbody>
-      </table></div>
-    </section>
-    <section aria-labelledby="cycles-title">
-      <h2 id="cycles-title">Batch details</h2>
-      <p class="section-intro">The raw evidence for TAC: every command response of every batch, exactly as the firewall returned it.</p>
-      {details_html}
-    </section>
-    <section aria-labelledby="events-title">
-      <details class="section-disclosure">
-        <summary><h2 id="events-title">Events and metadata</h2><span class="pill">{_escape(len(events))} records</span></summary>
-        <div class="section-body">{events_html}</div>
-      </details>
-    </section>
+    {sections_html}
   </main>
   <footer>
     Generated by PBP Monitoring v{_escape(__version__)} at {_escape(generated_at)} · JSONL SHA-256: <code>{_escape(source_hash)}</code> ·

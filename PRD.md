@@ -165,7 +165,9 @@ than create a concurrent one.
    as evidence and a failed lookup never blocks the stop marker or the
    report.
 10. After the stop marker is written, a standalone HTML report is generated in
-   the background from the JSONL file.
+   the background from the JSONL file. Its offender ranking and top-sources
+   tables are bounded to 50 rows each and state what was left out, and every
+   section can be folded from its heading without script.
 11. Each completed batch also writes an atomic TXT view of its command and
     session outputs. A Web UI displays bounded Syslog reception status and
     read-only artifact links. A report served by the Web UI is shown with an
@@ -455,7 +457,9 @@ key must be backed up and restored together.
     preserved across an edit.
 42. The report aggregates the `drop` severity global counters over the capture,
     groups them by counter aspect and name prefix, and excludes a batch whose
-    delta baseline was untrusted from the totals. When packets were denied
+    delta baseline was untrusted from the totals. Packet buffer protection's
+    own RED drops (`flow_dos_pbp_*`) form their own family, reported but never
+    added to the denied total. When packets were denied
     before session setup and a source IP was ranked without an enriched
     session, the report states that the pressure is consistent with traffic
     denied by policy, DoS protection, or zone protection, which creates no
@@ -547,6 +551,12 @@ key must be backed up and restored together.
     parsers offline, reporting which command a parser fails on, so a customer
     archive becomes a fixture and a regression test without access to the
     firewall it came from.
+53. The dashboard's received-log table names the firewall each message is
+    attributed to and can be filtered to one declared firewall, or to the
+    messages no firewall claims, so a refused sender is diagnosed without
+    reading past the ordinary traffic of the other firewalls. The filter is
+    carried by the URL, so it survives the page refresh, and it never applies to
+    the global reception state or to the per-firewall cards.
 
 ## 12. Possible enhancements
 

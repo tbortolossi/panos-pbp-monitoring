@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
-## [0.24.0] - 2026-08-30
+## [0.26.0] - 2026-08-30
 
 ### Added
 
@@ -16,6 +16,80 @@ follows [Semantic Versioning](https://semver.org/).
   stored `report.html` stays a standalone file, so a copy attached to a TAC case
   carries no link that resolves only inside the deployment and no button
   offering a bundle that names the customer's network. Refs #149.
+
+## [0.25.0] - 2026-08-30
+
+### Added
+
+- **Received logs filtered per firewall.** Every row of the dashboard's
+  reception table now names the firewall the message is attributed to, and a
+  chip row filters the table to one declared firewall, or to what none of them
+  claims. The **Unattributed** chip, with its count, is the commissioning view:
+  a message refused because its source address or its device serial is not
+  registered appears on no firewall card, and was previously buried in the
+  common list. Filtering happens on the server, through a `?firewall=` link, so
+  it survives the page's own refresh; an unknown value falls back to the
+  unfiltered table. The filter is a view over the table only — global freshness
+  and the per-firewall cards keep reading the whole journal, so a filtered
+  dashboard cannot hide a reception outage.
+
+### Fixed
+
+- **Timeline session column named as a candidate list.** The Timeline table of
+  the HTML report labelled its last-but-one column `Sessions`, while the
+  top-sources rollup uses the same word for an actual per-source count. An
+  operator reading a calm capture saw a different list of five to eight IDs on
+  every batch and read it as a session total that made no sense. The column is
+  now `Candidate sessions`, matching the wording the batch-details panel
+  already used, and a note under the table states that these are the session
+  IDs the firewall ranked for that batch — not a total — and points at the
+  session-table section for the device-wide count. No change to collection: the
+  same `candidate_session_ids` are rendered.
+
+## [0.24.0] - 2026-08-30
+
+### Changed
+
+- **Bounded offender tables.** The offender ranking and the top-sources
+  rollup of the HTML report now list at most 50 rows each, in their existing
+  order, and say how many lower-ranked entries were left out. A lab incident of
+  50 batches had rendered 2,523 ranked entities and 364 sources, most of them
+  at 0% PBP, which put roughly eighty screens of rows between the attribution
+  and the drops, sessions, CPU and timeline sections. The aggregation is
+  unchanged: the stop marker, the probable cause and the rollup still work
+  from the full attribution, and the JSONL capture keeps every ranked entity.
+  Refs #150.
+- **Core functions recalled once in the CPU charts.** The dataplane CPU
+  section lists what each core does under its heading, then names cores by
+  number in the line-chart legend, the heatmap rows and the verdict. The row
+  labels no longer carry a function list wide enough to squeeze the heatmap
+  cells, and the per-core summary table still shows the full function groups.
+  Refs #159.
+- **Collapsible report sections.** Every section of the report can be folded
+  from its heading with a native disclosure, open by default except the events
+  section which stays collapsed as before. The report remains a single file
+  without script, and the navigation bar anchors keep working. Refs #150.
+
+### Fixed
+
+- **PBP RED drops no longer count as denied traffic.** The
+  `flow_dos_pbp_drop` and `flow_dos_pbp_cnt_drop` counters are packet buffer
+  protection's own RED drops, what the mitigation discarded during the
+  incident. They were classified as "DoS / zone protection" and added to the
+  **Denied packets** total, so a lab incident with 71 packets denied by policy
+  reported 1,171 and concluded that the pressure was consistent with a flood
+  denied by a Security policy rule. They now form a "PBP RED drops" family,
+  reported in the drop verdict and the probable cause without joining the
+  denied total. Refs #151.
+
+- **Support bundle buttons were clipped.** The three download links of the
+  Support bundle card shared the compact button row of the firewall table,
+  which pinned every button to the width of "Edit". Their labels overflowed and
+  overlapped, hiding which link produced the anonymized bundle and which one
+  the token mapping the operator must keep on site. The row now sizes each
+  button to its label, wraps on a narrow window instead of overflowing the
+  card, and keeps its spacing below the explanatory text. Display only: no
+  change to the archives, to what they redact, or to any firewall call.
 
 ## [0.23.0] - 2026-08-30
 

@@ -31,6 +31,7 @@ from pbp_monitoring.webui import (
     collect_dashboard_state,
     collect_text_exports,
     render_dashboard,
+    UNATTRIBUTED_LOGS,
     render_text_export_index,
     redirect_handler_factory,
     write_run_archive,
@@ -209,6 +210,11 @@ class ArtifactAuthenticationTests(unittest.TestCase):
                 )
                 dashboard = opener.open(base + "/").read().decode()
                 self.assertIn("PBP Monitoring", dashboard)
+                # An unknown or hostile firewall filter is dropped rather than
+                # rendered: the dashboard falls back to every received log.
+                filtered = opener.open(base + "/?firewall=../etc/passwd")
+                self.assertEqual(filtered.status, 200)
+                self.assertIn("PBP Monitoring", filtered.read().decode())
                 report = opener.open(base + "/reports/fw-a/run-1/report.html")
                 self.assertEqual(report.status, 200)
                 self.assertIn("fixture report", report.read().decode())
@@ -322,6 +328,106 @@ class WebUITests(unittest.TestCase):
             self.assertIsNone(state["firewalls"][0]["last_received_at"])
             self.assertIn("fw-a: needs attention", rendered)
             self.assertIn("not stored: device serial is not the registered one", rendered)
+
+    def test_received_logs_can_be_filtered_to_one_firewall(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data = Path(temporary_directory)
+            store = ConfigStore(data / "configuration" / "config.db")
+            store.initialize()
+            store.save_target(
+                name="fw-a", panos_url="https://192.0.2.10", api_key="key-a",
+                target_serial=None, serials=[], syslog_sources=["192.0.2.10"],
+            )
+            store.save_target(
+                name="fw-b", panos_url="https://192.0.2.11", api_key="key-b",
+                target_serial=None, serials=[], syslog_sources=["192.0.2.11"],
+            )
+            records = [
+                {
+                    "timestamp": "2026-08-28T12:00:00+00:00",
+                    "transport_source_ip": "192.0.2.10",
+                    "target_names": ["fw-a"],
+                    "trigger": False,
+                    "metadata": {"syslog_source_ip": "192.0.2.10"},
+                    "message": "system log from fw-a",
+                },
+                {
+                    "timestamp": "2026-08-28T12:00:30+00:00",
+                    "transport_source_ip": "192.0.2.11",
+                    "target_names": ["fw-b"],
+                    "trigger": False,
+                    "metadata": {"syslog_source_ip": "192.0.2.11"},
+                    "message": "system log from fw-b",
+                },
+            ]
+            (data / "syslog-received.jsonl").write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            state = collect_dashboard_state(
+                data,
+                now=datetime(2026, 8, 28, 12, 1, tzinfo=timezone.utc),
+                config_store=store,
+                log_filter="fw-b",
+            )
+            rendered = render_dashboard(state)
+            self.assertEqual(
+                [record["message"] for record in state["logs"]],
+                ["system log from fw-b"],
+            )
+            self.assertNotIn("system log from fw-a", rendered)
+            self.assertIn('<a class="chip on" href="/?firewall=fw-b">fw-b</a>', rendered)
+            # The filter is a view over the table only: both watchdogs keep
+            # reading the whole journal, so neither card loses its freshness.
+            self.assertTrue(state["firewalls"][0]["healthy"])
+            self.assertTrue(state["firewalls"][1]["healthy"])
+
+    def test_unattributed_filter_shows_the_logs_no_firewall_claims(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data = Path(temporary_directory)
+            store = ConfigStore(data / "configuration" / "config.db")
+            store.initialize()
+            store.save_target(
+                name="fw-a", panos_url="https://192.0.2.10", api_key="key-a",
+                target_serial=None, serials=[], syslog_sources=["192.0.2.10"],
+            )
+            records = [
+                {
+                    "timestamp": "2026-08-28T12:00:00+00:00",
+                    "transport_source_ip": "192.0.2.10",
+                    "target_names": ["fw-a"],
+                    "trigger": False,
+                    "metadata": {"syslog_source_ip": "192.0.2.10"},
+                    "message": "system log from fw-a",
+                },
+                {
+                    "timestamp": "2026-08-28T12:00:30+00:00",
+                    "transport_source_ip": "198.51.100.9",
+                    "target_names": [],
+                    "trigger": False,
+                    "metadata": {"syslog_source_ip": "198.51.100.9"},
+                    "suppressed": "source_not_registered",
+                },
+            ]
+            (data / "syslog-received.jsonl").write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            state = collect_dashboard_state(
+                data,
+                now=datetime(2026, 8, 28, 12, 1, tzinfo=timezone.utc),
+                config_store=store,
+                log_filter=UNATTRIBUTED_LOGS,
+            )
+            rendered = render_dashboard(state)
+            self.assertEqual(state["unattributed_logs"], 1)
+            self.assertEqual(
+                [record.get("suppressed") for record in state["logs"]],
+                ["source_not_registered"],
+            )
+            self.assertNotIn("system log from fw-a", rendered)
+            self.assertIn("Unattributed (1)", rendered)
+            self.assertIn("not stored: source is not a registered firewall", rendered)
 
     def test_dashboard_has_global_and_per_firewall_reception_state(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

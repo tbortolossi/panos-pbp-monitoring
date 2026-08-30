@@ -38,7 +38,9 @@ the exact `raw_response` remains available in a nested section collapsed by
 default. Command status and timing fields are presented as compact metadata,
 the summary separates capture facts, incident state, and peak utilization, and
 its peak metrics are grouped into packet buffers, packet descriptors, and
-system load. The lower-level event metadata is collapsed by default.
+system load. Every section folds from its heading — a native disclosure,
+no script — so a section already read can be put away; all open by default
+except the lower-level event metadata, which is collapsed.
 
 ## At a glance and probable cause
 
@@ -63,7 +65,10 @@ CPU tables fold away when no core came close to saturation.
 
 A **Top sources** table above the attribution ranking rolls ranked sessions up
 by source address — a scan or flood spread over hundreds of short sessions is
-attributed to the source that owns them — and a **Pressure over time** chart
+attributed to the source that owns them. Both tables list at most 50 rows in
+ranking order and state how many lower-ranked entries were left out; the JSONL
+capture keeps every ranked entity, and the stop marker and probable cause are
+computed from all of them. A **Pressure over time** chart
 plots packet-buffer, descriptor, and session-table utilization batch by batch
 so the offender's first appearance can be aligned with the pressure curve. Its
 vertical axis fits the data (10, 25, 50, or 100%) so a lightly loaded firewall
@@ -77,9 +82,13 @@ The **Denied and dropped traffic** section aggregates the `drop` severity global
 counters returned by `show counter global filter delta yes` over the whole
 capture, with the total packet count, the peak per-second rate, and the number
 of batches each counter appeared in. Counters are grouped by their PAN-OS aspect
-and name prefix — policy deny, DoS or zone protection, forwarding, parse,
-resource exhaustion — so a counter renamed or added by a later PAN-OS release is
-still classified instead of being dropped from the report. A batch whose delta
+and name prefix — policy deny, DoS or zone protection, PBP RED drops,
+forwarding, parse, resource exhaustion — so a counter renamed or added by a
+later PAN-OS release is still classified instead of being dropped from the
+report. The `flow_dos_pbp_*` counters are packet buffer protection's own RED
+drops: they measure the mitigation, not traffic refused before session setup,
+so they form their own family and are reported in the verdict without being
+added to the denied total. A batch whose delta
 baseline was untrusted is excluded from the totals, because its sampling window
 is unknown, and the report says how many batches were counted and excluded.
 
@@ -182,10 +191,13 @@ responsible, so it must be read alongside session rates, PBP offenders, and
 ingress backlogs.
 
 Dataplane cores are not interchangeable, so the comparison is restricted to
-cores that actually forward traffic. Cores are labelled by what distinguishes
-them from their peers, such as `flow_mgmt`, `flow_ctrl`, or `pan_timer`, and
-only cores carrying `flow_fastpath` are compared: a timer core sitting
-permanently at 0% is not a sign of imbalance.
+cores that actually forward traffic. What distinguishes each core from its
+peers, such as `flow_mgmt`, `flow_ctrl`, or `pan_timer`, is recalled once under
+the dataplane heading; the charts and the verdict then name a core by its
+number alone, which keeps the legend and the heatmap rows short. Only cores
+carrying `flow_fastpath` are compared: a timer core sitting permanently at 0%
+is not a sign of imbalance. The per-core summary table underneath still lists
+the complete function groups of every core.
 
 ## Where the dataplane core map comes from
 

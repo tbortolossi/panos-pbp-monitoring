@@ -255,6 +255,16 @@ firewall can be recognized and added in the admin UI, and nothing else:
 | `device_serial_missing` | no device serial in the message | *not stored: no device serial in the message* |
 | `device_serial_not_registered` | the serial is not the registered one | *not stored: device serial is not the registered one* |
 
+The dashboard's **20 most recent received logs** table names, for every row,
+the firewall the message is attributed to, and the chips above it narrow the
+table: one chip per declared firewall, plus **Unattributed** with the number of
+recent messages no firewall claims. That last one is the commissioning view — a
+refused message never reaches a firewall card, so this is where a firewall
+declared with the wrong Syslog source or the wrong serial becomes visible. The
+filter is a link, so it survives the automatic refresh of the page, and it
+changes nothing else: the global reception state and each firewall card keep
+reading the whole journal.
+
 The same rule gates monitoring: a refused message starts no incident and causes
 no API call, so a spoofed or stray sender cannot make the collector fill the
 capture volume. A firewall saved without a serial on record keeps the

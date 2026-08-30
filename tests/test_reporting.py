@@ -193,8 +193,11 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("Packet descriptors", rendered)
             self.assertIn("System load", rendered)
             self.assertIn('class="card metric-card"', rendered)
-            self.assertIn('<details class="section-disclosure">', rendered)
-            self.assertNotIn('<details class="section-disclosure" open>', rendered)
+            self.assertIn(
+                '<details class="section-disclosure section-fold">'
+                '<summary><h2 id="events-title">',
+                rendered,
+            )
             self.assertNotIn("http://", rendered)
             self.assertNotIn("https://", rendered)
 
@@ -699,6 +702,21 @@ class CpuChartTests(unittest.TestCase):
         self.assertIn("core 2 · flow_ctrl", html)
         self.assertIn("4 cores, 3 forwarding traffic", html)
 
+    def test_core_functions_are_recalled_once_and_charts_show_only_numbers(self):
+        html = self._render(
+            {"dp0": {"0": 0.0, "1": 12.0, "2": 12.0, "3": 98.0}},
+            self.FUNCTIONS,
+        )
+        recall = html.count('<p class="chart-legend core-roles">')
+        charts = html[html.index('<p class="chart-legend core-roles">') :]
+
+        self.assertEqual(recall, 1)
+        self.assertEqual(html.count("core 2 · flow_ctrl"), 1)
+        self.assertIn('<span class="key">core 3 · fastpath only</span>', html)
+        self.assertIn('<i style="background:#b91c1c"></i>core 3</span>', charts)
+        self.assertIn('class="axis heat-label">core 3</text>', charts)
+        self.assertIn("Core 3 peaked at", charts)
+
     def test_charts_still_render_when_function_groups_are_missing(self):
         html = self._render({"dp0": {"1": 12.0, "2": 12.0, "3": 98.0}}, None)
 
@@ -820,6 +838,79 @@ class DropCounterTests(unittest.TestCase):
         self.assertIn("1 source IP(s) were ranked without an enriched session", html)
         self.assertIn("Denied packets", html)
         self.assertIn(">419200<", html)
+
+    def test_pbp_red_drops_are_not_counted_as_denied_traffic(self):
+        html = self._render(
+            [
+                {
+                    "candidate_entities": [
+                        {
+                            "rank": 1,
+                            "entity_type": "source_ip",
+                            "source_ip": "192.0.2.55",
+                            "drop_state": True,
+                            "evidence_sources": ["packet_buffer_protection"],
+                        }
+                    ],
+                    "global_counters_delta_status": "primed_interval",
+                    "global_counters_delta": {
+                        "elapsed_seconds": 5.0,
+                        "counters": [
+                            self._counter(
+                                "flow_dos_pbp_cnt_drop",
+                                550,
+                                11,
+                                "dos",
+                                "Packets dropped by packet buffer protection RED trigger by buffer",
+                            ),
+                            self._counter(
+                                "flow_dos_pbp_drop",
+                                550,
+                                11,
+                                "dos",
+                                "Packets dropped by packet buffer protection RED",
+                            ),
+                            self._counter(
+                                "flow_policy_deny",
+                                71,
+                                2,
+                                "session",
+                                "Session setup: denied by policy",
+                            ),
+                        ],
+                    },
+                }
+            ]
+        )
+
+        self.assertIn("PBP RED drops", html)
+        self.assertNotIn("DoS / zone protection", html)
+        self.assertIn("policy deny 71, DoS or zone protection 0", html)
+        self.assertIn("71 packets were dropped before session setup", html)
+        self.assertNotIn("1171", html)
+        self.assertIn("PBP itself discarded 1100 packets by RED", html)
+        self.assertIn(
+            '<span class="card-label">Denied packets</span><strong>71</strong>', html
+        )
+    def test_offender_tables_are_bounded_and_say_what_was_left_out(self):
+        entities = [
+            {
+                "rank": rank,
+                "entity_type": "source_ip",
+                "source_ip": f"192.0.2.{rank}",
+                "pbp_percentage_total": 60 - rank,
+                "evidence_sources": ["packet_buffer_protection"],
+            }
+            for rank in range(1, 61)
+        ]
+        html = self._render([{"candidate_entities": entities}])
+        offenders = html.split("Denied and dropped traffic")[0]
+
+        self.assertIn("<code>192.0.2.50</code>", offenders)
+        self.assertNotIn("<code>192.0.2.51</code>", offenders)
+        self.assertIn("10 lower-ranked entries not listed", offenders)
+        self.assertIn("10 lower-ranked sources not listed", offenders)
+        self.assertIn("the JSONL capture keeps every ranked entity", offenders)
 
     def test_untrusted_baseline_batch_is_excluded_from_the_denied_total(self):
         untrusted = {
@@ -1123,6 +1214,32 @@ class ReadabilityTests(unittest.TestCase):
             self.assertIn(f'href="#{anchor}"', html)
             self.assertIn(f'id="{anchor}"', html)
 
+    def test_every_section_folds_and_only_the_events_start_folded(self):
+        html = self._render(self._capture([4.0, 4.1]))
+
+        for anchor in (
+            "summary-title",
+            "pressure-title",
+            "attribution-title",
+            "drop-counters-title",
+            "session-table-title",
+            "large-sessions-title",
+            "cpu-tracking-title",
+            "timeline-title",
+            "cycles-title",
+        ):
+            self.assertIn(
+                '<details class="section-disclosure section-fold" open>'
+                f'<summary><h2 id="{anchor}">',
+                html,
+            )
+        self.assertIn(
+            '<details class="section-disclosure section-fold">'
+            '<summary><h2 id="events-title">',
+            html,
+        )
+        self.assertNotIn("<script", html)
+
     def test_pressure_axis_fits_the_data_and_marks_received_triggers(self):
         quiet = self._render(self._capture([4.0, 4.5, 4.2], triggers=2))
         loud = self._render(self._capture([30.0, 85.0]))
@@ -1142,6 +1259,17 @@ class ReadabilityTests(unittest.TestCase):
         self.assertNotIn("<th>Descriptor ATOMIC %</th>", html)
         self.assertIn("<th>PBP congestion %</th>", html)
         self.assertIn("Not collected", html)
+
+    def test_timeline_session_column_is_named_as_a_candidate_list(self):
+        html = self._render(self._capture([4.0, 4.1]))
+
+        self.assertIn("<th>Candidate sessions</th>", html)
+        self.assertNotIn("<th>Sessions</th><th>Errors</th>", html)
+        self.assertIn(
+            "lists the session IDs the firewall ranked for that batch, "
+            "not a session total",
+            html,
+        )
 
     def test_batch_summaries_show_their_buffer_reading_and_clock_time(self):
         html = self._render(self._capture([4.0, 87.0]))
