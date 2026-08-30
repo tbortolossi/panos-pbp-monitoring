@@ -1166,5 +1166,176 @@ class ReadabilityTests(unittest.TestCase):
         self.assertIn("CPU imbalance timeline", html)
 
 
+class LargeSessionSectionTests(unittest.TestCase):
+    """An elephant session must be readable even though it writes no log."""
+
+    def _session(self, **values) -> dict:
+        session = {
+            "session_id": 5258,
+            "source_ip": "198.51.100.20",
+            "destination_ip": "203.0.113.30",
+            "source_port": "44321",
+            "destination_port": "443",
+            "protocol": "6",
+            "application": "ssl",
+            "from_zone": "LAN",
+            "to_zone": "INTERNET",
+            "ingress_interface": "ethernet1/1",
+            "egress_interface": "ethernet1/2",
+            "state": "ACTIVE",
+            "start_time": "Thu Aug 27 09:00:00 2026",
+            "total_bytes": 4_500_000_000,
+            "duration_seconds": 3600.0,
+            "average_bits_per_second": 10_000_000.0,
+            "rate_status": "baseline",
+        }
+        session.update(values)
+        return session
+
+    def _render(self, cycles: list[dict]) -> str:
+        records: list[dict] = [
+            {
+                "timestamp": "2026-08-27T10:00:00+00:00",
+                "run_id": "large-run",
+                "event": "monitor_started",
+                "collector_version": "test",
+                "device": {"serial": "fixture", "model": "PA-fixture"},
+            }
+        ]
+        for batch, cycle in enumerate(cycles, 1):
+            record = {
+                "timestamp": f"2026-08-27T10:0{batch}:00+00:00",
+                "run_id": "large-run",
+                "cycle": batch,
+                "elapsed_seconds": float(batch),
+                "percentages": {"packet_buffer_congestion": [61]},
+                "commands": {},
+            }
+            record.update(cycle)
+            records.append(record)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "large.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            report = generate_html_report(capture, capture.with_suffix(".html"))
+            return report.read_text(encoding="utf-8")
+
+    def test_a_large_session_is_listed_with_its_age_volume_and_rates(self):
+        html = self._render(
+            [
+                {
+                    "large_sessions": {
+                        "status": "collected",
+                        "min_kb": 1048576,
+                        "min_age_seconds": 600,
+                        "truncated": False,
+                        "session_count": 1,
+                        "sessions": [self._session()],
+                    }
+                },
+                {
+                    "large_sessions": {
+                        "status": "collected",
+                        "min_kb": 1048576,
+                        "min_age_seconds": 600,
+                        "truncated": False,
+                        "session_count": 1,
+                        "sessions": [
+                            self._session(
+                                total_bytes=4_506_250_000,
+                                duration_seconds=3605.0,
+                                rate_status="calculated",
+                                bits_per_second=10_000_000.0,
+                            )
+                        ],
+                    }
+                },
+            ]
+        )
+
+        self.assertIn("Largest sessions", html)
+        self.assertIn("more than 1.05 GB of cumulative traffic", html)
+        self.assertIn("open for more than 10 min 00 s", html)
+        self.assertIn("198.51.100.20", html)
+        self.assertIn("4.51 GB", html)
+        self.assertIn("1 h 00 min", html)
+        # Average and peak both land on ten megabits per second.
+        self.assertIn(">10<", html)
+
+    def test_a_recycled_index_is_reported_as_a_separate_session(self):
+        html = self._render(
+            [
+                {
+                    "large_sessions": {
+                        "status": "collected",
+                        "min_kb": 1048576,
+                        "min_age_seconds": 600,
+                        "session_count": 1,
+                        "sessions": [self._session()],
+                    }
+                },
+                {
+                    "large_sessions": {
+                        "status": "collected",
+                        "min_kb": 1048576,
+                        "min_age_seconds": 600,
+                        "session_count": 1,
+                        "sessions": [
+                            self._session(
+                                start_time="Thu Aug 27 09:30:00 2026",
+                                application="rsync",
+                                rate_status="session_reused",
+                            )
+                        ],
+                    }
+                },
+            ]
+        )
+
+        self.assertIn("ssl", html)
+        self.assertIn("rsync", html)
+
+    def test_no_matching_session_is_stated_instead_of_an_empty_table(self):
+        html = self._render(
+            [
+                {
+                    "large_sessions": {
+                        "status": "collected",
+                        "min_kb": 1048576,
+                        "min_age_seconds": 600,
+                        "session_count": 0,
+                        "sessions": [],
+                    }
+                }
+            ]
+        )
+
+        self.assertIn("no single transfer explains the buffer pressure", html)
+
+    def test_a_disabled_collection_says_so(self):
+        html = self._render(
+            [
+                {
+                    "large_sessions": {
+                        "status": "disabled",
+                        "min_kb": 0,
+                        "min_age_seconds": 600,
+                        "session_count": 0,
+                        "sessions": [],
+                    }
+                }
+            ]
+        )
+
+        self.assertIn("Largest-session tracking is disabled", html)
+
+    def test_an_older_capture_without_the_command_still_renders(self):
+        html = self._render([{}])
+
+        self.assertIn("predates largest-session tracking", html)
+
+
 if __name__ == "__main__":
     unittest.main()

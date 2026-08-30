@@ -23,11 +23,23 @@ published:
 | Request timeout | `15` | PAN-OS API timeout per request |
 | Maximum session lookups | `10` | Bounded session enrichments per cycle |
 | Session retry seconds | `5` | Minimum resampling interval per candidate |
+| Large session min kb | `1048576` | Cumulative volume above which a session is tracked; `0` disables the query |
+| Large session min age seconds | `600` | Minimum session age for the same query; `0` removes the age filter |
 | Generate HTML report | `true` | Build the standalone incident report |
 | Generate text export | `true` | Write startup and batch TXT files |
 | Syslog fresh seconds | `300` | Green/red dashboard freshness window |
 | Target check hours | `24` | Interval of the read-only firewall check; `0` disables it |
 | Webhook URL | *(empty)* | Incident notifications; empty disables them |
+
+The two large-session thresholds are the cost control of the largest-session
+query: `show session all filter` walks the session table on the management
+plane, and the filters are what keep the returned list short on a firewall
+carrying hundreds of thousands of sessions. Lower them and the query matches
+more, costs more, and fills the report with ordinary sessions; raise them and
+only the real elephants remain. The volume threshold accepts `0`, which stops
+the query being issued at all, or a value of at least `1000` kilobytes. Note
+that the age filter also hides a session younger than the threshold, so lower
+it when hunting a short, very fast transfer rather than a long-running one.
 
 When a webhook URL is configured, the collector POSTs a JSON payload at
 incident start (run, firewall, trigger metadata including the extracted flow)

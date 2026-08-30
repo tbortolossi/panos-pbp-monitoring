@@ -2290,6 +2290,158 @@ def _render_session_table(series: Sequence[dict[str, Any]]) -> str:
     )
 
 
+def _format_volume(total_bytes: Any) -> str:
+    """Render a cumulative byte counter in the unit an operator reads fastest."""
+    values = list(_numbers(total_bytes))
+    if not values:
+        return "—"
+    value = values[0]
+    for unit, scale in (("GB", 1_000_000_000.0), ("MB", 1_000_000.0), ("kB", 1_000.0)):
+        if value >= scale:
+            return f"{_format_number(round(value / scale, 2))} {unit}"
+    return f"{_format_number(round(value))} B"
+
+
+def _format_rate(bits_per_second: Any) -> str:
+    values = list(_numbers(bits_per_second))
+    if not values:
+        return "—"
+    return _format_number(round(values[0] / 1_000_000.0, 2))
+
+
+def _aggregate_large_sessions(
+    cycles: list[tuple[int, dict[str, Any]]],
+) -> dict[str, Any]:
+    """Follow each large session across the batches that listed it.
+
+    A session index is only stable while the session lives, so the start time
+    is part of the identity: a recycled index becomes a separate row instead of
+    inheriting the volume of the session that used to hold it.
+    """
+    tracked: dict[str, dict[str, Any]] = {}
+    summary: dict[str, Any] = {
+        "status": None,
+        "min_kb": None,
+        "min_age_seconds": None,
+        "truncated": False,
+        "sessions": [],
+    }
+    for _, record in cycles:
+        batch = record.get("large_sessions")
+        if not isinstance(batch, dict):
+            continue
+        summary["status"] = batch.get("status") or summary["status"]
+        if batch.get("min_kb") is not None:
+            summary["min_kb"] = batch["min_kb"]
+        if batch.get("min_age_seconds") is not None:
+            summary["min_age_seconds"] = batch["min_age_seconds"]
+        if batch.get("truncated"):
+            summary["truncated"] = True
+        for session in batch.get("sessions") or []:
+            if not isinstance(session, dict):
+                continue
+            key = f"{session.get('session_id')}@{session.get('start_time')}"
+            item = tracked.setdefault(
+                key,
+                {
+                    "session_id": session.get("session_id"),
+                    "start_time": session.get("start_time"),
+                    "batches": 0,
+                    "peak_bits_per_second": None,
+                },
+            )
+            item["batches"] += 1
+            for field in (
+                "source_ip", "destination_ip", "source_port", "destination_port",
+                "protocol", "application", "from_zone", "to_zone",
+                "ingress_interface", "egress_interface", "state",
+                "total_bytes", "duration_seconds", "average_bits_per_second",
+            ):
+                if session.get(field) is not None:
+                    item[field] = session[field]
+            rate = next(iter(_numbers(session.get("bits_per_second"))), None)
+            if rate is not None:
+                peak = item["peak_bits_per_second"]
+                item["peak_bits_per_second"] = (
+                    rate if peak is None else max(float(peak), rate)
+                )
+    summary["sessions"] = sorted(
+        tracked.values(),
+        key=lambda item: next(iter(_numbers(item.get("total_bytes"))), 0.0),
+        reverse=True,
+    )
+    return summary
+
+
+def _render_large_sessions(summary: dict[str, Any]) -> str:
+    """Render the elephant sessions with their age and their throughput."""
+    status = summary.get("status")
+    if status is None:
+        return (
+            '<p class="muted">This capture predates largest-session tracking, so '
+            "no session-table query was made.</p>"
+        )
+    if status == "disabled":
+        return (
+            '<p class="muted">Largest-session tracking is disabled for this '
+            "firewall, so no session-table query was made.</p>"
+        )
+    min_kb = next(iter(_numbers(summary.get("min_kb"))), None)
+    threshold = _format_volume(min_kb * 1000.0 if min_kb else None)
+    age = next(iter(_numbers(summary.get("min_age_seconds"))), None)
+    criteria = f"more than {threshold} of cumulative traffic"
+    if age:
+        criteria += f" and open for more than {_human_duration(age)}"
+    if status == "lookup_failed":
+        return (
+            '<p class="muted">The largest-session query failed on at least one '
+            "batch; the raw command output carries the error.</p>"
+        )
+    sessions = summary.get("sessions") or []
+    if not sessions:
+        return (
+            f'<p class="muted">No session carried {_escape(criteria)} during the '
+            "incident, so no single transfer explains the buffer pressure.</p>"
+        )
+    rows = "".join(
+        "<tr>"
+        f'<td class="number">{_escape(item.get("session_id"))}</td>'
+        f'<td><code>{_escape(item.get("source_ip") or "—")}</code>:'
+        f'{_escape(item.get("source_port") or "—")} &rarr; '
+        f'<code>{_escape(item.get("destination_ip") or "—")}</code>:'
+        f'{_escape(item.get("destination_port") or "—")}</td>'
+        f'<td>{_escape(item.get("application") or "—")}</td>'
+        f'<td>{_escape(item.get("from_zone") or "—")} &rarr; '
+        f'{_escape(item.get("to_zone") or "—")}</td>'
+        f'<td>{_escape(item.get("ingress_interface") or "—")} &rarr; '
+        f'{_escape(item.get("egress_interface") or "—")}</td>'
+        f'<td>{_escape(_human_duration(next(iter(_numbers(item.get("duration_seconds"))), None)))}</td>'
+        f'<td class="number">{_escape(_format_volume(item.get("total_bytes")))}</td>'
+        f'<td class="number">{_escape(_format_rate(item.get("average_bits_per_second")))}</td>'
+        f'<td class="number">{_escape(_format_rate(item.get("peak_bits_per_second")))}</td>'
+        f'<td class="number">{_escape(item.get("batches"))}</td>'
+        "</tr>"
+        for item in sessions
+    )
+    note = (
+        '<p class="muted">More sessions matched than the collector kept per '
+        "batch; only the largest ones are listed.</p>"
+        if summary.get("truncated")
+        else ""
+    )
+    return (
+        f'<p class="muted">Sessions carrying {_escape(criteria)}. '
+        "The average is the whole life of the session, the peak is the fastest "
+        "interval measured between two batches, so a long idle session shows a "
+        "low average and a low peak.</p>"
+        '<div class="table-wrap"><table>'
+        "<thead><tr><th>Session</th><th>Flow</th><th>Application</th>"
+        "<th>Zones</th><th>Interfaces</th><th>Open for</th><th>Volume</th>"
+        "<th>Avg Mbit/s</th><th>Peak Mbit/s</th><th>Batches</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table></div>{note}"
+    )
+
+
 def _render_html(
     source: Path,
     records: list[tuple[int, dict[str, Any]]],
@@ -2318,6 +2470,7 @@ def _render_html(
     )
     pressure_chart_html = _render_pressure_chart(cycles, events)
     session_table_html = _render_session_table(session_series)
+    large_sessions_html = _render_large_sessions(_aggregate_large_sessions(cycles))
     core_functions = next(
         (
             record["dp_core_functions"]
@@ -2927,6 +3080,11 @@ def _render_html(
       <h2 id="session-table-title">Session table</h2>
       <p class="section-intro">Whether new sessions followed the load, or packets arrived without creating any.</p>
       {session_table_html}
+    </section>
+    <section aria-labelledby="large-sessions-title">
+      <h2 id="large-sessions-title">Largest sessions</h2>
+      <p class="section-intro">Whether one long-lived high-volume transfer was consuming the link while the buffers filled. Such a session writes no traffic log until it closes, so it never appears in the offender ranking.</p>
+      {large_sessions_html}
     </section>
     <section aria-labelledby="cpu-tracking-title">
       <h2 id="cpu-tracking-title">Dataplane CPU core tracking</h2>

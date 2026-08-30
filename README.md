@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.18.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.19.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -145,12 +145,23 @@ show running resource-monitor ingress-backlogs
 show running resource-monitor
 debug dataplane pool statistics
 show counter global filter delta yes
+show session all filter min-kb 1048576 min-age 600
 ```
 
 `show system info` runs once at incident startup to identify the device.
 `show statistics`, which returns the function groups assigned to each dataplane
 core, runs when a firewall is saved in the admin UI rather than during an
 incident, so a firewall already under pressure spends no API call on it.
+
+The last command hunts the elephant session: one transfer large enough and old
+enough to fill a link on its own. It needs its own query because such a session
+writes no traffic log until it closes, shows little on the management plane
+when it is offloaded, and is never named as a PBP offender. Both filters are
+applied by the firewall, so it returns a short list rather than its session
+table; the thresholds are settings, and `0` on the volume one disables the
+query. Each listed session gets its age from the firewall clock of the same
+batch and its throughput from the delta of its byte counter between two
+batches.
 
 Candidate sessions are enriched with `show session id <session-id>`, and
 consecutive cumulative byte counters are sampled to derive c2s, s2c, and total

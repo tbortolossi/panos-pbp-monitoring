@@ -33,6 +33,7 @@ from pbp_monitoring.orchestrator import (
     append_recent_syslog,
     run_api_check,
     run_configured_api_checks,
+    large_session_command,
     resource_monitor_command,
     resource_monitor_window_seconds,
     incident_capture_path,
@@ -63,6 +64,26 @@ def make_config(output_dir: Path, **overrides):
     }
     values.update(overrides)
     return Config(**values)
+
+
+LARGE_SESSION_RESULT = (
+    "<result>"
+    "<entry><source>198.51.100.20</source><dst>203.0.113.30</dst>"
+    "<sport>44321</sport><dport>443</dport><proto>6</proto>"
+    "<from>LAN</from><to>INTERNET</to>"
+    "<start-time>Thu Aug 27 09:00:00 2026</start-time><state>ACTIVE</state>"
+    "<total-byte-count>4500000000</total-byte-count><idx>5258</idx>"
+    "<application>ssl</application>"
+    "<ingress>ethernet1/1</ingress><egress>ethernet1/2</egress></entry>"
+    "<entry><source>198.51.100.21</source><dst>203.0.113.31</dst>"
+    "<sport>51002</sport><dport>873</dport><proto>6</proto>"
+    "<from>LAN</from><to>INTERNET</to>"
+    "<start-time>Thu Aug 27 08:00:00 2026</start-time><state>ACTIVE</state>"
+    "<total-byte-count>2000000000</total-byte-count><idx>5259</idx>"
+    "<application>rsync</application>"
+    "<ingress>ethernet1/1</ingress><egress>ethernet1/2</egress></entry>"
+    "</result>"
+)
 
 
 def response(result: str) -> PanOSResponse:
@@ -137,6 +158,8 @@ class FakeClient:
                 "flow_dos_pbp_block_host 4 0 drop flow dos "
                 "Packets dropped by PBP</result>"
             )
+        if "<min-kb>" in command:
+            return response(LARGE_SESSION_RESULT)
         raise AssertionError(f"Unexpected command: {command}")
 
 
@@ -2072,3 +2095,71 @@ class RunDeletionExecutionTests(unittest.TestCase):
             router.router.pending = {}
             router.router.controllers = {}
             self.assertEqual(_runs_in_progress(router), set())
+
+
+class LargeSessionCollectionTests(unittest.TestCase):
+    """Every batch asks the firewall for its largest, longest-lived sessions."""
+
+    def _run(self, cfg):
+        async def scenario():
+            client = FakeClient()
+            controller = MonitorController(cfg, client)
+            await controller._monitor("fixture-run")
+            await controller.wait_for_reports()
+            return client
+
+        return asyncio.run(scenario())
+
+    def _cycles(self, output_dir: Path) -> list[dict]:
+        capture = incident_capture_path(output_dir, "fixture-run")
+        return [
+            record
+            for record in (
+                json.loads(line)
+                for line in capture.read_text(encoding="utf-8").splitlines()
+            )
+            if "cycle" in record
+        ]
+
+    def test_every_batch_queries_and_ranks_the_largest_sessions(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            client = self._run(make_config(output_dir))
+
+            queries = [
+                command for command in client.commands if "<min-kb>" in command
+            ]
+            self.assertTrue(queries)
+            self.assertEqual(
+                queries[0], large_session_command(1048576, 600)
+            )
+            cycles = self._cycles(output_dir)
+            summary = cycles[0]["large_sessions"]
+            self.assertEqual(summary["status"], "collected")
+            self.assertEqual(summary["min_kb"], 1048576)
+            self.assertEqual(summary["min_age_seconds"], 600)
+            self.assertEqual(
+                [session["session_id"] for session in summary["sessions"]],
+                [5258, 5259],
+            )
+            biggest = summary["sessions"][0]
+            self.assertEqual(biggest["duration_seconds"], 3600.0)
+            self.assertEqual(biggest["average_bits_per_second"], 10_000_000.0)
+            self.assertEqual(biggest["application"], "ssl")
+
+    def test_a_zero_threshold_never_walks_the_session_table(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            client = self._run(make_config(output_dir, large_session_min_kb=0))
+
+            self.assertFalse(
+                [command for command in client.commands if "<min-kb>" in command]
+            )
+            self.assertEqual(
+                self._cycles(output_dir)[0]["large_sessions"]["status"], "disabled"
+            )
+
+    def test_a_threshold_below_the_floor_is_refused_at_startup(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with self.assertRaises(ValueError):
+                make_config(Path(temporary_directory), large_session_min_kb=10)

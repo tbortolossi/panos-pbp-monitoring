@@ -64,6 +64,19 @@ def resource_monitor_command(poll_seconds: float) -> str:
         f"{window}</last></second></resource-monitor></running></show>"
     )
 
+def large_session_command(min_kb: int, min_age_seconds: int = 0) -> str:
+    """Build the largest-sessions query for a volume and an age threshold."""
+    seconds = int(min_age_seconds)
+    return LARGE_SESSION_COMMAND_TEMPLATE.format(
+        min_kb=int(min_kb),
+        min_age=(
+            LARGE_SESSION_MIN_AGE_ELEMENT.format(seconds=seconds)
+            if seconds > 0
+            else ""
+        ),
+    )
+
+
 OP_COMMANDS = {
     "packet_buffer_protection": "<show><session><packet-buffer-protection/></session></show>",
     "session_info": "<show><session><info/></session></show>",
@@ -153,6 +166,48 @@ SESSION_FILTER_LIST_COMMAND = (
 # the result carries <hw><entry><name/><port> with rx/tx counters.
 INTERFACE_COUNTER_COMMAND = (
     "<show><counter><interface>{name}</interface></counter></show>"
+)
+# Elephant-session tracking. An offloaded high-volume session writes no traffic
+# log while it is open and is never named as a PBP offender, so the offender
+# ranking cannot see it. `min-kb` filters the session table on cumulative
+# kilobytes; the threshold is what keeps the management-plane walk affordable
+# during an incident, hence a high default and an enforced floor.
+# Operational XML validated read-only against the lab PA-440 on 2026-08-30:
+# entries carry idx, start-time, total-byte-count, state, application, zones,
+# and the ingress and egress interfaces, so no per-session follow-up is needed.
+LARGE_SESSION_COMMAND_TEMPLATE = (
+    "<show><session><all><filter><min-kb>{min_kb}</min-kb>{min_age}"
+    "</filter></all></session></show>"
+)
+LARGE_SESSION_MIN_AGE_ELEMENT = "<min-age>{seconds}</min-age>"
+# One gibibyte of cumulative traffic and ten minutes of age. Both filters are
+# there to cut the candidate list down: on the lab firewall they take the
+# match from 44 sessions to 1. An age filter also hides a session younger than
+# the threshold, so an operator hunting a fast short transfer lowers it.
+LARGE_SESSION_MIN_KB_DEFAULT = 1048576
+LARGE_SESSION_MIN_AGE_DEFAULT = 600
+LARGE_SESSION_MIN_KB_FLOOR = 1000
+LARGE_SESSION_LIMIT = 10
+LARGE_SESSION_FIELDS = (
+    ("source_ip", "source"),
+    ("destination_ip", "dst"),
+    ("source_port", "sport"),
+    ("destination_port", "dport"),
+    ("protocol", "proto"),
+    ("application", "application"),
+    ("from_zone", "from"),
+    ("to_zone", "to"),
+    ("ingress_interface", "ingress"),
+    ("egress_interface", "egress"),
+    ("state", "state"),
+    ("start_time", "start-time"),
+)
+# PAN-OS prints both `show clock` and a session start time in asctime form, the
+# clock with a timezone name and the session without. Both come from the same
+# device, so comparing them naively yields the real session age.
+PANOS_TIME_PATTERN = re.compile(
+    r"^\s*\w{3}\s+(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+"
+    r"(?P<time>\d{2}:\d{2}:\d{2})(?:\s+\S+)?\s+(?P<year>\d{4})\s*$"
 )
 INTERFACE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9._/:-]{0,31}")
 INTERFACE_COUNTER_LIMIT = 2
@@ -379,6 +434,8 @@ class Config:
     dp_core_functions: tuple[dict[str, Any], ...] = ()
     dp_core_functions_identity: str | None = None
     webhook_url: str = ""
+    large_session_min_kb: int = LARGE_SESSION_MIN_KB_DEFAULT
+    large_session_min_age_seconds: int = LARGE_SESSION_MIN_AGE_DEFAULT
 
     def __post_init__(self) -> None:
         numeric_rules = (
@@ -425,6 +482,17 @@ class Config:
                 self.session_retry_seconds,
                 math.isfinite(self.session_retry_seconds)
                 and self.session_retry_seconds >= 0,
+            ),
+            (
+                "LARGE_SESSION_MIN_KB",
+                self.large_session_min_kb,
+                self.large_session_min_kb == 0
+                or self.large_session_min_kb >= LARGE_SESSION_MIN_KB_FLOOR,
+            ),
+            (
+                "LARGE_SESSION_MIN_AGE_SECONDS",
+                self.large_session_min_age_seconds,
+                self.large_session_min_age_seconds >= 0,
             ),
         )
         for name, value, valid in numeric_rules:
@@ -476,6 +544,15 @@ class Config:
             generate_text_export=env_bool("GENERATE_TEXT_EXPORT", True),
             target_profiles=target_profiles,
             webhook_url=os.getenv("WEBHOOK_URL", "").strip(),
+            large_session_min_kb=int(
+                os.getenv("LARGE_SESSION_MIN_KB", str(LARGE_SESSION_MIN_KB_DEFAULT))
+            ),
+            large_session_min_age_seconds=int(
+                os.getenv(
+                    "LARGE_SESSION_MIN_AGE_SECONDS",
+                    str(LARGE_SESSION_MIN_AGE_DEFAULT),
+                )
+            ),
         )
 
     @classmethod
@@ -532,6 +609,14 @@ class Config:
             target_profiles=tuple(profiles),
             config_revision=store.revision(),
             webhook_url=values.get("webhook_url", "").strip(),
+            large_session_min_kb=int(
+                values.get("large_session_min_kb", LARGE_SESSION_MIN_KB_DEFAULT)
+            ),
+            large_session_min_age_seconds=int(
+                values.get(
+                    "large_session_min_age_seconds", LARGE_SESSION_MIN_AGE_DEFAULT
+                )
+            ),
         )
 
     def for_target(self, profile: TargetProfile) -> "Config":
@@ -1896,6 +1981,160 @@ def derive_session_rates(
     return rates
 
 
+def parse_panos_time(value: Any) -> datetime | None:
+    """Parse a PAN-OS asctime string, with or without its timezone name."""
+    if not isinstance(value, str):
+        return None
+    match = PANOS_TIME_PATTERN.match(value)
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(
+            f"{match['month']} {match['day']} {match['time']} {match['year']}",
+            "%b %d %H:%M:%S %Y",
+        )
+    except ValueError:
+        return None
+
+
+def extract_large_sessions(
+    output: str,
+    limit: int = LARGE_SESSION_LIMIT,
+) -> dict[str, Any]:
+    """Rank the sessions returned by the min-kb filter by cumulative volume."""
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return {
+            "status": "parse_failed",
+            "session_count": 0,
+            "truncated": False,
+            "sessions": [],
+        }
+    sessions: list[dict[str, Any]] = []
+    for element in root.iter("entry"):
+        entry: dict[str, Any] = {
+            name: (element.findtext(tag) or "").strip() or None
+            for name, tag in LARGE_SESSION_FIELDS
+        }
+        entry["session_id"] = _int_value(element.findtext("idx"))
+        entry["total_bytes"] = _int_value(element.findtext("total-byte-count"))
+        if entry["session_id"] is None or entry["total_bytes"] is None:
+            continue
+        sessions.append(entry)
+    sessions.sort(key=lambda item: item["total_bytes"], reverse=True)
+    return {
+        "status": "collected",
+        "session_count": len(sessions),
+        "truncated": len(sessions) > limit,
+        "sessions": sessions[:limit],
+    }
+
+
+def annotate_large_sessions(
+    sessions: list[dict[str, Any]],
+    previous_samples: dict[str, dict[str, Any]],
+    sampled_at_monotonic: float,
+    device_time: datetime | None,
+) -> list[dict[str, Any]]:
+    """Add how long each large session has been open and how fast it is going.
+
+    The age is measured against the firewall clock collected in the same batch,
+    never against the collector clock. The current rate is the delta of the
+    cumulative byte counter between two batches; a session index that PAN-OS
+    recycled is detected by its start time and never produces a rate.
+    """
+    current_samples: dict[str, dict[str, Any]] = {}
+    annotated: list[dict[str, Any]] = []
+    for session in sessions:
+        entry = dict(session)
+        key = str(entry.get("session_id"))
+        start_time = entry.get("start_time")
+        started = parse_panos_time(start_time)
+        total_bytes = _int_value(entry.get("total_bytes"))
+        duration: float | None = None
+        if started is not None and device_time is not None:
+            duration = (device_time - started).total_seconds()
+            if duration < 0:
+                duration = None
+        entry["duration_seconds"] = (
+            round(duration, 3) if duration is not None else None
+        )
+        entry["average_bits_per_second"] = (
+            round(8.0 * total_bytes / duration, 3)
+            if duration is not None and duration > 0 and total_bytes is not None
+            else None
+        )
+        previous = previous_samples.get(key)
+        if previous is None:
+            entry["rate_status"] = "baseline"
+        elif previous.get("start_time") != start_time:
+            entry["rate_status"] = "session_reused"
+        elif total_bytes is None:
+            entry["rate_status"] = "missing_byte_counter"
+        else:
+            interval = sampled_at_monotonic - float(previous["sampled_at_monotonic"])
+            previous_bytes = _int_value(previous.get("total_bytes"))
+            if interval <= 0:
+                entry["rate_status"] = "invalid_interval"
+            elif previous_bytes is None:
+                entry["rate_status"] = "missing_previous_byte_counter"
+            elif total_bytes < previous_bytes:
+                entry["rate_status"] = "counter_reset"
+            else:
+                delta = total_bytes - previous_bytes
+                entry["rate_status"] = "calculated"
+                entry["sample_interval_seconds"] = round(interval, 3)
+                entry["delta_bytes"] = delta
+                entry["bits_per_second"] = round(8.0 * delta / interval, 3)
+        current_samples[key] = {
+            "sampled_at_monotonic": sampled_at_monotonic,
+            "start_time": start_time,
+            "total_bytes": total_bytes,
+        }
+        annotated.append(entry)
+    # Only the sessions still above the threshold stay sampled, so a long run
+    # cannot grow this map without bound.
+    previous_samples.clear()
+    previous_samples.update(current_samples)
+    return annotated
+
+
+def summarize_large_sessions(
+    record: Any,
+    min_kb: int,
+    previous_samples: dict[str, dict[str, Any]],
+    sampled_at_monotonic: float,
+    firewall_clock: str | None,
+    min_age_seconds: int = 0,
+) -> dict[str, Any]:
+    """Build the per-batch elephant-session view, tolerating a failed command."""
+    summary: dict[str, Any] = {
+        "min_kb": min_kb,
+        "min_age_seconds": min_age_seconds,
+        "status": "disabled",
+        "session_count": 0,
+        "truncated": False,
+        "sessions": [],
+    }
+    if min_kb <= 0:
+        return summary
+    if record is None:
+        summary["status"] = "unavailable"
+        return summary
+    if not command_succeeded(record):
+        summary["status"] = "lookup_failed"
+        return summary
+    summary.update(extract_large_sessions(command_result(record)))
+    summary["sessions"] = annotate_large_sessions(
+        summary["sessions"],
+        previous_samples,
+        sampled_at_monotonic,
+        parse_panos_time(firewall_clock),
+    )
+    return summary
+
+
 def _structured_pbp_percentages(output: str) -> list[float]:
     try:
         root = ET.fromstring(output)
@@ -3191,6 +3430,11 @@ class MonitorController:
         commands["resource_monitor"] = resource_monitor_command(
             self.cfg.poll_seconds
         )
+        if self.cfg.large_session_min_kb > 0:
+            commands["large_sessions"] = large_session_command(
+                self.cfg.large_session_min_kb,
+                self.cfg.large_session_min_age_seconds,
+            )
         pairs = await asyncio.gather(
             clock_task,
             *(collect_op_command(name, cmd) for name, cmd in commands.items())
@@ -3423,6 +3667,7 @@ class MonitorController:
             )
         )
         session_rate_samples: dict[str, dict[str, Any]] = {}
+        large_session_samples: dict[str, dict[str, Any]] = {}
         offender_sources: dict[str, int] = {}
         peak_packet_buffer: float | None = None
         evidence_interfaces: set[str] = set()
@@ -3526,6 +3771,17 @@ class MonitorController:
                     session_rate_samples,
                     time.monotonic(),
                 )
+                firewall_clock = extract_firewall_clock(
+                    command_result(outputs.get("clock"))
+                )
+                large_sessions = summarize_large_sessions(
+                    outputs.get("large_sessions"),
+                    self.cfg.large_session_min_kb,
+                    large_session_samples,
+                    time.monotonic(),
+                    firewall_clock,
+                    self.cfg.large_session_min_age_seconds,
+                )
                 for sid in lookup_ids:
                     session_last_queried[sid] = now
 
@@ -3598,9 +3854,7 @@ class MonitorController:
                         "cycle_duration_seconds": round(
                             time.monotonic() - cycle_start, 3
                         ),
-                        "firewall_clock": extract_firewall_clock(
-                            command_result(outputs.get("clock"))
-                        ),
+                        "firewall_clock": firewall_clock,
                         "percentages": percentages,
                         "resource_monitor_cpu_cores": extract_resource_cpu_cores(
                             command_result(outputs.get("resource_monitor"))
@@ -3625,6 +3879,7 @@ class MonitorController:
                         "session_details": details,
                         "session_summaries": session_summaries,
                         "session_rates": session_rates,
+                        "large_sessions": large_sessions,
                         "interface_counters": interface_counters,
                         "commands": outputs,
                     }
@@ -4394,6 +4649,14 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
         cfg.recovery_threshold,
     )
     firewall_clock = extract_firewall_clock(command_result(outputs.get("clock")))
+    large_sessions = summarize_large_sessions(
+        outputs.get("large_sessions"),
+        cfg.large_session_min_kb,
+        {},
+        time.monotonic(),
+        firewall_clock,
+        cfg.large_session_min_age_seconds,
+    )
     validation_errors = list(identity_warnings)
     if not command_succeeded(system_info):
         validation_errors.append("system_info command failed")
@@ -4446,6 +4709,7 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
             "session_details": details,
             "session_summaries": session_summaries,
             "session_rates": session_rates,
+            "large_sessions": large_sessions,
             "commands": outputs,
         }
     append_jsonl(output_file, cycle_record)
