@@ -21,7 +21,7 @@ from urllib.request import (
 )
 
 from pbp_monitoring.webui import (
-    annotate_report,
+    annotate_report_head,
     handler_factory,
     _incident_run_dir,
     render_report_evidence_bar,
@@ -173,6 +173,55 @@ class ArtifactAuthenticationTests(unittest.TestCase):
             self.assertIn("Back to dashboard", page)
             self.assertIn("<h1>Incident report</h1>", page)
             self.assertLess(page.index("pbp-bar"), page.index("<h1>Incident report</h1>"))
+            self.assertEqual(
+                (run_dir / "report.html").read_text(encoding="utf-8"),
+                stored,
+                "the stored report must stay free of deployment-local links",
+            )
+
+    def test_a_report_heavier_than_a_chunk_still_offers_its_evidence(self):
+        """A real incident report weighs tens of megabytes and must keep its exports.
+
+        The bar used to be dropped above a size cap, which left the runs whose
+        evidence matters most, the long collections, with no way to reach their
+        JSONL or their support archive from the Web UI.
+        """
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            run_dir = root / "data" / "targets" / "fw-a" / "incidents" / "run-1"
+            (run_dir / "raw").mkdir(parents=True)
+            filler = "<p>packet buffer sample</p>" * 400_000
+            stored = f"<html><body><h1>Incident report</h1>{filler}</body></html>"
+            (run_dir / "report.html").write_text(stored, encoding="utf-8")
+            (run_dir / "incident.jsonl").write_text(
+                json.dumps({"event": "monitor_started"}) + "\n", encoding="utf-8"
+            )
+            self.assertGreater(
+                (run_dir / "report.html").stat().st_size,
+                8 * 1024 * 1024,
+                "the fixture must exceed the size that used to drop the bar",
+            )
+            server, thread, setup_code = self._server(root)
+            base = f"http://127.0.0.1:{server.server_port}"
+            opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            try:
+                self._sign_in(opener, base, setup_code)
+                response = opener.open(base + "/reports/fw-a/run-1/report.html")
+                page = response.read().decode()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+            self.assertIn('href="/artifacts/fw-a/run-1/incident.jsonl"', page)
+            self.assertIn('href="/artifacts/fw-a/run-1/run.zip"', page)
+            self.assertIn("<h1>Incident report</h1>", page)
+            # The whole report is served, not only the annotated first chunk.
+            self.assertTrue(page.endswith("</body></html>"))
+            self.assertEqual(
+                int(response.headers["Content-Length"]),
+                len(page.encode("utf-8")),
+                "a streamed report must announce the length it actually sends",
+            )
             self.assertEqual(
                 (run_dir / "report.html").read_text(encoding="utf-8"),
                 stored,
@@ -356,10 +405,10 @@ class WebUITests(unittest.TestCase):
             )
 
     def test_a_report_without_a_body_tag_is_served_unchanged(self):
-        self.assertEqual(annotate_report("fixture report", "<div>bar</div>"), "fixture report")
+        self.assertIsNone(annotate_report_head(b"fixture report", "<div>bar</div>"))
         self.assertEqual(
-            annotate_report('<html><BODY class="x">t</BODY></html>', "<i>bar</i>"),
-            '<html><BODY class="x"><i>bar</i>t</BODY></html>',
+            annotate_report_head(b'<html><BODY class="x">t</BODY></html>', "<i>bar</i>"),
+            b'<html><BODY class="x"><i>bar</i>t</BODY></html>',
         )
 
     def test_http_listener_redirects_to_same_host_https_and_rejects_bad_host(self):
