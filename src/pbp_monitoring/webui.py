@@ -199,6 +199,7 @@ def write_run_archive(
     target: str,
     run_id: str,
     config_store: ConfigStore | None = None,
+    anonymizer: diagnostics.Anonymizer | None = None,
 ) -> None:
     """Write a portable ZIP containing one run and a checksummed manifest.
 
@@ -215,6 +216,8 @@ def write_run_archive(
     )
     manifest_files: list[dict[str, Any]] = []
     prefix = f"pbp-run-{target}-{run_id}"
+    if anonymizer is not None:
+        prefix = f"pbp-run-{anonymizer.apply(target)}-{run_id}"
     with zipfile.ZipFile(
         destination,
         mode="w",
@@ -224,6 +227,18 @@ def write_run_archive(
     ) as archive:
         for path in files:
             relative = path.relative_to(root).as_posix()
+            if anonymizer is not None:
+                payload = anonymizer.apply_bytes(path.read_bytes())
+                relative = anonymizer.apply(relative)
+                manifest_files.append(
+                    {
+                        "path": relative,
+                        "size_bytes": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                )
+                archive.writestr(f"{prefix}/{relative}", payload)
+                continue
             digest = hashlib.sha256()
             with path.open("rb") as handle:
                 while chunk := handle.read(1024 * 1024):
@@ -256,6 +271,11 @@ def write_run_archive(
                 for relative, payload in support_context.items()
             },
         }
+        if anonymizer is not None:
+            generated = {
+                anonymizer.apply(relative): (anonymizer.apply_bytes(payload), source)
+                for relative, (payload, source) in generated.items()
+            }
         for relative, (payload, source) in generated.items():
             manifest_files.append(
                 {
@@ -270,9 +290,10 @@ def write_run_archive(
             "format_version": 1,
             "application": "PBP Monitoring",
             "application_version": __version__,
-            "target": target,
+            "target": anonymizer.apply(target) if anonymizer else target,
             "run_id": run_id,
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "anonymized": anonymizer is not None,
             "files": manifest_files,
         }
         archive.writestr(
@@ -764,6 +785,9 @@ def render_dashboard(
             links.append(f'<a href="/artifacts/{target}/{run_id}/raw/">TXT ({int(run["text_files"])})</a>')
         if run.get("jsonl"):
             links.append(f'<a href="/artifacts/{target}/{run_id}/run.zip">ZIP support</a>')
+            links.append(
+                f'<a class="secondary" href="/artifacts/{target}/{run_id}/run.zip?anonymize=1">ZIP anonymized</a>'
+            )
         active = run.get("status") == "active"
         peak = run.get("peak_packet_buffer_pct")
         peak_text = (
@@ -965,11 +989,22 @@ def handler_factory(
                     while chunk := handle.read(1024 * 1024):
                         self.wfile.write(chunk)
 
-        def _serve_run_archive(self, run_dir: Path, target: str, run_id: str) -> None:
+        def _serve_run_archive(
+            self,
+            run_dir: Path,
+            target: str,
+            run_id: str,
+            *,
+            anonymize: bool = False,
+        ) -> None:
             if not run_dir.is_dir():
                 self.send_error(404)
                 return
-            filename = f"pbp-run-{target}-{run_id}-v{__version__}.zip"
+            anonymizer = (
+                diagnostics.build_anonymizer(config_store) if anonymize else None
+            )
+            label = anonymizer.apply(target) if anonymizer else target
+            filename = f"pbp-run-{label}-{run_id}-v{__version__}.zip"
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
@@ -984,6 +1019,7 @@ def handler_factory(
                     target=target,
                     run_id=run_id,
                     config_store=config_store,
+                    anonymizer=anonymizer,
                 )
 
         def do_HEAD(self) -> None:
@@ -1097,7 +1133,13 @@ def handler_factory(
                 if located is None:
                     self.send_error(404)
                 else:
-                    self._serve_run_archive(located[0], parts[1], parts[2])
+                    self._serve_run_archive(
+                        located[0],
+                        parts[1],
+                        parts[2],
+                        anonymize=parse_qs(request_url.query).get("anonymize")
+                        == ["1"],
+                    )
                 return
             if len(parts) == 4 and parts[0] == "artifacts" and parts[3] == "raw":
                 raw_dir = _artifact_path(data_dir, parts[1], parts[2], "raw")

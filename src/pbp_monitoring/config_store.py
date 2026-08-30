@@ -274,6 +274,28 @@ class ConfigStore:
         except OSError as exc:
             raise ValueError("configuration master key cannot be read") from exc
 
+    def anonymization_salt(self) -> str:
+        """Return the per-installation salt that pseudonymizes support exports.
+
+        It is generated once and kept, so the same address keeps the same token
+        across every bundle a deployment produces: an offender seen during two
+        incidents stays recognizable as one offender. It never leaves the
+        configuration volume, which is what makes a token irreversible for
+        whoever receives the export.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key='anonymization_salt'"
+            ).fetchone()
+            if row and str(row["value"]).strip():
+                return str(row["value"])
+            salt = secrets.token_hex(32)
+            connection.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('anonymization_salt',?)",
+                (salt,),
+            )
+        return salt
+
     def recovery_key_acknowledged(self) -> bool:
         with self._connect() as connection:
             row = connection.execute(

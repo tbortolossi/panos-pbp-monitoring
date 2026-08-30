@@ -412,27 +412,35 @@ collector cannot be claimed by whoever reaches this port first.</p>
 {self._target_form(csrf, edit_target)}
 {self._syslog_card(syslog or self._syslog_options(None), targets)}
 <section class="card"><h2>Support bundle</h2>
-<p class="muted">One archive describing this deployment, for remote diagnosis. It carries the collector and dashboard logs, the running versions, every setting, the run inventory and the recent Syslog journals including refused messages. It never carries PAN-OS API keys, the administrator password or the recovery key. It does carry firewall management addresses, hostnames, serial numbers and the source addresses recorded during an incident. Producing it makes no call to any firewall.</p>
-<a class="button" href="/admin/support-bundle.zip">Download support bundle</a></section>
+<p class="muted">One archive describing this deployment, for remote diagnosis. It carries the collector and dashboard logs, the running versions, every setting, the run inventory and the recent Syslog journals including refused messages. It never carries PAN-OS API keys, the administrator password or the recovery key. Producing it makes no call to any firewall.</p>
+<p class="muted">The complete bundle names your firewalls: management addresses, hostnames, serial numbers and the source addresses recorded during an incident. The anonymized bundle replaces each of those with a token such as <code>ip-3f2c1a9b4d</code>, the same token every time so an offender stays recognizable across incidents, and irreversible for whoever receives it. Download the token mapping to translate a token back, and keep that file: it is the one thing that must never be sent.</p>
+<div class="action-row"><a class="button" href="/admin/support-bundle.zip">Download support bundle</a>
+<a class="button" href="/admin/support-bundle-anonymized.zip">Download anonymized bundle</a>
+<a class="secondary button" href="/admin/support-token-mapping.csv">Download token mapping</a></div></section>
 <section class="card"><h2>Collector settings</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
 {''.join(f'<div><label>{_e(setting_label(key))}</label><input name="{_e(key)}" value="{_e(value)}"{"" if DEFAULT_SETTINGS.get(key) == "" else " required"}></div>' for key, value in settings.items())}
 </div><button type="submit">Save settings</button></form></section>""", refresh_seconds)
 
-    def _support_bundle(self) -> bytes:
-        """Build the deployment diagnostic archive for the maintainer.
+    def _support_bundle(self, anonymized: bool = False) -> tuple[bytes, bytes]:
+        """Build the deployment diagnostic archive, and its token mapping.
 
         The archive is bounded by construction: only tails of the journals and
         logs, the most recent read-only API validation per firewall, and small
         generated summaries. Building it makes no call to any firewall.
         """
+        anonymizer = (
+            diagnostics.build_anonymizer(self.store) if anonymized else None
+        )
         buffer = io.BytesIO()
         diagnostics.write_support_bundle(
             buffer,
             data_dir=self.data_dir if self.data_dir is not None else Path("/data"),
             config_store=self.store,
             log_dirs=self.log_dirs,
+            anonymizer=anonymizer,
         )
-        return buffer.getvalue()
+        mapping = anonymizer.mapping_csv() if anonymizer is not None else b""
+        return buffer.getvalue(), mapping
 
     def _syslog_options(self, handler: Any, query: dict[str, list[str]] | None = None) -> dict[str, str]:
         """Resolve the values the PAN-OS Syslog commands are rendered with.
@@ -771,12 +779,31 @@ generated on the firewall CLI, or enable TLS verification first.</p></div>
                         f"pbp-monitoring-recovery-key-v{__version__}.csv",
                     )
                     return True
-                if path == "/admin/support-bundle.zip":
+                if path in (
+                    "/admin/support-bundle.zip",
+                    "/admin/support-bundle-anonymized.zip",
+                ):
+                    anonymized = path.endswith("anonymized.zip")
+                    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                    payload, _mapping = self._support_bundle(anonymized)
                     self._send_download(
                         handler,
-                        self._support_bundle(),
+                        payload,
                         "application/zip",
-                        f"pbp-support-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.zip",
+                        f"pbp-support-{'anonymized-' if anonymized else ''}{stamp}.zip",
+                    )
+                    return True
+                if path == "/admin/support-token-mapping.csv":
+                    # Regenerating the bundle is what guarantees the mapping
+                    # covers exactly what an anonymized export contains; the
+                    # tokens are derived from the stored salt, so it matches any
+                    # bundle this installation has produced.
+                    _payload, mapping = self._support_bundle(True)
+                    self._send_download(
+                        handler,
+                        mapping,
+                        "text/csv; charset=utf-8",
+                        "pbp-support-token-mapping.csv",
                     )
                     return True
                 if path == "/admin/syslog-commands.txt":
