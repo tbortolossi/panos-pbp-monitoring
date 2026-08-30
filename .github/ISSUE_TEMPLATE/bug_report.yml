@@ -10,7 +10,7 @@ body:
     id: version
     attributes:
       label: Version
-      placeholder: "0.4.1"
+      placeholder: "0.23.0"
     validations:
       required: true
   - type: input
@@ -34,6 +34,16 @@ body:
     id: reproduction
     attributes:
       label: Reproduction steps using anonymized data
+    validations:
+      required: true
+  - type: dropdown
+    id: bundle
+    attributes:
+      label: Support bundle
+      description: An anonymized bundle (`./pbp-support.sh --anonymize`) can be transferred through the private channel on request. Never attach any bundle to this issue.
+      options:
+        - Anonymized bundle available on request
+        - No bundle available
     validations:
       required: true
   - type: checkboxes

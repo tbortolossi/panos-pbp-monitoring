@@ -9,14 +9,19 @@ evidence.
 Python 3.10 or newer is required. `cryptography` is the only runtime dependency
 outside the standard library and is used for authenticated secret encryption.
 
+Run the test suite against the sources with `PYTHONPATH=src` rather than
+installing the package: an editable install on a system Python would replace
+the pinned `cryptography` version that actually applies inside the containers.
+
 ```bash
-python3 -m pip install --editable .
-python3 -m unittest discover -s tests -t . -v
+PYTHONPATH=src python3 -m unittest discover -s tests -t . -v
 python3 -m compileall -q src/pbp_monitoring tools
 ```
 
 Application code belongs under `src/pbp_monitoring/`, command-line entry points
-are declared in `pyproject.toml`, and tests belong under `tests/`.
+are declared in `pyproject.toml`, and tests belong under `tests/`. Operator
+documentation lives under `docs/`; keep the page that owns a behavior in sync
+when that behavior changes.
 
 ## Change requirements
 
@@ -31,13 +36,16 @@ are declared in `pyproject.toml`, and tests belong under `tests/`.
 - Add or update tests for parser, trigger, configuration, persistence, or state
   machine changes.
 - Update the README and PRD when observable behavior or configuration changes.
+- Keep the remote-diagnosis path current: new evidence must reach the support
+  bundle or `tools/replay_capture.py`, and new identifying values must be
+  anonymized.
 
 ## Validation
 
 Before submitting a change, run:
 
 ```bash
-python3 -m unittest discover -s tests -t . -v
+PYTHONPATH=src python3 -m unittest discover -s tests -t . -v
 python3 -m compileall -q src/pbp_monitoring tools
 docker compose config --quiet
 ```

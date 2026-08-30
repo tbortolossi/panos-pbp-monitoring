@@ -160,7 +160,8 @@ It runs only read-only commands (`docker compose ps`, `config`, `logs`,
 --host-evidence`, and prints the path of the archive. If the collector is not
 running it starts a one-off container on the same volumes; if the image is
 absent it writes a host-only `.tar.gz`. With `--anonymize`, the token mapping
-is written beside the archive as `<archive>.mapping.csv`, owner-only. The
+is written beside the archive, with `.mapping.csv` in place of `.zip`
+(`pbp-support-anonymized-<stamp>.mapping.csv`), owner-only. The
 script is what to ask an operator for first: one command, one file.
 
 The bundle never carries PAN-OS API keys, the administrator password or its

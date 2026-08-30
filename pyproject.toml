@@ -5,11 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "panos-pbp-monitoring"
 version = "0.23.0"
-description = "Event-driven PAN-OS packet-buffer incident collector"
+description = "Read-only, event-driven diagnostic collector for Palo Alto Networks PAN-OS Packet Buffer Protection incidents"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
-keywords = ["pan-os", "packet-buffer-protection", "network-diagnostics", "syslog"]
+keywords = [
+    "pan-os", "palo-alto-networks", "panorama", "packet-buffer-protection",
+    "packet-buffer", "dos-protection", "firewall", "syslog", "xml-api",
+    "network-diagnostics", "incident-response", "docker-compose",
+]
 dependencies = ["cryptography>=50.0.1,<51"]
 
 [project.urls]
