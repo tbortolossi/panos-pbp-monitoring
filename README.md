@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.22.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.23.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -202,17 +202,31 @@ collector and dashboard log files, the running application, Python and
 `cryptography` versions, every collector setting and every registered firewall
 without credentials, the run inventory and storage usage, and the tail of the
 Syslog reception, routing and trigger journals including the messages the
-collector refused. It is what makes a remote installation diagnosable without
-access to its host. The same archive is available from a shell when the
-dashboard is itself the problem:
+collector refused, a summary of that reception by outcome and sender, the most
+recent incident runs of each firewall with their raw XML, and the facts of the
+web certificate actually served. It is what makes a remote installation
+diagnosable without access to its host. The same archive is available from a
+shell when the dashboard is itself the problem:
 
 ```bash
 docker compose exec -T collector pbp-support > pbp-support.zip
 ```
 
+The container cannot see what surrounds it: whether the three services are
+healthy, which host ports are published, what the Syslog gateway printed, or
+which image is running. `pbp-support.sh`, run on the Docker host from the
+directory holding `compose.yaml`, gathers that layer and folds it into the same
+archive under `host/`; it falls back to a one-off container when the collector
+is down, and to a host-only archive when the image is absent:
+
+```bash
+./pbp-support.sh                 # one archive, collector and host layer
+./pbp-support.sh --anonymize     # same, with addresses and names tokenized
+```
+
 The bundle never carries PAN-OS API keys, the administrator password or its
 hash, the installation recovery key, or the one-time setup code. Producing it
-makes no call to any firewall.
+makes no call to any firewall, and the script changes nothing in the stack.
 
 **Anonymized exports.** The complete bundle names your firewalls: management
 addresses, hostnames, serial numbers and the source addresses recorded as

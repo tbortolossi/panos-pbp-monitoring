@@ -124,17 +124,44 @@ the deployment:
 | `logs/*.log` | The tail of the collector and dashboard log files |
 | `environment.json` | Application, Python and `cryptography` versions, platform, timezone, container flag |
 | `configuration.json` | Every collector setting and every registered firewall, without credentials |
-| `runs.json` | Inventory of stored incident and API-check runs |
+| `runs.json` | Inventory of stored incident and API-check runs, with a `bundled` flag on the runs that travel in the archive |
 | `storage.json` | What the capture volume holds and how full it is |
-| `syslog/` | Tail of the reception, routing and trigger journals, refused messages included |
+| `syslog/` | Tail of the reception, routing and trigger journals, refused messages included, and `summary.json` counting the reception by outcome, firewall and sender |
 | `api-checks/` | The most recent read-only API validation of each firewall, with its raw PAN-OS XML |
+| `incidents/` | The three most recent incident runs of each firewall, capture and raw PAN-OS XML without the HTML report, newest first within a 64 MB budget; a run that does not fit is left out whole |
+| `host/` | Only with `pbp-support.sh`: service state, effective Compose configuration, published ports, container output including the Syslog gateway, image digest, Docker and host versions |
 | `manifest.json` | SHA-256 of every file above |
+
+`environment.json` also describes the web certificate the dashboard serves —
+subject, names, validity window, self-signed or custom, fingerprint — never its
+key, so a browser that refuses the page is diagnosable from the bundle alone.
 
 When the dashboard is itself the problem, the same archive comes from a shell:
 
 ```bash
 docker compose exec -T collector pbp-support > pbp-support.zip
 ```
+
+#### The host layer
+
+Everything above is produced from inside the `collector` container, which
+cannot see whether the `syslog-gateway` is up, which host ports are published,
+or what the gateway printed. `pbp-support.sh`, at the root of the checkout,
+gathers that from the Docker host and folds it into the same archive:
+
+```bash
+./pbp-support.sh                              # pbp-support-<stamp>.zip
+./pbp-support.sh --anonymize                  # tokenized, mapping written beside it
+./pbp-support.sh --output /tmp/site.zip
+```
+
+It runs only read-only commands (`docker compose ps`, `config`, `logs`,
+`images`, `docker inspect`, `ss`), streams the result into `pbp-support
+--host-evidence`, and prints the path of the archive. If the collector is not
+running it starts a one-off container on the same volumes; if the image is
+absent it writes a host-only `.tar.gz`. With `--anonymize`, the token mapping
+is written beside the archive as `<archive>.mapping.csv`, owner-only. The
+script is what to ask an operator for first: one command, one file.
 
 The bundle never carries PAN-OS API keys, the administrator password or its
 hash, the installation recovery key, or the one-time setup code. Producing it

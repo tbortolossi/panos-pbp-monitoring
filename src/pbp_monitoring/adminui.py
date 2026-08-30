@@ -168,6 +168,7 @@ class AdminController:
         secure_cookie: bool = False,
         data_dir: Path | None = None,
         log_dirs: Sequence[Path] = (),
+        tls_cert: Path | None = None,
     ):
         self.store = store
         self.trust_loopback_proxy = trust_loopback_proxy
@@ -175,6 +176,7 @@ class AdminController:
         self.secure_cookie = secure_cookie
         self.data_dir = Path(data_dir) if data_dir is not None else None
         self.log_dirs = tuple(Path(directory) for directory in log_dirs)
+        self.tls_cert = Path(tls_cert) if tls_cert is not None else None
         self.store.initialize()
         self.sessions: dict[str, tuple[float, str]] = {}
         self.setup_token = secrets.token_urlsafe(32)
@@ -425,11 +427,16 @@ collector cannot be claimed by whoever reaches this port first.</p>
         """Build the deployment diagnostic archive, and its token mapping.
 
         The archive is bounded by construction: only tails of the journals and
-        logs, the most recent read-only API validation per firewall, and small
-        generated summaries. Building it makes no call to any firewall.
+        logs, the most recent read-only API validation per firewall, the most
+        recent incidents under a size budget, and small generated summaries.
+        Building it makes no call to any firewall.
         """
         anonymizer = (
-            diagnostics.build_anonymizer(self.store) if anonymized else None
+            diagnostics.build_anonymizer(
+                self.store, diagnostics.web_hostnames(self.tls_cert)
+            )
+            if anonymized
+            else None
         )
         buffer = io.BytesIO()
         diagnostics.write_support_bundle(
@@ -438,6 +445,7 @@ collector cannot be claimed by whoever reaches this port first.</p>
             config_store=self.store,
             log_dirs=self.log_dirs,
             anonymizer=anonymizer,
+            tls_cert=self.tls_cert,
         )
         mapping = anonymizer.mapping_csv() if anonymizer is not None else b""
         return buffer.getvalue(), mapping

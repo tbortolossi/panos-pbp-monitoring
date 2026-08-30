@@ -108,9 +108,29 @@ it in every batch.
 ## Reporting a problem in a deployment you do not administer
 
 When the collector runs at a site you cannot reach, ask the operator for the
-support bundle rather than for a description of the symptom. Admin page,
-**Support bundle** card, **Download support bundle**. If the dashboard itself is
-the problem:
+support bundle rather than for a description of the symptom. The most complete
+form is one command on the Docker host, from the directory holding
+`compose.yaml`:
+
+```bash
+./pbp-support.sh
+```
+
+It produces one archive with the collector's own bundle and the layer only the
+host can see: `host/compose-ps.txt` (which services are up, healthy, or
+restarting), `host/ports.txt` (the ports actually published and the listeners
+found on 514, 1514 and 5514), `host/compose-config.yaml` (the effective
+configuration, credentials redacted), `host/syslog-gateway.log`,
+`host/collector-stdout.log` and `host/webui-stdout.log` (the container output,
+which is the only trace of a crash before file logging started), and
+`host/images.txt` (the image digest and labels, to confirm the version that is
+really running). When `syslog/received.jsonl` is empty, those files are what
+tells a firewall that does not send from a blocked host port, a dead gateway,
+or a gateway forwarding to the wrong internal port.
+
+If the operator cannot run the script, the admin page still offers the
+container-side bundle — **Support bundle** card, **Download support bundle** —
+and so does a shell when the dashboard itself is the problem:
 
 ```bash
 docker compose exec -T collector pbp-support > pbp-support.zip
@@ -118,19 +138,21 @@ docker compose exec -T collector pbp-support > pbp-support.zip
 
 The bundle carries the collector and dashboard logs, the running versions, every
 setting, the firewall inventory, the run inventory, the Syslog journals
-including refused messages, and the most recent read-only API validation of each
-firewall with its raw PAN-OS XML. It carries no API key, no administrator
-password, no recovery key and no setup code. Producing it makes no call to any
-firewall.
+including refused messages with `syslog/summary.json` counting them by refusal
+slug and sender, the most recent read-only API validation of each firewall with
+its raw PAN-OS XML, the three most recent incident runs of each firewall with
+their raw XML, and the facts of the web certificate served. It carries no API
+key, no administrator password, no recovery key and no setup code. Producing it
+makes no call to any firewall.
 
-If the problem is tied to one incident, ask for that run's **ZIP support**
-archive as well: it holds the full raw XML of every command of every batch. Two
-files, then: the bundle explains the collector, the run archive explains the
-firewall.
+`runs.json` says which incident runs travelled (`"bundled": true`). If the
+incident of interest is older than those, ask for that run's **ZIP support**
+archive as well: it holds the full raw XML of every command of every batch.
 
 If their policy forbids sending addresses and serial numbers, ask for the
-anonymized forms instead — **Download anonymized bundle** and **ZIP
-anonymized** — which carry the same evidence under stable tokens. Diagnosis
+anonymized forms instead — `./pbp-support.sh --anonymize`, **Download
+anonymized bundle** and **ZIP anonymized** — which carry the same evidence
+under stable tokens; the dashboard's own hostnames are tokenized too. Diagnosis
 works the same way: an offender is followed by its token, and the operator
 translates it back on their side with **Download token mapping** when a real
 address is finally needed.
