@@ -3,6 +3,20 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.31.0] - 2026-08-30
+
+### Changed
+
+- **At a glance folds like every other report section.** The verdict block at
+  the top of an HTML report was the one section that could not be put away,
+  so a long report could not be reduced to its section headings for
+  navigation. It is now a disclosure like Summary, Pressure, Offenders, Drops,
+  Sessions, CPU, Timeline, Batches and Events, open by default and keeping its
+  severity colour on the left edge. The fold arrow of every section heading is
+  also drawn in the accent colour instead of grey, and the heading highlights
+  on hover, so the affordance is visible without hunting for it. Still a
+  native disclosure: the report stays one file with no script. Refs #171.
+
 ## [0.30.0] - 2026-08-30
 
 ### Changed

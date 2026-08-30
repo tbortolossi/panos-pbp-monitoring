@@ -48,9 +48,9 @@ the exact `raw_response` remains available in a nested section collapsed by
 default. Command status and timing fields are presented as compact metadata,
 the summary separates capture facts, incident state, and peak utilization, and
 its peak metrics are grouped into packet buffers, packet descriptors, and
-system load. Every section folds from its heading — a native disclosure,
-no script — so a section already read can be put away; all open by default
-except the lower-level event metadata, which is collapsed.
+system load. Every section folds from its heading — At a glance included, a
+native disclosure, no script — so a section already read can be put away; all
+open by default except the lower-level event metadata, which is collapsed.
 
 ## At a glance and probable cause
 

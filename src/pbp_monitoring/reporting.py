@@ -1945,6 +1945,8 @@ def _render_section(
     intro: str = "",
     pill: str = "",
     open: bool = True,
+    section_class: str = "",
+    data_level: str = "",
 ) -> str:
     """Wrap a report section in a native disclosure so it can be folded away.
 
@@ -1953,10 +1955,12 @@ def _render_section(
     and the heading keeps its anchor for the navigation bar.
     """
     state = " open" if open else ""
+    class_html = f' class="{section_class}"' if section_class else ""
+    level_html = f' data-level="{data_level}"' if data_level else ""
     pill_html = f'<span class="pill">{pill}</span>' if pill else ""
     intro_html = f'<p class="section-intro">{intro}</p>' if intro else ""
     return (
-        f'<section aria-labelledby="{anchor}">'
+        f'<section{class_html}{level_html} aria-labelledby="{anchor}">'
         f'<details class="section-disclosure section-fold"{state}>'
         f'<summary><h2 id="{anchor}">{title}</h2>{pill_html}</summary>'
         f'<div class="section-body">{intro_html}{body}</div>'
@@ -2951,14 +2955,15 @@ def _render_html(
         facts_html = "".join(
             f"<div><dt>{label}</dt><dd>{value}</dd></div>" for label, value in facts
         )
-        glance_html = (
-            f'<section class="glance" data-level="{severity_state}" '
-            'aria-labelledby="glance-title">'
-            '<h2 id="glance-title">At a glance</h2>'
+        glance_html = _render_section(
+            "glance-title",
+            "At a glance",
             f'<p class="headline"><strong>{_escape(severity_label)}.</strong> '
             f"{_escape(severity_text)}</p>"
             f'<dl class="key-facts">{facts_html}</dl>'
-            f"{probable_cause_html}</section>"
+            f"{probable_cause_html}",
+            section_class="glance",
+            data_level=severity_state,
         )
 
     nav_items = [
@@ -3135,12 +3140,15 @@ def _render_html(
     details.section-fold {{ border:0; background:transparent; overflow:visible; }}
     details.section-fold>summary {{ padding:0; margin:0 0 14px; list-style:none; }}
     details.section-fold>summary::-webkit-details-marker {{ display:none; }}
-    details.section-fold>summary::before {{ content:"▾"; width:18px; color:var(--muted); font-size:15px; transition:transform .15s; }}
+    details.section-fold>summary::before {{ content:"▾"; width:18px; color:var(--accent); font-size:16px; transition:transform .15s; }}
     details.section-fold:not([open])>summary::before {{ transform:rotate(-90deg); }}
     details.section-fold:not([open])>summary {{ padding:12px 16px; border:1px solid var(--line); border-radius:12px; background:#fff; }}
     details.section-fold>summary h2 {{ margin:0; }}
     details.section-fold>.section-body {{ padding:0; border-top:0; }}
     details.section-fold>.section-body>.section-intro {{ margin-top:0; }}
+    details.section-fold>summary:hover h2,
+    details.section-fold>summary:focus-visible h2 {{ color:var(--accent); }}
+    .glance>details.section-fold:not([open])>summary {{ padding:0; margin:0; border:0; background:transparent; }}
     .metadata {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; }}
     .metadata div {{ padding:10px; border-radius:8px; background:var(--soft); }}
     dt {{ color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; }}
