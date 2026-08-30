@@ -59,16 +59,27 @@ accordingly:
    must extend/reinforce the current monitor, not create a polling storm.
 9. Add or update tests for every parser, trigger, or state-machine change.
 10. Update the README and PRD when configuration changes.
-11. Keep changes focused and reviewable. Preserve backward-compatible persisted
+11. Keep the remote-diagnosis path current. A deployment at a customer site is
+    diagnosed only from what the support bundle, the run archives and the
+    replay tool carry, so anything that adds evidence must add it there in the
+    same change: a new PAN-OS command needs an entry in
+    `tools/replay_capture.py`; a new journal, log file or persisted artifact
+    needs to be exported by `write_support_bundle`; a new setting needs to
+    appear in the redacted configuration; and any new identifying value needs
+    to be anonymized. Two tests enforce the first two mechanically and will
+    fail on drift; the rest is on review. Never let a value that identifies the
+    customer's network reach an anonymized export, and never let a credential
+    reach either form.
+12. Keep changes focused and reviewable. Preserve backward-compatible persisted
     data whenever practical, provide explicit migrations for schema changes, and
     do not mix unrelated cleanup into a functional change.
-12. Prefer the Python standard library and existing project patterns. Add a
+13. Prefer the Python standard library and existing project patterns. Add a
     runtime dependency only when its operational or security benefit is clear,
     documented in the PRD, and covered by tests.
-13. Validate untrusted input at the boundary, escape all rendered data, reject
+14. Validate untrusted input at the boundary, escape all rendered data, reject
     redirects and path traversal, use bounded reads/concurrency/retention, and
     fail closed for authentication and authorization decisions.
-14. Keep tests deterministic, independent of external firewalls and public
+15. Keep tests deterministic, independent of external firewalls and public
     networks, and use only anonymized fixtures.
 
 The runtime uses `cryptography` for authenticated secret encryption. Keep other
@@ -107,6 +118,8 @@ firewall whenever possible. Never generate a flood to test this collector.
 - No credentials or real management addresses are committed.
 - Failure paths are logged and do not terminate the syslog listener.
 - Documentation matches observable behavior.
+- New evidence is reachable remotely: exported by the support bundle, or
+  replayable by `tools/replay_capture.py`, as change rule 11 requires.
 - Application-version declarations are synchronized when a bump is required.
 
 ## Development commands
