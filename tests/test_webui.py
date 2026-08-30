@@ -101,6 +101,7 @@ class ArtifactAuthenticationTests(unittest.TestCase):
                 for path in (
                     "/",
                     "/reports/fw/run/report.html",
+                    "/artifacts/fw/run/report.html",
                     "/artifacts/fw/run/incident.jsonl",
                     "/artifacts/fw/run/run.zip",
                     "/artifacts/fw/run/raw",
@@ -171,6 +172,7 @@ class ArtifactAuthenticationTests(unittest.TestCase):
             )
             self.assertIn('href="/artifacts/fw-a/run-1/run.zip"', page)
             self.assertIn('href="/artifacts/fw-a/run-1/run.zip?anonymize=1"', page)
+            self.assertIn('href="/artifacts/fw-a/run-1/report.html"', page)
             self.assertIn("Back to dashboard", page)
             self.assertIn("<h1>Incident report</h1>", page)
             self.assertLess(page.index("pbp-bar"), page.index("<h1>Incident report</h1>"))
@@ -179,6 +181,41 @@ class ArtifactAuthenticationTests(unittest.TestCase):
                 stored,
                 "the stored report must stay free of deployment-local links",
             )
+
+    def test_the_downloaded_report_is_the_stored_file_named_for_its_run(self):
+        """The file sent out of the deployment must work outside of it.
+
+        Saving the served page from the browser would keep the injected bar,
+        whose links resolve only here. The export hands over the stored report
+        byte for byte instead, under a name that identifies the run.
+        """
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            run_dir = root / "data" / "targets" / "fw-a" / "incidents" / "run-1"
+            run_dir.mkdir(parents=True)
+            stored = "<html><body><h1>Incident report</h1></body></html>"
+            (run_dir / "report.html").write_text(stored, encoding="utf-8")
+            server, thread, setup_code = self._server(root)
+            base = f"http://127.0.0.1:{server.server_port}"
+            opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            try:
+                self._sign_in(opener, base, setup_code)
+                download = opener.open(base + "/artifacts/fw-a/run-1/report.html")
+                payload = download.read().decode()
+                with self.assertRaises(HTTPError) as missing:
+                    opener.open(base + "/artifacts/fw-a/run-2/report.html")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+            self.assertEqual(payload, stored)
+            self.assertNotIn("pbp-bar", payload)
+            self.assertNotIn("/artifacts/", payload)
+            self.assertEqual(
+                download.headers["Content-Disposition"],
+                'attachment; filename="pbp-report-fw-a-run-1.html"',
+            )
+            self.assertEqual(missing.exception.code, 404)
 
     def test_only_the_report_page_may_run_a_script_and_only_its_own(self):
         """A report folds its sections; every other page stays script-free.
@@ -336,17 +373,19 @@ class WebUITests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             run_dir = Path(temporary_directory)
             (run_dir / "raw").mkdir()
+            (run_dir / "report.html").write_bytes(b"x" * 2048)
             (run_dir / "incident.jsonl").write_bytes(b"x" * 4096)
             (run_dir / "raw" / "batch-0001.txt").write_text("out", encoding="utf-8")
             (run_dir / "raw" / "batch-0002.txt").write_text("out", encoding="utf-8")
             bar = render_report_evidence_bar("fw-a", "run-1", run_dir)
 
         self.assertIn(">Exports<", bar)
+        self.assertIn('>HTML<span class="pbp-bar-meta">2 KiB</span>', bar)
         self.assertIn('>JSONL<span class="pbp-bar-meta">4 KiB</span>', bar)
         self.assertIn('>TXT<span class="pbp-bar-meta">2 files</span>', bar)
         self.assertIn('>ZIP<span class="pbp-bar-meta">support archive</span>', bar)
         self.assertIn('>ZIP<span class="pbp-bar-meta">anonymized</span>', bar)
-        # The report itself is an export too: the page says how to keep it.
+        # The report itself is an export too, and the bar says how to keep it.
         self.assertIn("print it from the browser", bar)
         self.assertIn('<a class="back" href="/">&larr; Back to dashboard</a>', bar)
 

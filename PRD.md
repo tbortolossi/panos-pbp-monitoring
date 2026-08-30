@@ -173,7 +173,8 @@ than create a concurrent one.
     session outputs. A Web UI displays bounded Syslog reception status and
     read-only artifact links. A report served by the Web UI is shown with an
     evidence bar offering the same run artifacts as the dashboard row, each
-    named by its format and its weight; the bar
+    named by its format and its weight, plus the report itself as a standalone
+    HTML download named for its run; the bar
     is added when the page is served, so the stored file stays standalone and a
     copy sent outside the deployment carries neither dead links nor an offer to
     download a bundle that names the network. The dashboard and every artifact route require
@@ -568,7 +569,9 @@ key must be backed up and restored together.
     to the per-firewall cards.
 54. A completed run's dashboard row opens that run's HTML report wherever it is
     clicked, its **Delete** cell keeping its own action, and the report's
-    evidence bar carries a button back to the dashboard. The run table lists no
+    evidence bar carries a button back to the dashboard and offers the report
+    itself as an HTML download — the stored file, free of the bar, so it opens
+    outside the deployment. The run table lists no
     export of its own: the report page is the single place where a run's
     evidence is chosen. A run with no report to open — an active monitor, or a
     run whose report could not be produced — keeps a plain row and offers the

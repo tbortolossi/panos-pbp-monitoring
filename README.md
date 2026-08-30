@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.32.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.33.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -200,7 +200,9 @@ incidents is visible without opening a single report.
 Clicking a run's row in **Recent runs** opens its report, and every one of
 those artifacts is offered by the evidence bar at the top of that report, which
 names each export by format and by weight and carries the way back to the
-dashboard. A run with no report yet shows a **JSONL** link on its row instead,
+dashboard. The bar also offers the report itself as an **HTML** download: the
+stored standalone file, without the bar, ready to send to someone who has no
+access to this deployment. A run with no report yet shows a **JSONL** link on its row instead,
 for the records collected so far.
 
 Read-only API validation runs, under `api-checks/<run_id>/`, export the same

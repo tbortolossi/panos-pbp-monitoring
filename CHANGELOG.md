@@ -3,6 +3,28 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.33.0] - 2026-08-30
+
+### Added
+
+- **The HTML report is now an export of its own.** The evidence bar of a served
+  report offered the JSONL, the TXT batches and the two support archives, but
+  never the report itself, and `report.html` is deliberately kept out of the
+  archives because it is derived from the JSONL. Sending a report to a
+  colleague or attaching it to a TAC case therefore meant a browser **Save page
+  as**, which keeps the injected bar and its `/artifacts/...` links: the
+  recipient opened a report topped by four buttons that resolve only inside the
+  deployment.
+
+  The bar now leads with **HTML**, named by the file's weight like every other
+  export. It hands over the stored file byte for byte, free of the bar, under a
+  name that identifies the run (`pbp-report-<firewall>-<run_id>.html`) so
+  several reports collected for one case stay distinguishable. The file is
+  self-contained and needs neither Docker nor a network to open. Nothing else
+  changes: the report stays out of the run archive and the support bundle, the
+  JSONL remains the source of truth, and the download requires the
+  administrator session like every other artifact route. Refs #177.
+
 ## [0.32.0] - 2026-08-30
 
 ### Added

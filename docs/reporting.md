@@ -27,18 +27,23 @@ a single **JSONL** link under its status, for the records written so far.
 
 The report opened that way carries an evidence bar above it: a **Back to
 dashboard** button, the firewall and the run the page belongs to, then the
-run's exports, each named by format and by weight — **JSONL** with its size,
-**TXT** with its number of batch files, **ZIP** as the support archive and
-**ZIP** anonymized. The report itself is the fourth format: it is a standalone
-HTML file, so keep it as it is, or print it from the browser to obtain a PDF.
-The bar is where you decide, having read the report, that the case needs its
-raw evidence.
+run's exports, each named by format and by weight — **HTML** with its size,
+**JSONL** with its size, **TXT** with its number of batch files, **ZIP** as the
+support archive and **ZIP** anonymized. The bar is where you decide, having read
+the report, that the case needs its raw evidence.
 
-The bar is added while the page is served. The `report.html` file stored beside
-the capture never contains it, so a report attached to a TAC case stays a single
-standalone file, with no link that only resolves inside your deployment and no
-button offering a support bundle that names your network. The bar is also hidden
-when the page is printed.
+**HTML** downloads the report you are reading, as the single self-contained file
+stored beside the capture. That is the file to attach to a mail or to a TAC
+case: it opens on a workstation that has no access to this deployment, and it
+needs neither Docker nor a network. It is named for the run it documents
+(`pbp-report-<firewall>-<run_id>.html`), so several reports collected for one
+case stay distinguishable. Print it from the browser to obtain a PDF instead.
+
+Do not use the browser's own **Save page as** for this: the bar is added while
+the page is served, and a manual save would keep it, together with links that
+resolve only inside your deployment. The `report.html` file stored beside the
+capture never contains the bar, which is exactly what the **HTML** export hands
+over. The bar is also hidden when the page is printed.
 
 ## Layout and conventions
 
