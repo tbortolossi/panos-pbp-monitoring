@@ -125,15 +125,23 @@ administrator password](images/admin-setup.png)
 > serial shown is real.
 
 
-Open `https://<docker-host>:8088/admin` and create a
-password of at least 8 characters. The password is stored as a salted PBKDF2
-verifier; the plaintext password is never stored.
+Open `https://<docker-host>:8088` and create a
+password of at least 8 characters. Any address of the service answers with the
+authentication page as long as no session is open. The password is stored as a
+salted PBKDF2 verifier; the plaintext password is never stored.
 
-An authenticated administrator can later change it in the configuration page.
-The current password is required and all active administrator sessions are
-invalidated after the change.
+The setup code already proved you operate this host, so creating the password
+opens the session and the configuration page directly: the first run continues
+into the recovery key below and the first firewall in section 3, without
+authenticating twice. Afterwards, signing in opens the dashboard, unless the
+recovery key is still unacknowledged or no firewall is declared yet, in which
+case it opens the configuration page where the installation is finished.
 
-After the first authenticated sign-in, the admin page displays the installation
+An authenticated administrator can later change the password in the
+configuration page. The current password is required and all active
+administrator sessions are invalidated after the change.
+
+The configuration page that follows setup displays the installation
 recovery key. Save it in a password manager or offline vault, then acknowledge
 the backup in the page. It remains visible until acknowledgement and is not
 rendered again afterwards. A CSV download is available before acknowledgement.

@@ -13,7 +13,12 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import urlencode
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+from urllib.request import (
+    HTTPCookieProcessor,
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+)
 
 from pbp_monitoring.adminui import (
     AdminController,
@@ -105,7 +110,7 @@ def signed_in_admin(root: Path):
     try:
         setup = opener.open(base + "/admin").read().decode()
         csrf = re.search(r'name="csrf" value="([^"]+)"', setup).group(1)
-        login = opener.open(
+        page = opener.open(
             Request(
                 base + "/admin/setup",
                 data=urlencode(
@@ -116,13 +121,6 @@ def signed_in_admin(root: Path):
                         "confirm": "long-test-password",
                     }
                 ).encode(),
-            )
-        ).read().decode()
-        csrf = re.search(r'name="csrf" value="([^"]+)"', login).group(1)
-        page = opener.open(
-            Request(
-                base + "/admin/login",
-                data=urlencode({"csrf": csrf, "password": "long-test-password"}).encode(),
             )
         ).read().decode()
         yield opener, base, re.search(r'name="csrf" value="([^"]+)"', page).group(1), page
@@ -160,13 +158,8 @@ class AdminUITests(unittest.TestCase):
                         "confirm": "long-test-password",
                     }
                 ).encode()
-                login = opener.open(Request(base + "/admin/setup", data=setup_body)).read().decode()
-                self.assertIn("Administrator sign in", login)
-                login_csrf = re.search(r'name="csrf" value="([^"]+)"', login).group(1)
-                login_body = urlencode(
-                    {"csrf": login_csrf, "password": "long-test-password"}
-                ).encode()
-                page = opener.open(Request(base + "/admin/login", data=login_body)).read().decode()
+                page = opener.open(Request(base + "/admin/setup", data=setup_body)).read().decode()
+                self.assertIn("Configuration", page)
                 self.assertIn("Collector settings", page)
                 self.assertIn("Incident idle TTL seconds", page)
                 self.assertIn("Generate HTML report", page)
@@ -266,7 +259,8 @@ class AdminUITests(unittest.TestCase):
                         ).encode(),
                     )
                 ).read().decode()
-                self.assertIn("Administrator sign in", accepted)
+                self.assertIn("Save the installation recovery key", accepted)
+                self.assertIn("Add a firewall", accepted)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -291,7 +285,7 @@ class AdminUITests(unittest.TestCase):
             try:
                 setup = opener.open(base + "/admin").read().decode()
                 csrf = re.search(r'name="csrf" value="([^"]+)"', setup).group(1)
-                login = opener.open(
+                page = opener.open(
                     Request(
                         base + "/admin/setup",
                         data=urlencode(
@@ -304,6 +298,14 @@ class AdminUITests(unittest.TestCase):
                         ).encode(),
                     )
                 ).read().decode()
+                session_csrf = re.search(r'name="csrf" value="([^"]+)"', page).group(1)
+                login = opener.open(
+                    Request(
+                        base + "/admin/logout",
+                        data=urlencode({"csrf": session_csrf}).encode(),
+                    )
+                ).read().decode()
+                self.assertIn("Administrator sign in", login)
                 login_csrf = re.search(r'name="csrf" value="([^"]+)"', login).group(1)
                 for _ in range(5):
                     with self.assertRaises(HTTPError) as context:
@@ -904,3 +906,151 @@ class SupportBundleUITests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Expose the redirect itself instead of following it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class SignInLandingTests(unittest.TestCase):
+    """Where an administrator session lands, and what the first run walks through."""
+
+    @contextlib.contextmanager
+    def _server(self, root: Path):
+        with capture_setup_code() as catcher:
+            server = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                handler_factory(root / "data", 300, root / "config" / "config.db"),
+            )
+        thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": SERVER_POLL_INTERVAL},
+            daemon=True,
+        )
+        thread.start()
+        opener = build_opener(
+            HTTPCookieProcessor(http.cookiejar.CookieJar()), _NoRedirect()
+        )
+        try:
+            yield opener, f"http://127.0.0.1:{server.server_port}", catcher.code
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    @staticmethod
+    def _csrf(page: str) -> str:
+        return re.search(r'name="csrf" value="([^"]+)"', page).group(1)
+
+    def _post(self, opener, url: str, form: dict) -> tuple[int, str]:
+        """Submit a form and report the status and the Location header."""
+        try:
+            response = opener.open(Request(url, data=urlencode(form).encode()))
+        except HTTPError as error:
+            return error.code, error.headers.get("Location", "")
+        return response.status, response.headers.get("Location", "")
+
+    def _create_administrator(self, opener, base: str, setup_code: str) -> tuple[int, str]:
+        setup = opener.open(base + "/admin").read().decode()
+        self.assertIn("Secure initial setup", setup)
+        return self._post(
+            opener,
+            base + "/admin/setup",
+            {
+                "csrf": self._csrf(setup),
+                "setup_code": setup_code,
+                "password": "long-test-password",
+                "confirm": "long-test-password",
+            },
+        )
+
+    def _sign_in(self, opener, base: str) -> tuple[int, str]:
+        login = opener.open(base + "/admin").read().decode()
+        self.assertIn("Administrator sign in", login)
+        return self._post(
+            opener,
+            base + "/admin/login",
+            {"csrf": self._csrf(login), "password": "long-test-password"},
+        )
+
+    def test_creating_the_administrator_opens_the_configuration_without_signing_in_again(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with self._server(root) as (opener, base, setup_code):
+                status, location = self._create_administrator(opener, base, setup_code)
+                self.assertEqual(status, 303)
+                self.assertEqual(location, "/admin")
+                page = opener.open(base + "/admin").read().decode()
+                self.assertIn("Save the installation recovery key", page)
+                self.assertIn("Add a firewall", page)
+
+    def test_an_installation_without_a_firewall_signs_in_on_the_configuration_page(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with self._server(root) as (opener, base, setup_code):
+                self._create_administrator(opener, base, setup_code)
+                page = opener.open(base + "/admin").read().decode()
+                csrf = self._csrf(page)
+                self._post(opener, base + "/admin/recovery-key/ack", {"csrf": csrf})
+                self._post(opener, base + "/admin/logout", {"csrf": csrf})
+                # The recovery key is saved, but no firewall forwards its logs
+                # yet: the dashboard would have nothing to show.
+                self.assertEqual(self._sign_in(opener, base), (303, "/admin"))
+
+    def test_an_unacknowledged_recovery_key_keeps_sign_in_on_the_configuration_page(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with self._server(root) as (opener, base, setup_code):
+                self._create_administrator(opener, base, setup_code)
+                page = opener.open(base + "/admin").read().decode()
+                self._post(opener, base + "/admin/logout", {"csrf": self._csrf(page)})
+                store = ConfigStore(root / "config" / "config.db")
+                store.save_target(
+                    name="lab-fw-01",
+                    panos_url="https://192.0.2.10",
+                    api_key="test-api-key",
+                    target_serial=None,
+                    serials=["001122334455"],
+                    syslog_sources=["192.0.2.10"],
+                    tls_verify="false",
+                )
+                self.assertEqual(self._sign_in(opener, base), (303, "/admin"))
+
+    def test_a_configured_installation_signs_in_on_the_dashboard(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with self._server(root) as (opener, base, setup_code):
+                self._create_administrator(opener, base, setup_code)
+                page = opener.open(base + "/admin").read().decode()
+                csrf = self._csrf(page)
+                self._post(opener, base + "/admin/recovery-key/ack", {"csrf": csrf})
+                self._post(opener, base + "/admin/logout", {"csrf": csrf})
+                store = ConfigStore(root / "config" / "config.db")
+                store.save_target(
+                    name="lab-fw-01",
+                    panos_url="https://192.0.2.10",
+                    api_key="test-api-key",
+                    target_serial=None,
+                    serials=["001122334455"],
+                    syslog_sources=["192.0.2.10"],
+                    tls_verify="false",
+                )
+                self.assertEqual(self._sign_in(opener, base), (303, "/"))
+                dashboard = opener.open(base + "/").read().decode()
+                self.assertIn("PBP Monitoring", dashboard)
+
+    def test_the_authentication_forms_redirect_an_established_session(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with self._server(root) as (opener, base, setup_code):
+                self._create_administrator(opener, base, setup_code)
+                for path in ("/admin/login", "/admin/setup"):
+                    with self.assertRaises(HTTPError) as context:
+                        opener.open(base + path)
+                    self.assertEqual(context.exception.code, 303, path)
+                    self.assertEqual(
+                        context.exception.headers["Location"], "/admin", path
+                    )

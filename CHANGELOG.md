@@ -3,6 +3,25 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.29.0] - 2026-08-30
+
+### Changed
+
+- **Signing in opens the dashboard, and the first run is one flow.** Reaching
+  the collector still asks for the administrator password, but a successful
+  sign-in now opens the dashboard, the page an operator watches day to day,
+  instead of always landing on the configuration page. An installation that is
+  not finished opens the configuration page instead — the installation recovery
+  key has not been acknowledged, or no firewall is declared yet — because the
+  dashboard has nothing to show until a firewall forwards its logs. Creating
+  the administrator with the one-time setup code now opens the session
+  directly, so the first run continues into the recovery key and the first
+  firewall without typing the password a second time; the setup code is still
+  required, and it is still the only thing that authorizes that first
+  administrator. Reaching the sign-in or setup form with a live session
+  redirects to the page that session belongs on. Web UI routing only:
+  collection, the firewall and the persisted data are untouched. Refs #167.
+
 ## [0.28.0] - 2026-08-30
 
 ### Changed

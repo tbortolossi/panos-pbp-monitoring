@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.28.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.29.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -75,9 +75,11 @@ docker compose ps                       # the three services must be healthy
 docker compose logs webui | grep "setup code"
 ```
 
-Open `https://<docker-host>:8088/admin`, enter the one-time setup code from the
-log, create the administrator password, then add a firewall and paste the
-generated PAN-OS Syslog configuration into the firewall. The full sequence,
+Open `https://<docker-host>:8088`, enter the one-time setup code from the log
+and create the administrator password. That signs you in and opens the
+configuration page: save the installation recovery key, add a firewall, and
+paste the generated PAN-OS Syslog configuration into the firewall. Once a
+firewall is declared, signing in opens the dashboard. The full sequence,
 including PAN-OS forwarding profiles and host firewall rules, is in
 [docs/installation.md](docs/installation.md).
 
