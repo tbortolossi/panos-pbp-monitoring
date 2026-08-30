@@ -195,7 +195,14 @@ def _safe_webhook(value: str) -> dict[str, Any]:
 
 
 def redacted_configuration(store: Any) -> dict[str, Any]:
-    """Return every setting that shapes behaviour, and no secret material."""
+    """Return every setting that shapes behaviour, and no secret material.
+
+    Nothing derived from the administrator password state is reported here, not
+    even whether one exists. Whether setup was completed is already legible in
+    the dashboard log, which serves the setup page instead of the sign-in page,
+    so the bundle loses no diagnostic value by keeping password state out of an
+    artifact that leaves the site.
+    """
     if store is None:
         return {"available": False}
     try:
@@ -204,7 +211,6 @@ def redacted_configuration(store: Any) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "available": True,
             "revision": store.revision(),
-            "setup_completed": store.has_admin_password(),
             "recovery_key_acknowledged": store.recovery_key_acknowledged(),
             "settings": {
                 key: value
