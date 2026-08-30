@@ -125,6 +125,13 @@ docker compose cp \
   ./incident-export
 ```
 
+![The TXT export index of one run, listing the startup and batch files with
+their sizes](images/text-exports.png)
+
+> Every screenshot in this repository is generated from a fictitious
+> incident by `tools/generate_demo_stack.py`. No firewall, address, or
+> serial shown is real.
+
 ## Backup and recovery
 
 Back up `config.db` and `master.key` together. A database without its matching

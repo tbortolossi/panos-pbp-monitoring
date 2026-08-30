@@ -8,6 +8,14 @@ the JSONL capture it was built from.
 Related pages: [Installation](installation.md) · [Operations](operations.md) ·
 [Troubleshooting](troubleshooting.md) · [Back to the README](../README.md)
 
+![A complete incident report, from the at-a-glance block through offender
+attribution, pressure over time, dataplane CPU tracking, the timeline and the
+raw batch details](images/incident-report.png)
+
+> Every screenshot in this repository is generated from a fictitious
+> incident by `tools/generate_demo_stack.py`. No firewall, address, or
+> serial shown is real.
+
 ## Layout and conventions
 
 Reports contain a bounded two-axis timeline with sticky headers and batch

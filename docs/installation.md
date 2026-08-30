@@ -115,6 +115,16 @@ be supplied; otherwise startup fails closed.
 
 ## 2. Create the administrator
 
+![The first-run setup screen asking for the one-time setup code and a new
+administrator password](images/admin-setup.png)
+
+![The administrator sign-in page](images/admin-sign-in.png)
+
+> Every screenshot in this repository is generated from a fictitious
+> incident by `tools/generate_demo_stack.py`. No firewall, address, or
+> serial shown is real.
+
+
 Open `https://<docker-host>:8088/admin` and create a
 password of at least 8 characters. The password is stored as a salted PBKDF2
 verifier; the plaintext password is never stored.
@@ -134,6 +144,10 @@ recovery key and `config.db` can decrypt the PAN-OS API keys, so treat it as a
 privileged credential.
 
 ## 3. Add a firewall
+
+![The configuration page listing the saved firewall with its device, serial and
+last check, above the add-a-firewall form](images/admin-configuration.png)
+
 
 In **Admin > Firewalls**, enter:
 
@@ -156,6 +170,9 @@ version are shown in the **Device** column of the firewall list, so none of them
 is typed by hand. The firewall must be reachable when the entry is saved: an
 unreachable address, an untrusted certificate, or a rejected key is reported and
 nothing is written.
+
+![The firewall form reopened on a saved entry, showing the authentication
+method and the TLS verification warning](images/admin-firewall-form.png)
 
 ### Keeping a saved firewall verified
 

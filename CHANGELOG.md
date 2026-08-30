@@ -3,6 +3,27 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.17.0] - 2026-08-30
+
+### Added
+
+- Documentation screenshots are generated from a fictitious deployment
+  instead of the lab stack. `tools/generate_demo_stack.py` writes an
+  anonymized incident, seeds a throwaway configuration store, starts the
+  real web server on the loopback interface, signs in, and captures every
+  page it serves with a headless Chromium: the first-run setup and sign-in
+  screens, the dashboard, the configuration page, the firewall form, the
+  TXT export index, and the generated HTML incident report.
+- The seven captures live in `docs/images/` and are referenced from the
+  README and the operator documentation.
+
+### Changed
+
+- Nothing in the collector itself. The tool contacts no firewall, issues no
+  operational command, and adds no runtime dependency: Chromium is invoked
+  as an external binary, and `--check` builds and verifies every page
+  without rendering, which is what CI runs.
+
 ## [0.16.0] - 2026-08-29
 
 ### Changed
