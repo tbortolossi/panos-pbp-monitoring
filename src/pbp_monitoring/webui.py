@@ -456,8 +456,11 @@ td:first-child strong,td:first-child code{{display:block}}td:first-child code{{m
 <div class="table-wrap"><table><thead><tr><th>Batch</th><th>Execution time (UTC)</th><th>Firewall time</th><th>Duration (s)</th><th>Size</th><th>Actions</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div></main></body></html>"""
 
 
-REPORT_ANNOTATION_MAX_BYTES = 8 * 1024 * 1024
-_BODY_TAG = re.compile(r"<body[^>]*>", re.IGNORECASE)
+#: How much of a report is read to find its opening body tag. The evidence bar
+#: is inserted in that chunk and the remainder of the file is streamed, so a
+#: report of any size keeps its exports without ever being held in memory.
+REPORT_HEAD_BYTES = 1024 * 1024
+_BODY_TAG = re.compile(rb"<body[^>]*>", re.IGNORECASE)
 
 
 def _human_size(size_bytes: int) -> str:
@@ -572,12 +575,19 @@ def render_report_evidence_bar(target: str, run_id: str, run_dir: Path) -> str:
     )
 
 
-def annotate_report(html_text: str, evidence_bar: str) -> str:
-    """Insert the evidence bar just after the report's opening body tag."""
-    match = _BODY_TAG.search(html_text)
+def annotate_report_head(head: bytes, evidence_bar: str) -> bytes | None:
+    """Insert the evidence bar just after the report's opening body tag.
+
+    Only the opening chunk of the report is taken, and bytes are searched
+    rather than decoded text: an incident report is as large as the evidence
+    it carries, and the exports must not depend on the whole file fitting in
+    memory. `None` says the chunk carries no body tag, and the report is then
+    served unchanged, because the evidence matters more than the bar.
+    """
+    match = _BODY_TAG.search(head)
     if match is None:
-        return html_text
-    return html_text[: match.end()] + evidence_bar + html_text[match.end() :]
+        return None
+    return head[: match.end()] + evidence_bar.encode("utf-8") + head[match.end() :]
 
 
 def _target_roots(data_dir: Path) -> list[tuple[str, Path]]:
@@ -1251,23 +1261,36 @@ def handler_factory(
         def _serve_report(self, run_dir: Path, target: str, run_id: str) -> None:
             """Serve a stored report with the run's evidence links added.
 
-            A report that cannot be read as text, or one large enough that
-            holding it in memory would be unreasonable, is streamed unchanged
-            rather than withheld: the report matters more than the bar.
+            The bar goes into the opening chunk and the rest of the report is
+            streamed from disk, so the run of a real packet-buffer incident,
+            whose report weighs tens of megabytes, still offers its JSONL, its
+            TXT batches and its support archive. A report that carries no body
+            tag is streamed unchanged rather than withheld.
             """
             report = run_dir / "report.html"
             try:
-                if report.stat().st_size > REPORT_ANNOTATION_MAX_BYTES:
-                    raise ValueError("report too large to annotate")
-                html_text = report.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError, ValueError):
+                with report.open("rb") as handle:
+                    size = os.fstat(handle.fileno()).st_size
+                    head = handle.read(REPORT_HEAD_BYTES)
+                    annotated = annotate_report_head(
+                        head,
+                        render_report_evidence_bar(target, run_id, run_dir),
+                    )
+                    if annotated is None:
+                        self._serve_file(report, "text/html; charset=utf-8")
+                        return
+                    self._headers(
+                        200,
+                        "text/html; charset=utf-8",
+                        size + len(annotated) - len(head),
+                    )
+                    if self.command == "HEAD":
+                        return
+                    self.wfile.write(annotated)
+                    while chunk := handle.read(1024 * 1024):
+                        self.wfile.write(chunk)
+            except OSError:
                 self._serve_file(report, "text/html; charset=utf-8")
-                return
-            page = annotate_report(
-                html_text,
-                render_report_evidence_bar(target, run_id, run_dir),
-            )
-            self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
 
         def _serve_run_archive(
             self,

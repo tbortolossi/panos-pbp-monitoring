@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.31.1] - 2026-08-30
+
+### Fixed
+
+- **A heavy incident report keeps its exports.** The Exports bar the Web UI adds
+  above a served report was dropped for any `report.html` larger than 8 MiB,
+  which is every report of a real collection: the page was streamed unannotated.
+  Since 0.30.0 removed the **Artifacts** column, and the runs table offers a
+  **JSONL** link only for a run that has no report, such a run had no way at all
+  to reach its JSONL, its TXT batches or its support archive from the Web UI —
+  exactly the long incidents whose evidence a TAC case needs. The bar is now
+  inserted into the report's opening chunk and the rest of the file is streamed
+  from disk, so the size limit is gone and memory use stays bounded whatever the
+  report weighs. A report carrying no `<body>` tag is still served unchanged.
+  Web UI presentation only: the stored `report.html` is never modified, the
+  firewall and the persisted data are untouched. Refs #173.
+
 ## [0.31.0] - 2026-08-30
 
 ### Changed
