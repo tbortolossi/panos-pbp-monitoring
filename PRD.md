@@ -545,6 +545,12 @@ key must be backed up and restored together.
     parsers offline, reporting which command a parser fails on, so a customer
     archive becomes a fixture and a regression test without access to the
     firewall it came from.
+53. The dashboard's received-log table names the firewall each message is
+    attributed to and can be filtered to one declared firewall, or to the
+    messages no firewall claims, so a refused sender is diagnosed without
+    reading past the ordinary traffic of the other firewalls. The filter is
+    carried by the URL, so it survives the page refresh, and it never applies to
+    the global reception state or to the per-firewall cards.
 
 ## 12. Possible enhancements
 
