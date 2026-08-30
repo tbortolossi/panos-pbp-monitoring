@@ -3770,6 +3770,47 @@ class MonitorController:
             },
         )
 
+    async def _reread_pbp_settings(
+        self,
+        output_file: Path,
+        run_id: str,
+        startup_settings: dict[str, Any],
+    ) -> None:
+        """Read the PBP settings again at stop and record whether they moved.
+
+        A monitor that starts while a commit is in progress reads the running
+        configuration before the commit lands, while the dataplane already
+        applies the new thresholds: the startup read then contradicts the
+        observed mitigation. A second read at stop, one call, settles it.
+        """
+        _, payload = await self._collect_command("pbp_settings", PBP_SETTINGS_COMMAND)
+        settings = extract_pbp_settings(command_result(payload))
+        compared = [key for _, key in _PBP_SETTING_FIELDS] + ["enabled"]
+        changed = (
+            settings.get("status") == "parsed"
+            and startup_settings.get("status") == "parsed"
+            and any(settings.get(key) != startup_settings.get(key) for key in compared)
+        )
+        if changed:
+            LOG.warning(
+                "PBP settings of %s changed during monitor %s: a commit was in "
+                "progress; the report uses the values read at stop",
+                self.cfg.target_name or self.cfg.panos_url,
+                run_id,
+            )
+        append_jsonl(
+            output_file,
+            {
+                "timestamp": utc_now(),
+                "run_id": run_id,
+                "event": "pbp_settings_reread",
+                "target_name": self.cfg.target_name,
+                "pbp_settings": settings,
+                "changed_since_start": bool(changed),
+                "commands": {"pbp_settings": payload},
+            },
+        )
+
     async def _collect_pbp_threat_logs(
         self,
         output_file: Path,
@@ -3903,6 +3944,7 @@ class MonitorController:
             )
         )
         first_firewall_clock: str | None = None
+        startup_pbp_settings: dict[str, Any] = {}
         session_rate_samples: dict[str, dict[str, Any]] = {}
         large_session_samples: dict[str, dict[str, Any]] = {}
         offender_sources: dict[str, int] = {}
@@ -3934,6 +3976,9 @@ class MonitorController:
                         startup_warnings.append(
                             "dataplane core function groups could not be read"
                         )
+                    startup_pbp_settings = extract_pbp_settings(
+                        command_result(pbp_settings_payload)
+                    )
                     startup_record = {
                         "timestamp": started_at,
                         "collector_version": __version__,
@@ -3945,9 +3990,7 @@ class MonitorController:
                         "parse_warnings": startup_warnings,
                         "dp_core_functions": core_functions,
                         "dp_core_functions_source": core_functions_source,
-                        "pbp_settings": extract_pbp_settings(
-                            command_result(pbp_settings_payload)
-                        ),
+                        "pbp_settings": startup_pbp_settings,
                         "commands": {
                             "system_info": system_info,
                             "pbp_settings": pbp_settings_payload,
@@ -4211,6 +4254,12 @@ class MonitorController:
                     )
                 except Exception:
                     LOG.exception("PBP threat log lookup failed for %s", run_id)
+                try:
+                    await self._reread_pbp_settings(
+                        output_file, run_id, startup_pbp_settings
+                    )
+                except Exception:
+                    LOG.exception("PBP settings re-read failed for %s", run_id)
             try:
                 append_jsonl(
                     output_file,

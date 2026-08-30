@@ -636,7 +636,13 @@ key must be backed up and restored together.
     thresholds: latency at or above the activate threshold with low buffers is
     the latency case, stated differently for a firewall running latency-based
     PBP and for one running buffer-based PBP that does not see it; a disabled
-    measurement is stated. The PBP threat logs of the incident window are
+    measurement is stated. The PBP settings are read a second time at stop and
+    the record says whether they moved: a monitor started while a commit is
+    landing reads the old configuration while the dataplane already applies
+    the new thresholds, so the read at stop wins when it differs, and when PBP
+    was seen mitigating below the activate threshold read, the diagnosis
+    states that the read was taken during a commit and does not quote it as
+    the threshold in force. The PBP threat logs of the incident window are
     queried once at stop and feed step 2: they confirm the entries marked for
     RED, name the sources placed in the block table (8509) and the sessions
     discarded (8508), and designate on their own when no batch caught a RED

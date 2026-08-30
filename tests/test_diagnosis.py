@@ -356,6 +356,39 @@ class CapturedEvidenceTests(unittest.TestCase):
         self.assertIn("alert 1% and activate 2%, read from the running configuration", pressure["facts"][-1][1])
         self.assertIn("alert 1% / activate 2% thresholds configured on the firewall", diagnosis["conclusion"][1])
 
+    def test_a_read_taken_during_a_commit_is_contradicted_by_the_mitigation(self):
+        """The lab case of 2026-08-30: monitor started mid-commit, config read
+        said 50/80 while PBP was already mitigating at 4%."""
+        diagnosis = _diagnose(
+            [_cycle(1, 4.4, pbp_status={"enabled": True, "active": True, "congestion_percentage": 4.3})],
+            [self._started(alert_percent=50.0, activate_percent=80.0),
+             {"event": "trigger_received", "message": "(alert threshold is 1%)."}],
+        )
+        context = diagnosis["context"]
+        thresholds = diagnosis["steps"][0]["facts"][-1][1]
+
+        self.assertEqual(context["alert_source"], "inconsistent")
+        self.assertEqual(context["alert_percent"], 1.0)
+        self.assertIn("yet PBP was mitigating at 4.3%, which it cannot do below its activate threshold", thresholds)
+        self.assertIn("while a commit was landing", thresholds)
+        self.assertIn("congestion log says alert 1%", thresholds)
+        self.assertNotIn("configured at 80%", diagnosis["steps"][0]["verdict"])
+        self.assertIn("a commit was landing when the monitor started", diagnosis["conclusion"][1])
+
+    def test_the_read_at_stop_wins_when_the_settings_changed(self):
+        reread = {"event": "pbp_settings_reread", "changed_since_start": True,
+                  "pbp_settings": {"status": "parsed", "enabled": True, "alert_percent": 1.0, "activate_percent": 2.0}}
+        diagnosis = _diagnose(
+            [_cycle(1, 4.4, pbp_status={"enabled": True, "active": True, "congestion_percentage": 4.3})],
+            [self._started(alert_percent=50.0, activate_percent=80.0), reread],
+        )
+        context = diagnosis["context"]
+
+        self.assertEqual(context["alert_source"], "configuration")
+        self.assertEqual(context["activate_percent"], 2.0)
+        self.assertTrue(context["settings_changed_during_run"])
+        self.assertIn("a commit landed during the incident", diagnosis["steps"][0]["facts"][-1][1])
+
     def test_latency_above_the_activate_threshold_is_the_latency_case(self):
         cycles = [
             _cycle(1, 12.0, buffer_latency={"status": "parsed", "peak_ms": 260.0, "latest_ms": 240.0, "dataplanes": []}),

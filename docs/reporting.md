@@ -88,7 +88,11 @@ on-chip packet-descriptor peak on a Cavium chassis (an x86 platform never
 returns that pool, and the report says so instead of showing "Not collected"),
 the packet-descriptor and SW-tag peaks, the buffer latency peak, and the
 thresholds. The alert and activate thresholds come from the PBP settings read
-from the running configuration at monitor start; when a capture predates that
+from the running configuration at monitor start and again at stop — the read
+at stop wins when a commit landed during the incident, and a start read that
+PBP's own mitigation contradicts (mitigating below the activate threshold it
+reports, which happens when the monitor starts mid-commit) is named as such
+rather than quoted; when a capture predates that
 read, the alert threshold is taken from the firewall's own congestion log
 (`alert threshold is N%`) if a trigger carried it, and the lowest utilization
 at which PBP was seen mitigating bounds the activate threshold. The buffer
