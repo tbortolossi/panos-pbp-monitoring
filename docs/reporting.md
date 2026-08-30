@@ -69,9 +69,13 @@ The **Denied and dropped traffic** section aggregates the `drop` severity global
 counters returned by `show counter global filter delta yes` over the whole
 capture, with the total packet count, the peak per-second rate, and the number
 of batches each counter appeared in. Counters are grouped by their PAN-OS aspect
-and name prefix — policy deny, DoS or zone protection, forwarding, parse,
-resource exhaustion — so a counter renamed or added by a later PAN-OS release is
-still classified instead of being dropped from the report. A batch whose delta
+and name prefix — policy deny, DoS or zone protection, PBP RED drops,
+forwarding, parse, resource exhaustion — so a counter renamed or added by a
+later PAN-OS release is still classified instead of being dropped from the
+report. The `flow_dos_pbp_*` counters are packet buffer protection's own RED
+drops: they measure the mitigation, not traffic refused before session setup,
+so they form their own family and are reported in the verdict without being
+added to the denied total. A batch whose delta
 baseline was untrusted is excluded from the totals, because its sampling window
 is unknown, and the report says how many batches were counted and excluded.
 

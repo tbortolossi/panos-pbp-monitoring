@@ -1364,6 +1364,10 @@ def _drop_counter_family(counter: dict[str, Any]) -> tuple[str, str]:
     aspect = str(counter.get("aspect") or "")
     if name.startswith("flow_policy_"):
         return "policy", "Policy deny"
+    if name.startswith("flow_dos_pbp_"):
+        # Packet buffer protection's own RED drops: what PBP discarded during
+        # the incident, not traffic refused before session setup.
+        return "pbp", "PBP RED drops"
     if aspect == "dos" or name.startswith("flow_dos_"):
         return "dos", "DoS / zone protection"
     if aspect == "forward" or name.startswith("flow_fwd_"):
@@ -1472,6 +1476,14 @@ def _drop_counter_verdict(
     """Classify the denied-traffic evidence and word its verdict."""
     policy_total = summary["family_totals"].get("policy", 0.0)
     dos_total = summary["family_totals"].get("dos", 0.0)
+    pbp_total = summary["family_totals"].get("pbp", 0.0)
+    pbp_text = (
+        f" PBP itself discarded {_format_number(pbp_total)} packets by RED "
+        "(<code>flow_dos_pbp_*</code> counters); those are the mitigation, not "
+        "denied traffic, and are not counted above."
+        if pbp_total > 0
+        else ""
+    )
     source_ips = _unenriched_source_ips(attribution)
     if summary["denied_total"] > 0 and source_ips:
         return (
@@ -1483,7 +1495,7 @@ def _drop_counter_verdict(
             "That combination is consistent with a UDP or GRE flood denied by a "
             "Security policy rule: denied traffic never creates a session, so PAN-OS "
             "can attribute the buffer pressure to a source IP only and no "
-            "<code>show session id</code> can enrich it.",
+            f"<code>show session id</code> can enrich it.{pbp_text}",
         )
     if summary["denied_total"] > 0:
         return (
@@ -1491,14 +1503,15 @@ def _drop_counter_verdict(
             f"{_format_number(summary['denied_total'])} packets were dropped before "
             f"session setup (policy deny {_format_number(policy_total)}, DoS or zone "
             f"protection {_format_number(dos_total)}), and sessions were also ranked. "
-            "Both denied and permitted traffic contributed to the observed pressure.",
+            "Both denied and permitted traffic contributed to the observed "
+            f"pressure.{pbp_text}",
         )
     return (
         "collective",
         "No packet was denied by a Security policy rule, by DoS protection, or by "
         "zone protection during the counted batches. The drops below happened "
         "after session setup or outside policy evaluation, so the offender "
-        "attribution table stays the primary evidence.",
+        f"attribution table stays the primary evidence.{pbp_text}",
     )
 
 
