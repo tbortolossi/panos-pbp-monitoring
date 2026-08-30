@@ -83,7 +83,8 @@ Each incident contains:
   explains its own CPU charts;
 - `raw/batch-NNNN.txt`: human-readable export for every batch.
 
-The dashboard's **ZIP support** action downloads the complete run as one
+The dashboard's **ZIP support** action — also offered by the evidence bar at
+the top of the report itself — downloads the complete run as one
 compressed archive. It includes the JSONL, HTML and TXT evidence plus a
 `manifest.json` containing the application version, file sizes, and SHA-256
 digests for transfer to another workstation or a support case. It also contains:

@@ -3,6 +3,20 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.26.0] - 2026-08-30
+
+### Added
+
+- **Evidence bar on the report page.** A report opened from the dashboard is
+  served with a bar above it: back to the dashboard, then the run's **JSONL**,
+  **TXT**, **ZIP support** and **ZIP anonymized**, exactly what the **Recent
+  runs** row offers. Deciding, at the end of the report, that a case needs its
+  raw evidence no longer means navigating back and finding the row again. The
+  bar is added while the page is served and is hidden when it is printed: the
+  stored `report.html` stays a standalone file, so a copy attached to a TAC case
+  carries no link that resolves only inside the deployment and no button
+  offering a bundle that names the customer's network. Refs #149.
+
 ## [0.25.0] - 2026-08-30
 
 ### Added
