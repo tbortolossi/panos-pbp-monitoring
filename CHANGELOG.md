@@ -3,7 +3,21 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
-## [0.24.1] - 2026-08-30
+## [0.25.0] - 2026-08-30
+
+### Added
+
+- **Received logs filtered per firewall.** Every row of the dashboard's
+  reception table now names the firewall the message is attributed to, and a
+  chip row filters the table to one declared firewall, or to what none of them
+  claims. The **Unattributed** chip, with its count, is the commissioning view:
+  a message refused because its source address or its device serial is not
+  registered appears on no firewall card, and was previously buried in the
+  common list. Filtering happens on the server, through a `?firewall=` link, so
+  it survives the page's own refresh; an unknown value falls back to the
+  unfiltered table. The filter is a view over the table only — global freshness
+  and the per-firewall cards keep reading the whole journal, so a filtered
+  dashboard cannot hide a reception outage.
 
 ### Fixed
 
@@ -19,20 +33,6 @@ follows [Semantic Versioning](https://semver.org/).
   same `candidate_session_ids` are rendered.
 
 ## [0.24.0] - 2026-08-30
-
-### Added
-
-- **Received logs filtered per firewall.** Every row of the dashboard's
-  reception table now names the firewall the message is attributed to, and a
-  chip row filters the table to one declared firewall, or to what none of them
-  claims. The **Unattributed** chip, with its count, is the commissioning view:
-  a message refused because its source address or its device serial is not
-  registered appears on no firewall card, and was previously buried in the
-  common list. Filtering happens on the server, through a `?firewall=` link, so
-  it survives the page's own refresh; an unknown value falls back to the
-  unfiltered table. The filter is a view over the table only — global freshness
-  and the per-firewall cards keep reading the whole journal, so a filtered
-  dashboard cannot hide a reception outage.
 
 ### Changed
 
