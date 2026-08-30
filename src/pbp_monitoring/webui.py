@@ -21,6 +21,7 @@ from typing import Any, Sequence
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__, diagnostics
+from .reporting import REPORT_SCRIPT_CSP_HASH
 from .adminui import AdminController
 from .config_store import ALL_RUNS, DEFAULT_SETTINGS, TARGET_NAME, ConfigStore
 from .web_tls import ensure_self_signed_certificate
@@ -460,6 +461,9 @@ td:first-child strong,td:first-child code{{display:block}}td:first-child code{{m
 #: is inserted in that chunk and the remainder of the file is streamed, so a
 #: report of any size keeps its exports without ever being held in memory.
 REPORT_HEAD_BYTES = 1024 * 1024
+#: The script-src expression a report page is served with: the report's own
+#: folding control, named by hash and quoted as CSP requires, and nothing else.
+_REPORT_SCRIPT_SRC = f"'{REPORT_SCRIPT_CSP_HASH}'"
 _BODY_TAG = re.compile(rb"<body[^>]*>", re.IGNORECASE)
 
 
@@ -1222,13 +1226,20 @@ def handler_factory(
     class DashboardHandler(BaseHTTPRequestHandler):
         server_version = f"PBPWeb/{__version__}"
 
-        def _headers(self, status: int, content_type: str, length: int | None = None) -> None:
+        def _headers(
+            self,
+            status: int,
+            content_type: str,
+            length: int | None = None,
+            *,
+            script_src: str = "'none'",
+        ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+            self.send_header("Content-Security-Policy", f"default-src 'none'; style-src 'unsafe-inline'; script-src {script_src}; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
             if tls_enabled:
                 self.send_header("Strict-Transport-Security", "max-age=31536000")
             if length is not None:
@@ -1240,7 +1251,14 @@ def handler_factory(
             if self.command != "HEAD":
                 self.wfile.write(payload)
 
-        def _serve_file(self, path: Path, content_type: str, *, attachment: bool = False) -> None:
+        def _serve_file(
+            self,
+            path: Path,
+            content_type: str,
+            *,
+            attachment: bool = False,
+            script_src: str | None = None,
+        ) -> None:
             if not path.is_file():
                 self.send_error(404)
                 return
@@ -1250,6 +1268,8 @@ def handler_factory(
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
+            if script_src is not None:
+                self.send_header("Content-Security-Policy", f"default-src 'none'; style-src 'unsafe-inline'; script-src {script_src}; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
             if attachment:
                 self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
             self.end_headers()
@@ -1277,12 +1297,21 @@ def handler_factory(
                         render_report_evidence_bar(target, run_id, run_dir),
                     )
                     if annotated is None:
-                        self._serve_file(report, "text/html; charset=utf-8")
+                        self._serve_file(
+                            report,
+                            "text/html; charset=utf-8",
+                            script_src=_REPORT_SCRIPT_SRC,
+                        )
                         return
                     self._headers(
                         200,
                         "text/html; charset=utf-8",
                         size + len(annotated) - len(head),
+                        # A report folds its sections with its own script, and
+                        # only that one: the hash refuses anything else, and
+                        # default-src 'none' still forbids every request the
+                        # page could make.
+                        script_src=_REPORT_SCRIPT_SRC,
                     )
                     if self.command == "HEAD":
                         return
@@ -1290,7 +1319,11 @@ def handler_factory(
                     while chunk := handle.read(1024 * 1024):
                         self.wfile.write(chunk)
             except OSError:
-                self._serve_file(report, "text/html; charset=utf-8")
+                self._serve_file(
+                    report,
+                    "text/html; charset=utf-8",
+                    script_src=_REPORT_SCRIPT_SRC,
+                )
 
         def _serve_run_archive(
             self,

@@ -505,8 +505,13 @@ key must be backed up and restored together.
     never-returned metrics from the timeline, fits the pressure chart's axis
     to the data with the PBP levels and each received trigger marked, and
     folds the per-core CPU tables away when no core approached saturation.
-    None of this changes the JSONL, the commands, or the CSP: the report stays
-    a single static file with no script.
+    None of this changes the JSONL or the commands. The report stays a single
+    static file whose only active content is its own Collapse all control: one
+    inline script, pinned by SHA-256 in the report's own Content-Security-Policy
+    and in the policy the Web UI serves it with, that folds every section except
+    At a glance and reopens them. It builds its own button, so a report whose
+    script is stripped or blocked shows the page unchanged rather than a dead
+    control, and it reads nothing, stores nothing, and sends nothing.
 
 48. A signed-in operator can delete stored incident runs from the dashboard,
     one run at a time or all of them at once, and nothing else deletes them:

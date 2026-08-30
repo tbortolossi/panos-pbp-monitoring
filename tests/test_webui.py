@@ -20,6 +20,7 @@ from urllib.request import (
     build_opener,
 )
 
+from pbp_monitoring.reporting import REPORT_SCRIPT_CSP_HASH
 from pbp_monitoring.webui import (
     annotate_report_head,
     handler_factory,
@@ -178,6 +179,41 @@ class ArtifactAuthenticationTests(unittest.TestCase):
                 stored,
                 "the stored report must stay free of deployment-local links",
             )
+
+    def test_only_the_report_page_may_run_a_script_and_only_its_own(self):
+        """A report folds its sections; every other page stays script-free.
+
+        The Web UI is the usual way an operator reads a report, so the folding
+        control has to work there, but nothing else may run: the report route
+        names the report's own script by hash, and the dashboard keeps refusing
+        scripts outright.
+        """
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            run_dir = root / "data" / "targets" / "fw-a" / "incidents" / "run-1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "report.html").write_text(
+                "<html><body><h1>Incident report</h1></body></html>",
+                encoding="utf-8",
+            )
+            server, thread, setup_code = self._server(root)
+            base = f"http://127.0.0.1:{server.server_port}"
+            opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            try:
+                self._sign_in(opener, base, setup_code)
+                report = opener.open(base + "/reports/fw-a/run-1/report.html")
+                report.read()
+                dashboard = opener.open(base + "/")
+                dashboard.read()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+            report_policy = report.headers["Content-Security-Policy"]
+            self.assertIn(f"script-src '{REPORT_SCRIPT_CSP_HASH}'", report_policy)
+            self.assertIn("default-src 'none'", report_policy)
+            self.assertIn("script-src 'none'", dashboard.headers["Content-Security-Policy"])
 
     def test_a_report_heavier_than_a_chunk_still_offers_its_evidence(self):
         """A real incident report weighs tens of megabytes and must keep its exports.

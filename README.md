@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.31.1-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.32.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -193,7 +193,7 @@ incidents is visible without opening a single report.
 | Artifact | Content |
 |---|---|
 | `incident.jsonl` | Authoritative structured records and exact raw command output |
-| `report.html` | Standalone human report, single file, no script, carrying the JSONL SHA-256 digest |
+| `report.html` | Standalone human report, single file, no external asset, carrying the JSONL SHA-256 digest; its only script is the hash-pinned Collapse all control |
 | `raw/startup.txt`, `raw/batch-NNNN.txt` | Human-readable export of every command and response |
 | ZIP support archive | All of the above plus the deployment environment, the redacted configuration, the Syslog messages of the run including refused ones, and `manifest.json` with version, sizes, and digests, for a TAC case |
 
