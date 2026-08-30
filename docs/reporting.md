@@ -25,7 +25,9 @@ the exact `raw_response` remains available in a nested section collapsed by
 default. Command status and timing fields are presented as compact metadata,
 the summary separates capture facts, incident state, and peak utilization, and
 its peak metrics are grouped into packet buffers, packet descriptors, and
-system load. The lower-level event metadata is collapsed by default.
+system load. Every section folds from its heading — a native disclosure,
+no script — so a section already read can be put away; all open by default
+except the lower-level event metadata, which is collapsed.
 
 ## At a glance and probable cause
 
@@ -50,7 +52,10 @@ CPU tables fold away when no core came close to saturation.
 
 A **Top sources** table above the attribution ranking rolls ranked sessions up
 by source address — a scan or flood spread over hundreds of short sessions is
-attributed to the source that owns them — and a **Pressure over time** chart
+attributed to the source that owns them. Both tables list at most 50 rows in
+ranking order and state how many lower-ranked entries were left out; the JSONL
+capture keeps every ranked entity, and the stop marker and probable cause are
+computed from all of them. A **Pressure over time** chart
 plots packet-buffer, descriptor, and session-table utilization batch by batch
 so the offender's first appearance can be aligned with the pressure curve. Its
 vertical axis fits the data (10, 25, 50, or 100%) so a lightly loaded firewall

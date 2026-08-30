@@ -165,7 +165,9 @@ than create a concurrent one.
    as evidence and a failed lookup never blocks the stop marker or the
    report.
 10. After the stop marker is written, a standalone HTML report is generated in
-   the background from the JSONL file.
+   the background from the JSONL file. Its offender ranking and top-sources
+   tables are bounded to 50 rows each and state what was left out, and every
+   section can be folded from its heading without script.
 11. Each completed batch also writes an atomic TXT view of its command and
     session outputs. A Web UI displays bounded Syslog reception status and
     read-only artifact links. The dashboard and every artifact route require

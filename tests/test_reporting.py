@@ -193,8 +193,11 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("Packet descriptors", rendered)
             self.assertIn("System load", rendered)
             self.assertIn('class="card metric-card"', rendered)
-            self.assertIn('<details class="section-disclosure">', rendered)
-            self.assertNotIn('<details class="section-disclosure" open>', rendered)
+            self.assertIn(
+                '<details class="section-disclosure section-fold">'
+                '<summary><h2 id="events-title">',
+                rendered,
+            )
             self.assertNotIn("http://", rendered)
             self.assertNotIn("https://", rendered)
 
@@ -874,6 +877,25 @@ class DropCounterTests(unittest.TestCase):
         self.assertIn(
             '<span class="card-label">Denied packets</span><strong>71</strong>', html
         )
+    def test_offender_tables_are_bounded_and_say_what_was_left_out(self):
+        entities = [
+            {
+                "rank": rank,
+                "entity_type": "source_ip",
+                "source_ip": f"192.0.2.{rank}",
+                "pbp_percentage_total": 60 - rank,
+                "evidence_sources": ["packet_buffer_protection"],
+            }
+            for rank in range(1, 61)
+        ]
+        html = self._render([{"candidate_entities": entities}])
+        offenders = html.split("Denied and dropped traffic")[0]
+
+        self.assertIn("<code>192.0.2.50</code>", offenders)
+        self.assertNotIn("<code>192.0.2.51</code>", offenders)
+        self.assertIn("10 lower-ranked entries not listed", offenders)
+        self.assertIn("10 lower-ranked sources not listed", offenders)
+        self.assertIn("the JSONL capture keeps every ranked entity", offenders)
 
     def test_untrusted_baseline_batch_is_excluded_from_the_denied_total(self):
         untrusted = {
@@ -1176,6 +1198,32 @@ class ReadabilityTests(unittest.TestCase):
         ):
             self.assertIn(f'href="#{anchor}"', html)
             self.assertIn(f'id="{anchor}"', html)
+
+    def test_every_section_folds_and_only_the_events_start_folded(self):
+        html = self._render(self._capture([4.0, 4.1]))
+
+        for anchor in (
+            "summary-title",
+            "pressure-title",
+            "attribution-title",
+            "drop-counters-title",
+            "session-table-title",
+            "large-sessions-title",
+            "cpu-tracking-title",
+            "timeline-title",
+            "cycles-title",
+        ):
+            self.assertIn(
+                '<details class="section-disclosure section-fold" open>'
+                f'<summary><h2 id="{anchor}">',
+                html,
+            )
+        self.assertIn(
+            '<details class="section-disclosure section-fold">'
+            '<summary><h2 id="events-title">',
+            html,
+        )
+        self.assertNotIn("<script", html)
 
     def test_pressure_axis_fits_the_data_and_marks_received_triggers(self):
         quiet = self._render(self._capture([4.0, 4.5, 4.2], triggers=2))
