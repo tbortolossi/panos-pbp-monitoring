@@ -223,6 +223,9 @@ section 11 the acceptance criteria a release is validated against.
 - Initial administrator setup requires a one-time setup code printed in the
   webui container log. Failed sign-in and setup attempts are throttled per
   source address, and concurrent password verifications are capped.
+- Persisted process logs and support bundles are subject to the same rule as
+  evidence: no API key, administrator password material, recovery key or
+  one-time setup code may appear in them.
 - The service must run under an unprivileged Linux account.
 
 ## 9. Produced data
@@ -268,7 +271,29 @@ device serial is not the one read from the firewall when it was saved, marked
 a serial is registered for its source, marked `device_serial_missing`. Those
 slugs are persisted and stable.
 The Web UI streams a ZIP support export containing these run artifacts and a
-versioned checksum manifest.
+versioned checksum manifest. The export also carries the deployment context a
+remote diagnosis needs: the Syslog messages of the run window including the ones
+the collector refused, an environment fingerprint (application, Python and
+`cryptography` versions, platform, timezone), and the collector settings and
+firewall inventory with every credential removed. Read-only API validation runs
+under `api-checks/<run_id>/` export identically, so a credential, TLS or
+unsupported-command problem is diagnosable even when no incident was collected.
+
+The collector and the Web UI each keep a rotating process log inside a volume,
+capped in size and generations, relocatable with `PBP_LOG_DIR`. The one-time
+administrator setup code is excluded from those files by construction.
+
+An authenticated **support bundle**, downloadable from the admin page or with
+`pbp-support` from a shell, packages the deployment rather than one run: the
+process logs, the environment fingerprint, the redacted settings and firewall
+inventory, the run inventory, the capture-volume usage, the tail of the Syslog
+reception, routing and trigger journals including refused messages, and the most
+recent read-only API validation of each firewall with its raw PAN-OS XML. It
+carries a checksum manifest, makes no call to any firewall, and must never
+contain a PAN-OS API key, the administrator password or its verifier, the
+installation recovery key, or the setup code. It does contain management
+addresses, hostnames, serials and offender source addresses; the documentation
+states so where the action is offered.
 
 Stored runs are retained until an operator deletes them. The dashboard offers a
 per-run deletion and a delete-all across every firewall, both requiring the
@@ -469,6 +494,18 @@ key must be backed up and restored together.
     the floor that keeps the session-table walk bounded on a loaded firewall.
     A capture taken before this feature renders as such rather than as an empty
     table.
+50. A deployment can be diagnosed remotely from artifacts alone. The support
+    bundle carries the collector and dashboard process logs, the versions
+    actually running, every setting, the firewall and run inventories, the
+    Syslog journals including refused messages, and the latest read-only API
+    validation with its raw XML; it carries no credential of any kind, and
+    building it issues no firewall command. Read-only API validation runs export
+    as a run archive like incidents do, and every run archive states the
+    environment and the redacted configuration it was produced under.
+51. The raw XML preserved in any capture can be replayed through the shipped
+    parsers offline, reporting which command a parser fails on, so a customer
+    archive becomes a fixture and a regression test without access to the
+    firewall it came from.
 
 ## 12. Possible enhancements
 

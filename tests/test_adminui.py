@@ -1,10 +1,13 @@
 import contextlib
 import http.cookiejar
+import io
+import json
 import logging
 import re
 import tempfile
 import threading
 import unittest
+import zipfile
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -770,6 +773,73 @@ class SettingLabelTests(unittest.TestCase):
 
     def test_unknown_setting_falls_back_to_sentence_case(self):
         self.assertEqual(setting_label("future_knob_seconds"), "Future knob seconds")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class SupportBundleUITests(unittest.TestCase):
+    """The bundle is evidence about the deployment: it needs a session."""
+
+    def test_support_bundle_is_refused_without_an_administrator_session(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with capture_setup_code():
+                server = ThreadingHTTPServer(
+                    ("127.0.0.1", 0),
+                    handler_factory(root / "data", 300, root / "config" / "config.db"),
+                )
+            thread = threading.Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": SERVER_POLL_INTERVAL},
+                daemon=True,
+            )
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                response = build_opener().open(base + "/admin/support-bundle.zip")
+                body = response.read()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+            # Setup has never been completed, so the request is answered with
+            # the setup page rather than any deployment evidence.
+            self.assertNotEqual(body[:2], b"PK")
+            self.assertIn(b"setup", body.lower())
+
+    def test_signed_in_administrator_downloads_the_deployment_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "data").mkdir()
+            (root / "config").mkdir()
+            store = ConfigStore(root / "config" / "config.db")
+            store.initialize()
+            store.save_target(
+                name="fw-a",
+                panos_url="https://192.0.2.10",
+                api_key="super-secret-api-key",
+                target_serial=None,
+                serials=["001122334455"],
+                syslog_sources=["192.0.2.10"],
+            )
+            with signed_in_admin(root) as (opener, base, _csrf, page):
+                self.assertIn("Download support bundle", page)
+                response = opener.open(base + "/admin/support-bundle.zip")
+                payload = response.read()
+            self.assertEqual(response.headers["Content-Type"], "application/zip")
+            with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                names = archive.namelist()
+                environment = json.loads(
+                    archive.read(
+                        next(n for n in names if n.endswith("environment.json"))
+                    )
+                )
+                blob = b"".join(archive.read(name) for name in names)
+            self.assertEqual(environment["application_version"], __version__)
+            self.assertNotIn(b"super-secret-api-key", blob)
+            self.assertTrue(any(name.endswith("README.txt") for name in names))
 
 
 if __name__ == "__main__":

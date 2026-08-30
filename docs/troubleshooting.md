@@ -42,6 +42,20 @@ reachability, certificate trust, key validity, least-privilege permissions, and
 the target's enabled state. Re-saving the firewall in the admin page repeats the
 `show system info` validation immediately.
 
+## Reading the collector history beyond `docker logs`
+
+Both services also write a rotating log file inside a volume, so a failure that
+happened before the last container restart is still readable:
+
+```bash
+docker compose exec -T collector tail -n 200 /data/logs/collector.log
+docker compose exec -T webui tail -n 200 /config/logs/webui.log
+```
+
+Each file is capped at 2 MB with three generations, and `PBP_LOG_DIR` moves it.
+The one-time administrator setup code is never written there; it stays in the
+container log only.
+
 ## Admin page is not reachable remotely
 
 The default publishes the HTTP redirect on TCP 8090 and HTTPS on TCP 8088, not
@@ -90,6 +104,43 @@ When the question is which flow is saturating a link or the dataplane rather
 than which is the largest, `show running resource-monitor ingress-backlogs`
 names the sessions filling the ingress buffers. The collector already collects
 it in every batch.
+
+## Reporting a problem in a deployment you do not administer
+
+When the collector runs at a site you cannot reach, ask the operator for the
+support bundle rather than for a description of the symptom. Admin page,
+**Support bundle** card, **Download support bundle**. If the dashboard itself is
+the problem:
+
+```bash
+docker compose exec -T collector pbp-support > pbp-support.zip
+```
+
+The bundle carries the collector and dashboard logs, the running versions, every
+setting, the firewall inventory, the run inventory, the Syslog journals
+including refused messages, and the most recent read-only API validation of each
+firewall with its raw PAN-OS XML. It carries no API key, no administrator
+password, no recovery key and no setup code. Producing it makes no call to any
+firewall.
+
+If the problem is tied to one incident, ask for that run's **ZIP support**
+archive as well: it holds the full raw XML of every command of every batch.
+
+### Reproducing a parsing problem from an archive
+
+A capture keeps the raw HTTP XML of every command, which is enough to reproduce
+a parsing failure without any access to the firewall it came from:
+
+```bash
+PYTHONPATH=src python3 tools/replay_capture.py pbp-support.zip --failures-only
+PYTHONPATH=src python3 tools/replay_capture.py run.zip --command packet_buffer_protection --format json
+```
+
+The tool replays every stored response through the parsers of the current
+working tree, and exits non-zero when one raises. A command reported as
+`unmapped` has no parser entry yet. Once the offending response is identified,
+anonymize it, commit it as a fixture, and write the test that fails before the
+fix. Nothing in the replay contacts a firewall.
 
 ## Recovery key was not backed up
 

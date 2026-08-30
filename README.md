@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.20.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.21.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -190,7 +190,31 @@ incidents is visible without opening a single report.
 | `incident.jsonl` | Authoritative structured records and exact raw command output |
 | `report.html` | Standalone human report, single file, no script, carrying the JSONL SHA-256 digest |
 | `raw/startup.txt`, `raw/batch-NNNN.txt` | Human-readable export of every command and response |
-| ZIP support archive | All of the above plus `manifest.json` with version, sizes, and digests, for a TAC case |
+| ZIP support archive | All of the above plus the deployment environment, the redacted configuration, the Syslog messages of the run including refused ones, and `manifest.json` with version, sizes, and digests, for a TAC case |
+
+Read-only API validation runs, under `api-checks/<run_id>/`, export the same
+way: a credential, TLS or unsupported-command problem is diagnosable from an
+archive even when no incident was ever collected.
+
+**Deployment support bundle.** The admin page offers a **Download support
+bundle** action that packages the whole deployment rather than one run: the
+collector and dashboard log files, the running application, Python and
+`cryptography` versions, every collector setting and every registered firewall
+without credentials, the run inventory and storage usage, and the tail of the
+Syslog reception, routing and trigger journals including the messages the
+collector refused. It is what makes a remote installation diagnosable without
+access to its host. The same archive is available from a shell when the
+dashboard is itself the problem:
+
+```bash
+docker compose exec -T collector pbp-support > pbp-support.zip
+```
+
+The bundle never carries PAN-OS API keys, the administrator password or its
+hash, the installation recovery key, or the one-time setup code. It does carry
+firewall management addresses, hostnames, serial numbers and the source
+addresses recorded as offenders; review it before sending it if that matters.
+Producing it makes no call to any firewall.
 
 The report opens with an **At a glance** block — severity read against the
 PAN-OS PBP defaults, key figures, and probable-cause sentences ready for a
