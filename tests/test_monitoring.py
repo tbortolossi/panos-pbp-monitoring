@@ -21,6 +21,9 @@ from pbp_monitoring.orchestrator import (
     MultiTargetRouter,
     MonitorController,
     run_target_checks_once,
+    apply_run_deletions,
+    _run_directory,
+    _runs_in_progress,
     PanOSAPIError,
     PanOSResponse,
     SyslogProtocol,
@@ -1942,3 +1945,130 @@ class FirewallCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunDeletionExecutionTests(unittest.TestCase):
+    """The collector owns the evidence volume and performs every removal."""
+
+    def _run(self, root: Path, target: str, run_id: str) -> Path:
+        directory = root / "targets" / target / "incidents" / run_id
+        (directory / "raw").mkdir(parents=True)
+        (directory / "incident.jsonl").write_text('{"event":"x"}\n', encoding="utf-8")
+        (directory / "raw" / "batch-0001.txt").write_text("raw", encoding="utf-8")
+        return directory
+
+    def _store(self, root: Path) -> ConfigStore:
+        store = ConfigStore(root / "config.db")
+        store.initialize()
+        return store
+
+    def test_a_queued_run_is_removed_with_its_artifacts_and_the_request_cleared(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            data = root / "data"
+            kept = self._run(data, "fw-a", "20260101T000000Z")
+            doomed = self._run(data, "fw-a", "20260102T000000Z")
+            store = self._store(root)
+            store.request_run_deletion("fw-a", "20260102T000000Z")
+
+            removed = apply_run_deletions(store, data, set())
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(doomed.exists())
+            self.assertTrue(kept.is_dir())
+            self.assertTrue((kept / "raw" / "batch-0001.txt").is_file())
+            self.assertEqual(store.pending_run_deletions(), [])
+
+    def test_a_run_still_being_collected_is_kept_and_retried_on_the_next_tick(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            data = root / "data"
+            active = self._run(data, "fw-a", "20260103T000000Z")
+            store = self._store(root)
+            store.request_run_deletion("fw-a", "20260103T000000Z")
+
+            self.assertEqual(
+                apply_run_deletions(store, data, {("fw-a", "20260103T000000Z")}), 0
+            )
+            self.assertTrue(active.is_dir())
+            self.assertEqual(len(store.pending_run_deletions()), 1)
+
+            self.assertEqual(apply_run_deletions(store, data, set()), 1)
+            self.assertFalse(active.exists())
+            self.assertEqual(store.pending_run_deletions(), [])
+
+    def test_deleting_everything_spares_the_active_run_and_other_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            data = root / "data"
+            first = self._run(data, "fw-a", "20260101T000000Z")
+            second = self._run(data, "fw-b", "20260102T000000Z")
+            active = self._run(data, "fw-b", "20260103T000000Z")
+            checks = data / "targets" / "fw-a" / "api-checks" / "20260101T000000Z"
+            checks.mkdir(parents=True)
+            (checks / "api-check.jsonl").write_text("{}\n", encoding="utf-8")
+            journal = data / "syslog-received.jsonl"
+            journal.write_text('{"message":"kept"}\n', encoding="utf-8")
+            store = self._store(root)
+            store.request_all_runs_deletion()
+
+            self.assertEqual(
+                apply_run_deletions(store, data, {("fw-b", "20260103T000000Z")}), 2
+            )
+
+            self.assertFalse(first.exists())
+            self.assertFalse(second.exists())
+            self.assertTrue(active.is_dir())
+            self.assertTrue((checks / "api-check.jsonl").is_file())
+            self.assertEqual(journal.read_text(encoding="utf-8"), '{"message":"kept"}\n')
+            self.assertEqual(len(store.pending_run_deletions()), 1)
+
+            self.assertEqual(apply_run_deletions(store, data, set()), 1)
+            self.assertFalse(active.exists())
+            self.assertEqual(store.pending_run_deletions(), [])
+
+    def test_a_run_name_cannot_escape_the_incidents_directory(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data = Path(temporary_directory)
+            self.assertIsNone(_run_directory(data, "fw-a", "../../etc"))
+            self.assertIsNone(_run_directory(data, "..", "run-1"))
+            self.assertIsNone(_run_directory(data, "fw-a", "run 1"))
+            self.assertIsNone(_run_directory(data, "*", "*"))
+            self.assertEqual(
+                _run_directory(data, "fw-a", "run-1"),
+                (data / "targets" / "fw-a" / "incidents" / "run-1").resolve(),
+            )
+
+    def test_an_unusable_request_is_discarded_instead_of_blocking_the_queue(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            data = root / "data"
+            survivor = self._run(data, "fw-a", "20260101T000000Z")
+            store = self._store(root)
+            # Written straight to the table: request_run_deletion refuses this,
+            # so only a tampered database could ever hold it.
+            with sqlite3.connect(store.path) as connection:
+                connection.execute(
+                    "INSERT INTO run_deletions(target,run_id,requested_at)"
+                    " VALUES('fw-a','../../etc','2026-01-01T00:00:00Z')"
+                )
+
+            self.assertEqual(apply_run_deletions(store, data, set()), 0)
+            self.assertTrue(survivor.is_dir())
+            self.assertEqual(store.pending_run_deletions(), [])
+
+    def test_a_routing_probe_in_flight_defers_every_deletion(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = make_config(root / "data")
+            store = ConfigStore(root / "config.db")
+            store.initialize()
+            router = ManagedRouter(config, store)
+            router.router = Mock()
+            router.router.pending = {"192.0.2.1": []}
+
+            self.assertIsNone(_runs_in_progress(router))
+
+            router.router.pending = {}
+            router.router.controllers = {}
+            self.assertEqual(_runs_in_progress(router), set())

@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import signal
 import ssl
 import sys
@@ -32,7 +33,12 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from . import __version__
-from .config_store import ConfigStore, StoredTarget, dp_core_identity
+from .config_store import (
+    SAFE_RUN_COMPONENT,
+    ConfigStore,
+    StoredTarget,
+    dp_core_identity,
+)
 from .panos_keygen import parse_untrusted_xml, read_bounded_response
 from .text_export import write_record_text_export
 
@@ -4642,9 +4648,174 @@ async def run_target_checks_once(router: "ManagedRouter") -> int:
     return performed
 
 
+def _run_directory(data_dir: Path, target: str, run_id: str) -> Path | None:
+    """Resolve one stored incident run, refusing anything outside the volume."""
+    if not SAFE_RUN_COMPONENT.fullmatch(target):
+        return None
+    if not SAFE_RUN_COMPONENT.fullmatch(run_id):
+        return None
+    root = (data_dir / "targets" / target / "incidents").resolve()
+    candidate = (root / run_id).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    return candidate
+
+
+def _runs_in_progress(router: "ManagedRouter") -> set[tuple[str, str]] | None:
+    """Return the runs the collector is still writing, as (target, run_id).
+
+    ``None`` means the answer is not knowable yet: a routing probe is in flight
+    and may start a run on any candidate firewall, so nothing may be deleted
+    during this tick.
+    """
+    multi = router.router
+    if multi is None:
+        return set()
+    if multi.pending:
+        return None
+    busy: set[tuple[str, str]] = set()
+    for name, controller in multi.controllers.items():
+        if controller.run_id is None:
+            continue
+        collecting = (
+            controller.monitor_task is not None and not controller.monitor_task.done()
+        )
+        reporting = any(not task.done() for task in controller.report_tasks)
+        if collecting or reporting:
+            busy.add((name, controller.run_id))
+    return busy
+
+
+def _remove_run_tree(path: Path) -> bool:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        LOG.exception("Unable to delete the incident run stored at %s", path)
+        return False
+    return True
+
+
+def _delete_one_run(
+    data_dir: Path,
+    target: str,
+    run_id: str,
+    busy: set[tuple[str, str]],
+) -> tuple[bool, int]:
+    """Delete one run. Returns (request satisfied, directories removed)."""
+    if (target, run_id) in busy:
+        LOG.info(
+            "Deletion of run %s on %s deferred: collection is still in progress",
+            run_id,
+            target,
+        )
+        return False, 0
+    path = _run_directory(data_dir, target, run_id)
+    if path is None:
+        LOG.warning(
+            "Discarding a deletion request naming an unusable run: %s/%s",
+            target,
+            run_id,
+        )
+        return True, 0
+    if not path.is_dir():
+        LOG.info("Run %s on %s is already absent from the volume", run_id, target)
+        return True, 0
+    if not _remove_run_tree(path):
+        return False, 0
+    LOG.warning("Deleted incident run %s on %s at operator request", run_id, target)
+    return True, 1
+
+
+def _delete_all_runs(data_dir: Path, busy: set[tuple[str, str]]) -> tuple[bool, int]:
+    """Delete every stored run. Returns (request satisfied, directories removed)."""
+    targets_root = data_dir / "targets"
+    if not targets_root.is_dir():
+        return True, 0
+    satisfied = True
+    removed = 0
+    for target_dir in sorted(targets_root.iterdir()):
+        if not target_dir.is_dir() or not SAFE_RUN_COMPONENT.fullmatch(target_dir.name):
+            continue
+        incidents = target_dir / "incidents"
+        if not incidents.is_dir():
+            continue
+        for run_dir in sorted(incidents.iterdir()):
+            if not run_dir.is_dir():
+                continue
+            done, count = _delete_one_run(
+                data_dir, target_dir.name, run_dir.name, busy
+            )
+            satisfied = satisfied and done
+            removed += count
+    return satisfied, removed
+
+
+def apply_run_deletions(
+    store: ConfigStore,
+    data_dir: Path,
+    busy: set[tuple[str, str]],
+) -> int:
+    """Execute the queued deletions and return how many runs were removed.
+
+    A run still being collected or reported is never touched: its request stays
+    queued and is retried on the next tick.
+    """
+    try:
+        requests = store.pending_run_deletions()
+    except Exception:  # a broken queue must not stop the check loop
+        LOG.exception("Unable to read the queued incident-run deletions")
+        return 0
+    removed = 0
+    for request in requests:
+        try:
+            if request.deletes_everything:
+                satisfied, count = _delete_all_runs(data_dir, busy)
+            else:
+                satisfied, count = _delete_one_run(
+                    data_dir, request.target, request.run_id, busy
+                )
+            removed += count
+            if satisfied:
+                store.clear_run_deletion(request.deletion_id)
+        except Exception:  # one bad request must not block the others
+            LOG.exception(
+                "Incident-run deletion failed for %s/%s",
+                request.target,
+                request.run_id,
+            )
+    return removed
+
+
+async def run_deletions_once(router: "ManagedRouter") -> int:
+    """Execute the incident-run deletions queued by the Web UI.
+
+    The Web UI mounts the evidence volume read-only, so it can only record the
+    operator's intent; the removal happens here. Which runs are in progress is
+    read on the event loop, and the recursive removal itself runs off it so a
+    large capture tree never stalls the Syslog listener.
+    """
+    busy = _runs_in_progress(router)
+    if busy is None:
+        LOG.debug("Incident-run deletion deferred: a routing probe is in flight")
+        return 0
+    return await asyncio.to_thread(
+        apply_run_deletions, router.store, router.cfg.output_dir, busy
+    )
+
+
 async def run_target_check_loop(router: "ManagedRouter") -> None:
     while True:
         await asyncio.sleep(CHECK_TICK_SECONDS)
+        try:
+            await run_deletions_once(router)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # the listener must survive any deletion failure
+            LOG.exception("Incident-run deletion cycle failed")
         try:
             await run_target_checks_once(router)
         except asyncio.CancelledError:

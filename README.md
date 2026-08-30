@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.17.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.18.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -191,6 +191,12 @@ The dashboard, the reports, and every evidence download require the
 administrator sign-in: captures contain device serials, addresses, session
 tuples, and raw command output. Only `/healthz` answers without
 authentication.
+
+Evidence is kept until you remove it. The **Recent runs** table carries a
+**Delete** button per completed run and a **Delete all N runs** button for the
+whole set, both signed-in actions. There is no automatic retention or purge: a
+run disappears only when an operator asks for it, and a run still being
+collected is never touched.
 
 ## Documentation
 

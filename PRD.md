@@ -257,9 +257,18 @@ slugs are persisted and stable.
 The Web UI streams a ZIP support export containing these run artifacts and a
 versioned checksum manifest.
 
+Stored runs are retained until an operator deletes them. The dashboard offers a
+per-run deletion and a delete-all across every firewall, both requiring the
+administrator session and its CSRF token. No automatic retention, age limit or
+size cap exists. Because the Web service mounts the evidence volume read-only,
+a deletion is queued in the configuration database and executed by the collector
+on its periodic tick; a run still being collected or reported is skipped and the
+request retried, and only `incidents/<run_id>/` is removed.
+
 The separate configuration volume contains `config.db` and `master.key`.
 The database contains settings, target metadata, a salted PBKDF2 admin-password
-verifier, and authenticated ciphertext for each API key. Database and master
+verifier, authenticated ciphertext for each API key, and the pending
+incident-run deletions the collector has yet to carry out. Database and master
 key must be backed up and restored together.
 
 ## 10. Security
@@ -274,6 +283,8 @@ key must be backed up and restored together.
   TCP and UDP. Use an appropriately configured TLS-capable gateway when Syslog
   transport encryption is required.
 - No automatic mitigation action in this version.
+- Stored evidence is deleted only by an authenticated operator request, never
+  automatically.
 - Only a fixed XML allowlist is available; arbitrary `type=op` commands supplied
   by a user or log are never executed.
 
@@ -416,6 +427,17 @@ key must be backed up and restored together.
     folds the per-core CPU tables away when no core approached saturation.
     None of this changes the JSONL, the commands, or the CSP: the report stays
     a single static file with no script.
+
+48. A signed-in operator can delete stored incident runs from the dashboard,
+    one run at a time or all of them at once, and nothing else deletes them:
+    there is no retention window, age limit, or size cap. Because the Web
+    service mounts the evidence volume read-only, the request is queued in the
+    configuration database and executed by the collector on its periodic tick.
+    A run being collected or reported is skipped and retried, and offers no
+    button while it is active. Only `incidents/<run_id>/` is removed; the
+    `api-checks/` artifacts and the trigger and reception journals are kept.
+    Requested names are validated on both sides, so no request can reach a path
+    outside `targets/<firewall>/incidents/`, and each removal is logged.
 
 ## 12. Possible enhancements
 
