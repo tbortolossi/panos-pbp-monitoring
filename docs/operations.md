@@ -23,7 +23,7 @@ published:
 | Request timeout | `15` | PAN-OS API timeout per request |
 | Maximum session lookups | `10` | Bounded session enrichments per cycle |
 | Session retry seconds | `5` | Minimum resampling interval per candidate |
-| Large session min kb | `1048576` | Cumulative volume above which a session is tracked; `0` disables the query |
+| Large session min KB | `1048576` | Cumulative volume above which a session is tracked; `0` disables the query |
 | Large session min age seconds | `600` | Minimum session age for the same query; `0` removes the age filter |
 | Generate HTML report | `true` | Build the standalone incident report |
 | Generate text export | `true` | Write startup and batch TXT files |

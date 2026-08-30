@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.19.1] - 2026-08-30
+
+### Fixed
+
+- The collector settings form no longer derives its labels from the stored
+  keys, which turned acronyms into words: **Incident Idle Ttl Seconds**,
+  **Generate Html Report** and **Webhook Url** now read *Incident idle TTL
+  seconds*, *Generate HTML report* and *Webhook URL*, and every label matches
+  the settings table in `docs/operations.md`. Display only: the stored keys,
+  the values, and the collector behavior are unchanged.
+
 ## [0.19.0] - 2026-08-30
 
 ### Added
