@@ -197,6 +197,21 @@ section still forbids any change to PAN-OS state.
    without asking; a red or missing check turns this back into a question for
    the maintainer.
 
+   If that merge is refused with "the base branch policy prohibits the merge"
+   while every check passes, the branch protection is reporting a requirement
+   GitHub does not name through the API; the reason is only readable in the
+   merge box on the pull request page. `main` is protected with
+   `enforce_admins` disabled, so the maintainer's account is exempt and the
+   merge goes through with `--admin`. Verify first, and never on red:
+
+   ```bash
+   gh pr checks <n>                                   # every line must say pass
+   gh pr merge <n> --squash --delete-branch --admin
+   ```
+
+   `--admin` merges whatever the checks say, so the verification above is what
+   keeps the rule of this step intact. Report the fallback whenever it is used.
+
    A pushed tag is not a published version. Every tag must also carry a GitHub
    release, otherwise the repository's front page keeps advertising an old
    version as the latest one. Create it in the same step, with the notes taken
