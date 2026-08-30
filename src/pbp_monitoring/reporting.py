@@ -2796,11 +2796,22 @@ def _render_html(
         timeline_body = (
             f'<tr><td colspan="{column_count}" class="empty">No valid batch.</td></tr>'
         )
+    timeline_notes: list[str] = []
+    if hidden_metrics and cycles:
+        timeline_notes.append(
+            "Columns never returned by the firewall are hidden: "
+            f"{_escape(', '.join(hidden_metrics))}."
+        )
+    if cycles:
+        # The header used to read "Sessions", which the same report already uses
+        # for a per-source count. State that this one is a list of IDs.
+        timeline_notes.append(
+            "<strong>Candidate sessions</strong> lists the session IDs the firewall "
+            "ranked for that batch, not a session total; the device-wide count is in "
+            "the session-table section."
+        )
     timeline_note = (
-        '<p class="muted">Columns never returned by the firewall are hidden: '
-        f"{_escape(', '.join(hidden_metrics))}.</p>"
-        if hidden_metrics and cycles
-        else ""
+        f'<p class="muted">{" ".join(timeline_notes)}</p>' if timeline_notes else ""
     )
 
     cycle_details: list[str] = []
@@ -3016,7 +3027,7 @@ def _render_html(
                 timeline_note
                 + '<div class="table-wrap timeline-wrap"><table class="timeline">'
                 "<thead><tr><th>Batch</th><th>Collector time</th><th>Firewall time</th>"
-                f"<th>Elapsed (s)</th>{metric_headers}<th>Sessions</th><th>Errors</th>"
+                f"<th>Elapsed (s)</th>{metric_headers}<th>Candidate sessions</th><th>Errors</th>"
                 f"</tr></thead><tbody>{timeline_body}</tbody></table></div>",
                 intro="One row per batch with every collected percentage. Hover a "
                 "time for its full timestamp.",
