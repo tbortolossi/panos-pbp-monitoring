@@ -3,6 +3,24 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.24.0] - 2026-08-30
+
+### Changed
+
+- **Bounded offender tables.** The offender ranking and the top-sources
+  rollup of the HTML report now list at most 50 rows each, in their existing
+  order, and say how many lower-ranked entries were left out. A lab incident of
+  50 batches had rendered 2,523 ranked entities and 364 sources, most of them
+  at 0% PBP, which put roughly eighty screens of rows between the attribution
+  and the drops, sessions, CPU and timeline sections. The aggregation is
+  unchanged: the stop marker, the probable cause and the rollup still work
+  from the full attribution, and the JSONL capture keeps every ranked entity.
+  Refs #150.
+- **Collapsible report sections.** Every section of the report can be folded
+  from its heading with a native disclosure, open by default except the events
+  section which stays collapsed as before. The report remains a single file
+  without script, and the navigation bar anchors keep working. Refs #150.
+
 ## [0.23.0] - 2026-08-30
 
 ### Added
