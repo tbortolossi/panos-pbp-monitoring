@@ -3,6 +3,24 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.30.0] - 2026-08-30
+
+### Changed
+
+- **One place to take a run's evidence: its report.** The **Recent runs** table
+  no longer carries an **Artifacts** column. Its **HTML report** link repeated
+  the row itself, which opens the report since 0.28.0, and its **JSONL**,
+  **TXT**, **ZIP support** and **ZIP anonymized** links repeated the Exports bar
+  shown above every report served by the Web UI, where each export is also named
+  by its weight. That column was the widest of the table and what forced the
+  runs table to scroll sideways, pushing **Delete** out of view; the table now
+  fits an ordinary window. A run with no report to open — a monitor still
+  collecting, or a run whose report could not be produced — keeps a plain row
+  and offers the records written so far as a single **JSONL** link under its
+  status, so evidence is never out of reach. Web UI presentation only:
+  collection, the artifact routes, the stored `report.html`, the firewall and
+  the persisted data are untouched. Refs #169.
+
 ## [0.29.0] - 2026-08-30
 
 ### Changed
