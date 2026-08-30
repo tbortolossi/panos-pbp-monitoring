@@ -2072,7 +2072,43 @@ class PbpEvidenceTests(unittest.TestCase):
             self.assertEqual(threat["entries"][0]["source_ip"], "203.0.113.9")
             self.assertEqual(threat["entries"][1]["threat_id"], 8507)
             self.assertEqual(threat["entries"][1]["session_id"], "38492")
+            reread = next(r for r in records if r.get("event") == "pbp_settings_reread")
+            self.assertEqual(reread["pbp_settings"]["activate_percent"], 60.0)
+            self.assertFalse(reread["changed_since_start"])
+            self.assertIn("pbp_settings", reread["commands"])
+            self.assertEqual(client.commands.count(PBP_SETTINGS_COMMAND), 2)
             self.assertEqual(stopped["event"], "monitor_stopped")
+
+    def test_settings_that_moved_during_the_run_are_flagged_at_stop(self):
+        class CommitClient(self.LogClient):
+            def op_response(self, command):
+                if command == PBP_SETTINGS_COMMAND and self.commands.count(command) >= 1:
+                    self.commands.append(command)
+                    return response(
+                        "<result><session>"
+                        "<packet-buffer-protection-alert>1</packet-buffer-protection-alert>"
+                        "<packet-buffer-protection-activate>2</packet-buffer-protection-activate>"
+                        "</session></result>"
+                    )
+                return super().op_response(command)
+
+        async def scenario(cfg):
+            controller = MonitorController(cfg, CommitClient())
+            await controller._monitor("fixture-run")
+            return incident_capture_path(cfg.output_dir, "fixture-run")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_file = asyncio.run(scenario(make_config(Path(temporary_directory))))
+            records = [
+                json.loads(line)
+                for line in output_file.read_text(encoding="utf-8").splitlines()
+            ]
+            started = next(r for r in records if r.get("event") == "monitor_started")
+            reread = next(r for r in records if r.get("event") == "pbp_settings_reread")
+
+            self.assertEqual(started["pbp_settings"]["activate_percent"], 60.0)
+            self.assertEqual(reread["pbp_settings"]["activate_percent"], 2.0)
+            self.assertTrue(reread["changed_since_start"])
 
     def test_a_failed_threat_query_never_blocks_the_stop_marker(self):
         async def scenario(cfg):

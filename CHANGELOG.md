@@ -3,6 +3,22 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.35.1] - 2026-08-30
+
+### Fixed
+
+- **A configuration read taken during a commit no longer contradicts the
+  diagnosis.** The first run collected with 0.35.0 on the lab started while
+  the commit lowering the PBP thresholds was still landing: the dataplane
+  already mitigated at 4%, the trigger fired, and the read of the running
+  configuration still answered alert 50% / activate 80%. The report would
+  have stated both side by side. The PBP settings are now read a second time
+  at monitor stop (one call) and the record says whether they moved; the
+  diagnosis takes the read at stop when a commit landed during the run, and
+  when PBP was seen mitigating below the activate threshold read at start —
+  which it cannot do — it says the read was taken during a commit and falls
+  back to the alert threshold printed in the firewall's own congestion log.
+
 ## [0.35.0] - 2026-08-30
 
 ### Added

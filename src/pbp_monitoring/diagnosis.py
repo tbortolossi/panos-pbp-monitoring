@@ -169,14 +169,30 @@ DEFAULT_LATENCY_MAX_TOLERATE_MS = 500.0
 
 
 def _configured_settings(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """The PBP settings read from the running configuration at monitor start."""
+    """The PBP settings read from the running configuration.
+
+    The read at stop wins over the read at start when both parsed and differ:
+    a monitor started during a commit reads the old configuration while the
+    dataplane already applies the new thresholds. The result says whether
+    that happened.
+    """
+    start: dict[str, Any] = {}
+    reread: dict[str, Any] = {}
+    changed = False
     for record in events:
-        if str(record.get("event", "")).lower() != "monitor_started":
-            continue
+        event = str(record.get("event", "")).lower()
         settings = record.get("pbp_settings")
-        if isinstance(settings, dict) and settings.get("status") == "parsed":
-            return settings
-    return {}
+        if not isinstance(settings, dict) or settings.get("status") != "parsed":
+            continue
+        if event == "monitor_started" and not start:
+            start = settings
+        elif event == "pbp_settings_reread":
+            reread = settings
+            changed = bool(record.get("changed_since_start"))
+    chosen = reread if reread and changed else (start or reread)
+    if not chosen:
+        return {}
+    return {**chosen, "changed_during_run": changed}
 
 
 def _threat_log_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -218,6 +234,14 @@ def _threat_log_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 
 _THREAT_LABELS = {8507: "PBP Packet Drop", 8508: "PBP Session Discarded", 8509: "PBP IP Blocked"}
+
+
+def syslog_alert_known(context: dict[str, Any]) -> bool:
+    """Whether the alert percentage in the context came from the syslog text."""
+    return context.get("alert_percent") is not None and (
+        context.get("configured_alert_percent") is None
+        or context["alert_percent"] != context["configured_alert_percent"]
+    )
 
 
 def _pbp_statuses(cycles: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -410,10 +434,16 @@ def _context(
     configured_alert = _first_number(settings.get("alert_percent"))
     configured_activate = _first_number(settings.get("activate_percent"))
     syslog_alert = _configured_alert_percent(events)
+    mitigating_from = min(active_congestions) if active_congestions else None
     if settings:
         alert = configured_alert if configured_alert is not None else DEFAULT_ALERT_PERCENT
         activate = configured_activate if configured_activate is not None else DEFAULT_ACTIVATE_PERCENT
         alert_source = "configuration"
+        # PBP cannot mitigate below its activate threshold: a read that says
+        # otherwise was taken while a commit was landing. Say so and fall back.
+        if mitigating_from is not None and mitigating_from < activate:
+            alert_source = "inconsistent"
+            alert = syslog_alert if syslog_alert is not None else alert
     elif syslog_alert is not None:
         alert, activate, alert_source = syslog_alert, None, "firewall"
     else:
@@ -443,10 +473,13 @@ def _context(
         "pbp_enabled": enabled,
         "monitor_only": monitor_only,
         "pbp_active_observed": any(status.get("active") is True for status in statuses),
-        "mitigating_from_percent": min(active_congestions) if active_congestions else None,
+        "mitigating_from_percent": mitigating_from,
         "alert_percent": alert,
         "activate_percent": activate,
         "alert_source": alert_source,
+        "configured_alert_percent": configured_alert,
+        "configured_activate_percent": configured_activate,
+        "settings_changed_during_run": bool(settings.get("changed_during_run")) if settings else False,
         "configured_enabled": settings.get("enabled") if settings else None,
         "latency_alert_ms": _first_number(settings.get("latency_alert_ms")) if settings else None,
         "latency_activate_ms": _first_number(settings.get("latency_activate_ms")) if settings else None,
@@ -500,8 +533,27 @@ def _step_pressure(cycles: Sequence[dict[str, Any]], context: dict[str, Any]) ->
             f"alert {_fmt(alert)}% and activate {_fmt(context['activate_percent'])}%, "
             "read from the running configuration"
         )
+        if context["settings_changed_during_run"]:
+            threshold_text += (
+                " at monitor stop; the values read at start differed, so a "
+                "commit landed during the incident"
+            )
         if context["configured_enabled"] is False:
             threshold_text += "; PBP is disabled in the configuration"
+    elif context["alert_source"] == "inconsistent":
+        threshold_text = (
+            f"the running configuration read alert "
+            f"{_fmt(context['configured_alert_percent'] if context['configured_alert_percent'] is not None else DEFAULT_ALERT_PERCENT)}% "
+            f"and activate {_fmt(context['configured_activate_percent'] if context['configured_activate_percent'] is not None else DEFAULT_ACTIVATE_PERCENT)}%, "
+            f"yet PBP was mitigating at {_fmt(mitigating_from)}%, which it cannot do "
+            "below its activate threshold: the read was taken while a commit was "
+            "landing and does not describe the thresholds in force"
+            + (
+                f"; the firewall's own congestion log says alert {_fmt(alert)}%"
+                if context["alert_percent"] is not None and syslog_alert_known(context)
+                else ""
+            )
+        )
     elif context["alert_source"] == "firewall":
         threshold_text = f"alert {_fmt(alert)}% as printed by the firewall's own congestion log"
     else:
@@ -510,7 +562,7 @@ def _step_pressure(cycles: Sequence[dict[str, Any]], context: dict[str, Any]) ->
             f"{_fmt(DEFAULT_ACTIVATE_PERCENT)}%, because neither the configuration "
             "nor a trigger carried the configured value"
         )
-    if mitigating_from is not None:
+    if mitigating_from is not None and context["alert_source"] != "inconsistent":
         threshold_text += (
             f"; PBP was observed mitigating from {_fmt(mitigating_from)}%"
             + (
@@ -645,7 +697,7 @@ def _step_pressure(cycles: Sequence[dict[str, Any]], context: dict[str, Any]) ->
                 )
                 + (
                     f" with the activate threshold configured at {_fmt(context['activate_percent'])}%"
-                    if context["activate_percent"] is not None
+                    if context["activate_percent"] is not None and context["alert_source"] == "configuration"
                     else ""
                 )
                 + f", far below the {_fmt(DEFAULT_ACTIVATE_PERCENT)}% default: the "
@@ -1527,6 +1579,9 @@ def _conclusion(
         f"the alert {_fmt(context['alert_percent'])}% / activate "
         f"{_fmt(context['activate_percent'])}% thresholds configured on the firewall"
         if context["alert_source"] == "configuration"
+        else "thresholds the configuration read could not establish, because a commit "
+        "was landing when the monitor started"
+        if context["alert_source"] == "inconsistent"
         else f"the {_fmt(context['alert_percent'])}% alert threshold configured on the firewall"
         if context["alert_source"] == "firewall"
         else f"the {_fmt(DEFAULT_ALERT_PERCENT)}% default alert threshold"
@@ -1614,7 +1669,10 @@ def render_diagnosis(diagnosis: dict[str, Any]) -> str:
         chips.append(
             f"configured alert {_fmt(context['alert_percent'])}% · activate "
             f"{_fmt(context['activate_percent'])}%"
+            + (" (changed during the run)" if context["settings_changed_during_run"] else "")
         )
+    elif context["alert_source"] == "inconsistent":
+        chips.append("configuration read during a commit · thresholds unreliable")
     elif context["alert_percent"] is not None:
         chips.append(f"alert threshold {_fmt(context['alert_percent'])}% (from the firewall)")
     if context["latency_peak_ms"] is not None:
