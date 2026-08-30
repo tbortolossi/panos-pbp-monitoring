@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.34.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.35.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -151,9 +151,18 @@ show running resource-monitor
 debug dataplane pool statistics
 show counter global filter delta yes
 show session all filter min-kb 1048576 min-age 600
+show session packet-buffer-protection buffer-latency
 ```
 
-`show system info` runs once at incident startup to identify the device.
+`show system info` runs once at incident startup to identify the device, and
+the PBP settings of the running configuration
+(`show config running xpath devices/entry/deviceconfig/setting/session`) are
+read once with it: the alert and activate thresholds and the latency thresholds
+the firewall actually runs with, which no operational command exposes. It is
+the collector's only configuration read, and it changes nothing. The buffer
+latency command returns the dataplane processing latency latency-based PBP acts
+on, the one reading of descriptor pressure that does not depend on buffer
+utilization.
 `show statistics`, which returns the function groups assigned to each dataplane
 core, runs when a firewall is saved in the admin UI rather than during an
 incident, so a firewall already under pressure spends no API call on it.
@@ -176,7 +185,11 @@ interfaces, on the first batch then every third batch — so input bytes and
 drops say where the flood enters when session evidence is thin. At monitor
 stop, the top ranked sources get their live sessions listed
 (`show session all filter source <ip>`, capped) and, for what never created a
-session, one bounded traffic-log query each.
+session, one bounded traffic-log query each. One more bounded threat-log
+query then captures the PBP threat logs of the incident window (8507 RED drop,
+8508 session discarded, 8509 source blocked), so the firewall's own
+designations reach the capture even when its threat log is not forwarded to
+the collector.
 
 ## What you get out of it
 

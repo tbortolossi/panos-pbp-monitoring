@@ -97,7 +97,14 @@ than create a concurrent one.
    request travels through the configuration database because the Web service
    mounts the evidence volume read-only and the collector exposes no port.
 4. At startup, the monitor runs `show system info` once without delaying the
-   first diagnostic batch. The dataplane core-to-function-group map returned by
+   first diagnostic batch, together with one read of the PBP settings of the
+   running configuration (`show config running xpath
+   devices/entry/deviceconfig/setting/session`): enable flag, alert and
+   activate percentages, latency alert, activate, max-tolerate and block
+   countdown. No operational command exposes those thresholds, so this is the
+   collector's single, declared exception to the operational-command rule; it
+   reads and never writes, and a value left at its default is absent from the
+   answer and read as the PAN-OS default. The dataplane core-to-function-group map returned by
    `show statistics` is captured once per firewall, when the firewall is saved,
    and stored with the model and PAN-OS release it was captured on. An incident
    reuses it and spends no API call unless that identity no longer matches, in
@@ -114,7 +121,10 @@ than create a concurrent one.
    - `debug dataplane pool statistics`;
    - `show counter global filter delta yes`;
    - `show session all filter min-kb <threshold> min-age <seconds>`, unless the
-     volume threshold is set to `0`.
+     volume threshold is set to `0`;
+   - `show session packet-buffer-protection buffer-latency`, the dataplane
+     processing latency in milliseconds per dataplane (latest, last ten
+     seconds average and maximum), which latency-based PBP acts on.
 6. The PBP table is structured without losing rows or directions: session or
    source-IP type, zone, rank, samples, percentage, `Drop State`, packets, and
    time until discard. Both output forms are accepted: the pipe-delimited CLI
@@ -161,9 +171,13 @@ than create a concurrent one.
    enumerated without scanning the session table), then one bounded read-only
    traffic-log query per source (20 entries, fixed query template
    interpolating only a validated address) for traffic that never created a
-   session — denied before setup or RED-blocked. Raw responses are preserved
-   as evidence and a failed lookup never blocks the stop marker or the
-   report.
+   session — denied before setup or RED-blocked. One further bounded
+   threat-log query (50 entries) captures the PBP threat logs 8507, 8508 and
+   8509 of the incident window, expressed on the firewall clock read in the
+   first batch with a one-minute margin, so the firewall's own designations
+   are in the capture even when its threat log is not forwarded to the
+   collector. Raw responses are preserved as evidence and a failed lookup
+   never blocks the stop marker or the report.
 10. After the stop marker is written, a standalone HTML report is generated in
    the background from the JSONL file. Its offender ranking and top-sources
    tables are bounded to 50 rows each and state what was left out, and every
@@ -245,9 +259,12 @@ trigger is copied into the incident as an event. Each incident creates
 firewall clock, ranked candidate entities, PBP rows, ingress details, normalized
 session snapshots and rates, dataplane pool headroom, global/flow/significant
 counter views, parsing status, and raw XML command responses. A
-`monitor_started` record preserves the identity returned by `show system info`
-and the `dp_core_functions` core-to-function-group map with the
-`dp_core_functions_source` field naming where that map came from, and a
+`monitor_started` record preserves the identity returned by `show system info`,
+the `pbp_settings` read from the running configuration, and the
+`dp_core_functions` core-to-function-group map with the
+`dp_core_functions_source` field naming where that map came from; each cycle
+carries its `buffer_latency` report; a `pbp_threat_logs` event carries the
+PBP threat logs captured at stop with the query and its window; and a
 `monitor_stopped` record gives the stop reason together with a run summary
 (peak packet-buffer percentage and top ranked sources) that the dashboard
 reads from its bounded tail read to compare runs. Multi-target mode roots
@@ -608,6 +625,24 @@ key must be backed up and restored together.
     sections follow the same order, and the summary cards, timeline, batch
     details and events become folded appendices. Collection, the JSONL, the
     commands and the exports do not change.
+
+57. Three pieces of evidence the firewall gives read-only reach the capture and
+    the diagnosis. The PBP settings of the running configuration are read once
+    per incident and once per API check (the collector's only configuration
+    read, declared in the flow), so step 1 judges the pressure against the
+    alert and activate thresholds the firewall actually runs with and states
+    them; the syslog text and the PAN-OS defaults remain the fallbacks. The
+    buffer latency is collected every batch and read against the latency
+    thresholds: latency at or above the activate threshold with low buffers is
+    the latency case, stated differently for a firewall running latency-based
+    PBP and for one running buffer-based PBP that does not see it; a disabled
+    measurement is stated. The PBP threat logs of the incident window are
+    queried once at stop and feed step 2: they confirm the entries marked for
+    RED, name the sources placed in the block table (8509) and the sessions
+    discarded (8508), and designate on their own when no batch caught a RED
+    entry, always presented as the firewall's own list and not as proof; a
+    failed query is stated. Every new command is replayable and exported with
+    the capture.
 
 ## 12. Possible enhancements
 

@@ -24,6 +24,7 @@ ADDITIONAL_COLLECTED_COMMANDS = frozenset(
     {
         "clock",
         "system_info",
+        "pbp_settings",
         "dp_core_functions",
         "global_counters_baseline",
         "large_sessions",

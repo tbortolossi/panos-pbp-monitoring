@@ -328,5 +328,109 @@ class ElsewhereStepTests(unittest.TestCase):
         self.assertIn("software-defect scenario", diagnosis["conclusion"][-1])
 
 
+class CapturedEvidenceTests(unittest.TestCase):
+    """Configured thresholds, buffer latency and threat logs feed the steps."""
+
+    def _started(self, **settings: object) -> dict:
+        base = {"status": "parsed", "enabled": True, "alert_percent": 50.0,
+                "activate_percent": 80.0, "latency_alert_ms": 50.0,
+                "latency_activate_ms": 200.0, "latency_max_tolerate_ms": 500.0}
+        base.update(settings)
+        return {"run_id": "r", "event": "monitor_started",
+                "device": {"model": "PA-5220", "software_version": "10.2.9"},
+                "pbp_settings": base}
+
+    def test_configured_thresholds_win_over_the_syslog_text_and_the_defaults(self):
+        diagnosis = _diagnose(
+            [_cycle(1, 4.4, pbp_status={"enabled": True, "active": True, "congestion_percentage": 4.3})],
+            [self._started(alert_percent=1.0, activate_percent=2.0),
+             {"event": "trigger_received", "message": "(alert threshold is 1%)."}],
+        )
+        context = diagnosis["context"]
+        pressure = diagnosis["steps"][0]
+
+        self.assertEqual(context["alert_source"], "configuration")
+        self.assertEqual(context["alert_percent"], 1.0)
+        self.assertEqual(context["activate_percent"], 2.0)
+        self.assertIn("with the activate threshold configured at 2%", pressure["verdict"])
+        self.assertIn("alert 1% and activate 2%, read from the running configuration", pressure["facts"][-1][1])
+        self.assertIn("alert 1% / activate 2% thresholds configured on the firewall", diagnosis["conclusion"][1])
+
+    def test_latency_above_the_activate_threshold_is_the_latency_case(self):
+        cycles = [
+            _cycle(1, 12.0, buffer_latency={"status": "parsed", "peak_ms": 260.0, "latest_ms": 240.0, "dataplanes": []}),
+            _cycle(2, 11.0, buffer_latency={"status": "parsed", "peak_ms": 90.0, "latest_ms": 60.0, "dataplanes": []}),
+        ]
+        buffer_based = _diagnose(cycles, [self._started()])
+        latency_based = _diagnose(
+            [dict(cycle, pbp_status={"enabled": True, "active": True, "mode": "latency"}) for cycle in cycles],
+            [self._started()],
+        )
+
+        self.assertEqual(buffer_based["context"]["latency_peak_ms"], 260.0)
+        self.assertEqual(buffer_based["steps"][0]["state"], "positive")
+        self.assertIn("Dataplane latency reached 260 ms while the buffers stayed at 12%", buffer_based["steps"][0]["verdict"])
+        self.assertIn("runs buffer-based PBP, which does not see it", buffer_based["steps"][0]["verdict"])
+        self.assertIn("mitigating on latency rather than on buffer utilization", latency_based["steps"][0]["verdict"])
+        self.assertEqual(buffer_based["steps"][0]["facts"][-1][0], "Buffer latency peak")
+        self.assertEqual(buffer_based["steps"][0]["facts"][-1][2], "bad")
+
+    def test_threat_logs_designate_when_no_batch_caught_a_red_entry(self):
+        threat = {
+            "event": "pbp_threat_logs", "ok": True,
+            "entries": [
+                {"threat_id": 8509, "source_ip": "203.0.113.9", "threat_name": "PBP IP Blocked"},
+                {"threat_id": 8507, "source_ip": "203.0.113.9", "threat_name": "PBP Packet Drop"},
+                {"threat_id": 8507, "source_ip": "203.0.113.7", "threat_name": "PBP Packet Drop"},
+            ],
+        }
+        diagnosis = _diagnose(
+            [_cycle(1, 84.0, pbp_status={"enabled": True, "active": False})],
+            [self._started(), threat],
+        )
+        named = diagnosis["steps"][1]
+
+        self.assertEqual(named["state"], "positive")
+        self.assertIn("but the firewall's threat log did", named["verdict"])
+        self.assertIn("2 × PBP Packet Drop (8507), 1 × PBP IP Blocked (8509)", named["verdict"])
+        self.assertIn("<code>203.0.113.9</code> was placed in the block table (8509)", named["verdict"])
+        self.assertEqual(named["named"][0], "source IP <code>203.0.113.9</code> — PBP Packet Drop, PBP IP Blocked")
+        self.assertEqual(diagnosis["headline"]["label"], "Offender named by the firewall")
+        self.assertEqual(named["facts"][-1][0], "PBP threat logs")
+
+    def test_a_failed_threat_query_is_stated_not_hidden(self):
+        diagnosis = _diagnose(
+            [_cycle(1, 84.0)],
+            [self._started(), {"event": "pbp_threat_logs", "ok": False, "error": "log job 60 did not finish within 20s"}],
+        )
+
+        self.assertEqual(diagnosis["steps"][1]["facts"][-1][1], "query failed: log job 60 did not finish within 20s")
+
+    def test_the_report_renders_the_latency_table_and_the_threat_log_section(self):
+        html = _render(
+            [
+                self._started(),
+                _cycle(1, 60.0, buffer_latency={"status": "parsed", "peak_ms": 7.0, "latest_ms": 3.0,
+                                                "dataplanes": [{"dataplane": "s1.dp0", "enabled": True, "latest_ms": 3.0,
+                                                                "last_avg_ms": [2.0, 1.0], "last_max_ms": [7.0, 4.0]}]}),
+                _cycle(2, 61.0, buffer_latency={"status": "parsed", "peak_ms": 5.0, "latest_ms": 5.0, "dataplanes": []}),
+                {"run_id": "r", "event": "pbp_threat_logs", "ok": True, "since_firewall_time": "2026/08/30 12:04:06",
+                 "entries": [{"receive_time": "2026/08/30 12:15:26", "threat_id": 8507, "threat_name": "PBP Packet Drop",
+                              "source_ip": "203.0.113.7", "destination_ip": "0.0.0.0", "source_port": "0",
+                              "destination_port": "0", "protocol": "tcp", "application": "not-applicable",
+                              "from_zone": "LAN", "action": "drop", "session_id": "0", "repeat_count": "1"}]},
+            ]
+        )
+
+        self.assertIn("<h3>Buffer latency</h3>", html)
+        self.assertIn("<td>s1.dp0</td>", html)
+        self.assertIn('href="#pbp-threat-logs-title"', html)
+        self.assertIn("Step 2 · PBP threat logs", html)
+        self.assertIn("1 entries since 2026/08/30 12:04:06 on the firewall clock", html)
+        self.assertIn("8507 <span class=\"muted\">PBP Packet Drop</span>", html)
+        self.assertIn("buffer latency peak 7 ms", html)
+        self.assertIn("configured alert 50% · activate 80%", html)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,7 +25,7 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -84,7 +84,31 @@ OP_COMMANDS = {
     "resource_monitor": resource_monitor_command(5),
     "dataplane_pool_statistics": "<debug><dataplane><pool><statistics/></pool></dataplane></debug>",
     "global_counters_delta": "<show><counter><global><filter><delta>yes</delta></filter></global></counter></show>",
+    # Validated read-only on the lab PA-440 (PAN-OS 12.2.2) on 2026-08-30: the
+    # API returns sw.comm.s<slot>.dp<n>.packet-buffer-latency-report with
+    # latest, last-avg and last-max in milliseconds. This is the measurement
+    # latency-based PBP acts on, and the only view of descriptor pressure that
+    # does not depend on buffer utilization.
+    "buffer_latency": "<show><session><packet-buffer-protection><buffer-latency/></packet-buffer-protection></session></show>",
 }
+
+# The configured PBP thresholds are not exposed by any operational command:
+# `show session packet-buffer-protection` reports max-tolerate and the latency
+# thresholds but never the alert and activate percentages, and the system
+# state has no cfg.session.pbp entry. This read of the running configuration,
+# validated read-only on the lab PA-440 on 2026-08-30, is the one exception to
+# the operational-command rule and is declared as such in the PRD. It runs
+# once per incident, with the identity command, and changes nothing.
+PBP_SETTINGS_COMMAND = (
+    "<show><config><running><xpath>devices/entry/deviceconfig/setting/session"
+    "</xpath></running></config></show>"
+)
+# The PBP threat IDs: RED drop, session discard, source IP block. One bounded
+# query at monitor stop captures the firewall's own designations even when it
+# does not forward its threat log to the collector.
+PBP_THREAT_IDS = (8507, 8508, 8509)
+PBP_THREAT_LOG_NLOGS = 50
+PBP_THREAT_LOG_TIMEOUT_SECONDS = 20.0
 
 SYSTEM_INFO_COMMAND = "<show><system><info/></system></show>"
 DP_CORE_FUNCTIONS_COMMAND = "<show><statistics/></show>"
@@ -1029,6 +1053,93 @@ def _structured_pbp_state(output: str) -> dict[str, Any]:
     if modes:
         state["mode"] = "latency" if "latency" in modes else "packet_buffer"
     return state
+
+
+_PBP_SETTING_FIELDS = (
+    ("packet-buffer-protection-alert", "alert_percent"),
+    ("packet-buffer-protection-activate", "activate_percent"),
+    ("packet-buffer-protection-latency-alert", "latency_alert_ms"),
+    ("packet-buffer-protection-latency-activate", "latency_activate_ms"),
+    ("packet-buffer-protection-latency-max-tolerate", "latency_max_tolerate_ms"),
+    ("packet-buffer-protection-latency-block-countdown", "latency_block_countdown_ms"),
+)
+
+
+def extract_pbp_settings(output: str) -> dict[str, Any]:
+    """Read the configured PBP thresholds from the session settings element.
+
+    A threshold PAN-OS leaves at its default is absent from the running
+    configuration, so a missing element means "default", never "unknown":
+    the report applies the PAN-OS defaults for what is not returned.
+    """
+    settings: dict[str, Any] = {"status": "unparsed"}
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return settings
+    element = next(
+        (item for item in root.iter() if _local_tag(item) == "session"),
+        None,
+    )
+    if element is None:
+        return settings
+    settings["status"] = "parsed"
+    enabled = _panos_flag(_child_text(element, "packet-buffer-protection-enable"))
+    settings["enabled"] = enabled
+    for tag, key in _PBP_SETTING_FIELDS:
+        settings[key] = _float_value(_child_text(element, tag))
+    return settings
+
+
+def extract_buffer_latency(output: str) -> dict[str, Any]:
+    """Normalize the per-dataplane buffer latency report, in milliseconds."""
+    dataplanes: list[dict[str, Any]] = []
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return {"status": "unparsed", "dataplanes": dataplanes}
+    text = panos_result_text(output).lower()
+    if "latency measurement is disabled" in text:
+        return {"status": "disabled", "dataplanes": dataplanes}
+    for element in root.iter():
+        tag = _local_tag(element)
+        if not tag.endswith("packet-buffer-latency-report"):
+            continue
+        match = re.search(r"(s\d+)\.(dp\d+)", tag)
+        dataplane = f"{match.group(1)}.{match.group(2)}" if match else "dp0"
+        entry: dict[str, Any] = {
+            "dataplane": dataplane,
+            "enabled": _panos_flag(_child_text(element, "buffer-latency-enabled")),
+            "latest_ms": _float_value(_child_text(element, "latest")),
+            "last_avg_ms": [],
+            "last_max_ms": [],
+        }
+        for tag_name, key in (("last-avg", "last_avg_ms"), ("last-max", "last_max_ms")):
+            container = next(
+                (child for child in element if _local_tag(child) == tag_name), None
+            )
+            if container is None:
+                continue
+            entry[key] = [
+                value
+                for member in container
+                if (value := _float_value((member.text or "").strip())) is not None
+            ]
+        dataplanes.append(entry)
+    if not dataplanes:
+        return {"status": "unparsed", "dataplanes": dataplanes}
+    peaks = [
+        max([*entry["last_max_ms"], *( [entry["latest_ms"]] if entry["latest_ms"] is not None else [])], default=None)
+        for entry in dataplanes
+    ]
+    peaks = [value for value in peaks if value is not None]
+    latest = [entry["latest_ms"] for entry in dataplanes if entry["latest_ms"] is not None]
+    return {
+        "status": "parsed",
+        "dataplanes": dataplanes,
+        "latest_ms": max(latest) if latest else None,
+        "peak_ms": max(peaks) if peaks else None,
+    }
 
 
 def extract_pbp_status(
@@ -2888,6 +2999,72 @@ def extract_traffic_log_entries(output: str) -> list[dict[str, Any]]:
     return entries
 
 
+def extract_pbp_threat_log_entries(output: str) -> list[dict[str, Any]]:
+    """Normalize the PBP threat log entries (8507, 8508, 8509) of one query."""
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return []
+    entries: list[dict[str, Any]] = []
+    for element in root.iter("entry"):
+        entry: dict[str, Any] = {
+            name: (element.findtext(tag) or "").strip() or None
+            for name, tag in (
+                ("receive_time", "receive_time"),
+                ("threat_name", "threat_name"),
+                ("source_ip", "src"),
+                ("destination_ip", "dst"),
+                ("source_port", "sport"),
+                ("destination_port", "dport"),
+                ("protocol", "proto"),
+                ("application", "app"),
+                ("from_zone", "from"),
+                ("to_zone", "to"),
+                ("action", "action"),
+                ("session_id", "sessionid"),
+                ("repeat_count", "repeatcnt"),
+            )
+        }
+        threat_id = (element.findtext("tid") or "").strip()
+        if not threat_id.isdigit():
+            threat_id = (element.findtext("threatid") or "").strip()
+        entry["threat_id"] = int(threat_id) if threat_id.isdigit() else None
+        if entry["threat_name"] is None:
+            name = (element.findtext("threatid") or "").strip()
+            entry["threat_name"] = name if name and not name.isdigit() else None
+        if entry["source_ip"] or entry["threat_id"] is not None:
+            entries.append(entry)
+    return entries
+
+
+def firewall_clock_query_time(clock_text: Any, margin_seconds: int = 60) -> str | None:
+    """Turn a `show clock` reading into the log-query time format, minus a margin.
+
+    The threat log is filtered on the firewall's own clock, so the window
+    must be expressed in its local time, not in the collector's UTC.
+    """
+    if not isinstance(clock_text, str) or not clock_text.strip():
+        return None
+    tokens = clock_text.split()
+    # "Sun Aug 30 12:05:20 CEST 2026": drop the zone token before parsing.
+    if len(tokens) == 6:
+        tokens = tokens[:4] + tokens[5:]
+    try:
+        moment = datetime.strptime(" ".join(tokens), "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return None
+    moment -= timedelta(seconds=margin_seconds)
+    return moment.strftime("%Y/%m/%d %H:%M:%S")
+
+
+def pbp_threat_log_query(since: str | None) -> str:
+    ids = " or ".join(f"(threatid eq {threat_id})" for threat_id in PBP_THREAT_IDS)
+    query = f"({ids})"
+    if since:
+        query += f" and (receive_time geq '{since}')"
+    return query
+
+
 def is_flood_corroboration(message: str) -> bool:
     """Recognize a zone-protection or DoS flood THREAT log.
 
@@ -3593,6 +3770,62 @@ class MonitorController:
             },
         )
 
+    async def _collect_pbp_threat_logs(
+        self,
+        output_file: Path,
+        run_id: str,
+        firewall_clock: str | None,
+    ) -> None:
+        """Capture the PBP threat logs (8507, 8508, 8509) of the incident window.
+
+        One bounded, read-only query at monitor stop. The firewall's own
+        designations reach the capture this way even when its threat log is
+        not forwarded to the collector; the window is expressed on the
+        firewall clock read in the first batch, with a margin, or left open
+        when that clock could not be parsed.
+        """
+        since = firewall_clock_query_time(firewall_clock)
+        query = pbp_threat_log_query(since)
+        outcome: dict[str, Any] = {
+            "timestamp": utc_now(),
+            "run_id": run_id,
+            "event": "pbp_threat_logs",
+            "target_name": self.cfg.target_name,
+            "query": query,
+            "since_firewall_time": since,
+            "ok": False,
+        }
+        try:
+            job_id = await asyncio.to_thread(
+                self.client.log_query_job, "threat", query, PBP_THREAT_LOG_NLOGS
+            )
+            deadline = time.monotonic() + PBP_THREAT_LOG_TIMEOUT_SECONDS
+            response: PanOSResponse | None = None
+            status = ""
+            while time.monotonic() < deadline:
+                response = await asyncio.to_thread(self.client.log_query_result, job_id)
+                status = extract_log_job_status(response.result_xml)
+                if status == "FIN":
+                    break
+                await asyncio.sleep(OFFENDER_LOG_POLL_SECONDS)
+            if response is None or status != "FIN":
+                outcome["error"] = (
+                    f"log job {job_id} did not finish within "
+                    f"{PBP_THREAT_LOG_TIMEOUT_SECONDS:.0f}s"
+                )
+            else:
+                outcome.update(
+                    {
+                        "ok": True,
+                        "job_id": job_id,
+                        "entries": extract_pbp_threat_log_entries(response.result_xml),
+                        "raw_response": self._redact_secret(response.raw_response),
+                    }
+                )
+        except Exception as exc:  # the stop marker must follow regardless
+            outcome["error"] = self._redact_secret(f"{type(exc).__name__}: {exc}")
+        append_jsonl(output_file, outcome)
+
     async def _session_details(self, ids: list[int]) -> dict[str, dict[str, Any]]:
         semaphore = asyncio.Semaphore(4)
 
@@ -3660,12 +3893,16 @@ class MonitorController:
         system_info_task = asyncio.create_task(
             self._collect_command("system_info", SYSTEM_INFO_COMMAND)
         )
+        pbp_settings_task = asyncio.create_task(
+            self._collect_command("pbp_settings", PBP_SETTINGS_COMMAND)
+        )
         global_counter_primer_task = asyncio.create_task(
             self._collect_command(
                 "global_counters_baseline",
                 OP_COMMANDS["global_counters_delta"],
             )
         )
+        first_firewall_clock: str | None = None
         session_rate_samples: dict[str, dict[str, Any]] = {}
         large_session_samples: dict[str, dict[str, Any]] = {}
         offender_sources: dict[str, int] = {}
@@ -3677,9 +3914,12 @@ class MonitorController:
                 cycle_start = time.monotonic()
                 cycle_started_at = utc_now()
                 if cycle_number == 1:
-                    (_, system_info), outputs = await asyncio.gather(
-                        system_info_task,
-                        self._op_commands(global_counter_primer_task),
+                    (_, system_info), (_, pbp_settings_payload), outputs = (
+                        await asyncio.gather(
+                            system_info_task,
+                            pbp_settings_task,
+                            self._op_commands(global_counter_primer_task),
+                        )
                     )
                     _, global_counter_baseline = global_counter_primer_task.result()
                     device = extract_system_info(command_result(system_info))
@@ -3705,8 +3945,12 @@ class MonitorController:
                         "parse_warnings": startup_warnings,
                         "dp_core_functions": core_functions,
                         "dp_core_functions_source": core_functions_source,
+                        "pbp_settings": extract_pbp_settings(
+                            command_result(pbp_settings_payload)
+                        ),
                         "commands": {
                             "system_info": system_info,
+                            "pbp_settings": pbp_settings_payload,
                             **(
                                 {"dp_core_functions": dp_core_functions}
                                 if dp_core_functions is not None
@@ -3881,8 +4125,13 @@ class MonitorController:
                         "session_rates": session_rates,
                         "large_sessions": large_sessions,
                         "interface_counters": interface_counters,
+                        "buffer_latency": extract_buffer_latency(
+                            command_result(outputs.get("buffer_latency"))
+                        ),
                         "commands": outputs,
                     }
+                if first_firewall_clock is None and firewall_clock:
+                    first_firewall_clock = firewall_clock
                 append_jsonl(output_file, cycle_record)
                 self._write_text_export(output_file, cycle_record)
                 LOG.info(
@@ -3927,7 +4176,11 @@ class MonitorController:
             stop_reason = "monitor_error"
             LOG.exception("Monitor %s stopped after an unexpected error", run_id)
         finally:
-            for startup_task in (system_info_task, global_counter_primer_task):
+            for startup_task in (
+                system_info_task,
+                pbp_settings_task,
+                global_counter_primer_task,
+            ):
                 if not startup_task.done():
                     startup_task.cancel()
                     await asyncio.gather(startup_task, return_exceptions=True)
@@ -3951,6 +4204,13 @@ class MonitorController:
                     LOG.exception(
                         "Offender traffic log lookup failed for %s", run_id
                     )
+            if stop_reason != "cancelled":
+                try:
+                    await self._collect_pbp_threat_logs(
+                        output_file, run_id, first_firewall_clock
+                    )
+                except Exception:
+                    LOG.exception("PBP threat log lookup failed for %s", run_id)
             try:
                 append_jsonl(
                     output_file,
@@ -4578,8 +4838,9 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
             OP_COMMANDS["global_counters_delta"],
         )
     )
-    (_, system_info), outputs = await asyncio.gather(
+    (_, system_info), (_, pbp_settings_payload), outputs = await asyncio.gather(
         controller._collect_command("system_info", SYSTEM_INFO_COMMAND),
+        controller._collect_command("pbp_settings", PBP_SETTINGS_COMMAND),
         controller._op_commands(global_counter_primer_task),
     )
     _, global_counter_baseline = global_counter_primer_task.result()
@@ -4603,8 +4864,10 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
         "parse_warnings": startup_warnings,
         "dp_core_functions": core_functions,
         "dp_core_functions_source": core_functions_source,
+        "pbp_settings": extract_pbp_settings(command_result(pbp_settings_payload)),
         "commands": {
             "system_info": system_info,
+            "pbp_settings": pbp_settings_payload,
             "dp_core_functions": dp_core_functions,
             "global_counters_baseline": global_counter_baseline,
         },
@@ -4660,6 +4923,8 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
     validation_errors = list(identity_warnings)
     if not command_succeeded(system_info):
         validation_errors.append("system_info command failed")
+    if not command_succeeded(pbp_settings_payload):
+        validation_errors.append("pbp_settings command failed")
     if not command_succeeded(global_counter_baseline):
         validation_errors.append("global counter baseline command failed")
     validation_errors.extend(
@@ -4710,6 +4975,9 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
             "session_summaries": session_summaries,
             "session_rates": session_rates,
             "large_sessions": large_sessions,
+            "buffer_latency": extract_buffer_latency(
+                command_result(outputs.get("buffer_latency"))
+            ),
             "commands": outputs,
         }
     append_jsonl(output_file, cycle_record)

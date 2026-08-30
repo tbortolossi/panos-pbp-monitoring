@@ -33,6 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from pbp_monitoring.orchestrator import (  # noqa: E402
+    extract_buffer_latency,
     extract_dataplane_pool_statistics,
     extract_dp_core_functions,
     extract_firewall_clock,
@@ -41,6 +42,7 @@ from pbp_monitoring.orchestrator import (  # noqa: E402
     extract_interface_counters,
     extract_large_sessions,
     extract_pbp_offenders,
+    extract_pbp_settings,
     extract_pbp_status,
     extract_resource_cpu_cores,
     extract_session_filter_count,
@@ -54,7 +56,9 @@ from pbp_monitoring.orchestrator import (  # noqa: E402
 #: gets a replay entry is exactly the one nobody can diagnose remotely.
 PARSERS: dict[str, Callable[[str], Any]] = {
     "system_info": extract_system_info,
+    "pbp_settings": extract_pbp_settings,
     "clock": extract_firewall_clock,
+    "buffer_latency": extract_buffer_latency,
     "packet_buffer_protection": extract_pbp_offenders,
     "ingress_backlogs": extract_ingress_backlogs,
     "dataplane_pool_statistics": extract_dataplane_pool_statistics,
