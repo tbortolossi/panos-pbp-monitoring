@@ -341,7 +341,9 @@ administrator login. Confirm all of the following on the dashboard:
 
 - **Syslog reception is active** is green globally;
 - the corresponding firewall shows **receiving logs**;
-- the event appears in **20 most recent received logs**;
+- the event appears in **20 most recent received logs**, attributed to that
+  firewall — its chip above the table isolates it, and the **Unattributed**
+  chip shows what no firewall claims;
 - no diagnostic run starts for an ordinary non-PBP event.
 
 Then wait for a genuine PBP event or use the controlled injection described

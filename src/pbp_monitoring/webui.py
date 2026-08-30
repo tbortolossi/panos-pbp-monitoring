@@ -22,13 +22,18 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__, diagnostics
 from .adminui import AdminController
-from .config_store import ALL_RUNS, DEFAULT_SETTINGS, ConfigStore
+from .config_store import ALL_RUNS, DEFAULT_SETTINGS, TARGET_NAME, ConfigStore
 from .web_tls import ensure_self_signed_certificate
 
 
 LOG = logging.getLogger("pbp-web")
 SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 SAFE_REDIRECT_HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\Z")
+#: Received-log filter selecting what no declared firewall claims: refused
+#: messages, and messages from a sender that is not a registered source. A
+#: target name cannot start with a dash, so the sentinel never collides with
+#: a firewall the operator declared.
+UNATTRIBUTED_LOGS = "-unattributed"
 
 
 class ThreadingTLSHTTPServer(ThreadingHTTPServer):
@@ -463,6 +468,36 @@ def _target_roots(data_dir: Path) -> list[tuple[str, Path]]:
     return found
 
 
+def _attributed_firewalls(
+    record: dict[str, Any], targets: Sequence[dict[str, Any]]
+) -> list[str]:
+    """Declared firewalls a received log belongs to.
+
+    A refused message is attributed to none of them by design: the collector
+    rejected it before it could be tied to a firewall, and that is exactly what
+    the unattributed filter has to surface. Without a configuration store the
+    record's own attribution is kept, so the column still says something.
+    """
+    if record.get("suppressed"):
+        return []
+    names = record.get("target_names")
+    claimed = [str(name) for name in names] if isinstance(names, list) else []
+    if not targets:
+        return claimed
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    source = metadata.get("syslog_source_ip") or record.get("transport_source_ip")
+    serial = metadata.get("device_serial")
+    return [
+        target["name"]
+        for target in targets
+        if target["name"] in claimed
+        or (
+            source in target["syslog_sources"]
+            and (not serial or str(serial) in target["serials"])
+        )
+    ]
+
+
 def collect_dashboard_state(
     data_dir: Path,
     *,
@@ -471,11 +506,17 @@ def collect_dashboard_state(
     now: datetime | None = None,
     freshness_seconds: float = 300,
     config_store: ConfigStore | None = None,
+    log_filter: str | None = None,
 ) -> dict[str, Any]:
-    """Build a bounded dashboard snapshot without loading full incident files."""
+    """Build a bounded dashboard snapshot without loading full incident files.
+
+    ``log_filter`` restricts the received-log table to one declared firewall, or
+    to :data:`UNATTRIBUTED_LOGS` for what none of them claims. It never touches
+    the reception watchdogs: global freshness and every firewall card keep
+    reading the whole journal tail, so a filtered view cannot hide an outage.
+    """
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     status_logs = _tail_json_records(data_dir / "syslog-received.jsonl", 200)
-    logs = status_logs[-log_limit:]
     latest_time = _parse_time(status_logs[-1].get("timestamp")) if status_logs else None
     age_seconds = (
         max(0.0, (current - latest_time).total_seconds()) if latest_time else None
@@ -523,6 +564,7 @@ def collect_dashboard_state(
     runs.sort(key=lambda item: item["run_id"], reverse=True)
     firewall_statuses: list[dict[str, Any]] = []
     check_interval_hours = float(DEFAULT_SETTINGS["target_check_hours"])
+    targets: list[dict[str, Any]] = []
     if config_store is not None and config_store.path.is_file():
         try:
             targets = config_store.list_targets()
@@ -534,56 +576,46 @@ def collect_dashboard_state(
             )
         except (KeyError, OSError, ValueError):
             pass
-        chronological_logs = status_logs
-        for target in targets:
-            matching: list[dict[str, Any]] = []
-            for record in chronological_logs:
-                if record.get("suppressed"):
-                    continue
-                names = record.get("target_names")
-                if isinstance(names, list) and target["name"] in names:
-                    matching.append(record)
-                    continue
-                metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-                source = metadata.get("syslog_source_ip") or record.get("transport_source_ip")
-                serial = metadata.get("device_serial")
-                if source in target["syslog_sources"] and (
-                    not serial or str(serial) in target["serials"]
-                ):
-                    matching.append(record)
-            last = matching[-1] if matching else None
-            last_time = _parse_time(last.get("timestamp")) if last else None
-            target_age = max(0.0, (current - last_time).total_seconds()) if last_time else None
-            active_run = next(
-                (
-                    run["run_id"]
-                    for run in runs
-                    if run["target"] == target["name"] and run["status"] == "active"
-                ),
-                None,
-            )
-            check_time = _parse_time(target.get("last_check_at"))
-            check_age = (
-                max(0.0, (current - check_time).total_seconds())
-                if check_time
-                else None
-            )
-            firewall_statuses.append(
-                {
-                    "name": target["name"],
-                    "enabled": target["enabled"],
-                    "healthy": bool(target["enabled"] and target_age is not None and target_age <= freshness_seconds),
-                    "last_received_at": last.get("timestamp") if last else None,
-                    "age_seconds": target_age,
-                    "active_run": active_run,
-                    "last_check_at": target.get("last_check_at"),
-                    "last_check_kind": target.get("last_check_kind"),
-                    "last_check_status": target.get("last_check_status"),
-                    "last_check_detail": target.get("last_check_detail"),
-                    "check_requested_at": target.get("check_requested_at"),
-                    "check_age_seconds": check_age,
-                }
-            )
+    attribution = [_attributed_firewalls(record, targets) for record in status_logs]
+    for target in targets:
+        matching = [
+            record
+            for record, names in zip(status_logs, attribution)
+            if target["name"] in names
+        ]
+        last = matching[-1] if matching else None
+        last_time = _parse_time(last.get("timestamp")) if last else None
+        target_age = max(0.0, (current - last_time).total_seconds()) if last_time else None
+        active_run = next(
+            (
+                run["run_id"]
+                for run in runs
+                if run["target"] == target["name"] and run["status"] == "active"
+            ),
+            None,
+        )
+        check_time = _parse_time(target.get("last_check_at"))
+        check_age = (
+            max(0.0, (current - check_time).total_seconds())
+            if check_time
+            else None
+        )
+        firewall_statuses.append(
+            {
+                "name": target["name"],
+                "enabled": target["enabled"],
+                "healthy": bool(target["enabled"] and target_age is not None and target_age <= freshness_seconds),
+                "last_received_at": last.get("timestamp") if last else None,
+                "age_seconds": target_age,
+                "active_run": active_run,
+                "last_check_at": target.get("last_check_at"),
+                "last_check_kind": target.get("last_check_kind"),
+                "last_check_status": target.get("last_check_status"),
+                "last_check_detail": target.get("last_check_detail"),
+                "check_requested_at": target.get("check_requested_at"),
+                "check_age_seconds": check_age,
+            }
+        )
     pending_deletions: list[dict[str, str]] = []
     if config_store is not None and config_store.path.is_file():
         try:
@@ -593,11 +625,24 @@ def collect_dashboard_state(
             ]
         except Exception:  # a broken queue must never blank the dashboard
             LOG.exception("Unable to read the queued incident-run deletions")
+    attributed = list(zip(status_logs, attribution))
+    if log_filter == UNATTRIBUTED_LOGS:
+        selected = [item for item in attributed if not item[1]]
+    elif log_filter:
+        selected = [item for item in attributed if log_filter in item[1]]
+    else:
+        selected = attributed
     return {
         "generated_at": current.isoformat(),
         "syslog_healthy": syslog_healthy,
         "syslog_age_seconds": age_seconds,
-        "logs": list(reversed(logs)),
+        "logs": [
+            {**record, "firewalls": names}
+            for record, names in reversed(selected[-log_limit:])
+        ],
+        "log_filter": log_filter or "",
+        "log_firewalls": [target["name"] for target in targets],
+        "unattributed_logs": sum(1 for names in attribution if not names),
         "runs": runs[:run_limit],
         "runs_total": len(runs),
         "firewalls": firewall_statuses,
@@ -750,16 +795,41 @@ def render_dashboard(
             message = str(record.get("message", ""))
             if len(message) > 320:
                 message = message[:317] + "..."
+        firewalls = record.get("firewalls")
+        attributed = (
+            ", ".join(str(name) for name in firewalls)
+            if isinstance(firewalls, list)
+            else ""
+        )
         log_rows.append(
             "<tr>"
             f"<td>{_escape(record.get('timestamp'))}</td>"
             f"<td>{_escape(metadata.get('syslog_source_ip') or record.get('transport_source_ip'))}</td>"
+            f"<td>{_escape(attributed) if attributed else '&mdash;'}</td>"
             f"<td><span class=\"badge {'trigger' if record.get('trigger') else ''}\">{_escape(kind)}</span></td>"
             f"<td class=\"message\">{_escape(message)}</td>"
             "</tr>"
         )
+    log_filter = str(state.get("log_filter") or "")
     if not log_rows:
-        log_rows.append('<tr><td colspan="4" class="muted">No log observed.</td></tr>')
+        empty = "No log observed." if not log_filter else "No log matches this filter."
+        log_rows.append(f'<tr><td colspan="5" class="muted">{empty}</td></tr>')
+
+    # Filtering happens on the server: the dashboard reloads itself every few
+    # seconds, so a client-side filter would reset under the operator's hands.
+    chips: list[tuple[str, str]] = [("", "All firewalls")]
+    chips += [(str(name), str(name)) for name in state.get("log_firewalls", [])]
+    if len(chips) > 1:
+        chips.append(
+            (UNATTRIBUTED_LOGS, f"Unattributed ({int(state.get('unattributed_logs') or 0)})")
+        )
+        log_filters = '<nav class="chips">' + "".join(
+            f'<a class="chip{" on" if value == log_filter else ""}" href="/'
+            f'{"?firewall=" + quote(value, safe="") if value else ""}">{_escape(label)}</a>'
+            for value, label in chips
+        ) + "</nav>"
+    else:
+        log_filters = ""
 
     queued_deletions = {
         (str(item.get("target")), str(item.get("run_id")))
@@ -866,12 +936,14 @@ h1{{margin:0;font-size:clamp(25px,4vw,40px)}}header p{{margin:5px 0 0;color:#d9f
 th,td{{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}th{{position:sticky;top:0;background:#eef3f8;font-size:12px;text-transform:uppercase}}
 .message{{max-width:680px;white-space:normal;overflow-wrap:anywhere;font:12px/1.45 ui-monospace,Consolas,monospace}}.badge{{display:inline-block;padding:2px 8px;border-radius:999px;background:#e2e8f0;font-size:11px;font-weight:700}}
 .section-head{{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}}.section-head h2{{margin:0}}
+.chips{{display:flex;flex-wrap:wrap;gap:6px}}.chip{{padding:3px 11px;border:1px solid var(--line);border-radius:999px;background:#fff;color:var(--muted);font-size:12px;font-weight:650;text-decoration:none}}
+.chip:hover{{border-color:var(--accent)}}.chip.on{{border-color:var(--accent);background:#e0f2fe;color:var(--accent)}}
 button.danger{{padding:5px 11px;border:1px solid #fca5a5;border-radius:8px;background:#fff;color:var(--bad);font:inherit;font-weight:650;cursor:pointer}}button.danger:hover{{background:#fef2f2}}form.inline{{display:inline}}
 .badge.trigger,.badge.active{{background:#fef3c7;color:#92400e}}.badge.done{{background:#dcfce7;color:#166534}}a{{color:#0369a1;font-weight:650}}code{{color:#075985}}
 </style></head><body><header><h1>PBP Monitoring <small style="font-size:14px;font-weight:600">v{_escape(__version__)}</small></h1><p>Dashboard &middot; refreshes every {max(2, int(refresh_seconds))} seconds &middot; <a style="color:white" href="/admin">Admin</a></p></header><main>
 <div class="status {status_class}"><span class="dot"></span><div><strong>{_escape(status_text)}</strong><span>{_escape(age_text)}</span></div></div>
 <div class="status-grid">{''.join(firewall_cards)}</div>
-<section><h2>20 most recent received logs</h2><div class="table-wrap"><table><thead><tr><th>Time (UTC)</th><th>Observed source</th><th>Type</th><th>Message</th></tr></thead><tbody>{''.join(log_rows)}</tbody></table></div></section>
+<section><div class="section-head"><h2>20 most recent received logs</h2>{log_filters}</div><div class="table-wrap"><table><thead><tr><th>Time (UTC)</th><th>Observed source</th><th>Firewall</th><th>Type</th><th>Message</th></tr></thead><tbody>{''.join(log_rows)}</tbody></table></div></section>
 <section><div class="section-head"><h2>Recent runs</h2>{delete_all_control}</div><div class="table-wrap"><table><thead><tr><th>Target</th><th>Run ID</th><th>Start time (UTC)</th><th>Status</th><th>Batches</th><th>Peak buffer</th><th>Top sources</th><th>Stop reason</th><th>Artifacts</th><th>Delete</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table></div></section>
 </main></body></html>"""
 
@@ -1110,10 +1182,17 @@ def handler_factory(
                         effective_freshness = float(config_store.get_settings()["syslog_fresh_seconds"])
                     except (KeyError, OSError, ValueError):
                         pass
+                requested = parse_qs(request_url.query).get("firewall", [""])[0]
+                selected = (
+                    requested
+                    if requested == UNATTRIBUTED_LOGS or TARGET_NAME.fullmatch(requested)
+                    else ""
+                )
                 state = collect_dashboard_state(
                     data_dir,
                     freshness_seconds=effective_freshness,
                     config_store=config_store,
+                    log_filter=selected,
                 )
                 page = render_dashboard(
                     state,
