@@ -157,7 +157,7 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("Timeline", rendered)
             self.assertIn('class="table-wrap timeline-wrap"', rendered)
             self.assertIn('class="timeline"', rendered)
-            self.assertIn("Offender attribution", rendered)
+            self.assertIn("Offenders named by PBP", rendered)
             self.assertIn("Dataplane CPU core tracking", rendered)
             self.assertIn("Per-core summary", rendered)
             self.assertIn("CPU imbalance timeline", rendered)
@@ -285,11 +285,8 @@ class ReportingTests(unittest.TestCase):
 
             self.assertIn("Top sources", rendered)
             self.assertIn("<code>203.0.113.7</code></td><td>2</td>", rendered)
-            self.assertIn("Probable cause", rendered)
-            self.assertIn(
-                "The strongest evidence points to session <code>101</code>",
-                rendered,
-            )
+            self.assertIn("Conclusion for the case", rendered)
+            self.assertIn("PBP marked session <code>101</code>", rendered)
             self.assertIn("Pressure over time", rendered)
             self.assertIn("Packet buffer</span>", rendered)
             self.assertIn(
@@ -1183,18 +1180,18 @@ class ReadabilityTests(unittest.TestCase):
 
         self.assertIn('<section class="glance" data-level="ok"', html)
         self.assertIn("<strong>Low pressure.</strong>", html)
-        self.assertIn("peaked at 4.46%, below the 50% PBP alert level", html)
-        self.assertIn("Probable cause", html)
+        self.assertIn("peaked at 4.46%, below the 50% PAN-OS alert default", html)
+        self.assertIn("Conclusion for the case", html)
 
     def test_elevated_and_critical_pressure_follow_the_pbp_thresholds(self):
         elevated = self._render(self._capture([30.0, 65.0]))
         critical = self._render(self._capture([30.0, 91.5]))
 
-        self.assertIn('data-level="warn"', elevated)
-        self.assertIn("<strong>Elevated pressure.</strong>", elevated)
+        self.assertIn('<section class="glance" data-level="warn"', elevated)
+        self.assertIn("<strong>Elevated pressure without exhaustion.</strong>", elevated)
         self.assertIn('<section class="glance" data-level="bad"', critical)
-        self.assertIn("<strong>Critical pressure.</strong>", critical)
-        self.assertIn("at or above the 80% PBP activate level", critical)
+        self.assertIn("<strong>Packet buffers were exhausted.</strong>", critical)
+        self.assertIn("at or above the 80% level", critical)
 
     def test_header_times_duration_and_stop_reason_are_human_readable(self):
         html = self._render(self._capture([4.0, 4.1]))
@@ -1211,43 +1208,52 @@ class ReadabilityTests(unittest.TestCase):
         self.assertIn('<nav class="toc"', html)
         for anchor in (
             "glance-title",
-            "summary-title",
             "pressure-title",
             "attribution-title",
-            "drop-counters-title",
+            "ingress-title",
             "cpu-tracking-title",
+            "large-sessions-title",
+            "drop-counters-title",
+            "session-table-title",
+            "summary-title",
             "timeline-title",
             "cycles-title",
             "events-title",
         ):
             self.assertIn(f'href="#{anchor}"', html)
             self.assertIn(f'id="{anchor}"', html)
+        # The navigation follows the investigation, not the data sources.
+        self.assertLess(html.index('href="#pressure-title"'), html.index('href="#attribution-title"'))
+        self.assertLess(html.index('href="#attribution-title"'), html.index('href="#ingress-title"'))
+        self.assertLess(html.index('href="#ingress-title"'), html.index('href="#cpu-tracking-title"'))
+        self.assertLess(html.index('href="#session-table-title"'), html.index('href="#summary-title"'))
 
-    def test_every_section_folds_and_only_the_events_start_folded(self):
+    def test_every_section_folds_and_the_appendices_start_folded(self):
         html = self._render(self._capture([4.0, 4.1]))
 
         for anchor in (
             "glance-title",
-            "summary-title",
             "pressure-title",
             "attribution-title",
+            "ingress-title",
             "drop-counters-title",
             "session-table-title",
             "large-sessions-title",
             "cpu-tracking-title",
-            "timeline-title",
-            "cycles-title",
         ):
             self.assertIn(
                 '<details class="section-disclosure section-fold" open>'
                 f'<summary><h2 id="{anchor}">',
                 html,
             )
-        self.assertIn(
-            '<details class="section-disclosure section-fold">'
-            '<summary><h2 id="events-title">',
-            html,
-        )
+        # Summary cards, timeline, batches and events are the appendix: kept
+        # in full, folded until the reader asks for them.
+        for anchor in ("summary-title", "timeline-title", "cycles-title", "events-title"):
+            self.assertIn(
+                '<details class="section-disclosure section-fold">'
+                f'<summary><h2 id="{anchor}">',
+                html,
+            )
         self.assertEqual(html.lower().count("<script"), 1)
 
     def test_the_only_script_the_report_runs_is_its_own_folding_control(self):
@@ -1281,7 +1287,7 @@ class ReadabilityTests(unittest.TestCase):
             'aria-labelledby="glance-title">',
             html,
         )
-        self.assertIn("At a glance", html)
+        self.assertIn("Diagnosis", html)
 
     def test_pressure_axis_fits_the_data_and_marks_received_triggers(self):
         quiet = self._render(self._capture([4.0, 4.5, 4.2], triggers=2))

@@ -9,9 +9,9 @@ but fold the report's own sections.
 Related pages: [Installation](installation.md) · [Operations](operations.md) ·
 [Troubleshooting](troubleshooting.md) · [Back to the README](../README.md)
 
-![A complete incident report, from the at-a-glance block through offender
-attribution, pressure over time, dataplane CPU tracking, the timeline and the
-raw batch details](images/incident-report.png)
+![A complete incident report, from the diagnosis block through pressure over
+time, offender attribution, the ingress backlog, dataplane CPU tracking and the
+folded appendices](images/incident-report.png)
 
 > Every screenshot in this repository is generated from a fictitious
 > incident by `tools/generate_demo_stack.py`. No firewall, address, or
@@ -54,12 +54,13 @@ the exact `raw_response` remains available in a nested section collapsed by
 default. Command status and timing fields are presented as compact metadata,
 the summary separates capture facts, incident state, and peak utilization, and
 its peak metrics are grouped into packet buffers, packet descriptors, and
-system load. Every section folds from its heading — At a glance included, a
-native disclosure — so a section already read can be put away; all open by
-default except the lower-level event metadata, which is collapsed.
+system load. Every section folds from its heading — Diagnosis included, a
+native disclosure — so a section already read can be put away; the evidence
+sections open by default and the appendices (summary, timeline, batches,
+events) collapsed.
 
 **Collapse all** sits at the right of the section navigation and folds every
-section at once, except At a glance, which is the verdict block and stays open.
+section at once, except Diagnosis, which is the verdict block and stays open.
 The same control then reads **Expand all** and reopens them; each heading keeps
 working individually. It is the report's only script, allowed by its SHA-256
 hash in the report's own Content-Security-Policy and in the one the Web UI
@@ -68,24 +69,93 @@ created by that script, so a report whose script a mail gateway strips, or a
 reader's policy blocks, shows exactly the page it always did, with every
 section unfolded and no dead control.
 
-## At a glance and probable cause
+## Diagnosis: the investigation, step by step
 
-The report opens with an **At a glance** block that names the severity from
-the peak packet-buffer pressure against the PAN-OS PBP defaults (low below the
-50% alert level, elevated between alert and the 80% activate level, critical at
-or above it), lists the key figures (peak, duration, batches, triggers, top
-offender, denied packets, PBP state, stop reason), and carries the
-**Probable cause** sentences: the peak buffer usage, the strongest offender
-with its flow and rate, the denied-traffic correlation, and the session-table
-verdict, composed into a few sentences ready for a TAC case. The header shows
-formatted start and end times, the duration, and the stop reason in words with
-its slug underneath; a sticky navigation bar links every section, and each
-section starts with the question it answers. Peak cards and timeline cells turn
-amber above the alert level and red above the activate level, a metric the
-firewall never returned reads "Not collected" and is hidden from the timeline
-columns, batch summaries show their buffer reading without being opened, time
-columns show the clock time with the full timestamp on hover, and the per-core
-CPU tables fold away when no core came close to saturation.
+The report opens with a **Diagnosis** block that walks the questions an
+engineer asks when a customer's PBP fires, in order, and answers each one from
+the capture. Every step states what it found *or* that it found nothing, and
+the closing **Conclusion for the case** is composed only from the steps that
+were reached, so the report cannot claim a flood on one line and low pressure
+on the next. The headline names the outcome: *Low pressure*, *Offender named
+by the firewall*, *Offender in the ingress backlog*, one of the wider
+hypotheses, or *No responsible party identified*. A row of chips recalls the
+context: model and hardware family (Cavium gen3 such as PA-3200, PA-5200 and
+PA-7000; x86 gen4 such as PA-400, PA-1400, PA-3400 and PA-5400; virtual),
+PAN-OS version, PBP mode, and the thresholds the firewall itself reported.
+
+**Step 1 — How much pressure, on which resource?** The packet-buffer peak, the
+on-chip packet-descriptor peak on a Cavium chassis (an x86 platform never
+returns that pool, and the report says so instead of showing "Not collected"),
+the packet-descriptor and SW-tag peaks, and the thresholds. The alert
+threshold is read from the firewall's own congestion log (`alert threshold is
+N%`) when a trigger carried it; the lowest utilization at which PBP was seen
+mitigating bounds the activate threshold. Pressure is judged against the
+PAN-OS levels: buffers at or above 80% are *exhausted*, descriptors at or
+above 80% with low buffers are *the latency case* the PBP TOI describes,
+buffers between 50% and 80% are *elevated*, and anything below 50% is *low
+pressure* — if PBP still activated, the trigger is a lowered threshold, not
+resource exhaustion, and every later step is read in that light: the entries
+PBP ranked are the ordinary traffic mix, not an attack.
+
+**Step 2 — Did the firewall already name the offender?** The entries of
+`show session packet-buffer-protection` with `Drop State = Yes`, which are the
+entries whose dataplane work PBP learned as the largest and the ones its threat
+logs 8507, 8508 and 8509 report: the firewall's own designation and the place
+to start, not a proof by itself. A session is named with its tuple,
+application, rule and zone from `show session id`; a source address alone is
+slowpath work, traffic that never completed session setup, and the traffic log
+recovered at monitor stop says whether it was denied and by which rule. When
+PBP never activated (alert only) the step says no offender was learned; when it
+activated but marked nothing for RED, the work was spread over many small
+entries.
+
+**Step 3 — Does the ingress backlog hold a session?** The sessions holding at
+least 2% of the work queue in `show running resource-monitor
+ingress-backlogs`, with the queue's peak ATOMIC and TOTAL usage. This view is
+independent of the PBP learning: it is the queue of packets waiting for a
+dataplane core, where the on-chip descriptors are consumed. An `undecided` or
+`unknown` application at a high share is called out as the signature of attack
+traffic, and a session queued in `flow_slowpath` that `show session id` does
+not know (`Bad Key`) is the policy-deny case: the same six-tuple, typically UDP
+syslog, denied and re-evaluated packet by packet on one core. An empty result
+on an x86 platform is stated as not being proof, because PAN-OS documents the
+command for the hardware queue of the Cavium chassis.
+
+**Step 4 — If not, where else?** Five hypotheses, each with its own verdict:
+
+- *Elephant session* — one `flow_fastpath` core hot against the median of its
+  peers, or a session above the largest-sessions threshold listed through most
+  of the capture at 100 Mbit/s or more.
+- *Burst of denied sessions* — `flow_policy_deny` and DoS or zone-protection
+  drops at 100 packets per second or 5,000 packets over the capture, a packet
+  rate that rises while the session count stays flat, PBP tracking source
+  addresses without a session, or a zone-protection flood log received during
+  the capture.
+- *Storm of new sessions* — 500 new connections per second, or a source that
+  PBP tracks owning 100 or more ranked sessions.
+- *Interface errors* — receive discards, missed frames or transmit errors
+  growing on the interfaces the evidence named.
+- *Aggregate load* — every comparable core rising together to 60% or more, or
+  the session table at 80% of its capacity.
+
+At low pressure the signals are listed but not blamed. When the pressure is
+real and nothing names a cause, the headline says so and the conclusion points
+at the software-defect scenario of the PAN-OS guidance: a Tech Support File
+taken while the pressure lasts, with the PBP threat logs and the buffer latency
+reading.
+
+The evidence sections follow in the same order — pressure, offenders named by
+PBP, ingress backlog, then the four wider views — each with its own verdict
+sentence, and the appendices (summary cards, timeline, batch details, events)
+start folded. The header shows formatted start and end times, the duration,
+and the stop reason in words with its slug underneath; a sticky navigation bar
+links every section, and each section starts with the question it answers.
+Peak cards and timeline cells turn amber above the alert level and red above
+the activate level, a metric the firewall never returned reads "Not collected"
+and is hidden from the timeline columns, batch summaries show their buffer
+reading without being opened, time columns show the clock time with the full
+timestamp on hover, and the per-core CPU tables fold away when no core came
+close to saturation.
 
 ## Top sources and pressure over time
 
@@ -93,7 +163,7 @@ A **Top sources** table above the attribution ranking rolls ranked sessions up
 by source address — a scan or flood spread over hundreds of short sessions is
 attributed to the source that owns them. Both tables list at most 50 rows in
 ranking order and state how many lower-ranked entries were left out; the JSONL
-capture keeps every ranked entity, and the stop marker and probable cause are
+capture keeps every ranked entity, and the stop marker and the diagnosis are
 computed from all of them. A **Pressure over time** chart
 plots packet-buffer, descriptor, and session-table utilization batch by batch
 so the offender's first appearance can be aligned with the pressure curve. Its
