@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.26.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.27.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -178,10 +178,10 @@ session, one bounded traffic-log query each.
 
 ## What you get out of it
 
-**A dashboard** at `https://<docker-host>:8088` showing global Syslog reception
-freshness, one card per firewall with its three live signals (Syslog freshness,
-last read-only API check, monitoring run in progress), each carrying its own
-green, amber or red dot beside the general state of the card, the 20 latest received
+**A dashboard** at `https://<docker-host>:8088` showing one card per firewall
+with its three live signals (Syslog freshness, last read-only API check,
+monitoring run in progress), each carrying its own green, amber or red dot
+beside the general state of the card, the 20 latest received
 logs, and the active and completed runs — each completed run carrying its peak
 packet-buffer percentage and top ranked sources, so a recurring offender across
 incidents is visible without opening a single report.

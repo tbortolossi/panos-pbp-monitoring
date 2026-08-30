@@ -339,8 +339,8 @@ directory.
 Generate or wait for an ordinary PAN-OS System event, such as an authorized
 administrator login. Confirm all of the following on the dashboard:
 
-- **Syslog reception is active** is green globally;
-- the corresponding firewall shows **receiving logs**;
+- the card of the firewall that sent it is green and its **Syslog** signal
+  names the reception time of that event;
 - the event appears in **20 most recent received logs**, attributed to that
   firewall — its chip above the table isolates it, and the **Unattributed**
   chip shows what no firewall claims;

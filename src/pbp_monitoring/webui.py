@@ -967,6 +967,19 @@ def render_dashboard(
             "</div></div>"
         )
 
+    if firewall_cards:
+        status_panel = f'<div class="status-grid">{"".join(firewall_cards)}</div>'
+    else:
+        status_panel = (
+            f'<div class="status {status_class}"><span class="dot"></span><div>'
+            f"<strong>{_escape(status_text)}</strong>"
+            f"<span>{_escape(age_text)}</span>"
+            "<span>No firewall is registered yet: declare one in the "
+            '<a href="/admin">admin page</a> to get its own reception, API '
+            "check and incident signals.</span>"
+            "</div></div>"
+        )
+
     total_runs = int(state.get("runs_total") or len(state.get("runs", [])))
     if not csrf or not total_runs:
         delete_all_control = ""
@@ -991,7 +1004,7 @@ def render_dashboard(
 header{{padding:28px max(20px,calc((100vw - 1280px)/2));color:#fff;background:linear-gradient(125deg,#0f172a,#155e75)}}
 h1{{margin:0;font-size:clamp(25px,4vw,40px)}}header p{{margin:5px 0 0;color:#d9f4f2}}main{{width:min(1280px,calc(100% - 28px));margin:22px auto 42px}}
 .status{{display:flex;align-items:flex-start;gap:13px;padding:16px 18px;border:1px solid var(--line);border-radius:12px;background:#fff}}
-.status-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-top:12px}}
+.status-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}}
 .dot{{flex:0 0 auto;width:18px;height:18px;border-radius:50%;background:var(--bad);box-shadow:0 0 0 5px #fee2e2}}.status.ok .dot{{background:var(--ok);box-shadow:0 0 0 5px #dcfce7}}
 .status.busy .dot{{background:var(--busy);box-shadow:0 0 0 5px #fef3c7}}.status .dot{{margin-top:3px}}.status>div{{min-width:0}}.status span{{display:block}}
 .status strong{{display:block;font-size:17px}}.muted,.status span{{color:var(--muted)}}section{{margin-top:24px}}h2{{margin:0 0 12px}}
@@ -1007,8 +1020,7 @@ th,td{{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;ver
 button.danger{{padding:5px 11px;border:1px solid #fca5a5;border-radius:8px;background:#fff;color:var(--bad);font:inherit;font-weight:650;cursor:pointer}}button.danger:hover{{background:#fef2f2}}form.inline{{display:inline}}
 .badge.trigger,.badge.active{{background:#fef3c7;color:#92400e}}.badge.done{{background:#dcfce7;color:#166534}}a{{color:#0369a1;font-weight:650}}code{{color:#075985}}
 </style></head><body><header><h1>PBP Monitoring <small style="font-size:14px;font-weight:600">v{_escape(__version__)}</small></h1><p>Dashboard &middot; refreshes every {max(2, int(refresh_seconds))} seconds &middot; <a style="color:white" href="/admin">Admin</a></p></header><main>
-<div class="status {status_class}"><span class="dot"></span><div><strong>{_escape(status_text)}</strong><span>{_escape(age_text)}</span></div></div>
-<div class="status-grid">{''.join(firewall_cards)}</div>
+{status_panel}
 <section><div class="section-head"><h2>20 most recent received logs</h2>{log_filters}</div><div class="table-wrap"><table><thead><tr><th>Time (UTC)</th><th>Observed source</th><th>Firewall</th><th>Type</th><th>Message</th></tr></thead><tbody>{''.join(log_rows)}</tbody></table></div></section>
 <section><div class="section-head"><h2>Recent runs</h2>{delete_all_control}</div><div class="table-wrap"><table><thead><tr><th>Target</th><th>Run ID</th><th>Start time (UTC)</th><th>Status</th><th>Batches</th><th>Peak buffer</th><th>Top sources</th><th>Stop reason</th><th>Artifacts</th><th>Delete</th></tr></thead><tbody>{''.join(run_rows)}</tbody></table></div></section>
 </main></body></html>"""

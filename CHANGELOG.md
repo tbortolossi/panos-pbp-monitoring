@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.27.0] - 2026-08-30
+
+### Changed
+
+- **Syslog reception reported per firewall only.** The dashboard no longer
+  opens with a global **Syslog reception is active** card above the firewall
+  cards. Reception is checked per firewall — a message is attributed to a
+  firewall by its source address and its device serial — so the card of that
+  firewall already carries the reception time, beside its API check and its
+  incident state. The global card repeated it less precisely and, with a single
+  firewall registered, said strictly less than the card below it. The page now
+  starts with the firewall grid. While no firewall is registered yet, that grid
+  would be empty, so a single global reception card takes its place and points
+  at the admin page: a fresh installation still sees whether messages arrive
+  before it has declared anything. Presentation only — collection, the firewall
+  and the persisted data are untouched. Refs #163.
+
 ## [0.26.0] - 2026-08-30
 
 ### Added
