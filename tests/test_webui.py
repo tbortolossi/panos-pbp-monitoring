@@ -23,6 +23,7 @@ from urllib.request import (
 from pbp_monitoring.webui import (
     annotate_report,
     handler_factory,
+    _incident_run_dir,
     render_report_evidence_bar,
     _artifact_path,
     _run_root,
@@ -234,6 +235,18 @@ class WebUITests(unittest.TestCase):
             self.assertNotIn("<script>", bar)
             self.assertIn("&lt;script&gt;", bar)
             self.assertIn("run&amp;1", bar)
+
+    def test_a_report_lookup_cannot_escape_the_capture_directory(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data = Path(temporary_directory)
+            (data / "targets" / "fw-a" / "incidents" / "run-1").mkdir(parents=True)
+            self.assertIsNone(_incident_run_dir(data, "..", "run-1"))
+            self.assertIsNone(_incident_run_dir(data, "fw-a", ".."))
+            self.assertIsNone(_incident_run_dir(data, "fw-a", "run-2"))
+            self.assertEqual(
+                _incident_run_dir(data, "fw-a", "run-1"),
+                data / "targets" / "fw-a" / "incidents" / "run-1",
+            )
 
     def test_a_report_without_a_body_tag_is_served_unchanged(self):
         self.assertEqual(annotate_report("fixture report", "<div>bar</div>"), "fixture report")
