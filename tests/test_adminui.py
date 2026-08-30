@@ -885,6 +885,22 @@ class SupportBundleUITests(unittest.TestCase):
             self.assertNotIn(b"super-secret-api-key", blob)
             self.assertTrue(any(name.endswith("README.txt") for name in names))
 
+    def test_the_bundle_buttons_are_wide_enough_for_their_labels(self):
+        """The compact table actions must not clip the bundle download links.
+
+        Both rows share ``.action-row``; sizing its buttons to the width of
+        "Edit" hid where the anonymized bundle and its mapping were.
+        """
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "data").mkdir()
+            (root / "config").mkdir()
+            ConfigStore(root / "config" / "config.db").initialize()
+            with signed_in_admin(root) as (_opener, _base, _csrf, page):
+                pass
+        self.assertIn("min-width:72px", page)
+        self.assertNotIn(";width:72px", page)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,15 @@ follows [Semantic Versioning](https://semver.org/).
   reported in the drop verdict and the probable cause without joining the
   denied total. Refs #151.
 
+- **Support bundle buttons were clipped.** The three download links of the
+  Support bundle card shared the compact button row of the firewall table,
+  which pinned every button to the width of "Edit". Their labels overflowed and
+  overlapped, hiding which link produced the anonymized bundle and which one
+  the token mapping the operator must keep on site. The row now sizes each
+  button to its label, wraps on a narrow window instead of overflowing the
+  card, and keeps its spacing below the explanatory text. Display only: no
+  change to the archives, to what they redact, or to any firewall call.
+
 ## [0.23.0] - 2026-08-30
 
 ### Added
