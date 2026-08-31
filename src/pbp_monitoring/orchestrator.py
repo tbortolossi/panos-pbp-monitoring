@@ -2494,8 +2494,8 @@ def extract_resource_cpu_cores(resource_monitor: str) -> list[dict[str, Any]]:
     return samples
 
 
-def _extract_latest_resource_percentages(resource_monitor: str) -> dict[str, list[float]]:
-    metrics: dict[str, list[float]] = {
+def _extract_latest_resource_percentages(resource_monitor: str) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
         "resource_monitor_dp_cpu": [],
         "resource_monitor_session": [],
         "resource_monitor_packet_buffer": [],
@@ -2526,21 +2526,49 @@ def _extract_latest_resource_percentages(resource_monitor: str) -> dict[str, lis
             ),
             "sw tags descriptor": "resource_monitor_sw_tags_descriptor",
         }
-        for second in root.iter():
-            if _local_tag(second) != "second":
-                continue
-            for utilization in second:
-                if _local_tag(utilization) != "resource-utilization":
+        # A multi-DP firewall (PA-5200, PA-7000) answers with one element per
+        # dataplane (dp0, s1dp0…). The flat lists keep every dataplane's value
+        # so max-based trigger and recovery logic is unchanged, but a chassis
+        # incident is often one saturated DP next to idle ones, so the latest
+        # value of each metric is also kept per dataplane.
+        dataplane_elements = [
+            element
+            for element in root.iter()
+            if re.fullmatch(r"(?:s\d+)?dp\d+", _local_tag(element), re.I)
+        ]
+        if not dataplane_elements:
+            dataplane_elements = [root]
+        per_dataplane: list[dict[str, Any]] = []
+        for dataplane in dataplane_elements:
+            dataplane_name = (
+                "dp0" if dataplane is root else _local_tag(dataplane)
+            )
+            latest_by_metric: dict[str, float] = {}
+            for second in dataplane.iter():
+                if _local_tag(second) != "second":
                     continue
-                for entry in utilization:
-                    name = (_child_text(entry, "name") or "").strip().lower()
-                    metric_name = metric_names.get(name)
-                    value_text = _child_text(entry, "value")
-                    if metric_name is None or not value_text:
+                for utilization in second:
+                    if _local_tag(utilization) != "resource-utilization":
                         continue
-                    latest = _float_value(value_text.split(",", 1)[0])
-                    if latest is not None:
-                        metrics[metric_name].append(latest)
+                    for entry in utilization:
+                        name = (_child_text(entry, "name") or "").strip().lower()
+                        metric_name = metric_names.get(name)
+                        value_text = _child_text(entry, "value")
+                        if metric_name is None or not value_text:
+                            continue
+                        latest = _float_value(value_text.split(",", 1)[0])
+                        if latest is not None:
+                            metrics[metric_name].append(latest)
+                            latest_by_metric.setdefault(
+                                metric_name.removeprefix("resource_monitor_"),
+                                latest,
+                            )
+            if latest_by_metric:
+                per_dataplane.append(
+                    {"dataplane": dataplane_name, **latest_by_metric}
+                )
+        if per_dataplane:
+            metrics["resource_monitor_dataplanes"] = per_dataplane
         if any(metrics.values()):
             return metrics
 
@@ -2574,7 +2602,17 @@ def _extract_latest_resource_percentages(resource_monitor: str) -> dict[str, lis
         ),
     )
 
+    # Chassis CLI text repeats every window under one ``DP sXdpY:`` header per
+    # dataplane; the header is tracked so the per-dataplane view survives the
+    # text fallback too.
+    dataplane_pattern = re.compile(r"^\s*DP\s+((?:s\d+)?dp\d+)\s*:\s*$", re.I)
+    current_dataplane = "dp0"
+    text_dataplanes: dict[str, dict[str, float]] = {}
     for index, line in enumerate(lines):
+        dataplane_match = dataplane_pattern.match(line)
+        if dataplane_match:
+            current_dataplane = dataplane_match.group(1).lower()
+            continue
         window_match = window_pattern.search(line)
         if window_match:
             current_window = window_match.group(1).strip().lower()
@@ -2594,7 +2632,16 @@ def _extract_latest_resource_percentages(resource_monitor: str) -> dict[str, lis
             values = re.findall(r"\d+(?:\.\d+)?", value_line)
             if values:
                 metrics[metric_name].append(float(values[0]))
+                text_dataplanes.setdefault(current_dataplane, {}).setdefault(
+                    metric_name.removeprefix("resource_monitor_"),
+                    float(values[0]),
+                )
             break
+    if text_dataplanes:
+        metrics["resource_monitor_dataplanes"] = [
+            {"dataplane": name, **latest}
+            for name, latest in text_dataplanes.items()
+        ]
     return metrics
 
 
@@ -2602,9 +2649,29 @@ def extract_dataplane_pool_statistics(output: str) -> dict[str, Any]:
     """Parse available/total dataplane pools and the packet-buffer headroom."""
     text = panos_result_text(output)
     section: str | None = None
+    dataplane: str | None = None
     pools: list[dict[str, Any]] = []
     low_free_buffer_limit: int | None = None
+    # ``DP s1dp0:`` headers repeat the whole table per dataplane on multi-DP
+    # platforms; a wedged DP next to a healthy one is itself evidence, so the
+    # plane must survive into each pool row.
+    dataplane_pattern = re.compile(r"^\s*DP\s+((?:s\d+)?dp\d+)\s*:\s*$", re.I)
+    # One line shape per platform generation: the single-chip form ends after
+    # ``free/total`` plus at most an address, the ASIC (PA-3200/5200/7000)
+    # hardware form appends ``address intr``, and the ASIC software form is
+    # ``name (object-size): free/total high-wm/populated used/total range
+    # cache`` — so the object size is optional before the colon and anything
+    # may follow the first fraction.
+    pool_pattern = re.compile(
+        r"^\s*\[\s*(\d+)\]\s*(.+?)\s*(?:\(\s*(\d+)\s*\)\s*)?"
+        r":\s*(\d+)\s*/\s*(\d+)(?:\s+\S+)*\s*$"
+    )
     for line in text.splitlines():
+        dataplane_match = dataplane_pattern.match(line)
+        if dataplane_match:
+            dataplane = dataplane_match.group(1).lower()
+            section = None
+            continue
         stripped = line.strip()
         if stripped and not stripped.startswith("[") and stripped.lower().endswith("pools"):
             section = stripped
@@ -2617,20 +2684,23 @@ def extract_dataplane_pool_statistics(output: str) -> dict[str, Any]:
         if low_limit_match:
             low_free_buffer_limit = int(low_limit_match.group(1))
             continue
-        pool_match = re.match(
-            r"^\s*\[\s*(\d+)\]\s*(.+?)\s*:\s*(\d+)\s*/\s*(\d+)(?:\s+\S+)?\s*$",
-            line,
-        )
+        pool_match = pool_pattern.match(line)
         if not pool_match:
             continue
-        available = int(pool_match.group(3))
-        total = int(pool_match.group(4))
+        available = int(pool_match.group(4))
+        total = int(pool_match.group(5))
         used = max(0, total - available)
         pools.append(
             {
                 "section": section,
+                "dataplane": dataplane,
                 "index": int(pool_match.group(1)),
                 "name": pool_match.group(2).strip(),
+                "object_bytes": (
+                    int(pool_match.group(3))
+                    if pool_match.group(3) is not None
+                    else None
+                ),
                 "available": available,
                 "total": total,
                 "used": used,
@@ -2662,6 +2732,32 @@ def extract_dataplane_pool_statistics(output: str) -> dict[str, Any]:
             ),
             None,
         )
+    if packet_buffers is None:
+        # ASIC platforms (PA-3200/5200/7000) have no ``Packet Buffers`` pool:
+        # the pool the ``Packet buffer congestion`` alert measures is
+        # ``PKI POOL DFLT`` under ``Hardware Pools`` (its total equals the
+        # alert's denominator). On a chassis the most exhausted dataplane's
+        # pool is the one the incident is about.
+        pki_pools = [
+            pool
+            for pool in pools
+            if pool["name"].strip().lower() == "pki pool dflt"
+        ]
+        hardware_pki = [
+            pool
+            for pool in pki_pools
+            if (pool.get("section") or "").lower() == "hardware pools"
+        ]
+        candidates = hardware_pki or pki_pools
+        if candidates:
+            packet_buffers = min(
+                candidates,
+                key=lambda pool: (
+                    pool["available_percentage"]
+                    if pool["available_percentage"] is not None
+                    else 100.0
+                ),
+            ).copy()
     if packet_buffers is not None:
         packet_buffers["low_free_buffer_limit"] = low_free_buffer_limit
         packet_buffers["below_low_free_buffer_limit"] = (

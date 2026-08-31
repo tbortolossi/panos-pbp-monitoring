@@ -696,6 +696,73 @@ Pow Atomic Memory Pools
             [3.987],
         )
 
+    def test_asic_pool_lines_parse_and_pki_pool_reports_the_worst_dataplane(self):
+        # Anonymized PA-5250 shape: per-DP tables, hardware rows with an
+        # address and interrupt column, software rows with an object size and
+        # extra fraction columns, and no "Packet Buffers" pool at all.
+        output = """
+DP s1dp0:
+
+
+Hardware Pools
+[55] Timer Pool                :     4093/4096     0x800000080f158c00    0
+[61] PKI POOL DFLT             :    12684/17203    0x800000072cb21000    0
+
+Software Pools
+Id   Name                      Length         Free/Total      HighWm/Populated  Used/Total  DataRange                  CacheSz
+[10] software packet buffer 0  (    512):   205481/208000      15032/24570         6/51     0x8000000377800080-0x80000003779ffe80* 10725
+
+Software Pool Segment Info
+Id    SegSize      MaxSegs    NumActive  None       Default    Overflow   Unused     Depleted   Assigned   va_mask
+[ 10] 2097152      51         6          45         6          0          0          0          0          0xffffffffffe00000
+
+DP s1dp1:
+
+
+Hardware Pools
+[55] Timer Pool                :     4096/4096     0x800000080f158c00    0
+[61] PKI POOL DFLT             :     2170/17203    0x800000072cb21000    0
+"""
+
+        parsed = extract_dataplane_pool_statistics(output)
+        packet_buffers = parsed["packet_buffers"]
+        percentages = extract_live_percentages("", "", "", output)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(len(parsed["pools"]), 5)
+        software = next(
+            pool
+            for pool in parsed["pools"]
+            if pool["name"] == "software packet buffer 0"
+        )
+        self.assertEqual(software["dataplane"], "s1dp0")
+        self.assertEqual(software["object_bytes"], 512)
+        self.assertEqual(software["available"], 205481)
+        self.assertEqual(software["total"], 208000)
+        self.assertEqual(packet_buffers["name"], "PKI POOL DFLT")
+        self.assertEqual(packet_buffers["dataplane"], "s1dp1")
+        self.assertEqual(packet_buffers["available"], 2170)
+        self.assertEqual(packet_buffers["used_percentage"], 87.386)
+        self.assertIsNone(packet_buffers["low_free_buffer_limit"])
+        self.assertIsNone(packet_buffers["below_low_free_buffer_limit"])
+        self.assertEqual(
+            percentages["dataplane_pool_packet_buffer_used"],
+            [87.386],
+        )
+
+    def test_named_packet_buffers_pool_still_wins_over_pki_pool(self):
+        output = """
+Hardware Pools
+[ 1] Packet Buffers            :    93401/97280    0x8070bf3a40
+[61] PKI POOL DFLT             :     2170/17203    0x800000072cb21000    0
+"""
+
+        packet_buffers = extract_dataplane_pool_statistics(output)[
+            "packet_buffers"
+        ]
+
+        self.assertEqual(packet_buffers["name"], "Packet Buffers")
+
     def test_global_counter_delta_normalizes_flow_rows(self):
         output = """
 Global counters:
@@ -831,6 +898,87 @@ packet descriptor (on-chip):
         )
         self.assertEqual(cores[1]["window_peak"], 81.0)
         self.assertEqual(cores[1]["sample_count"], 1)
+
+    def test_resource_monitor_xml_keeps_per_dataplane_attribution(self):
+        resource_monitor = """
+<response status="success"><result><resource-monitor><data-processors>
+<s1dp0><second><resource-utilization>
+  <entry><name>session</name><value>2,2,2</value></entry>
+  <entry><name>packet buffer</name><value>7,7,6</value></entry>
+  <entry><name>packet descriptor (on-chip)</name><value>9,8,8</value></entry>
+</resource-utilization></second></s1dp0>
+<s1dp1><second><resource-utilization>
+  <entry><name>session</name><value>2,2,2</value></entry>
+  <entry><name>packet buffer</name><value>87,87,87</value></entry>
+  <entry><name>packet descriptor (on-chip)</name><value>92,91,90</value></entry>
+</resource-utilization></second></s1dp1>
+</data-processors></resource-monitor></result></response>
+""".strip()
+
+        percentages = extract_live_percentages("", "", resource_monitor)
+
+        self.assertEqual(
+            percentages["resource_monitor_packet_buffer"], [7.0, 87.0]
+        )
+        self.assertEqual(
+            percentages["resource_monitor_dataplanes"],
+            [
+                {
+                    "dataplane": "s1dp0",
+                    "session": 2.0,
+                    "packet_buffer": 7.0,
+                    "packet_descriptor_on_chip": 9.0,
+                },
+                {
+                    "dataplane": "s1dp1",
+                    "session": 2.0,
+                    "packet_buffer": 87.0,
+                    "packet_descriptor_on_chip": 92.0,
+                },
+            ],
+        )
+
+    def test_resource_monitor_text_keeps_per_dataplane_attribution(self):
+        resource_monitor = """
+DP s1dp0:
+
+Resource monitoring sampling data (per second):
+Resource utilization (%) during last 5 seconds:
+packet buffer:
+  7  7  6
+packet descriptor (on-chip):
+  9  8  8
+
+DP s1dp1:
+
+Resource monitoring sampling data (per second):
+Resource utilization (%) during last 5 seconds:
+packet buffer:
+ 87 87 87
+packet descriptor (on-chip):
+ 92 91 90
+"""
+
+        percentages = extract_live_percentages("", "", resource_monitor)
+
+        self.assertEqual(
+            percentages["resource_monitor_packet_buffer"], [7.0, 87.0]
+        )
+        self.assertEqual(
+            percentages["resource_monitor_dataplanes"],
+            [
+                {
+                    "dataplane": "s1dp0",
+                    "packet_buffer": 7.0,
+                    "packet_descriptor_on_chip": 9.0,
+                },
+                {
+                    "dataplane": "s1dp1",
+                    "packet_buffer": 87.0,
+                    "packet_descriptor_on_chip": 92.0,
+                },
+            ],
+        )
 
     def test_structured_panos_metrics_are_parsed(self):
         pbp = """
