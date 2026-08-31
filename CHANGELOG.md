@@ -3,6 +3,34 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.37.0] - 2026-08-31
+
+### Fixed
+
+- **Dataplane pool statistics now parse on ASIC platforms (PA-3200, PA-5200,
+  PA-7000 families).** The pool parser only understood the single-chip line
+  shape, so on the platforms whose on-chip pool is the resource PBP incidents
+  exhaust, every `debug dataplane pool statistics` capture stored raw output
+  with `parsed: false` and no packet-buffer headroom. The parser now reads
+  the ASIC hardware rows (trailing address and interrupt columns), the
+  software rows (object size and extra fraction columns), and the per-`DP
+  sXdpY:` tables, and when no `Packet Buffers` pool exists it reports the
+  most exhausted `PKI POOL DFLT` hardware pool — the pool whose total is the
+  denominator of the firewall's own `Packet buffer congestion` alert.
+  Validated against anonymized tech-support files from four real TAC
+  packet-buffer cases. Refs #187.
+
+### Added
+
+- **Per-dataplane buffer attribution.** Each pool row now carries its
+  `dataplane` and `object_bytes`, and the per-cycle resource-monitor metrics
+  gain `resource_monitor_dataplanes` — the latest session, packet-buffer and
+  descriptor utilization per dataplane — so a chassis incident can say
+  *which* dataplane saturated (one DP at 92 % beside an idle chassis median
+  is a per-flow problem, not a capacity one). Existing flat metric lists and
+  trigger/recovery behavior are unchanged; the new fields are additive and
+  backward compatible. Refs #188.
+
 ## [0.36.0] - 2026-08-30
 
 ### Changed
