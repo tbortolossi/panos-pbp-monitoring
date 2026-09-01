@@ -22,6 +22,7 @@ from __future__ import annotations
 import html
 import math
 import re
+import statistics
 from typing import Any, Iterable, Sequence
 
 # PAN-OS packet buffer protection defaults: alert at 50 %, activate at 80 %.
@@ -48,6 +49,39 @@ SESSION_TABLE_CONSTRAINT_PERCENT = 80.0
 NEW_SESSION_STORM_CPS = 500.0
 NEW_SESSION_STORM_SESSIONS_PER_SOURCE = 100
 AGGREGATE_CPU_PERCENT = 60.0
+
+# Signature thresholds derived from eight closed TAC packet-buffer cases
+# (PAN-OS 10.2.9 - 11.2.10, PA-1420 - PA-7080). Each fires on positive
+# evidence only: the counter deltas sample fractions of a second, so the
+# absence of a low-rate counter proves nothing and no signature ever claims
+# a negative.
+ARP_STORM_RATE_PER_SECOND = 1000.0
+ARP_GRATUITOUS_SHARE = 0.9
+FRAGMENTATION_RATE_PER_SECOND = 500.0
+FRAGMENTATION_REASSEMBLY_RATIO = 4.0
+PROXY_RETRANSMIT_RATE_PER_SECOND = 100.0
+POOL_HELD_PERCENT = 80.0
+LEAK_SESSION_TABLE_PERCENT = 5.0
+SESSION_COLLAPSE_RATIO = 0.5
+SESSION_COLLAPSE_FLOOR = 1000.0
+CHASSIS_IMBALANCE_MEDIAN_PERCENT = 20.0
+LATENCY_LONG_TAIL_RATIO = 100.0
+RECENT_BOOT_DAYS = 3.0
+# Applications whose elephant flows are the operator's own infrastructure:
+# blocking them trades an incident for an outage.
+BACKUP_APPLICATIONS = frozenset(
+    {
+        "netbackup",
+        "veeam",
+        "veritas-pbx",
+        "ms-ds-smb",
+        "iscsi",
+        "nfs",
+        "rsync",
+        "vmware",
+        "commvault",
+    }
+)
 
 _MAX_NAMED = 3
 
@@ -130,6 +164,17 @@ def _metric_peak(cycles: Sequence[dict[str, Any]], *keys: str) -> float | None:
 
 def _metric_returned(cycles: Sequence[dict[str, Any]], *keys: str) -> bool:
     return _metric_peak(cycles, *keys) is not None
+
+
+def uptime_days(value: Any) -> float | None:
+    """Parse PAN-OS's own uptime wording (``60 days, 4:22:03``) into days."""
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"(\d+)\s+days?,\s*(\d+):(\d+):(\d+)", value)
+    if match is None:
+        return None
+    days, hours, minutes, seconds = (int(group) for group in match.groups())
+    return round(days + (hours * 3600 + minutes * 60 + seconds) / 86400.0, 3)
 
 
 def hardware_generation(model: Any) -> dict[str, Any]:
@@ -366,12 +411,17 @@ def build_diagnosis(
     large_sessions: dict[str, Any],
     cpu_verdicts: Sequence[dict[str, Any]],
     device: dict[str, Any],
+    signal_summary: dict[str, Any] | None = None,
+    diagnostic_pools: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Walk the investigation and return its steps and conclusion.
 
     ``cpu_verdicts`` carries one entry per dataplane with ``state`` (``calm``,
     ``isolated``, ``collective`` or ``mixed``), the hottest core and its peak,
     exactly as the CPU section states them, so the two never disagree.
+    ``signal_summary`` and ``diagnostic_pools`` are the root-cause counter
+    families and the held-pool table exactly as the evidence sections render
+    them, for the same reason.
     """
     steps: list[dict[str, Any]] = []
     context = _context(cycles, events, device)
@@ -389,6 +439,9 @@ def build_diagnosis(
     elsewhere = _step_elsewhere(
         drop_summary, session_series, large_sessions, cpu_verdicts, cycles,
         attribution, events, low_significance,
+        context=context,
+        signal_summary=signal_summary,
+        diagnostic_pools=diagnostic_pools,
     )
     steps.append(elsewhere)
 
@@ -487,6 +540,12 @@ def _context(
         "latency_peak_ms": max(latency_values) if latency_values else None,
         "latency_status": latency_status,
         "threat_logs": _threat_log_summary(events),
+        "uptime": str(device.get("uptime"))
+        if isinstance(device, dict) and device.get("uptime")
+        else None,
+        "uptime_days": uptime_days(
+            device.get("uptime") if isinstance(device, dict) else None
+        ),
     }
 
 
@@ -1086,6 +1145,41 @@ def _flood_corroborations(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return {"count": count, "destinations": sorted(destinations)}
 
 
+def _signal_family_counters(
+    signal_summary: dict[str, Any] | None, key: str
+) -> dict[str, dict[str, Any]]:
+    """Index one root-cause counter family by counter name."""
+    for family in (signal_summary or {}).get("families") or []:
+        if family.get("key") == key:
+            return {
+                str(counter.get("name")): counter
+                for counter in family.get("counters") or []
+                if isinstance(counter, dict)
+            }
+    return {}
+
+
+def _signal_total(counters: dict[str, dict[str, Any]], *names: str) -> float:
+    return sum(
+        value
+        for name in (names or counters.keys())
+        if (counter := counters.get(name)) is not None
+        and (value := _first_number(counter.get("total"))) is not None
+    )
+
+
+def _signal_peak_rate(counters: dict[str, dict[str, Any]], *names: str) -> float:
+    return max(
+        (
+            value
+            for name in (names or counters.keys())
+            if (counter := counters.get(name)) is not None
+            and (value := _first_number(counter.get("peak_rate"))) is not None
+        ),
+        default=0.0,
+    )
+
+
 def _step_elsewhere(
     drop_summary: dict[str, Any],
     session_series: Sequence[dict[str, Any]],
@@ -1095,9 +1189,13 @@ def _step_elsewhere(
     attribution: Sequence[dict[str, Any]],
     events: Sequence[dict[str, Any]] = (),
     low_significance: bool = False,
+    context: dict[str, Any] | None = None,
+    signal_summary: dict[str, Any] | None = None,
+    diagnostic_pools: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     hypotheses: list[dict[str, Any]] = []
     batch_count = len(cycles)
+    context = context or {}
 
     # 4a — elephant session: one hot core, or a long-lived transfer near link speed.
     isolated = [verdict for verdict in cpu_verdicts if verdict.get("state") == "isolated"]
@@ -1137,6 +1235,26 @@ def _step_elsewhere(
                 "capture</strong>, which is what an elephant session looks like: it "
                 "writes no traffic log while it runs and PBP never names it."
             )
+            backup_applications = sorted(
+                {
+                    str(session.get("application")).lower()
+                    for session, _, _ in elephant_sessions
+                    if str(session.get("application") or "").lower()
+                    in BACKUP_APPLICATIONS
+                }
+            )
+            if backup_applications:
+                text += (
+                    " The application"
+                    + ("s" if len(backup_applications) != 1 else "")
+                    + " ("
+                    + ", ".join(f"<code>{_escape(app)}</code>" for app in backup_applications)
+                    + ") is backup or storage traffic: these flows are the "
+                    "operator's own infrastructure. Align PBP thresholds, QoS "
+                    "or the job schedule with the backup window rather than "
+                    "blocking the source - a blocked media server silently "
+                    "interrupts every client that converges on it."
+                )
         elif isolated:
             text += (
                 "No session above the largest-sessions threshold matched it, so the "
@@ -1447,6 +1565,471 @@ def _step_elsewhere(
                     + "."
                     if cpu_verdicts or session_series
                     else "Neither the per-core CPU nor the session table was collected."
+                ),
+                "named": [],
+            }
+        )
+
+    # --- Corpus signatures. Each of the blocks below encodes one incident
+    # class verified on the eight-case TAC corpus, and fires on positive
+    # evidence only: the counter deltas sample fractions of a second, so a
+    # signature that did not fire proves nothing and none of these ever
+    # claims a negative.
+    activate_percent = (
+        _first_number(context.get("activate_percent")) or DEFAULT_ACTIVATE_PERCENT
+    )
+    buffer_series: list[float | None] = []
+    for record in cycles:
+        percentages = record.get("percentages")
+        values = (
+            list(_numbers(percentages.get("packet_buffer_congestion")))
+            + list(_numbers(percentages.get("resource_monitor_packet_buffer")))
+            if isinstance(percentages, dict)
+            else []
+        )
+        buffer_series.append(max(values) if values else None)
+    buffer_last = next(
+        (value for value in reversed(buffer_series) if value is not None), None
+    )
+    buffer_peak = max(
+        (value for value in buffer_series if value is not None), default=None
+    )
+
+    # ARP / L2 storm: a flood that never creates a session, so every
+    # session-driven view above stays empty while the buffer fills.
+    arp = _signal_family_counters(signal_summary, "arp_storm")
+    arp_rate = _signal_peak_rate(arp, "flow_arp_pkt_rcv")
+    arp_total = _signal_total(arp, "flow_arp_pkt_rcv")
+    if arp_rate >= ARP_STORM_RATE_PER_SECOND:
+        gratuitous_share = (
+            _signal_total(arp, "flow_arp_rcv_gratuitous") / arp_total
+            if arp_total > 0
+            else None
+        )
+        hypotheses.append(
+            {
+                "key": "l2_storm",
+                "title": "ARP / L2 storm",
+                "state": "positive",
+                "text": (
+                    f"<strong>The dataplane received ARP at up to {_fmt(arp_rate)}/s</strong>"
+                    + (
+                        f", {_fmt(round(gratuitous_share * 100.0, 1))}% of it gratuitous"
+                        if gratuitous_share is not None
+                        and gratuitous_share >= ARP_GRATUITOUS_SHARE
+                        else ""
+                    )
+                    + ". An ARP flood creates no session: PBP can neither name nor "
+                    "block it, the offender ranking stays empty, and a firewall "
+                    "reboot changes nothing. Locate the ingress port with "
+                    "<code>show counter interface all</code> - one interface or "
+                    "aggregate group whose rx-broadcast and rx-multicast dwarf its "
+                    "rx-unicast names the entry point - and remediate at layer 2 "
+                    "(storm control, or disconnecting the offending device)."
+                ),
+                "named": [],
+            }
+        )
+
+    # Fragmentation pressure: reassembly holds buffers until the last
+    # fragment arrives, and allocation errors inside the defrag path tie the
+    # fragments directly to the exhaustion.
+    frag = _signal_family_counters(signal_summary, "fragmentation")
+    frag_rate = _signal_peak_rate(frag, "flow_ipfrag_recv")
+    frag_received = _signal_total(frag, "flow_ipfrag_recv")
+    frag_completed = _signal_total(frag, "flow_ipfrag_merge")
+    frag_alloc_errors = _signal_total(frag, "flow_ipfrag_pkt_alloc_err")
+    allocation_failures = _signal_total(
+        _signal_family_counters(signal_summary, "allocation_failure")
+    )
+    frag_ratio = frag_received / frag_completed if frag_completed > 0 else None
+    if frag_rate >= FRAGMENTATION_RATE_PER_SECOND or (
+        frag_ratio is not None
+        and frag_ratio > FRAGMENTATION_REASSEMBLY_RATIO
+        and frag_received >= DENIED_BURST_TOTAL_PACKETS
+    ):
+        text = (
+            f"<strong>IP fragments arrived at up to {_fmt(frag_rate)}/s</strong>"
+            + (
+                f" at {_fmt(round(frag_ratio, 1))} fragments per reassembled packet"
+                if frag_ratio is not None
+                else ""
+            )
+            + ". Reassembly holds a buffer for every fragment until the last one "
+            "arrives, so heavy fragmentation occupies the pool out of proportion "
+            "to its bandwidth."
+        )
+        if frag_alloc_errors > 0 or allocation_failures > 0:
+            text += (
+                f" Allocation failed {_fmt(frag_alloc_errors)} time(s) inside the "
+                f"defragmentation path and {_fmt(allocation_failures)} time(s) "
+                "overall: fragmentation was exhausting the pool, not merely using "
+                "it."
+            )
+        text += (
+            " Fragmented UDP tunnels (VPN or WireGuard-style traffic) are the "
+            "classic source; identify the flows before considering "
+            "<code>discard-ip-frag</code> zone protection on the ingress zone."
+        )
+        hypotheses.append(
+            {
+                "key": "fragmentation",
+                "title": "Fragmentation pressure",
+                "state": "positive",
+                "text": text,
+                "named": [],
+            }
+        )
+
+    # Distributed proxy/retransmit exhaustion: aggregate SSL-proxy packet
+    # rate with no single offender - blocking what PBP names punishes
+    # victims.
+    fptcp = _signal_family_counters(signal_summary, "proxy_retransmit")
+    fptcp_rate = _signal_peak_rate(
+        fptcp, "tcp_fptcp_rxmt", "tcp_fptcp_fast_retransmit"
+    )
+    on_chip_peak = _metric_peak(
+        cycles,
+        "resource_monitor_packet_descriptor_on_chip",
+        "descriptor_atomic",
+        "descriptor_total",
+    )
+    if fptcp_rate >= PROXY_RETRANSMIT_RATE_PER_SECOND:
+        hypotheses.append(
+            {
+                "key": "proxy_retransmit",
+                "title": "Decryption proxy pressure",
+                "state": "positive",
+                "text": (
+                    f"<strong>The decryption proxy's own TCP stack retransmitted at "
+                    f"up to {_fmt(fptcp_rate)}/s</strong>. Each unacknowledged "
+                    "segment holds a buffer - and on ASIC platforms an on-chip "
+                    "packet descriptor"
+                    + (
+                        f" - and the descriptors did reach {_fmt(on_chip_peak)}%"
+                        if on_chip_peak is not None
+                        and on_chip_peak >= DESCRIPTOR_EXHAUSTION_PERCENT
+                        else ""
+                    )
+                    + ". This pressure is the sum of many proxied sessions, not one "
+                    "offender: blocking the sources PBP names punishes victims. "
+                    "Reduce or reshape the decryption load, and on Octeon "
+                    "platforms ask TAC about the legacy-retransmit knob for this "
+                    "pattern."
+                ),
+                "named": [],
+            }
+        )
+
+    # Held resources: buffer occupancy decoupled from session load, pools
+    # pinned near full, or a latency long tail - the leak class. Positive
+    # evidence that buffers are being kept, not processed.
+    held_pools = [
+        pool
+        for pool in diagnostic_pools or []
+        if (_first_number(pool.get("used_percentage")) or 0.0)
+        >= POOL_HELD_PERCENT
+    ]
+    # Decoupling is judged against the PAN-OS default alert level, never a
+    # lowered configured threshold: a lab firewall alerting at 1% with 4%
+    # buffers is a threshold artifact, not held memory.
+    decoupled = (
+        buffer_peak is not None
+        and buffer_peak >= DEFAULT_ALERT_PERCENT
+        and table_peak is not None
+        and table_peak <= LEAK_SESSION_TABLE_PERCENT
+        and buffer_last is not None
+        and buffer_last >= DEFAULT_ALERT_PERCENT
+    )
+    latency_peaks: list[float] = []
+    latency_averages: list[float] = []
+    for record in cycles:
+        latency = record.get("buffer_latency")
+        if not isinstance(latency, dict):
+            continue
+        for dataplane in latency.get("dataplanes") or []:
+            if not isinstance(dataplane, dict):
+                continue
+            latency_peaks.extend(_numbers(dataplane.get("last_max_ms")))
+            latency_averages.extend(
+                value
+                for value in _numbers(dataplane.get("last_avg_ms"))
+                if value > 0
+            )
+    latency_ratio = (
+        max(latency_peaks) / statistics.median(latency_averages)
+        if latency_peaks and latency_averages
+        else None
+    )
+    long_tail = (
+        latency_ratio is not None and latency_ratio >= LATENCY_LONG_TAIL_RATIO
+    )
+    if held_pools or decoupled or long_tail:
+        parts = []
+        if decoupled:
+            parts.append(
+                f"packet buffers held {_fmt(buffer_last)}% at the end of the "
+                f"capture while the session table never exceeded {_fmt(table_peak)}% "
+                "- occupancy decoupled from session load"
+            )
+        if held_pools:
+            parts.append(
+                "dataplane pools stayed near full (see the diagnostic pools table)"
+            )
+        if long_tail:
+            parts.append(
+                f"a few packets waited {_fmt(round(latency_ratio, 0))}x longer than "
+                "the median buffer latency - a long tail, not uniform congestion"
+            )
+        quiet_cores = bool(cpu_verdicts) and not collective
+        text = (
+            "<strong>Resources were held, not processed</strong>: "
+            + "; ".join(parts)
+            + (
+                ", while the dataplane cores stayed quiet"
+                if quiet_cores
+                else ""
+            )
+            + ". That is the leak signature: occupancy that survives an idle "
+            "period and clears only at a dataplane restart is a software leak, "
+            "not traffic. If it recurs, capture the dataplane "
+            "<code>pan_task</code> logs within minutes of an episode (at debug "
+            "level they rotate in about a minute) and review later maintenance "
+            "releases of PAN-OS "
+            + _escape(str(context.get("software_version") or "this release"))
+            + " for buffer-leak fixes before treating the traffic as the cause"
+            + (
+                " - the held proxy pools point at the SSL-proxy leak class"
+                if any(
+                    str(pool.get("name") or "").strip().lower()
+                    in {"timer pool", "proxy_flow", "ssl_st", "fptcp_seg"}
+                    for pool in held_pools
+                )
+                else ""
+            )
+            + "."
+        )
+        hypotheses.append(
+            {
+                "key": "held_resources",
+                "title": "Held resources (leak signature)",
+                "state": "positive",
+                "text": text,
+                "named": [
+                    f"<code>{_escape(pool.get('name'))}</code>"
+                    + (
+                        f" on {_escape(pool.get('dataplane'))}"
+                        if pool.get("dataplane")
+                        else ""
+                    )
+                    + f" at {_fmt(_first_number(pool.get('used_percentage')))}% used"
+                    for pool in held_pools[:_MAX_NAMED]
+                ],
+            }
+        )
+
+    # Flood through an unprotected zone: PBP dropping hard while the
+    # zone-protection flood counters never moved - PBP doing zone
+    # protection's job. Worded as a suspicion to verify, not a verdict:
+    # the capture does not read `show zone-protection`.
+    pbp_counters = _signal_family_counters(signal_summary, "pbp")
+    pbp_drop_total = _signal_total(
+        pbp_counters, "flow_dos_pbp_drop", "pkt_buf_protect_red"
+    )
+    pbp_drop_rate = _signal_peak_rate(
+        pbp_counters, "flow_dos_pbp_drop", "pkt_buf_protect_red"
+    )
+    zone_flood_counters = _signal_family_counters(signal_summary, "zone_flood")
+    if (
+        pbp_drop_total >= DENIED_BURST_TOTAL_PACKETS
+        and not zone_flood_counters
+        and (
+            packets_without_sessions
+            or (cps_peak is not None and cps_peak >= NEW_SESSION_STORM_CPS)
+        )
+    ):
+        hypotheses.append(
+            {
+                "key": "unprotected_flood",
+                "title": "Flood through an unprotected zone",
+                "state": "positive",
+                "text": (
+                    f"<strong>PBP dropped {_fmt(pbp_drop_total)} packets (up to "
+                    f"{_fmt(pbp_drop_rate)}/s) while no zone-protection flood "
+                    "counter moved</strong> in the counted deltas. When a flood "
+                    "reaches the packet buffer with the zone flood counters "
+                    "silent, the classic cause is flood protection disabled on "
+                    "the ingress zone - PBP is then the last line, doing zone "
+                    "protection's job one buffer at a time. Verify on the "
+                    "firewall with <code>show zone-protection</code>: a zone "
+                    "whose profile has a flood mechanism disabled prints no "
+                    "line at all for it."
+                ),
+                "named": [],
+            }
+        )
+
+    # Single-dataplane saturation on a chassis: one DP pinned while the
+    # median idles - a flow group hashed onto one dataplane, not capacity.
+    imbalance: tuple[str, float, float, int] | None = None
+    for record in cycles:
+        percentages = record.get("percentages")
+        dataplanes = (
+            percentages.get("resource_monitor_dataplanes")
+            if isinstance(percentages, dict)
+            else None
+        )
+        if not isinstance(dataplanes, list) or len(dataplanes) < 2:
+            continue
+        readings = [
+            (str(entry.get("dataplane") or "?"), value)
+            for entry in dataplanes
+            if isinstance(entry, dict)
+            and (value := _first_number(entry.get("packet_buffer"))) is not None
+        ]
+        if len(readings) < 2:
+            continue
+        worst_name, worst_value = max(readings, key=lambda item: item[1])
+        median_value = statistics.median(value for _, value in readings)
+        if (
+            worst_value >= activate_percent
+            and median_value <= CHASSIS_IMBALANCE_MEDIAN_PERCENT
+            and (imbalance is None or worst_value > imbalance[1])
+        ):
+            imbalance = (worst_name, worst_value, median_value, len(readings))
+    if imbalance is not None:
+        worst_name, worst_value, median_value, dataplane_count = imbalance
+        hypotheses.append(
+            {
+                "key": "chassis_imbalance",
+                "title": "Single-dataplane saturation",
+                "state": "positive",
+                "text": (
+                    f"<strong>Dataplane {_escape(worst_name)} reached "
+                    f"{_fmt(worst_value)}% packet buffer while the median of "
+                    f"{dataplane_count} dataplanes stayed at {_fmt(median_value)}%"
+                    "</strong>. Sessions are pinned to a dataplane by their flow "
+                    "hash, so one heavy flow group saturates its dataplane while "
+                    "the chassis as a whole has headroom. The remedy is per-flow "
+                    "- the offenders and backlog sessions on that dataplane - "
+                    "not capacity."
+                ),
+                "named": [],
+            }
+        )
+
+    # Session-table collapse: the firewall stopped admitting sessions while
+    # the buffer stayed high - the terminal stage, where tunnels and routing
+    # adjacencies start failing.
+    if allocated:
+        peak_allocated = max(allocated)
+        last_allocated = allocated[-1]
+        if (
+            peak_allocated >= SESSION_COLLAPSE_FLOOR
+            and last_allocated <= SESSION_COLLAPSE_RATIO * peak_allocated
+            and buffer_last is not None
+            and buffer_last >= DEFAULT_ALERT_PERCENT
+        ):
+            hypotheses.append(
+                {
+                    "key": "session_collapse",
+                    "title": "Session-table collapse",
+                    "state": "positive",
+                    "text": (
+                        f"<strong>Allocated sessions fell from "
+                        f"{_fmt(peak_allocated)} to {_fmt(last_allocated)} while "
+                        f"the packet buffer still read {_fmt(buffer_last)}%"
+                        "</strong>. Buffers pinned while the session table drains "
+                        "means the firewall was no longer admitting sessions - "
+                        "the late stage of exhaustion, where VPN tunnels and "
+                        "routing adjacencies through the firewall start failing. "
+                        "Treat the incident as severe even where the traffic "
+                        "rates look modest."
+                    ),
+                    "named": [],
+                }
+            )
+
+    # Block-ip collateral: PBP escalated to blocking sources. The block
+    # itself is silent for its whole duration, so the report must say who
+    # was blocked and what that costs when the source is shared
+    # infrastructure.
+    threat_summary = context.get("threat_logs") or {}
+    threat_counts = (
+        threat_summary.get("counts") if isinstance(threat_summary, dict) else {}
+    ) or {}
+    blocked_hosts = _signal_total(
+        pbp_counters, "flow_dos_pbp_block_host", "pkt_buf_protect_block_ip"
+    )
+    block_events = _first_number(threat_counts.get(8509)) or 0.0
+    block_collateral = _signal_total(
+        _signal_family_counters(signal_summary, "block_collateral")
+    )
+    if blocked_hosts > 0 or block_events > 0:
+        blocked_sources = [
+            f"<code>{_escape(source)}</code>"
+            for source, item in (
+                threat_summary.get("sources") or {}
+            ).items()
+            if isinstance(item, dict) and 8509 in (item.get("ids") or set())
+        ]
+        hypotheses.append(
+            {
+                "key": "block_collateral",
+                "title": "Source blocking and its collateral",
+                "state": "positive",
+                "text": (
+                    "<strong>PBP escalated to blocking source addresses</strong> ("
+                    + ", ".join(
+                        part
+                        for part in (
+                            f"{_fmt(block_events)} PBP IP Blocked threat log(s)"
+                            if block_events > 0
+                            else "",
+                            f"{_fmt(blocked_hosts)} block-host counter event(s)"
+                            if blocked_hosts > 0
+                            else "",
+                        )
+                        if part
+                    )
+                    + ")."
+                    + (
+                        f" {_fmt(block_collateral)} packets were then dropped "
+                        "from blocked sources - the size of the outage the "
+                        "blocks caused."
+                        if block_collateral > 0
+                        else ""
+                    )
+                    + " A blocked source stays silently blocked for the whole "
+                    "block duration. If it is a NAT gateway, a proxy or a "
+                    "backup media server, every host behind or converging on it "
+                    "loses traffic with no log of its own: check what the named "
+                    "sources are before treating them as attackers."
+                ),
+                "named": blocked_sources[:_MAX_NAMED],
+            }
+        )
+
+    # Recent boot or upgrade: not a cause, a context that raises the
+    # known-issue hypothesis - one corpus case started 14 hours after an
+    # upgrade and its nightly trigger had been self-recovering before it.
+    days_up = _first_number(context.get("uptime_days"))
+    if days_up is not None and days_up < RECENT_BOOT_DAYS:
+        hypotheses.append(
+            {
+                "key": "recent_boot",
+                "title": "Recent boot or upgrade",
+                "state": "positive",
+                "text": (
+                    f"<strong>The firewall had been up only "
+                    f"{_escape(str(context.get('uptime')))} </strong>when this "
+                    "incident was captured. An incident starting within days of "
+                    "a boot raises the known-issue hypothesis: check the release "
+                    "notes and known issues of PAN-OS "
+                    + _escape(str(context.get("software_version") or "-"))
+                    + " before treating the environment as the cause, and note "
+                    "whether buffer utilization clears at each reboot and climbs "
+                    "back - that history is itself the leak fingerprint."
                 ),
                 "named": [],
             }

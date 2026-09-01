@@ -146,7 +146,8 @@ syslog, denied and re-evaluated packet by packet on one core. An empty result
 on an x86 platform is stated as not being proof, because PAN-OS documents the
 command for the hardware queue of the Cavium chassis.
 
-**Step 4 — If not, where else?** Five hypotheses, each with its own verdict:
+**Step 4 — If not, where else?** Five always-answered hypotheses, each with
+its own verdict:
 
 - *Elephant session* — one `flow_fastpath` core hot against the median of its
   peers, or a session above the largest-sessions threshold listed through most
@@ -162,6 +163,29 @@ command for the hardware queue of the Cavium chassis.
   growing on the interfaces the evidence named.
 - *Aggregate load* — every comparable core rising together to 60% or more, or
   the session table at 80% of its capacity.
+
+Nine further **corpus signatures** join the same list, derived from eight
+closed TAC packet-buffer cases and appearing only when their evidence is
+present — the counter deltas sample fractions of a second, so an absent
+counter proves nothing and these never claim a negative: *ARP / L2 storm* (a
+flood PBP cannot name or block because it creates no session; a reboot changes
+nothing and `show counter interface all` finds the port), *fragmentation
+pressure* (fragments held for reassembly, with allocation errors tying them to
+the exhaustion), *decryption proxy pressure* (`tcp_fptcp_*` retransmissions —
+aggregate proxied load where blocking PBP's named sources punishes victims),
+*held resources* (occupancy decoupled from session load, a pool pinned near
+full, or a buffer-latency long tail — the leak signature, with the advice to
+capture the dataplane `pan_task` logs within minutes), *flood through an
+unprotected zone* (PBP dropping while the zone flood counters stay silent —
+verify with `show zone-protection`), *single-dataplane saturation* (one DP at
+the activate threshold beside an idle chassis median), *session-table
+collapse* (sessions draining under a pinned buffer — the terminal stage),
+*source blocking and its collateral* (who PBP blocked, what
+`flow_dos_drop_ip_blocked` says it cost, and the warning when the source may
+be shared infrastructure), and *recent boot or upgrade* (the known-issue
+hypothesis). An elephant session whose application is backup or storage
+traffic carries its own guardrail: align PBP, QoS or the schedule with the
+backup window rather than blocking your own media server.
 
 At low pressure the signals are listed but not blamed. When the pressure is
 real and nothing names a cause, the headline says so and the conclusion points

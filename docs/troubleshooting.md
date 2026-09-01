@@ -117,6 +117,78 @@ than which is the largest, `show running resource-monitor ingress-backlogs`
 names the sessions filling the ingress buffers. The collector already collects
 it in every batch.
 
+## Reading a packet-buffer incident
+
+The incident report's diagnosis now names the incident classes below when their
+evidence is present. They were derived from eight closed TAC packet-buffer
+cases (PA-1420 to PA-7080, PAN-OS 10.2.9 to 11.2.10); this section is the
+operator's map of the same knowledge, for reading a report or a firewall by
+hand.
+
+**Leak or burst is the first question.** A burst shows utilization *maxima*
+spiking while the same minute's average stays low, full recovery to baseline
+between events, and an offender or a schedule you can point at. A leak shows
+the *average* pinned or a floor that only ratchets upward, high occupancy
+persisting through idle hours (nights, weekends) with the session table at a
+few percent, and a reset only at a dataplane restart. The
+`Packet buffer congestion (utilization) is X/Y` System log line is the
+long-term memory for this call: one line per minute above the alert threshold,
+across weeks and reboots — and its denominator Y names the measured pool
+(the software buffer pool on PA-400/1400/3400/5400, the on-chip
+`PKI POOL DFLT` on PA-3200/5200/7000). An hour-of-day histogram of those
+lines that clusters in the same window across days is a scheduler — usually
+the backup window — not an attack.
+
+**The classes the report can name**, and what proves each:
+
+- **ARP / L2 storm** — buffers pegged, sessions and connection rate flat,
+  no PBP offender, `flow_arp_pkt_rcv` at storm rate (gratuitous share near
+  100% = gratuitous-ARP storm). PBP cannot mitigate a flood that creates no
+  session, and a firewall reboot changes nothing. `show counter interface all`
+  finds the port: rx-broadcast and rx-multicast dwarfing rx-unicast on one
+  interface or AE group.
+- **Fragmentation pressure** — `flow_ipfrag_recv` at hundreds per second or
+  many fragments per reassembled packet, with `flow_ipfrag_pkt_alloc_err` or
+  `pkt_alloc_failure` tying the fragments to the exhaustion. Fragmented UDP
+  tunnels are the classic source.
+- **Decryption proxy pressure** — `tcp_fptcp_*` retransmissions sustained
+  under SSL forward proxy; on ASIC platforms the on-chip descriptors saturate
+  while software buffers stay moderate, and the load is spread over many
+  proxied sessions: blocking the sources PBP names punishes victims.
+- **Held resources (leak)** — occupancy decoupled from session load, a
+  diagnostic pool (`Timer Pool`, `PKI POOL DFLT`, `proxy_flow`, `ssl_st`,
+  `fptcp_seg`) near full, or a buffer-latency maximum orders of magnitude
+  above the average. The proof of the root cause usually lives in the
+  dataplane `pan_task` logs, which rotate in about a minute at debug level —
+  capture them within minutes of an episode, and check later maintenance
+  releases for buffer-leak fixes before blaming the traffic.
+- **Flood through an unprotected zone** — PBP dropping hard while the
+  zone-protection flood counters stay silent. Confirm with
+  `show zone-protection`: a zone whose profile has a flood mechanism disabled
+  prints no line at all for it — absence means disabled, not zero.
+- **Single-dataplane saturation** — on a multi-DP chassis, one dataplane at
+  the activate threshold while the median idles: a flow group pinned by its
+  hash. The fix is per-flow, not capacity.
+- **Session-table collapse** — allocated sessions draining while the buffer
+  stays high: the firewall has stopped admitting sessions, the stage where
+  tunnels and routing adjacencies fail. Severe even at modest traffic rates.
+- **Source blocking collateral** — a PBP block-ip (threat ID 8509) is silent
+  for its whole duration; `flow_dos_drop_ip_blocked` counts what it cost.
+  Before treating a blocked source as an attacker, check whether it is a NAT
+  gateway, a proxy or a backup media server: blocking a convergence point is
+  a site outage with no log of its own.
+- **Recent boot or upgrade** — an incident starting within days of a boot
+  raises the known-issue hypothesis; check the release notes of the running
+  PAN-OS before treating the environment as the cause.
+
+Two caveats the corpus proved. The zone written on PBP threat logs is the
+ingress interface's zone whenever `flow_dos_pbp_ifp_zone` is a large share of
+the PBP drops — do not attribute offenders by that label. And a tech-support
+file cannot answer after the fact what the collector captures live: none of
+the eight corpus TSFs contained `show session packet-buffer-protection`,
+`ingress-backlogs`, threat logs, or the identity of blocked hosts. Keep the
+collector's captures with the case.
+
 ## Reporting a problem in a deployment you do not administer
 
 When the collector runs at a site you cannot reach, ask the operator for the

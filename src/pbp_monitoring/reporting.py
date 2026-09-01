@@ -3139,9 +3139,8 @@ def _render_html(
     drop_counters_html = _render_drop_counters(
         drop_counter_summary, attribution
     ) + _render_signal_counters(signal_counter_summary)
-    diagnostic_pools_html = _render_diagnostic_pools(
-        _aggregate_diagnostic_pools(cycles)
-    )
+    diagnostic_pools = _aggregate_diagnostic_pools(cycles)
+    diagnostic_pools_html = _render_diagnostic_pools(diagnostic_pools)
     offender_logs_html = _render_offender_live_sessions(
         events
     ) + _render_offender_traffic_logs(events)
@@ -3539,6 +3538,8 @@ def _render_html(
             large_sessions=large_session_summary,
             cpu_verdicts=cpu_verdict_data,
             device=device,
+            signal_summary=signal_counter_summary,
+            diagnostic_pools=diagnostic_pools,
         )
         glance_html = _render_section(
             "glance-title",
