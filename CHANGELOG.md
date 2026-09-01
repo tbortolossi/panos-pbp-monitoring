@@ -3,6 +3,41 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.39.0] - 2026-09-01
+
+### Added
+
+- **A layered incident report, offered beside the original one.** Every run
+  now writes a second report, `report-v2.html`, from the same capture and the
+  same diagnosis, presented in three strict layers instead of one flat list of
+  sections. Layer 1 is the verdict: the headline, the peak buffer and
+  descriptor levels, the buffer latency and the level PBP mitigated from, and
+  the case context (model, PAN-OS, configured alert and activate thresholds
+  and where they were read from). Layer 2 states only the causes this capture
+  supports, ranked, each linking to the section that proves it; everything the
+  investigation rejected folds behind a single **N other causes ruled out**
+  line, everything it could not judge behind **N causes not evaluable**, and
+  the four-step walk and the conclusion paragraph fold under their own names.
+  Layer 3 carries the evidence sections and the raw appendix, unchanged.
+  Clicking a run on the dashboard opens the layered report; the report's
+  evidence bar offers **HTML v2** and **HTML v1**, each named by its weight,
+  and `pbp-report-v2` regenerates one from a capture on the command line.
+  The layered report stays self-sufficient for a TAC case: it carries the same
+  raw command responses, the same capture digest and the same identity block.
+- **`collect_findings` in the diagnosis module.** The four-step investigation
+  is flattened into confirmed, ruled-out and not-evaluable findings, each
+  carrying the evidence anchor that proves it. A test fails if a hypothesis
+  the diagnosis can raise has no evidence section to open.
+
+### Changed
+
+- The v1 report is byte-for-byte what it was: the aggregation, the stylesheet,
+  the section list and the diagnosis rendering were factored into shared
+  builders that both renderers call, and the identity of the rendered output
+  is verified against the pre-change build.
+- The support archive leaves `report-v2.html` behind exactly as it leaves
+  `report.html`: both regenerate from the JSONL capture the archive carries.
+
 ## [0.38.0] - 2026-09-01
 
 ### Added

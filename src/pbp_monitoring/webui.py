@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__, diagnostics
 from .reporting import REPORT_SCRIPT_CSP_HASH
+from .reporting_v2 import REPORT_V2_FILENAME, REPORT_V2_SCRIPT_CSP_HASH
 from .adminui import AdminController
 from .config_store import ALL_RUNS, DEFAULT_SETTINGS, TARGET_NAME, ConfigStore
 from .web_tls import ensure_self_signed_certificate
@@ -461,9 +462,17 @@ td:first-child strong,td:first-child code{{display:block}}td:first-child code{{m
 #: is inserted in that chunk and the remainder of the file is streamed, so a
 #: report of any size keeps its exports without ever being held in memory.
 REPORT_HEAD_BYTES = 1024 * 1024
+
+#: The stored reports a run may offer, and the name each is downloaded under.
+#: A run keeps several reports of the same capture, so the file an operator
+#: saves has to say which reading it is.
+_REPORT_NAMES = {
+    "report.html": "pbp-report-{target}-{run}.html",
+    REPORT_V2_FILENAME: "pbp-report-v2-{target}-{run}.html",
+}
 #: The script-src expression a report page is served with: the report's own
 #: folding control, named by hash and quoted as CSP requires, and nothing else.
-_REPORT_SCRIPT_SRC = f"'{REPORT_SCRIPT_CSP_HASH}'"
+_REPORT_SCRIPT_SRC = f"'{REPORT_SCRIPT_CSP_HASH}' '{REPORT_V2_SCRIPT_CSP_HASH}'"
 _BODY_TAG = re.compile(rb"<body[^>]*>", re.IGNORECASE)
 
 
@@ -509,7 +518,17 @@ def render_report_evidence_bar(target: str, run_id: str, run_dir: Path) -> str:
     text_files = len(list(raw_dir.glob("*.txt"))) if raw_dir.is_dir() else 0
     jsonl = run_dir / "incident.jsonl"
     report = run_dir / "report.html"
+    report_v2 = run_dir / REPORT_V2_FILENAME
     links: list[str] = []
+    if report_v2.is_file():
+        links.append(
+            _export_link(
+                f"/artifacts/{target_url}/{run_url}/{REPORT_V2_FILENAME}",
+                "HTML v2",
+                _human_size(report_v2.stat().st_size),
+                "The layered report as a standalone file: the verdict, what explains it, then the evidence",
+            )
+        )
     if report.is_file():
         # The report is the artifact a case is actually sent with, and the one
         # the browser cannot save cleanly: "Save page as" would keep this bar
@@ -518,9 +537,9 @@ def render_report_evidence_bar(target: str, run_id: str, run_dir: Path) -> str:
         links.append(
             _export_link(
                 f"/artifacts/{target_url}/{run_url}/report.html",
-                "HTML",
+                "HTML v1",
                 _human_size(report.stat().st_size),
-                "This report as a standalone file, without these links, to send or archive",
+                "The original flat report as a standalone file, every section at the same weight",
             )
         )
     if jsonl.is_file():
@@ -562,8 +581,9 @@ def render_report_evidence_bar(target: str, run_id: str, run_dir: Path) -> str:
     if links:
         exports_html = '<span class="pbp-bar-label">Exports</span>' + "".join(links)
         note = (
-            "HTML downloads this page as a standalone file, without this bar; "
-            "print it from the browser to obtain a PDF."
+            "HTML downloads a report as a standalone file, without this bar; "
+            "print it from the browser to obtain a PDF. v2 leads with the "
+            "verdict, v1 keeps the original flat layout."
         )
     else:
         exports_html = '<span class="pbp-bar-note">No stored evidence for this run.</span>'
@@ -707,6 +727,7 @@ def collect_dashboard_state(
                     ),
                     "updated_at": last.get("timestamp"),
                     "report": (directory / "report.html").is_file(),
+                    "report_v2": (directory / REPORT_V2_FILENAME).is_file(),
                     "jsonl": capture.is_file(),
                     "text_files": len(list((directory / "raw").glob("*.txt")))
                     if (directory / "raw").is_dir()
@@ -1017,9 +1038,15 @@ def render_dashboard(
             str(run.get("target")),
             str(run.get("run_id")),
         ) in queued_deletions
-        report_url = (
-            f"/reports/{target}/{run_id}/report.html" if run.get("report") else None
-        )
+        # The row opens the layered report when the run has one: it is the
+        # reading an operator needs first. The flat v1 stays one link away, in
+        # the report's own evidence bar.
+        if run.get("report_v2"):
+            report_url = f"/reports/{target}/{run_id}/{REPORT_V2_FILENAME}"
+        elif run.get("report"):
+            report_url = f"/reports/{target}/{run_id}/report.html"
+        else:
+            report_url = None
         active = run.get("status") == "active"
         peak = run.get("peak_packet_buffer_pct")
         peak_text = (
@@ -1297,7 +1324,9 @@ def handler_factory(
                     while chunk := handle.read(1024 * 1024):
                         self.wfile.write(chunk)
 
-        def _serve_report(self, run_dir: Path, target: str, run_id: str) -> None:
+        def _serve_report(
+            self, run_dir: Path, target: str, run_id: str, name: str = "report.html"
+        ) -> None:
             """Serve a stored report with the run's evidence links added.
 
             The bar goes into the opening chunk and the rest of the report is
@@ -1306,7 +1335,7 @@ def handler_factory(
             TXT batches and its support archive. A report that carries no body
             tag is streamed unchanged rather than withheld.
             """
-            report = run_dir / "report.html"
+            report = run_dir / name
             try:
                 with report.open("rb") as handle:
                     size = os.fstat(handle.fileno()).st_size
@@ -1482,15 +1511,23 @@ def handler_factory(
                 self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
                 return
             parts = [part for part in path.split("/") if part]
-            if len(parts) == 4 and parts[0] == "reports" and parts[3] == "report.html":
+            if (
+                len(parts) == 4
+                and parts[0] == "reports"
+                and parts[3] in _REPORT_NAMES
+            ):
                 run_dir = _incident_run_dir(data_dir, parts[1], parts[2])
-                if run_dir is None or not (run_dir / "report.html").is_file():
+                if run_dir is None or not (run_dir / parts[3]).is_file():
                     self.send_error(404)
                     return
-                self._serve_report(run_dir, parts[1], parts[2])
+                self._serve_report(run_dir, parts[1], parts[2], parts[3])
                 return
-            if len(parts) == 4 and parts[0] == "artifacts" and parts[3] == "report.html":
-                artifact = _artifact_path(data_dir, parts[1], parts[2], "report.html")
+            if (
+                len(parts) == 4
+                and parts[0] == "artifacts"
+                and parts[3] in _REPORT_NAMES
+            ):
+                artifact = _artifact_path(data_dir, parts[1], parts[2], parts[3])
                 if artifact is None:
                     self.send_error(404)
                     return
@@ -1499,7 +1536,9 @@ def handler_factory(
                     "text/html; charset=utf-8",
                     attachment=True,
                     script_src=_REPORT_SCRIPT_SRC,
-                    download_name=f"pbp-report-{parts[1]}-{parts[2]}.html",
+                    download_name=_REPORT_NAMES[parts[3]].format(
+                        target=parts[1], run=parts[2]
+                    ),
                 )
                 return
             if len(parts) == 4 and parts[0] == "artifacts" and parts[3] == "incident.jsonl":

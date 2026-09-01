@@ -2123,6 +2123,189 @@ def _render_pressure_chart(
 #: button. It reads and writes nothing but the open state of the report's own
 #: sections: no network, no storage, no cookie. The Web UI pins it by hash, so
 #: this text must stay byte-for-byte what REPORT_SCRIPT_CSP_HASH covers.
+#: The report stylesheet, shared by every renderer so the v1 and the
+#: layered v2 report present the same tables, cards and charts.
+REPORT_STYLE = """    :root { color-scheme: light; --ink:#172033; --muted:#64748b; --line:#dbe3ee;
+      --surface:#fff; --soft:#f4f7fb; --accent:#155e75; --accent2:#0f766e;
+      --danger:#b42318; --warn:#92400e; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--soft); color:var(--ink); font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    header { padding:36px max(24px,calc((100vw - 1180px)/2)); color:#fff;
+      background:linear-gradient(125deg,#0f172a,#155e75 58%,#0f766e); }
+    header p { margin:7px 0 0; color:#d9f4f2; }
+    h1 { margin:0; font-size:clamp(25px,4vw,42px); letter-spacing:-.025em; }
+    h2 { margin:0 0 14px; font-size:21px; }
+    h3 { margin:22px 0 10px; font-size:15px; }
+    h4 { margin:0 0 10px; color:#334155; font-size:13px; }
+    h5 { margin:12px 0 5px; }
+    main { width:min(1180px,calc(100% - 32px)); margin:24px auto 48px; }
+    section { margin:0 0 24px; }
+    .facts,.cards { display:grid; gap:12px; }
+    .facts { grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); margin-top:22px; }
+    .fact { padding:12px 14px; border:1px solid #ffffff35; border-radius:10px; background:#ffffff12; }
+    .fact span,.card-label { display:block; color:var(--muted); font-size:12px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }
+    .fact span { color:#a7f3d0; }
+    .fact strong { display:block; overflow-wrap:anywhere; margin-top:3px; }
+    .cards { grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); }
+    .summary-group { margin:0 0 22px; }
+    .summary-group h3 { margin:0 0 10px; color:#475569; }
+    .state-cards { grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); }
+    .metric-families { display:grid; gap:12px; }
+    .metric-family { padding:14px; border:1px solid var(--line); border-radius:12px; background:#eaf0f6; }
+    .metric-cards { grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); }
+    .metric-card { min-height:104px; box-shadow:none; }
+    .card { min-height:108px; padding:16px; border:1px solid var(--line); border-radius:12px; background:var(--surface); box-shadow:0 5px 20px #0f172a0a; }
+    .card strong { display:block; margin:7px 0; font-size:25px; }
+    meter { width:100%; accent-color:var(--accent2); }
+    .warning { padding:16px 20px; border:1px solid #fbbf24; border-radius:12px; background:#fffbeb; color:var(--warn); }
+    .warning ul { margin:0; padding-left:20px; }
+    .table-wrap { overflow:auto; border:1px solid var(--line); border-radius:12px; background:#fff; scrollbar-gutter:stable; }
+    .timeline-wrap { max-height:min(72vh,760px); }
+    .timeline { min-width:1780px; }
+    .timeline th:first-child,.timeline td:first-child { position:sticky; left:0; z-index:1; background:#fff; box-shadow:1px 0 0 var(--line); }
+    .timeline th:first-child { z-index:3; background:#eef3f8; }
+    table { width:100%; border-collapse:collapse; white-space:nowrap; }
+    th,td { padding:10px 12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { position:sticky; top:0; background:#eef3f8; color:#334155; font-size:12px; text-transform:uppercase; }
+    tr:last-child td { border-bottom:0; }
+    .number { text-align:right; font-variant-numeric:tabular-nums; }
+    .sessions { max-width:280px; overflow:hidden; text-overflow:ellipsis; }
+    .wrap { max-width:360px; white-space:normal; overflow-wrap:anywhere; }
+    .empty,.muted { color:var(--muted); }
+    details.cycle { margin:10px 0; border:1px solid var(--line); border-radius:12px; background:#fff; overflow:hidden; }
+    details.cycle>summary { display:flex; align-items:center; gap:12px; padding:13px 16px; cursor:pointer; font-weight:700; }
+    details.cycle>summary time { margin-left:auto; color:var(--muted); font-weight:500; }
+    .cycle-body { padding:4px 16px 18px; border-top:1px solid var(--line); }
+    details.section-disclosure { border:1px solid var(--line); border-radius:12px; background:#fff; overflow:hidden; }
+    details.section-disclosure>summary { display:flex; align-items:center; gap:10px; padding:14px 16px; cursor:pointer; }
+    details.section-disclosure>summary h2 { margin:0; }
+    details.section-disclosure>.section-body { padding:2px 16px 16px; border-top:1px solid var(--line); }
+    details.section-fold { border:0; background:transparent; overflow:visible; }
+    details.section-fold>summary { padding:0; margin:0 0 14px; list-style:none; }
+    details.section-fold>summary::-webkit-details-marker { display:none; }
+    details.section-fold>summary::before { content:"▾"; width:18px; color:var(--accent); font-size:16px; transition:transform .15s; }
+    details.section-fold:not([open])>summary::before { transform:rotate(-90deg); }
+    details.section-fold:not([open])>summary { padding:12px 16px; border:1px solid var(--line); border-radius:12px; background:#fff; }
+    details.section-fold>summary h2 { margin:0; }
+    details.section-fold>.section-body { padding:0; border-top:0; }
+    details.section-fold>.section-body>.section-intro { margin-top:0; }
+    details.section-fold>summary:hover h2,
+    details.section-fold>summary:focus-visible h2 { color:var(--accent); }
+    .glance>details.section-fold:not([open])>summary { padding:0; margin:0; border:0; background:transparent; }
+    .metadata { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; }
+    .metadata div { padding:10px; border-radius:8px; background:var(--soft); }
+    dt { color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; }
+    dd { margin:3px 0 0; overflow-wrap:anywhere; }
+    .command-metadata { display:grid; grid-template-columns:repeat(auto-fit,minmax(155px,1fr)); gap:8px; margin:0; padding:12px; border-top:1px solid var(--line); }
+    .command-metadata div { min-width:0; padding:9px 10px; border:1px solid var(--line); border-radius:8px; background:#fff; }
+    .command-value { display:block; font-weight:700; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+    .command-value.good { color:#047857; }
+    .command-value.bad { color:var(--danger); }
+    details.raw-block { margin:8px 0; border-left:3px solid var(--accent); background:#f8fafc; }
+    details.raw-block>summary { display:flex; align-items:center; gap:9px; padding:9px 12px; cursor:pointer; }
+    .pill { margin-left:auto; padding:2px 8px; border-radius:999px; background:#dff6f2; color:#115e59; font-size:11px; font-weight:700; }
+    .pill.bad { background:#fee4e2; color:var(--danger); }
+    .signal-high { color:var(--danger); font-weight:800; }
+    .chart { display:block; max-width:100%; height:auto; margin:6px 0 4px; padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:#fff; }
+    .chart text.axis { fill:#475569; font:11px ui-sans-serif,system-ui,sans-serif; }
+    .chart text.heat-label { font-size:10.5px; }
+    .chart-legend { display:flex; flex-wrap:wrap; gap:6px 14px; margin:2px 0 4px; color:#475569; font-size:12px; }
+    .chart-legend .key { display:inline-flex; align-items:center; gap:6px; }
+    .core-roles { gap:6px 8px; margin:6px 0 8px; }
+    .core-roles .key { padding:2px 9px; border-radius:999px; background:var(--soft); }
+    .core-roles .core-roles-title { padding:0; background:none; color:#64748b; }
+    .chart-legend i { width:13px; height:11px; border:1px solid #94a3b8; border-radius:3px; }
+    .chart-legend i.dashed { height:0; border:0; border-top:2px dashed #0f172a; border-radius:0; }
+    .chart-caption { margin:0 0 14px; font-size:12px; }
+    .verdict { margin:8px 0 10px; padding:11px 13px; border-left:4px solid var(--line); border-radius:8px; background:var(--soft); }
+    .verdict-isolated { border-left-color:var(--danger); background:#fef2f2; }
+    .verdict-collective { border-left-color:#0f766e; background:#f0fdfa; }
+    .verdict-mixed { border-left-color:#f59e0b; background:#fffbeb; }
+    code { overflow-wrap:anywhere; color:#075985; }
+    .payload-label { padding:0 12px; color:#475569; }
+    details.exact-response { margin:10px 12px 12px; border:1px solid var(--line); border-radius:8px; background:#fff; overflow:hidden; }
+    details.exact-response>summary { padding:9px 11px; cursor:pointer; color:#475569; font-weight:700; }
+    details.exact-response pre.raw { max-height:520px; }
+    pre.raw { overflow:auto; max-height:520px; margin:0; padding:12px; border-top:1px solid var(--line); background:#0f172a; color:#d9e5f5; font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+    pre.raw-error { color:#fecaca; }
+    footer { width:min(1180px,calc(100% - 32px)); margin:0 auto 30px; color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+    .fact .fact-detail { display:inline; color:#a7f3d0; font-weight:500; font-size:12px; letter-spacing:0; text-transform:none; }
+    .toc { position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; gap:4px 6px; padding:8px max(24px,calc((100vw - 1180px)/2)); background:#ffffffee; border-bottom:1px solid var(--line); backdrop-filter:blur(4px); }
+    .toc a { padding:5px 11px; border-radius:999px; color:#0f3f4f; font-size:13px; font-weight:600; text-decoration:none; }
+    .toc a:hover,.toc a:focus { background:#e0f2f1; }
+    .toc button.fold-all { margin-left:auto; padding:5px 13px; border:1px solid var(--line); border-radius:999px; background:#fff; color:#0f3f4f; font:600 13px/1.4 inherit; cursor:pointer; }
+    .toc button.fold-all:hover,.toc button.fold-all:focus { background:#e0f2f1; border-color:var(--accent); }
+    h2 { scroll-margin-top:56px; }
+    .section-intro { margin:-8px 0 14px; color:var(--muted); }
+    .part-head { margin:34px 0 14px; padding-top:16px; border-top:2px solid var(--line); }
+    .part-head h2.part-title { margin:0 0 4px; color:#334155; font-size:15px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; }
+    .part-head p { margin:0; font-size:13px; }
+    .glance { padding:18px 20px; border:1px solid var(--line); border-left:6px solid #64748b; border-radius:12px; background:#fff; }
+    .glance[data-level="ok"] { border-left-color:#047857; }
+    .glance[data-level="warn"] { border-left-color:#d97706; }
+    .glance[data-level="bad"] { border-left-color:var(--danger); }
+    .glance .headline { margin:0 0 14px; font-size:16px; }
+    .glance .headline strong { font-size:18px; }
+    .glance[data-level="ok"] .headline strong { color:#047857; }
+    .glance[data-level="warn"] .headline strong { color:#b45309; }
+    .glance[data-level="bad"] .headline strong { color:var(--danger); }
+    .key-facts { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:0 0 6px; }
+    .key-facts div { padding:9px 11px; border-radius:8px; background:var(--soft); }
+    .key-facts dd { font-size:17px; font-weight:700; }
+    .probable-cause { margin-top:14px; padding-top:10px; border-top:1px solid var(--line); }
+    .diagnosis-context { margin:0 0 14px; }
+    .diagnosis-context .key { padding:2px 9px; border-radius:999px; background:var(--soft); }
+    ol.steps { margin:0; padding:0; list-style:none; display:grid; gap:10px; }
+    .step { padding:12px 14px; border:1px solid var(--line); border-left:5px solid #94a3b8; border-radius:10px; background:#fff; }
+    .step[data-level="ok"] { border-left-color:#047857; }
+    .step[data-level="warn"] { border-left-color:#d97706; }
+    .step[data-level="bad"] { border-left-color:var(--danger); }
+    .step-head { display:flex; align-items:center; gap:10px; }
+    .step-head h3 { margin:0; font-size:15px; }
+    .step-number { display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px; border-radius:50%; background:#0f172a; color:#fff; font-weight:800; font-size:13px; }
+    .step-evidence { margin-left:auto; color:var(--accent); font-size:12px; font-weight:700; text-decoration:none; }
+    .step-evidence:hover,.step-evidence:focus { text-decoration:underline; }
+    .step-verdict { margin:8px 0 6px; }
+    .step-unavailable .step-verdict { color:var(--muted); }
+    .step-facts { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:8px; margin:8px 0 0; }
+    .step-facts div { padding:7px 10px; border-radius:8px; background:var(--soft); }
+    .step-facts div[data-level="warn"] { background:#fffbeb; }
+    .step-facts div[data-level="bad"] { background:#fee4e2; }
+    .step-facts dd { font-weight:700; }
+    ol.step-named { margin:6px 0 4px; padding-left:22px; }
+    ol.step-named li { margin:3px 0; }
+    ul.hypotheses { margin:6px 0 0; padding:0; list-style:none; display:grid; gap:6px; }
+    .hypothesis { position:relative; padding:8px 10px 8px 30px; border-radius:8px; background:var(--soft); }
+    .hypothesis-mark { position:absolute; left:10px; top:11px; width:12px; height:12px; border-radius:50%; background:#94a3b8; }
+    .hypothesis-positive { background:#fef2f2; }
+    .hypothesis-positive .hypothesis-mark { background:var(--danger); }
+    .hypothesis-negative .hypothesis-mark { background:#047857; }
+    .hypothesis-unavailable { color:var(--muted); }
+    .probable-cause h3 { margin:0 0 6px; }
+    .probable-cause p { margin:6px 0; }
+    .not-collected { color:var(--muted); font-size:15px; font-weight:600; }
+    .metric-card[data-level="none"] { background:#f8fafc; border-style:dashed; }
+    .metric-card[data-level="warn"] { border-color:#f59e0b; background:#fffbeb; }
+    .metric-card[data-level="bad"] { border-color:#f04438; background:#fef2f2; }
+    .metric-card[data-level="bad"] strong { color:var(--danger); }
+    .metric-card[data-level="warn"] strong { color:#b45309; }
+    td[data-level="warn"] { background:#fff7e6; color:#92400e; font-weight:700; }
+    td[data-level="bad"] { background:#fee4e2; color:var(--danger); font-weight:700; }
+    .bar-cell { position:relative; min-width:120px; }
+    .bar-cell .bar { position:absolute; left:6px; bottom:6px; height:4px; max-width:calc(100% - 12px); border-radius:2px; background:#94a3b8; }
+    .glance-metric { padding:2px 8px; border-radius:6px; background:#ecfdf5; color:#047857; font-size:12px; font-weight:700; }
+    .glance-metric[data-level="warn"] { background:#fffbeb; color:#b45309; }
+    .glance-metric[data-level="bad"] { background:#fee4e2; color:var(--danger); }
+    .glance-metric.muted { background:var(--soft); color:var(--muted); font-weight:500; }
+    details.cycle>summary .pill.bad { margin-left:0; }
+    details.cpu-tables { margin-top:14px; }
+    details.cpu-tables>summary h3 { margin:0; }
+    .chart text.peak-label { font-weight:700; fill:#0f172a; }
+    .chart-legend i.marker { width:0; height:0; border:0; border-left:6px solid transparent; border-right:6px solid transparent; border-top:9px solid #d97706; border-radius:0; }
+    @media print { body { background:#fff; } header { background:#fff; color:#000; padding:16px 0; } header p,.fact span,.fact-detail { color:#444; } main,footer { width:100%; } .toc { display:none; } .card,.table-wrap,details.cycle,.glance { box-shadow:none; break-inside:avoid; } }
+"""
+
+
 REPORT_SCRIPT = """(function(){
 var sections=document.querySelectorAll("section:not(.glance)>details.section-fold");
 var nav=document.querySelector("nav.toc");
@@ -3117,12 +3300,178 @@ def _render_large_sessions(summary: dict[str, Any]) -> str:
     )
 
 
-def _render_html(
+def _evidence_sections(parts: dict[str, Any]) -> str:
+    """The sections that carry the detail behind the diagnosis.
+
+    Shared by both renderers so the v1 report and the layered v2 report can
+    never present a different table, verdict or pill for the same capture.
+    """
+    pressure_chart_html = parts["pressure_chart_html"]
+    metric_groups_html = parts["metric_groups_html"]
+    buffer_latency_html = parts["buffer_latency_html"]
+    diagnostic_pools_html = parts["diagnostic_pools_html"]
+    alert_text = parts["alert_text"]
+    activate_text = parts["activate_text"]
+    pressure_pill = parts["pressure_pill"]
+    attribution_html = parts["attribution_html"]
+    attribution_pill = parts["attribution_pill"]
+    pbp_threat_logs_html = parts["pbp_threat_logs_html"]
+    offender_logs_html = parts["offender_logs_html"]
+    ingress_html = parts["ingress_html"]
+    ingress_pill = parts["ingress_pill"]
+    cpu_charts_html = parts["cpu_charts_html"]
+    cpu_tracking_html = parts["cpu_tracking_html"]
+    cpu_pill = parts["cpu_pill"]
+    large_sessions_html = parts["large_sessions_html"]
+    large_pill = parts["large_pill"]
+    drop_counters_html = parts["drop_counters_html"]
+    drops_pill = parts["drops_pill"]
+    session_table_html = parts["session_table_html"]
+    session_pill = parts["session_pill"]
+    return "".join(
+        [
+            _render_section(
+                "pressure-title",
+                "Pressure over time",
+                (
+                    pressure_chart_html
+                    or '<p class="muted">At least two batches are required to draw '
+                    "the pressure curve.</p>"
+                )
+                + '<h3>Peak resource utilization</h3>'
+                f'<div class="metric-families">{metric_groups_html}</div>'
+                + buffer_latency_html
+                + diagnostic_pools_html,
+                intro="How much pressure there was, on which resource, and when: "
+                "the curve batch by batch with the syslog triggers, then the peak "
+                "of every resource the firewall reported. Cards turn amber above "
+                f"the {alert_text}% alert level and red above the {activate_text}% "
+                "activate level.",
+                pill=pressure_pill,
+                open=False,
+            ),
+            _render_section(
+                "attribution-title",
+                "Offenders named by PBP",
+                attribution_html,
+                intro="Which sessions and source addresses PAN-OS itself blamed "
+                "for the buffer usage, with their flows and rates. RED drop "
+                "<strong>Yes</strong> is the firewall's own designation.",
+                pill=attribution_pill,
+                open=False,
+            ),
+            pbp_threat_logs_html,
+            offender_logs_html,
+            _render_section(
+                "ingress-title",
+                "Ingress backlog",
+                ingress_html,
+                intro="Which sessions held at least 2% of the work queue in front "
+                "of the dataplane cores (<code>show running resource-monitor "
+                "ingress-backlogs</code>). Independent of the PBP learning: the "
+                "queue is where the on-chip descriptors are consumed.",
+                pill=ingress_pill,
+                open=False,
+            ),
+            _render_section(
+                "cpu-tracking-title",
+                "Dataplane CPU core tracking",
+                cpu_charts_html + cpu_tracking_html,
+                intro="Whether every core rose together (aggregate load) or one "
+                "core ran hot alone (a single high-rate flow pinned to it).",
+                pill=cpu_pill,
+                open=False,
+            ),
+            _render_section(
+                "large-sessions-title",
+                "Largest sessions",
+                large_sessions_html,
+                intro="Whether one long-lived high-volume transfer was consuming "
+                "the link while the buffers filled. Such a session writes no "
+                "traffic log until it closes, so it never appears in the offender "
+                "ranking.",
+                pill=large_pill,
+                open=False,
+            ),
+            _render_section(
+                "drop-counters-title",
+                "Denied and dropped traffic",
+                drop_counters_html,
+                intro="What the dataplane discarded, and whether it was denied "
+                "before a session existed (a burst the policy refuses) or dropped "
+                "afterwards.",
+                pill=drops_pill,
+                open=False,
+            ),
+            _render_section(
+                "session-table-title",
+                "Session table",
+                session_table_html,
+                intro="Whether new sessions followed the load, or packets arrived "
+                "without creating any.",
+                pill=session_pill,
+                open=False,
+            ),
+        ]
+    )
+
+
+def _appendix_sections(parts: dict[str, Any]) -> str:
+    """The capture facts, the per-batch timeline and every raw response."""
+    summary_groups = parts["summary_groups"]
+    timeline_html = parts["timeline_html"]
+    details_html = parts["details_html"]
+    events_html = parts["events_html"]
+    cycles = parts["cycles"]
+    events = parts["events"]
+    return "".join(
+        [
+            _render_section(
+                "summary-title",
+                "Summary",
+                summary_groups,
+                intro="How much was collected and what state PBP was in.",
+                open=False,
+            ),
+            _render_section(
+                "timeline-title",
+                "Timeline",
+                timeline_html,
+                intro="One row per batch with every collected percentage. Hover a "
+                "time for its full timestamp.",
+                open=False,
+            ),
+            _render_section(
+                "cycles-title",
+                "Batch details",
+                details_html,
+                intro="The raw evidence for TAC: every command response of every "
+                "batch, exactly as the firewall returned it.",
+                pill=f"{_escape(len(cycles))} batches",
+                open=False,
+            ),
+            _render_section(
+                "events-title",
+                "Events and metadata",
+                events_html,
+                pill=f"{_escape(len(events))} records",
+                open=False,
+            ),
+        ]
+    )
+
+
+def _build_report_parts(
     source: Path,
     records: list[tuple[int, dict[str, Any]]],
     warnings: list[str],
     source_hash: str,
-) -> str:
+) -> dict[str, Any]:
+    """Aggregate a capture once, for every renderer that presents it.
+
+    The v1 report and the layered v2 report must never disagree on a fact,
+    so both read the fragments, pills and diagnosis this builder returns.
+    """
     cycles = [(line, record) for line, record in records if _is_cycle(record)]
     events = [(line, record) for line, record in records if not _is_cycle(record)]
     trigger_events = [
@@ -3527,6 +3876,7 @@ def _render_html(
         f"<th>{_escape(label)} %</th>" for _, label in timeline_metrics
     )
 
+    diagnosis: dict[str, Any] | None = None
     glance_html = ""
     if cycles:
         diagnosis = build_diagnosis(
@@ -3651,6 +4001,82 @@ def _render_html(
         if table_peak is not None
         else "not collected"
     )
+
+    return {
+        "activate_text": activate_text,
+        "alert_text": alert_text,
+        "attribution": attribution,
+        "attribution_html": attribution_html,
+        "attribution_pill": attribution_pill,
+        "buffer_latency_html": buffer_latency_html,
+        "collector_version": collector_version,
+        "cpu_charts_html": cpu_charts_html,
+        "cpu_pill": cpu_pill,
+        "cpu_tracking_html": cpu_tracking_html,
+        "cycles": cycles,
+        "details_html": details_html,
+        "device_model": device_model,
+        "device_name": device_name,
+        "diagnosis": diagnosis,
+        "diagnostic_pools_html": diagnostic_pools_html,
+        "drop_counters_html": drop_counters_html,
+        "drops_pill": drops_pill,
+        "duration": duration,
+        "ended_at": ended_at,
+        "events": events,
+        "events_html": events_html,
+        "generated_at": generated_at,
+        "glance_html": glance_html,
+        "ingress_html": ingress_html,
+        "ingress_pill": ingress_pill,
+        "large_pill": large_pill,
+        "large_sessions_html": large_sessions_html,
+        "metric_groups_html": metric_groups_html,
+        "nav_html": nav_html,
+        "offender_logs_html": offender_logs_html,
+        "pbp_threat_logs_html": pbp_threat_logs_html,
+        "pressure_chart_html": pressure_chart_html,
+        "pressure_pill": pressure_pill,
+        "report_script": report_script,
+        "run_id": run_id,
+        "session_pill": session_pill,
+        "session_table_html": session_table_html,
+        "software_version": software_version,
+        "source_hash": source_hash,
+        "started_at": started_at,
+        "stop_reason_html": stop_reason_html,
+        "summary_groups": summary_groups,
+        "target_name": target_name,
+        "timeline_html": timeline_html,
+        "title": title,
+        "warning_html": warning_html,
+        "warnings": warnings,
+        "source_name": source.name,
+    }
+
+
+def _render_html(
+    source: Path,
+    records: list[tuple[int, dict[str, Any]]],
+    warnings: list[str],
+    source_hash: str,
+) -> str:
+    parts = _build_report_parts(source, records, warnings, source_hash)
+    collector_version = parts["collector_version"]
+    device_model = parts["device_model"]
+    device_name = parts["device_name"]
+    duration = parts["duration"]
+    ended_at = parts["ended_at"]
+    generated_at = parts["generated_at"]
+    glance_html = parts["glance_html"]
+    nav_html = parts["nav_html"]
+    report_script = parts["report_script"]
+    software_version = parts["software_version"]
+    started_at = parts["started_at"]
+    stop_reason_html = parts["stop_reason_html"]
+    target_name = parts["target_name"]
+    title = parts["title"]
+    warning_html = parts["warning_html"]
     sections_html = "".join(
         [
             _part_heading(
@@ -3660,124 +4086,13 @@ def _render_html(
                 "readable without opening it. Expand all (top right) unfolds "
                 "everything, including for printing.",
             ),
-            _render_section(
-                "pressure-title",
-                "Pressure over time",
-                (
-                    pressure_chart_html
-                    or '<p class="muted">At least two batches are required to draw '
-                    "the pressure curve.</p>"
-                )
-                + '<h3>Peak resource utilization</h3>'
-                f'<div class="metric-families">{metric_groups_html}</div>'
-                + buffer_latency_html
-                + diagnostic_pools_html,
-                intro="How much pressure there was, on which resource, and when: "
-                "the curve batch by batch with the syslog triggers, then the peak "
-                "of every resource the firewall reported. Cards turn amber above "
-                f"the {alert_text}% alert level and red above the {activate_text}% "
-                "activate level.",
-                pill=pressure_pill,
-                open=False,
-            ),
-            _render_section(
-                "attribution-title",
-                "Offenders named by PBP",
-                attribution_html,
-                intro="Which sessions and source addresses PAN-OS itself blamed "
-                "for the buffer usage, with their flows and rates. RED drop "
-                "<strong>Yes</strong> is the firewall's own designation.",
-                pill=attribution_pill,
-                open=False,
-            ),
-            pbp_threat_logs_html,
-            offender_logs_html,
-            _render_section(
-                "ingress-title",
-                "Ingress backlog",
-                ingress_html,
-                intro="Which sessions held at least 2% of the work queue in front "
-                "of the dataplane cores (<code>show running resource-monitor "
-                "ingress-backlogs</code>). Independent of the PBP learning: the "
-                "queue is where the on-chip descriptors are consumed.",
-                pill=ingress_pill,
-                open=False,
-            ),
-            _render_section(
-                "cpu-tracking-title",
-                "Dataplane CPU core tracking",
-                cpu_charts_html + cpu_tracking_html,
-                intro="Whether every core rose together (aggregate load) or one "
-                "core ran hot alone (a single high-rate flow pinned to it).",
-                pill=cpu_pill,
-                open=False,
-            ),
-            _render_section(
-                "large-sessions-title",
-                "Largest sessions",
-                large_sessions_html,
-                intro="Whether one long-lived high-volume transfer was consuming "
-                "the link while the buffers filled. Such a session writes no "
-                "traffic log until it closes, so it never appears in the offender "
-                "ranking.",
-                pill=large_pill,
-                open=False,
-            ),
-            _render_section(
-                "drop-counters-title",
-                "Denied and dropped traffic",
-                drop_counters_html,
-                intro="What the dataplane discarded, and whether it was denied "
-                "before a session existed (a burst the policy refuses) or dropped "
-                "afterwards.",
-                pill=drops_pill,
-                open=False,
-            ),
-            _render_section(
-                "session-table-title",
-                "Session table",
-                session_table_html,
-                intro="Whether new sessions followed the load, or packets arrived "
-                "without creating any.",
-                pill=session_pill,
-                open=False,
-            ),
+            _evidence_sections(parts),
             _part_heading(
                 "Appendix — the complete capture",
                 "The capture facts, the per-batch timeline, and every raw "
                 "command response, for the TAC case.",
             ),
-            _render_section(
-                "summary-title",
-                "Summary",
-                summary_groups,
-                intro="How much was collected and what state PBP was in.",
-                open=False,
-            ),
-            _render_section(
-                "timeline-title",
-                "Timeline",
-                timeline_html,
-                intro="One row per batch with every collected percentage. Hover a "
-                "time for its full timestamp.",
-                open=False,
-            ),
-            _render_section(
-                "cycles-title",
-                "Batch details",
-                details_html,
-                intro="The raw evidence for TAC: every command response of every "
-                "batch, exactly as the firewall returned it.",
-                pill=f"{_escape(len(cycles))} batches",
-                open=False,
-            ),
-            _render_section(
-                "events-title",
-                "Events and metadata",
-                events_html,
-                pill=f"{_escape(len(events))} records",
-                open=False,
-            ),
+            _appendix_sections(parts),
         ]
     )
 
@@ -3790,185 +4105,7 @@ def _render_html(
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src '{REPORT_SCRIPT_CSP_HASH}'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>{_escape(title)}</title>
   <style>
-    :root {{ color-scheme: light; --ink:#172033; --muted:#64748b; --line:#dbe3ee;
-      --surface:#fff; --soft:#f4f7fb; --accent:#155e75; --accent2:#0f766e;
-      --danger:#b42318; --warn:#92400e; }}
-    * {{ box-sizing:border-box; }}
-    body {{ margin:0; background:var(--soft); color:var(--ink); font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }}
-    header {{ padding:36px max(24px,calc((100vw - 1180px)/2)); color:#fff;
-      background:linear-gradient(125deg,#0f172a,#155e75 58%,#0f766e); }}
-    header p {{ margin:7px 0 0; color:#d9f4f2; }}
-    h1 {{ margin:0; font-size:clamp(25px,4vw,42px); letter-spacing:-.025em; }}
-    h2 {{ margin:0 0 14px; font-size:21px; }}
-    h3 {{ margin:22px 0 10px; font-size:15px; }}
-    h4 {{ margin:0 0 10px; color:#334155; font-size:13px; }}
-    h5 {{ margin:12px 0 5px; }}
-    main {{ width:min(1180px,calc(100% - 32px)); margin:24px auto 48px; }}
-    section {{ margin:0 0 24px; }}
-    .facts,.cards {{ display:grid; gap:12px; }}
-    .facts {{ grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); margin-top:22px; }}
-    .fact {{ padding:12px 14px; border:1px solid #ffffff35; border-radius:10px; background:#ffffff12; }}
-    .fact span,.card-label {{ display:block; color:var(--muted); font-size:12px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }}
-    .fact span {{ color:#a7f3d0; }}
-    .fact strong {{ display:block; overflow-wrap:anywhere; margin-top:3px; }}
-    .cards {{ grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); }}
-    .summary-group {{ margin:0 0 22px; }}
-    .summary-group h3 {{ margin:0 0 10px; color:#475569; }}
-    .state-cards {{ grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); }}
-    .metric-families {{ display:grid; gap:12px; }}
-    .metric-family {{ padding:14px; border:1px solid var(--line); border-radius:12px; background:#eaf0f6; }}
-    .metric-cards {{ grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); }}
-    .metric-card {{ min-height:104px; box-shadow:none; }}
-    .card {{ min-height:108px; padding:16px; border:1px solid var(--line); border-radius:12px; background:var(--surface); box-shadow:0 5px 20px #0f172a0a; }}
-    .card strong {{ display:block; margin:7px 0; font-size:25px; }}
-    meter {{ width:100%; accent-color:var(--accent2); }}
-    .warning {{ padding:16px 20px; border:1px solid #fbbf24; border-radius:12px; background:#fffbeb; color:var(--warn); }}
-    .warning ul {{ margin:0; padding-left:20px; }}
-    .table-wrap {{ overflow:auto; border:1px solid var(--line); border-radius:12px; background:#fff; scrollbar-gutter:stable; }}
-    .timeline-wrap {{ max-height:min(72vh,760px); }}
-    .timeline {{ min-width:1780px; }}
-    .timeline th:first-child,.timeline td:first-child {{ position:sticky; left:0; z-index:1; background:#fff; box-shadow:1px 0 0 var(--line); }}
-    .timeline th:first-child {{ z-index:3; background:#eef3f8; }}
-    table {{ width:100%; border-collapse:collapse; white-space:nowrap; }}
-    th,td {{ padding:10px 12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }}
-    th {{ position:sticky; top:0; background:#eef3f8; color:#334155; font-size:12px; text-transform:uppercase; }}
-    tr:last-child td {{ border-bottom:0; }}
-    .number {{ text-align:right; font-variant-numeric:tabular-nums; }}
-    .sessions {{ max-width:280px; overflow:hidden; text-overflow:ellipsis; }}
-    .wrap {{ max-width:360px; white-space:normal; overflow-wrap:anywhere; }}
-    .empty,.muted {{ color:var(--muted); }}
-    details.cycle {{ margin:10px 0; border:1px solid var(--line); border-radius:12px; background:#fff; overflow:hidden; }}
-    details.cycle>summary {{ display:flex; align-items:center; gap:12px; padding:13px 16px; cursor:pointer; font-weight:700; }}
-    details.cycle>summary time {{ margin-left:auto; color:var(--muted); font-weight:500; }}
-    .cycle-body {{ padding:4px 16px 18px; border-top:1px solid var(--line); }}
-    details.section-disclosure {{ border:1px solid var(--line); border-radius:12px; background:#fff; overflow:hidden; }}
-    details.section-disclosure>summary {{ display:flex; align-items:center; gap:10px; padding:14px 16px; cursor:pointer; }}
-    details.section-disclosure>summary h2 {{ margin:0; }}
-    details.section-disclosure>.section-body {{ padding:2px 16px 16px; border-top:1px solid var(--line); }}
-    details.section-fold {{ border:0; background:transparent; overflow:visible; }}
-    details.section-fold>summary {{ padding:0; margin:0 0 14px; list-style:none; }}
-    details.section-fold>summary::-webkit-details-marker {{ display:none; }}
-    details.section-fold>summary::before {{ content:"▾"; width:18px; color:var(--accent); font-size:16px; transition:transform .15s; }}
-    details.section-fold:not([open])>summary::before {{ transform:rotate(-90deg); }}
-    details.section-fold:not([open])>summary {{ padding:12px 16px; border:1px solid var(--line); border-radius:12px; background:#fff; }}
-    details.section-fold>summary h2 {{ margin:0; }}
-    details.section-fold>.section-body {{ padding:0; border-top:0; }}
-    details.section-fold>.section-body>.section-intro {{ margin-top:0; }}
-    details.section-fold>summary:hover h2,
-    details.section-fold>summary:focus-visible h2 {{ color:var(--accent); }}
-    .glance>details.section-fold:not([open])>summary {{ padding:0; margin:0; border:0; background:transparent; }}
-    .metadata {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; }}
-    .metadata div {{ padding:10px; border-radius:8px; background:var(--soft); }}
-    dt {{ color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; }}
-    dd {{ margin:3px 0 0; overflow-wrap:anywhere; }}
-    .command-metadata {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(155px,1fr)); gap:8px; margin:0; padding:12px; border-top:1px solid var(--line); }}
-    .command-metadata div {{ min-width:0; padding:9px 10px; border:1px solid var(--line); border-radius:8px; background:#fff; }}
-    .command-value {{ display:block; font-weight:700; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }}
-    .command-value.good {{ color:#047857; }}
-    .command-value.bad {{ color:var(--danger); }}
-    details.raw-block {{ margin:8px 0; border-left:3px solid var(--accent); background:#f8fafc; }}
-    details.raw-block>summary {{ display:flex; align-items:center; gap:9px; padding:9px 12px; cursor:pointer; }}
-    .pill {{ margin-left:auto; padding:2px 8px; border-radius:999px; background:#dff6f2; color:#115e59; font-size:11px; font-weight:700; }}
-    .pill.bad {{ background:#fee4e2; color:var(--danger); }}
-    .signal-high {{ color:var(--danger); font-weight:800; }}
-    .chart {{ display:block; max-width:100%; height:auto; margin:6px 0 4px; padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:#fff; }}
-    .chart text.axis {{ fill:#475569; font:11px ui-sans-serif,system-ui,sans-serif; }}
-    .chart text.heat-label {{ font-size:10.5px; }}
-    .chart-legend {{ display:flex; flex-wrap:wrap; gap:6px 14px; margin:2px 0 4px; color:#475569; font-size:12px; }}
-    .chart-legend .key {{ display:inline-flex; align-items:center; gap:6px; }}
-    .core-roles {{ gap:6px 8px; margin:6px 0 8px; }}
-    .core-roles .key {{ padding:2px 9px; border-radius:999px; background:var(--soft); }}
-    .core-roles .core-roles-title {{ padding:0; background:none; color:#64748b; }}
-    .chart-legend i {{ width:13px; height:11px; border:1px solid #94a3b8; border-radius:3px; }}
-    .chart-legend i.dashed {{ height:0; border:0; border-top:2px dashed #0f172a; border-radius:0; }}
-    .chart-caption {{ margin:0 0 14px; font-size:12px; }}
-    .verdict {{ margin:8px 0 10px; padding:11px 13px; border-left:4px solid var(--line); border-radius:8px; background:var(--soft); }}
-    .verdict-isolated {{ border-left-color:var(--danger); background:#fef2f2; }}
-    .verdict-collective {{ border-left-color:#0f766e; background:#f0fdfa; }}
-    .verdict-mixed {{ border-left-color:#f59e0b; background:#fffbeb; }}
-    code {{ overflow-wrap:anywhere; color:#075985; }}
-    .payload-label {{ padding:0 12px; color:#475569; }}
-    details.exact-response {{ margin:10px 12px 12px; border:1px solid var(--line); border-radius:8px; background:#fff; overflow:hidden; }}
-    details.exact-response>summary {{ padding:9px 11px; cursor:pointer; color:#475569; font-weight:700; }}
-    details.exact-response pre.raw {{ max-height:520px; }}
-    pre.raw {{ overflow:auto; max-height:520px; margin:0; padding:12px; border-top:1px solid var(--line); background:#0f172a; color:#d9e5f5; font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }}
-    pre.raw-error {{ color:#fecaca; }}
-    footer {{ width:min(1180px,calc(100% - 32px)); margin:0 auto 30px; color:var(--muted); font-size:12px; overflow-wrap:anywhere; }}
-    .fact .fact-detail {{ display:inline; color:#a7f3d0; font-weight:500; font-size:12px; letter-spacing:0; text-transform:none; }}
-    .toc {{ position:sticky; top:0; z-index:5; display:flex; flex-wrap:wrap; gap:4px 6px; padding:8px max(24px,calc((100vw - 1180px)/2)); background:#ffffffee; border-bottom:1px solid var(--line); backdrop-filter:blur(4px); }}
-    .toc a {{ padding:5px 11px; border-radius:999px; color:#0f3f4f; font-size:13px; font-weight:600; text-decoration:none; }}
-    .toc a:hover,.toc a:focus {{ background:#e0f2f1; }}
-    .toc button.fold-all {{ margin-left:auto; padding:5px 13px; border:1px solid var(--line); border-radius:999px; background:#fff; color:#0f3f4f; font:600 13px/1.4 inherit; cursor:pointer; }}
-    .toc button.fold-all:hover,.toc button.fold-all:focus {{ background:#e0f2f1; border-color:var(--accent); }}
-    h2 {{ scroll-margin-top:56px; }}
-    .section-intro {{ margin:-8px 0 14px; color:var(--muted); }}
-    .part-head {{ margin:34px 0 14px; padding-top:16px; border-top:2px solid var(--line); }}
-    .part-head h2.part-title {{ margin:0 0 4px; color:#334155; font-size:15px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; }}
-    .part-head p {{ margin:0; font-size:13px; }}
-    .glance {{ padding:18px 20px; border:1px solid var(--line); border-left:6px solid #64748b; border-radius:12px; background:#fff; }}
-    .glance[data-level="ok"] {{ border-left-color:#047857; }}
-    .glance[data-level="warn"] {{ border-left-color:#d97706; }}
-    .glance[data-level="bad"] {{ border-left-color:var(--danger); }}
-    .glance .headline {{ margin:0 0 14px; font-size:16px; }}
-    .glance .headline strong {{ font-size:18px; }}
-    .glance[data-level="ok"] .headline strong {{ color:#047857; }}
-    .glance[data-level="warn"] .headline strong {{ color:#b45309; }}
-    .glance[data-level="bad"] .headline strong {{ color:var(--danger); }}
-    .key-facts {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:0 0 6px; }}
-    .key-facts div {{ padding:9px 11px; border-radius:8px; background:var(--soft); }}
-    .key-facts dd {{ font-size:17px; font-weight:700; }}
-    .probable-cause {{ margin-top:14px; padding-top:10px; border-top:1px solid var(--line); }}
-    .diagnosis-context {{ margin:0 0 14px; }}
-    .diagnosis-context .key {{ padding:2px 9px; border-radius:999px; background:var(--soft); }}
-    ol.steps {{ margin:0; padding:0; list-style:none; display:grid; gap:10px; }}
-    .step {{ padding:12px 14px; border:1px solid var(--line); border-left:5px solid #94a3b8; border-radius:10px; background:#fff; }}
-    .step[data-level="ok"] {{ border-left-color:#047857; }}
-    .step[data-level="warn"] {{ border-left-color:#d97706; }}
-    .step[data-level="bad"] {{ border-left-color:var(--danger); }}
-    .step-head {{ display:flex; align-items:center; gap:10px; }}
-    .step-head h3 {{ margin:0; font-size:15px; }}
-    .step-number {{ display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px; border-radius:50%; background:#0f172a; color:#fff; font-weight:800; font-size:13px; }}
-    .step-evidence {{ margin-left:auto; color:var(--accent); font-size:12px; font-weight:700; text-decoration:none; }}
-    .step-evidence:hover,.step-evidence:focus {{ text-decoration:underline; }}
-    .step-verdict {{ margin:8px 0 6px; }}
-    .step-unavailable .step-verdict {{ color:var(--muted); }}
-    .step-facts {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:8px; margin:8px 0 0; }}
-    .step-facts div {{ padding:7px 10px; border-radius:8px; background:var(--soft); }}
-    .step-facts div[data-level="warn"] {{ background:#fffbeb; }}
-    .step-facts div[data-level="bad"] {{ background:#fee4e2; }}
-    .step-facts dd {{ font-weight:700; }}
-    ol.step-named {{ margin:6px 0 4px; padding-left:22px; }}
-    ol.step-named li {{ margin:3px 0; }}
-    ul.hypotheses {{ margin:6px 0 0; padding:0; list-style:none; display:grid; gap:6px; }}
-    .hypothesis {{ position:relative; padding:8px 10px 8px 30px; border-radius:8px; background:var(--soft); }}
-    .hypothesis-mark {{ position:absolute; left:10px; top:11px; width:12px; height:12px; border-radius:50%; background:#94a3b8; }}
-    .hypothesis-positive {{ background:#fef2f2; }}
-    .hypothesis-positive .hypothesis-mark {{ background:var(--danger); }}
-    .hypothesis-negative .hypothesis-mark {{ background:#047857; }}
-    .hypothesis-unavailable {{ color:var(--muted); }}
-    .probable-cause h3 {{ margin:0 0 6px; }}
-    .probable-cause p {{ margin:6px 0; }}
-    .not-collected {{ color:var(--muted); font-size:15px; font-weight:600; }}
-    .metric-card[data-level="none"] {{ background:#f8fafc; border-style:dashed; }}
-    .metric-card[data-level="warn"] {{ border-color:#f59e0b; background:#fffbeb; }}
-    .metric-card[data-level="bad"] {{ border-color:#f04438; background:#fef2f2; }}
-    .metric-card[data-level="bad"] strong {{ color:var(--danger); }}
-    .metric-card[data-level="warn"] strong {{ color:#b45309; }}
-    td[data-level="warn"] {{ background:#fff7e6; color:#92400e; font-weight:700; }}
-    td[data-level="bad"] {{ background:#fee4e2; color:var(--danger); font-weight:700; }}
-    .bar-cell {{ position:relative; min-width:120px; }}
-    .bar-cell .bar {{ position:absolute; left:6px; bottom:6px; height:4px; max-width:calc(100% - 12px); border-radius:2px; background:#94a3b8; }}
-    .glance-metric {{ padding:2px 8px; border-radius:6px; background:#ecfdf5; color:#047857; font-size:12px; font-weight:700; }}
-    .glance-metric[data-level="warn"] {{ background:#fffbeb; color:#b45309; }}
-    .glance-metric[data-level="bad"] {{ background:#fee4e2; color:var(--danger); }}
-    .glance-metric.muted {{ background:var(--soft); color:var(--muted); font-weight:500; }}
-    details.cycle>summary .pill.bad {{ margin-left:0; }}
-    details.cpu-tables {{ margin-top:14px; }}
-    details.cpu-tables>summary h3 {{ margin:0; }}
-    .chart text.peak-label {{ font-weight:700; fill:#0f172a; }}
-    .chart-legend i.marker {{ width:0; height:0; border:0; border-left:6px solid transparent; border-right:6px solid transparent; border-top:9px solid #d97706; border-radius:0; }}
-    @media print {{ body {{ background:#fff; }} header {{ background:#fff; color:#000; padding:16px 0; }} header p,.fact span,.fact-detail {{ color:#444; }} main,footer {{ width:100%; }} .toc {{ display:none; }} .card,.table-wrap,details.cycle,.glance {{ box-shadow:none; break-inside:avoid; }} }}
-  </style>
+{REPORT_STYLE}  </style>
 </head>
 <body>
   <header>
@@ -4003,16 +4140,13 @@ def _render_html(
 """
 
 
-def generate_html_report(jsonl_path: Path, html_path: Path | None = None) -> Path:
-    """Generate an atomic, standalone HTML report and return its final path."""
-    source = Path(jsonl_path)
-    destination = Path(html_path) if html_path is not None else source.with_suffix(".html")
+def write_report_atomically(destination: Path, rendered: str) -> Path:
+    """Write a rendered report in place of `destination`, never half-written.
 
-    if source.resolve() == destination.resolve():
-        raise ValueError("The HTML destination must differ from the JSONL source")
-
-    records, warnings, source_hash = _read_jsonl(source)
-    rendered = _render_html(source, records, warnings, source_hash)
+    A report is read straight from the captures volume, so a reader must never
+    meet a truncated file: the content lands in a private temporary file beside
+    the destination and replaces it in one rename.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     temporary_path: Path | None = None
@@ -4041,6 +4175,25 @@ def generate_html_report(jsonl_path: Path, html_path: Path | None = None) -> Pat
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def resolve_report_destination(jsonl_path: Path, html_path: Path | None, suffix: str) -> tuple[Path, Path]:
+    """Return the capture and the report path it may be written to."""
+    source = Path(jsonl_path)
+    destination = Path(html_path) if html_path is not None else source.with_suffix(suffix)
+
+    if source.resolve() == destination.resolve():
+        raise ValueError("The HTML destination must differ from the JSONL source")
+    return source, destination
+
+
+def generate_html_report(jsonl_path: Path, html_path: Path | None = None) -> Path:
+    """Generate an atomic, standalone HTML report and return its final path."""
+    source, destination = resolve_report_destination(jsonl_path, html_path, ".html")
+    records, warnings, source_hash = _read_jsonl(source)
+    return write_report_atomically(
+        destination, _render_html(source, records, warnings, source_hash)
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

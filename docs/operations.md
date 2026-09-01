@@ -25,7 +25,7 @@ published:
 | Session retry seconds | `5` | Minimum resampling interval per candidate |
 | Large session min KB | `1048576` | Cumulative volume above which a session is tracked; `0` disables the query |
 | Large session min age seconds | `600` | Minimum session age for the same query; `0` removes the age filter |
-| Generate HTML report | `true` | Build the standalone incident report |
+| Generate HTML report | `true` | Build the standalone incident reports, layered and flat |
 | Generate text export | `true` | Write startup and batch TXT files |
 | Syslog fresh seconds | `300` | Green/red dashboard freshness window |
 | Target check hours | `24` | Interval of the read-only firewall check; `0` disables it |
@@ -70,14 +70,16 @@ Evidence layout:
 └── targets/
     └── <target-name>/
         ├── syslog-triggers.jsonl
-        ├── api-checks/<run_id>/{api-check.jsonl,report.html,raw/}
-        └── incidents/<run_id>/{incident.jsonl,report.html,raw/}
+        ├── api-checks/<run_id>/{api-check.jsonl,report.html,report-v2.html,raw/}
+        └── incidents/<run_id>/{incident.jsonl,report.html,report-v2.html,raw/}
 ```
 
 Each incident contains:
 
 - `incident.jsonl`: authoritative structured and exact raw evidence;
-- `report.html`: standalone human report with the JSONL SHA-256 digest;
+- `report-v2.html`: the layered report — verdict, supported causes, then the
+  evidence — carrying the JSONL SHA-256 digest;
+- `report.html`: the flat report, same content at one weight, same digest;
 - `raw/startup.txt`: startup commands and raw HTTP/XML response, plus the
   dataplane core-to-function-group map and where it came from, so an exported run
   explains its own CPU charts;
@@ -128,7 +130,7 @@ the deployment:
 | `storage.json` | What the capture volume holds and how full it is |
 | `syslog/` | Tail of the reception, routing and trigger journals, refused messages included, and `summary.json` counting the reception by outcome, firewall and sender |
 | `api-checks/` | The most recent read-only API validation of each firewall, with its raw PAN-OS XML |
-| `incidents/` | The three most recent incident runs of each firewall, capture and raw PAN-OS XML without the HTML report, newest first within a 64 MB budget; a run that does not fit is left out whole |
+| `incidents/` | The three most recent incident runs of each firewall, capture and raw PAN-OS XML without either HTML report, newest first within a 64 MB budget; a run that does not fit is left out whole |
 | `host/` | Only with `pbp-support.sh`: service state, effective Compose configuration, published ports, container output including the Syslog gateway, image digest, Docker and host versions |
 | `manifest.json` | SHA-256 of every file above |
 
