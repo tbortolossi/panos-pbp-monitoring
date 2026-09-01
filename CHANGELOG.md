@@ -7,6 +7,23 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Nine corpus signatures in the diagnosis.** Step 4 of the investigation
+  now recognizes the incident classes verified on eight closed TAC
+  packet-buffer cases, each firing on positive evidence only (a fraction-of-a
+  -second counter delta proves no negative): ARP/L2 storm (PBP is
+  session-blind to it; a reboot changes nothing), fragmentation pressure,
+  decryption proxy pressure (blocking PBP's named sources punishes victims),
+  held resources — the leak signature (occupancy decoupled from sessions,
+  pools pinned near full, buffer-latency long tail, with the advice to pull
+  the dataplane `pan_task` logs within minutes), flood through an unprotected
+  zone (verify with `show zone-protection`), single-dataplane saturation on a
+  chassis, session-table collapse (terminal stage), source-blocking
+  collateral (who was blocked and what it cost, with the shared-
+  infrastructure warning), and recent boot or upgrade (the known-issue
+  hypothesis). Elephant sessions carrying backup or storage applications get
+  a guardrail against blocking the operator's own media server, and
+  `docs/troubleshooting.md` gains the operator's map of the same signatures.
+  Refs #191.
 - **Root-cause counter signals in the report.** The decisive counters of most
   real packet-buffer cases are informational, so the drop-severity table never
   showed them. The Denied and dropped traffic section now surfaces eight

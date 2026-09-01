@@ -465,5 +465,226 @@ class CapturedEvidenceTests(unittest.TestCase):
         self.assertIn("configured alert 50% · activate 80%", html)
 
 
+def _signal_summary(**families: list[dict]) -> dict:
+    return {
+        "families": [
+            {"key": key, "label": key, "note": "", "counters": counters}
+            for key, counters in families.items()
+        ],
+        "counted_batches": 2,
+    }
+
+
+def _signal(name: str, total: float, peak_rate: float) -> dict:
+    return {"name": name, "total": total, "peak_rate": peak_rate, "batches": 2}
+
+
+class SignatureTests(unittest.TestCase):
+    """Corpus signatures fire on positive evidence and never claim negatives."""
+
+    def _hypotheses(self, diagnosis: dict) -> dict[str, dict]:
+        step = next(s for s in diagnosis["steps"] if s["key"] == "elsewhere")
+        return {h["key"]: h for h in step["hypotheses"]}
+
+    def test_no_corpus_signature_appears_without_its_evidence(self):
+        diagnosis = _diagnose([_cycle(1, 85.0), _cycle(2, 86.0)])
+
+        keys = set(self._hypotheses(diagnosis))
+        self.assertTrue(
+            keys.isdisjoint(
+                {
+                    "l2_storm",
+                    "fragmentation",
+                    "proxy_retransmit",
+                    "held_resources",
+                    "unprotected_flood",
+                    "chassis_imbalance",
+                    "session_collapse",
+                    "block_collateral",
+                    "recent_boot",
+                }
+            ),
+            keys,
+        )
+
+    def test_an_arp_storm_names_the_l2_remedy_and_the_reboot_futility(self):
+        diagnosis = _diagnose(
+            [_cycle(1, 99.0), _cycle(2, 99.0)],
+            signal_summary=_signal_summary(
+                arp_storm=[
+                    _signal("flow_arp_pkt_rcv", 1_534_439_152, 465_000),
+                    _signal("flow_arp_rcv_gratuitous", 1_534_411_208, 465_000),
+                ]
+            ),
+        )
+
+        hypothesis = self._hypotheses(diagnosis)["l2_storm"]
+        self.assertEqual(hypothesis["state"], "positive")
+        self.assertIn("gratuitous", hypothesis["text"])
+        self.assertIn("reboot changes nothing", hypothesis["text"])
+        self.assertIn("show counter interface all", hypothesis["text"])
+
+    def test_fragmentation_with_allocation_errors_is_exhaustion_not_usage(self):
+        diagnosis = _diagnose(
+            [_cycle(1, 92.0)],
+            signal_summary=_signal_summary(
+                fragmentation=[
+                    _signal("flow_ipfrag_recv", 728_739_507, 515),
+                    _signal("flow_ipfrag_merge", 153_011_417, 99),
+                    _signal("flow_ipfrag_pkt_alloc_err", 1_745_926, 0),
+                ],
+                allocation_failure=[_signal("pkt_alloc_failure", 2_344_949, 0)],
+            ),
+        )
+
+        hypothesis = self._hypotheses(diagnosis)["fragmentation"]
+        self.assertIn("exhausting the pool", hypothesis["text"])
+        self.assertIn("discard-ip-frag", hypothesis["text"])
+
+    def test_proxy_retransmit_pressure_warns_against_blocking_victims(self):
+        cycles = [_cycle(1, 80.0)]
+        cycles[0]["percentages"]["resource_monitor_packet_descriptor_on_chip"] = [97.0]
+        diagnosis = _diagnose(
+            cycles,
+            signal_summary=_signal_summary(
+                proxy_retransmit=[_signal("tcp_fptcp_rxmt", 354_765, 500)]
+            ),
+        )
+
+        hypothesis = self._hypotheses(diagnosis)["proxy_retransmit"]
+        self.assertIn("97", hypothesis["text"])
+        self.assertIn("punishes victims", hypothesis["text"])
+
+    def test_held_pools_and_decoupled_buffers_state_the_leak_signature(self):
+        session_series = [
+            {"allocated": 6016.0, "pps": 618.0, "cps": 5.0, "utilization": 1.0}
+        ] * 3
+        diagnosis = _diagnose(
+            [_cycle(1, 85.0), _cycle(2, 86.0), _cycle(3, 86.0)],
+            session_series=session_series,
+            diagnostic_pools=[
+                {
+                    "name": "Timer Pool",
+                    "dataplane": "s1dp0",
+                    "used_percentage": 99.9,
+                    "available": 3,
+                    "total": 4096,
+                }
+            ],
+        )
+
+        hypothesis = self._hypotheses(diagnosis)["held_resources"]
+        self.assertIn("held, not processed", hypothesis["text"])
+        self.assertIn("pan_task", hypothesis["text"])
+        self.assertIn("SSL-proxy leak class", hypothesis["text"])
+        self.assertIn("Timer Pool", hypothesis["named"][0])
+
+    def test_pbp_dropping_with_silent_zone_counters_suspects_the_zone(self):
+        session_series = [
+            {"allocated": 1000.0, "pps": 1000.0, "cps": 10.0, "utilization": 1.0},
+            {"allocated": 1050.0, "pps": 30_000.0, "cps": 20.0, "utilization": 1.0},
+        ]
+        diagnosis = _diagnose(
+            [_cycle(1, 97.0), _cycle(2, 97.0)],
+            session_series=session_series,
+            signal_summary=_signal_summary(
+                pbp=[_signal("flow_dos_pbp_drop", 46_940_350, 641)]
+            ),
+        )
+
+        hypothesis = self._hypotheses(diagnosis)["unprotected_flood"]
+        self.assertIn("no zone-protection flood counter moved", hypothesis["text"])
+        self.assertIn("show zone-protection", hypothesis["text"])
+
+    def test_one_saturated_dataplane_beside_an_idle_median_is_named(self):
+        record = _cycle(1, 92.0)
+        record["percentages"]["resource_monitor_dataplanes"] = [
+            {"dataplane": "s2dp1", "packet_buffer": 92.0},
+            {"dataplane": "s8dp0", "packet_buffer": 7.0},
+            {"dataplane": "s9dp0", "packet_buffer": 6.0},
+        ]
+        diagnosis = _diagnose([record])
+
+        hypothesis = self._hypotheses(diagnosis)["chassis_imbalance"]
+        self.assertIn("s2dp1", hypothesis["text"])
+        self.assertIn("not capacity", hypothesis["text"])
+
+    def test_sessions_draining_under_a_pinned_buffer_is_terminal(self):
+        session_series = [
+            {"allocated": 477_120.0, "pps": 1000.0, "cps": 100.0, "utilization": 5.0},
+            {"allocated": 90_000.0, "pps": 400.0, "cps": 10.0, "utilization": 1.0},
+        ]
+        diagnosis = _diagnose(
+            [_cycle(1, 87.0), _cycle(2, 87.0)],
+            session_series=session_series,
+        )
+
+        hypothesis = self._hypotheses(diagnosis)["session_collapse"]
+        self.assertIn("no longer admitting sessions", hypothesis["text"])
+
+    def test_blocked_sources_are_named_with_their_collateral(self):
+        events = [
+            {
+                "run_id": "r",
+                "event": "pbp_threat_logs",
+                "ok": True,
+                "entries": [{"threat_id": 8509, "source_ip": "198.51.100.9"}],
+            }
+        ]
+        diagnosis = _diagnose(
+            [_cycle(1, 97.0)],
+            events,
+            signal_summary=_signal_summary(
+                pbp=[_signal("flow_dos_pbp_block_host", 17, 0)],
+                block_collateral=[_signal("flow_dos_drop_ip_blocked", 3_402_125, 39)],
+            ),
+        )
+
+        hypothesis = self._hypotheses(diagnosis)["block_collateral"]
+        self.assertIn("3402125", hypothesis["text"].replace(" ", "").replace(",", ""))
+        self.assertIn("198.51.100.9", hypothesis["named"][0])
+        self.assertIn("NAT gateway", hypothesis["text"])
+
+    def test_a_fresh_boot_raises_the_known_issue_hypothesis(self):
+        diagnosis = _diagnose(
+            [_cycle(1, 87.0)],
+            device={
+                "model": "PA-5250",
+                "software_version": "11.2.10-h6",
+                "uptime": "0 days, 21:24:13",
+            },
+        )
+
+        hypothesis = self._hypotheses(diagnosis)["recent_boot"]
+        self.assertIn("0 days, 21:24:13", hypothesis["text"])
+        self.assertIn("11.2.10-h6", hypothesis["text"])
+        self.assertIn("known issue", hypothesis["text"])
+
+    def test_a_backup_elephant_is_guarded_against_blocking(self):
+        diagnosis = _diagnose(
+            [_cycle(1, 97.0), _cycle(2, 97.0)],
+            large_sessions={
+                "status": "collected",
+                "sessions": [
+                    {
+                        "session_id": 4242,
+                        "source_ip": "100.64.1.229",
+                        "destination_ip": "100.64.1.230",
+                        "destination_port": 1556,
+                        "application": "netbackup",
+                        "peak_bits_per_second": 4.0e9,
+                        "batches": 2,
+                    }
+                ],
+            },
+        )
+
+        step = next(s for s in diagnosis["steps"] if s["key"] == "elsewhere")
+        elephant = next(h for h in step["hypotheses"] if h["key"] == "elephant")
+        self.assertIn("netbackup", elephant["text"])
+        self.assertIn("backup window", elephant["text"])
+        self.assertIn("media server", elephant["text"])
+
+
 if __name__ == "__main__":
     unittest.main()
