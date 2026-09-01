@@ -981,7 +981,13 @@ class DropCounterTests(unittest.TestCase):
             ]
         )
 
-        self.assertNotIn("flow_tcp_non_syn", html.split("Batch details")[0])
+        # The drop-severity table must not list it, but the signal section
+        # below the table now names it as out-of-order evidence.
+        self.assertNotIn(
+            "flow_tcp_non_syn", html.split("Root-cause counter signals")[0]
+        )
+        self.assertIn("flow_tcp_non_syn", html)
+        self.assertIn("Out-of-order / one-way TCP", html)
         self.assertIn("flow_fwd_l3_mcast_drop", html)
         self.assertIn("Forwarding", html)
         self.assertIn('<p class="verdict verdict-collective">', html)
@@ -992,6 +998,174 @@ class DropCounterTests(unittest.TestCase):
 
         self.assertIn("No drop counter was recorded in this capture.", html)
         self.assertNotIn('<p class="verdict', html)
+
+    def test_signal_counters_surface_informational_root_cause_families(self):
+        html = self._render(
+            [
+                {
+                    "global_counters_delta_status": "primed_interval",
+                    "global_counters_delta": {
+                        "counters": [
+                            self._counter(
+                                "flow_arp_pkt_rcv",
+                                1534439152,
+                                465000,
+                                "arp",
+                                "ARP packets received",
+                                severity="info",
+                            ),
+                            self._counter(
+                                "flow_ipfrag_recv",
+                                728739507,
+                                515,
+                                "ipfrag",
+                                "IP fragments received",
+                                severity="info",
+                            ),
+                            self._counter(
+                                "tcp_fptcp_rxmt",
+                                354765,
+                                500,
+                                "pktproc",
+                                "fptcp full retransmissions",
+                                severity="info",
+                            ),
+                            self._counter(
+                                "pkt_alloc_failure",
+                                2344949,
+                                83,
+                                "resource",
+                                "Packet allocation error",
+                                severity="warn",
+                            ),
+                        ]
+                    },
+                }
+            ]
+        )
+
+        self.assertIn("Root-cause counter signals", html)
+        self.assertIn("ARP / L2 storm", html)
+        self.assertIn("IP fragmentation", html)
+        self.assertIn("Decryption proxy retransmit", html)
+        self.assertIn("Buffer allocation failures", html)
+        self.assertIn("flow_arp_pkt_rcv", html)
+        self.assertIn("a firewall reboot changes nothing", html)
+
+    def test_ifp_zone_share_adds_the_zone_attribution_caveat(self):
+        html = self._render(
+            [
+                {
+                    "global_counters_delta_status": "primed_interval",
+                    "global_counters_delta": {
+                        "counters": [
+                            self._counter(
+                                "flow_dos_pbp_drop",
+                                1000,
+                                641,
+                                "dos",
+                                "Packets dropped: Dropped by packet buffer protection RED",
+                            ),
+                            self._counter(
+                                "flow_dos_pbp_ifp_zone",
+                                500,
+                                64,
+                                "dos",
+                                "packet buffer protection RED: used ifp's zone id",
+                                severity="info",
+                            ),
+                        ]
+                    },
+                }
+            ]
+        )
+
+        self.assertIn("Zone caveat", html)
+        self.assertIn("not the session's real zone", html)
+
+    def test_pkt_buf_protect_counters_group_with_the_pbp_family(self):
+        html = self._render(
+            [
+                {
+                    "global_counters_delta_status": "primed_interval",
+                    "global_counters_delta": {
+                        "counters": [
+                            self._counter(
+                                "pkt_buf_protect_red",
+                                550,
+                                11,
+                                "dos",
+                                "Packets dropped by packet buffer protection RED",
+                            ),
+                        ]
+                    },
+                }
+            ]
+        )
+
+        self.assertIn("PBP RED drops", html)
+        self.assertNotIn("Other drops", html)
+
+
+class DiagnosticPoolTests(unittest.TestCase):
+    """A held pool names the leaked resource even when buffers are the alarm."""
+
+    def _render(self, dataplane_pools: dict | None) -> str:
+        record = {
+            "timestamp": "2026-08-31T10:00:00+00:00",
+            "run_id": "pool-run",
+            "cycle": 1,
+            "elapsed_seconds": 1.0,
+            "percentages": {"packet_buffer_congestion": [61]},
+            "commands": {},
+        }
+        if dataplane_pools is not None:
+            record["dataplane_pools"] = dataplane_pools
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "pools.jsonl"
+            capture.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            report = generate_html_report(capture, capture.with_suffix(".html"))
+            return report.read_text(encoding="utf-8")
+
+    def _pool(self, name, available, total, dataplane=None) -> dict:
+        used = total - available
+        return {
+            "section": "Hardware Pools",
+            "dataplane": dataplane,
+            "index": 61,
+            "name": name,
+            "available": available,
+            "total": total,
+            "used": used,
+            "available_percentage": round(100.0 * available / total, 3),
+            "used_percentage": round(100.0 * used / total, 3),
+        }
+
+    def test_diagnostic_pools_report_the_worst_dataplane_and_meaning(self):
+        html = self._render(
+            {
+                "parsed": True,
+                "pools": [
+                    self._pool("PKI POOL DFLT", 12684, 17203, "s1dp0"),
+                    self._pool("PKI POOL DFLT", 2170, 17203, "s1dp1"),
+                    self._pool("Timer Pool", 4093, 4096, "s1dp0"),
+                    self._pool("WQE Pool", 835006, 856600, "s1dp0"),
+                ],
+            }
+        )
+
+        self.assertIn("Diagnostic pools", html)
+        self.assertIn("PKI POOL DFLT", html)
+        self.assertIn("s1dp1", html)
+        self.assertIn("87.386", html)
+        self.assertIn("congestion alert", html)
+        self.assertIn("Proxy timers", html)
+        self.assertNotIn("WQE Pool", html.split("Batch details")[0])
+
+    def test_report_without_pool_statistics_omits_the_table(self):
+        html = self._render(None)
+
+        self.assertNotIn("Diagnostic pools", html)
 
 
 class SessionTableTests(unittest.TestCase):

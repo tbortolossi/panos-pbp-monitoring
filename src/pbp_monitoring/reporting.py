@@ -1645,9 +1645,10 @@ def _drop_counter_family(counter: dict[str, Any]) -> tuple[str, str]:
     aspect = str(counter.get("aspect") or "")
     if name.startswith("flow_policy_"):
         return "policy", "Policy deny"
-    if name.startswith("flow_dos_pbp_"):
-        # Packet buffer protection's own RED drops: what PBP discarded during
-        # the incident, not traffic refused before session setup.
+    if name.startswith(("flow_dos_pbp_", "pkt_buf_protect_")):
+        # Packet buffer protection's own drops: what PBP discarded during the
+        # incident, not traffic refused before session setup. PAN-OS names
+        # these flow_dos_pbp_* on 10.2/11.x and pkt_buf_protect_* elsewhere.
         return "pbp", "PBP RED drops"
     if aspect == "dos" or name.startswith("flow_dos_"):
         return "dos", "DoS / zone protection"
@@ -2406,6 +2407,352 @@ def _render_drop_counters(
     )
 
 
+# Root-cause counter families, surfaced regardless of severity. The decisive
+# counters of most real packet-buffer cases are info or warn, so the
+# drop-severity table above never shows them. Names verified on anonymized
+# captures of closed TAC cases across PAN-OS 10.2.9 - 11.2.10.
+_SIGNAL_COUNTER_FAMILIES: tuple[dict[str, Any], ...] = (
+    {
+        "key": "pbp",
+        "label": "Packet buffer protection",
+        "names": (
+            "flow_dos_pbp_drop",
+            "flow_dos_pbp_cnt_drop",
+            "flow_dos_pbp_ifp_zone",
+            "flow_dos_pbp_block_host",
+            "pkt_buf_protect_red",
+            "pkt_buf_protect_discard",
+            "pkt_buf_protect_block_ip",
+        ),
+        "prefixes": (),
+        "note": (
+            "PBP's own mitigation, under both naming families: PAN-OS 10.2/11.x "
+            "counts it as flow_dos_pbp_*, other releases as pkt_buf_protect_*."
+        ),
+    },
+    {
+        "key": "block_collateral",
+        "label": "Blocked-source collateral",
+        "names": ("flow_dos_drop_ip_blocked",),
+        "prefixes": (),
+        "note": (
+            "Packets dropped because their source sits in the block table. When "
+            "a block-ip hits a NAT device, a proxy or a backup server, this "
+            "counter is the size of the silent outage it causes."
+        ),
+    },
+    {
+        "key": "arp_storm",
+        "label": "ARP / L2 storm",
+        "names": ("flow_arp_pkt_rcv", "flow_arp_rcv_gratuitous"),
+        "prefixes": (),
+        "note": (
+            "An ARP flood creates no session, so PBP can neither name nor block "
+            "it and the offender ranking stays empty while the buffer fills. A "
+            "gratuitous share near 100% is a gratuitous-ARP storm; the fix is "
+            "at layer 2, and a firewall reboot changes nothing."
+        ),
+    },
+    {
+        "key": "fragmentation",
+        "label": "IP fragmentation",
+        "names": (
+            "flow_ipfrag_recv",
+            "flow_ipfrag_merge",
+            "flow_ipfrag_fwd",
+            "flow_ipfrag_pkt_alloc_err",
+        ),
+        "prefixes": (),
+        "note": (
+            "Reassembly holds buffers until every fragment arrives. A received/"
+            "completed ratio well above the packets' natural fragment count, or "
+            "any flow_ipfrag_pkt_alloc_err, ties fragmentation directly to "
+            "buffer exhaustion."
+        ),
+    },
+    {
+        "key": "allocation_failure",
+        "label": "Buffer allocation failures",
+        "names": ("pkt_alloc_failure", "buf_alloc_fail", "hw_buf_alloc_fail"),
+        "prefixes": (),
+        "note": (
+            "The dataplane asked for a buffer and got none - exhaustion is no "
+            "longer a percentage but a fact, whatever PBP did about it."
+        ),
+    },
+    {
+        "key": "proxy_retransmit",
+        "label": "Decryption proxy retransmit",
+        "names": (
+            "tcp_fptcp_rxmt",
+            "tcp_fptcp_fast_retransmit",
+            "tcp_fptcp_max_rxmt",
+        ),
+        "prefixes": (),
+        "note": (
+            "The SSL forward proxy's own TCP stack retransmitting: each unacked "
+            "segment holds a buffer, and on ASIC platforms an on-chip "
+            "descriptor. A sustained rate under decryption is the distributed "
+            "descriptor-exhaustion signature."
+        ),
+    },
+    {
+        "key": "out_of_order",
+        "label": "Out-of-order / one-way TCP",
+        "names": (
+            "tcp_exceed_flow_seg_limit",
+            "tcp_drop_packet",
+            "tcp_out_of_sync",
+            "flow_tcp_non_syn",
+        ),
+        "prefixes": (),
+        "note": (
+            "Out-of-order queues hold buffers while reassembly waits. Sustained "
+            "rates point at an asymmetric or one-way feed - a TAP or mirror "
+            "port is the classic source, and long application timeouts keep "
+            "those queues alive."
+        ),
+    },
+    {
+        "key": "zone_flood",
+        "label": "Zone-protection flood counters",
+        "names": (),
+        "prefixes": ("flow_dos_red_", "flow_dos_syncookie_"),
+        "note": (
+            "Zone protection absorbing a flood where it is enabled. PBP RED "
+            "climbing while these stay at zero means the flood reached the "
+            "buffer through a zone whose flood protection is off."
+        ),
+    },
+)
+
+
+def _aggregate_signal_counters(
+    cycles: list[tuple[int, dict[str, Any]]],
+) -> dict[str, Any]:
+    """Sum the root-cause signal counters observed across the capture.
+
+    Same trust rules as the drop aggregation: a batch whose delta baseline is
+    untrusted has an unknown sampling window and is excluded from the totals.
+    """
+    per_family: dict[str, dict[str, dict[str, Any]]] = {}
+    counted_batches = 0
+    for _, record in cycles:
+        parsed = record.get("global_counters_delta")
+        if not isinstance(parsed, dict):
+            continue
+        counters = parsed.get("counters")
+        if not isinstance(counters, list):
+            continue
+        if str(record.get("global_counters_delta_status") or "") == "baseline_untrusted":
+            continue
+        counted_batches += 1
+        for counter in counters:
+            if not isinstance(counter, dict):
+                continue
+            name = str(counter.get("name") or "").strip()
+            if not name:
+                continue
+            family = next(
+                (
+                    definition
+                    for definition in _SIGNAL_COUNTER_FAMILIES
+                    if name in definition["names"]
+                    or name.startswith(tuple(definition["prefixes"]))
+                ),
+                None,
+            )
+            if family is None:
+                continue
+            value = next(iter(_numbers(counter.get("value"))), None)
+            rate = next(iter(_numbers(counter.get("rate"))), None)
+            bucket = per_family.setdefault(str(family["key"]), {})
+            item = bucket.get(name)
+            if item is None:
+                item = bucket[name] = {
+                    "name": name,
+                    "description": counter.get("description"),
+                    "total": 0.0,
+                    "peak_rate": None,
+                    "batches": 0,
+                }
+            if item["description"] in (None, "") and counter.get("description"):
+                item["description"] = counter.get("description")
+            item["batches"] += 1
+            if value is not None:
+                item["total"] += value
+            if rate is not None:
+                current_peak = item["peak_rate"]
+                item["peak_rate"] = (
+                    rate
+                    if current_peak is None
+                    else max(float(current_peak), rate)
+                )
+
+    families = []
+    for definition in _SIGNAL_COUNTER_FAMILIES:
+        bucket = per_family.get(str(definition["key"]))
+        if not bucket:
+            continue
+        items = sorted(
+            bucket.values(), key=lambda item: (-float(item["total"]), item["name"])
+        )
+        families.append(
+            {
+                "key": definition["key"],
+                "label": definition["label"],
+                "note": definition["note"],
+                "counters": items,
+                "total": sum(float(item["total"]) for item in items),
+                "totals_by_name": {
+                    item["name"]: float(item["total"]) for item in items
+                },
+            }
+        )
+    return {"families": families, "counted_batches": counted_batches}
+
+
+# The interface-zone fallback threshold: above this share of the PBP drops,
+# the zone stamped on PBP threat logs is routinely the ingress interface's
+# zone, so offender attribution by zone label becomes unreliable.
+_IFP_ZONE_SHARE = 0.3
+
+
+def _render_signal_counters(summary: dict[str, Any]) -> str:
+    families = summary.get("families") or []
+    if not families:
+        return ""
+    blocks: list[str] = [
+        "<h3>Root-cause counter signals</h3>",
+        '<p class="muted">The counters below are not all drops - most are '
+        "informational - but each family is the fingerprint of one known way a "
+        "packet buffer fills. They come from the same per-batch counter deltas "
+        "as the table above.</p>",
+    ]
+    for family in families:
+        notes = [str(family.get("note") or "")]
+        totals = family.get("totals_by_name") or {}
+        if family.get("key") == "pbp":
+            pbp_drops = totals.get("flow_dos_pbp_drop", 0.0) + totals.get(
+                "pkt_buf_protect_red", 0.0
+            )
+            ifp_zone = totals.get("flow_dos_pbp_ifp_zone", 0.0)
+            if pbp_drops > 0 and ifp_zone >= _IFP_ZONE_SHARE * pbp_drops:
+                notes.append(
+                    "<strong>Zone caveat:</strong> a large share of these drops "
+                    "used the ingress interface's zone id "
+                    "(<code>flow_dos_pbp_ifp_zone</code>), so the zone written "
+                    "on PBP threat logs is not the session's real zone - do "
+                    "not attribute offenders by that label."
+                )
+        rows = "".join(
+            "<tr>"
+            f'<td><code>{_escape(item["name"])}</code></td>'
+            f'<td class="number">{_escape(_format_number(item["total"]))}</td>'
+            f'<td class="number">{_escape(_format_number(item["peak_rate"]))}</td>'
+            f'<td class="number">{_escape(item["batches"])}</td>'
+            f'<td class="wrap">{_escape(item.get("description") or "—")}</td>'
+            "</tr>"
+            for item in family.get("counters") or []
+        )
+        blocks.append(
+            f"<h4>{_escape(family['label'])}</h4>"
+            f'<p class="muted">{" ".join(notes)}</p>'
+            '<div class="table-wrap"><table><thead><tr>'
+            "<th>Counter</th><th>Packets</th><th>Peak /s</th><th>Batches</th>"
+            "<th>PAN-OS description</th>"
+            f"</tr></thead><tbody>{rows}</tbody></table></div>"
+        )
+    return "".join(blocks)
+
+
+# Dataplane pools whose occupancy diagnoses a buffer incident even when the
+# packet-buffer pool itself is the one alarming: the proxy-load pools, the
+# proxy timer pool an SSL leak consumes, and the on-chip pool the congestion
+# alert measures on ASIC platforms.
+_DIAGNOSTIC_POOL_NAMES = {
+    "timer pool": "Proxy timers (an SSL-proxy leak consumes these)",
+    "pki pool dflt": "On-chip packet pool (the congestion alert's denominator)",
+    "proxy_flow": "Decryption proxy flows",
+    "ssl_st": "SSL states held by the proxy",
+    "fptcp_seg": "Proxy TCP segments in flight",
+}
+_POOL_ATTENTION_PERCENT = 80.0
+
+
+def _aggregate_diagnostic_pools(
+    cycles: list[tuple[int, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Worst observed occupancy per diagnostic pool and dataplane."""
+    worst: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for _, record in cycles:
+        parsed = record.get("dataplane_pools")
+        if not isinstance(parsed, dict):
+            continue
+        for pool in parsed.get("pools") or []:
+            if not isinstance(pool, dict):
+                continue
+            name = str(pool.get("name") or "").strip()
+            used = next(iter(_numbers(pool.get("used_percentage"))), None)
+            meaning = _DIAGNOSTIC_POOL_NAMES.get(name.lower())
+            if meaning is None and (
+                used is None or used < _POOL_ATTENTION_PERCENT
+            ):
+                continue
+            dataplane = pool.get("dataplane")
+            key = (name.lower(), str(dataplane) if dataplane else None)
+            current = worst.get(key)
+            current_used = (
+                next(iter(_numbers(current.get("used_percentage"))), None)
+                if current
+                else None
+            )
+            if current is None or (used or -1.0) > (
+                current_used if current_used is not None else -1.0
+            ):
+                worst[key] = {
+                    "name": name,
+                    "dataplane": dataplane,
+                    "used_percentage": used,
+                    "available": pool.get("available"),
+                    "total": pool.get("total"),
+                    "meaning": meaning
+                    or f"Pool above {_format_number(_POOL_ATTENTION_PERCENT)}% used",
+                }
+    return sorted(
+        worst.values(),
+        key=lambda item: -(
+            next(iter(_numbers(item.get("used_percentage"))), None) or 0.0
+        ),
+    )
+
+
+def _render_diagnostic_pools(pools: list[dict[str, Any]]) -> str:
+    if not pools:
+        return ""
+    rows = "".join(
+        "<tr>"
+        f'<td><code>{_escape(item["name"])}</code></td>'
+        f'<td>{_escape(item.get("dataplane") or "—")}</td>'
+        f'<td class="number">{_escape(_format_number(item.get("used_percentage")))}</td>'
+        f'<td class="number">{_escape(_format_number(item.get("available")))}'
+        f' / {_escape(_format_number(item.get("total")))}</td>'
+        f'<td class="wrap">{_escape(item.get("meaning"))}</td>'
+        "</tr>"
+        for item in pools
+    )
+    return (
+        "<h3>Diagnostic pools</h3>"
+        '<p class="muted">Worst occupancy observed per pool and dataplane, from '
+        "the same pool statistics as the headroom above. A held pool with idle "
+        "CPU means the resource is leaked or parked, not processed.</p>"
+        '<div class="table-wrap"><table><thead><tr>'
+        "<th>Pool</th><th>DP</th><th>Worst used %</th><th>Available / total</th>"
+        "<th>What it means</th>"
+        f"</tr></thead><tbody>{rows}</tbody></table></div>"
+    )
+
+
 _SESSION_PROTOCOLS = (
     ("tcp", "TCP"),
     ("udp", "UDP"),
@@ -2788,7 +3135,13 @@ def _render_html(
         _aggregate_top_sources(attribution)
     ) + _render_attribution_table(attribution)
     drop_counter_summary = _aggregate_drop_counters(cycles)
-    drop_counters_html = _render_drop_counters(drop_counter_summary, attribution)
+    signal_counter_summary = _aggregate_signal_counters(cycles)
+    drop_counters_html = _render_drop_counters(
+        drop_counter_summary, attribution
+    ) + _render_signal_counters(signal_counter_summary)
+    diagnostic_pools_html = _render_diagnostic_pools(
+        _aggregate_diagnostic_pools(cycles)
+    )
     offender_logs_html = _render_offender_live_sessions(
         events
     ) + _render_offender_traffic_logs(events)
@@ -3316,7 +3669,8 @@ def _render_html(
                 )
                 + '<h3>Peak resource utilization</h3>'
                 f'<div class="metric-families">{metric_groups_html}</div>'
-                + buffer_latency_html,
+                + buffer_latency_html
+                + diagnostic_pools_html,
                 intro="How much pressure there was, on which resource, and when: "
                 "the curve batch by batch with the syslog triggers, then the peak "
                 "of every resource the firewall reported. Cards turn amber above "

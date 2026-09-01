@@ -3,6 +3,35 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.38.0] - 2026-09-01
+
+### Added
+
+- **Root-cause counter signals in the report.** The decisive counters of most
+  real packet-buffer cases are informational, so the drop-severity table never
+  showed them. The Denied and dropped traffic section now surfaces eight
+  counter families from the same per-batch deltas: PBP's mitigation under both
+  naming families (`flow_dos_pbp_*` on 10.2/11.x, `pkt_buf_protect_*`
+  elsewhere — the drop table also groups both as PBP now), blocked-source
+  collateral (`flow_dos_drop_ip_blocked`), ARP/L2 storms (a flood PBP cannot
+  name because it creates no session), IP fragmentation with its allocation
+  errors, buffer allocation failures, decryption-proxy retransmissions
+  (`tcp_fptcp_*`), out-of-order queues from one-way or TAP feeds, and the
+  zone-protection flood counters whose silence while PBP climbs means the
+  flood came through an unprotected zone. When a large share of PBP drops
+  used the ingress interface's zone id, the report warns that PBP threat-log
+  zones are not the session's real zone. Counter names validated against
+  anonymized captures of eight closed TAC packet-buffer cases. Refs #189.
+- **Diagnostic pools table.** The pressure evidence lists the worst observed
+  occupancy per dataplane for the pools that diagnose an incident by
+  themselves — the on-chip `PKI POOL DFLT` (the congestion alert's
+  denominator on ASIC platforms), the proxy `Timer Pool` an SSL leak
+  consumes, the decryption load pools (`proxy_flow`, `ssl_st`, `fptcp_seg`),
+  and any pool at 80% used or more. Refs #189.
+- **Device uptime is captured.** `show system info` parsing keeps the
+  firewall's `uptime`, so an incident starting within days of a boot or
+  upgrade can be flagged in the diagnosis. Refs #189.
+
 ## [0.37.0] - 2026-08-31
 
 ### Fixed
