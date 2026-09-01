@@ -1167,6 +1167,7 @@ packet descriptor (on-chip):
   <model>PA-VM</model>
   <sw-version>11.2.4</sw-version>
   <time>Thu Aug 27 14:03:02 2026</time>
+  <uptime>0 days, 21:24:13</uptime>
 </system>
 """.strip()
         expected = {
@@ -1176,6 +1177,7 @@ packet descriptor (on-chip):
             "model": "PA-VM",
             "software_version": "11.2.4",
             "system_time": "Thu Aug 27 14:03:02 2026",
+            "uptime": "0 days, 21:24:13",
         }
         samples = (
             f'<response status="success"><result>{system}</result></response>',

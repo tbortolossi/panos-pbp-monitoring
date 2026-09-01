@@ -195,7 +195,14 @@ so the offender's first appearance can be aligned with the pressure curve. Its
 vertical axis fits the data (10, 25, 50, or 100%) so a lightly loaded firewall
 is not a flat line, the PBP alert and activate levels are drawn when they fit,
 the peak is labelled, and one triangle marks each syslog trigger received
-during the capture.
+during the capture. A **Diagnostic pools** table under the pressure evidence
+lists the worst occupancy observed per dataplane for the pools whose state
+diagnoses an incident by itself — the on-chip `PKI POOL DFLT` (the pool the
+firewall's `Packet buffer congestion` alert measures on ASIC platforms), the
+proxy `Timer Pool` an SSL-proxy leak consumes, the decryption load pools
+(`proxy_flow`, `ssl_st`, `fptcp_seg`), and any other pool seen at 80% used or
+more. A pool held near full while the dataplane CPU idles means the resource
+is leaked or parked, not processed.
 
 ## Denied and dropped traffic
 
@@ -212,6 +219,24 @@ so they form their own family and are reported in the verdict without being
 added to the denied total. A batch whose delta
 baseline was untrusted is excluded from the totals, because its sampling window
 is unknown, and the report says how many batches were counted and excluded.
+
+Under the drop table, a **Root-cause counter signals** part surfaces counter
+families that are mostly informational and therefore never appear in a
+drop-severity table, yet each is the fingerprint of one known way a packet
+buffer fills: PBP's own mitigation under both naming families
+(`flow_dos_pbp_*` on PAN-OS 10.2/11.x, `pkt_buf_protect_*` elsewhere), the
+blocked-source collateral (`flow_dos_drop_ip_blocked` — the size of the silent
+outage a block-ip causes when it hits shared infrastructure), ARP/L2 storms
+(`flow_arp_pkt_rcv` with its gratuitous share — a flood PBP cannot name or
+block because it creates no session), IP fragmentation tied to buffer
+exhaustion (`flow_ipfrag_*` and its allocation errors), outright buffer
+allocation failures, the decryption proxy's own retransmissions
+(`tcp_fptcp_*`), out-of-order queues held by one-way or TAP feeds, and the
+zone-protection flood counters whose silence while PBP drops climb means the
+flood came through a zone with flood protection disabled. When a large share
+of the PBP drops used the ingress interface's zone id
+(`flow_dos_pbp_ifp_zone`), the section warns that the zone written on PBP
+threat logs is not the session's real zone.
 
 That section answers a question the offender table cannot. A UDP or GRE flood
 denied by a Security policy rule never reaches session setup, so the firewall

@@ -2930,6 +2930,9 @@ def extract_system_info(output: str) -> dict[str, str]:
         "model": ("model",),
         "software_version": ("sw-version", "software-version"),
         "system_time": ("time", "system-time"),
+        # An incident starting within days of a boot is a diagnosis fact by
+        # itself (fresh upgrade, cleared leak): keep the firewall's own wording.
+        "uptime": ("uptime",),
     }
     identity: dict[str, str] = {}
     for name, tags in field_tags.items():
