@@ -163,7 +163,10 @@ class AdminUITests(unittest.TestCase):
                 self.assertIn("Collector settings", page)
                 self.assertIn("Incident idle TTL seconds", page)
                 self.assertIn("Generate HTML report", page)
-                self.assertNotIn("Ttl", page)
+                # Guard the label capitalization without matching the random
+                # CSRF tokens on the page, which can contain any substring
+                # (a token containing "Ttl" once failed this assertion).
+                self.assertNotIn("Ttl seconds", page)
                 self.assertIn("Firewalls", page)
                 self.assertIn("Save the installation recovery key", page)
                 self.assertIn("Download CSV", page)

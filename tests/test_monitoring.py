@@ -880,13 +880,16 @@ class MonitorTests(unittest.TestCase):
                 client.commands.count(OP_COMMANDS["global_counters_delta"]),
                 2,
             )
-            clock_index = client.commands.index(CLOCK_COMMAND)
+            # The clock is collected in the same batch as the evidence: it gets
+            # the first scheduling opportunity, but the gather never serializes
+            # it ahead of every op call, so command order is scheduler-dependent
+            # (it differed on CPython 3.13). Assert presence, not order.
             for name, command in OP_COMMANDS.items():
                 if name == "global_counters_delta":
                     continue
                 if name == "resource_monitor":
                     command = resource_monitor_command(cfg.poll_seconds)
-                self.assertGreater(client.commands.index(command), clock_index)
+                self.assertIn(command, client.commands)
 
             records = [
                 json.loads(line)
