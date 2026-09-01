@@ -425,6 +425,10 @@ key must be backed up and restored together.
     management, control, or timer duties that make them permanently busier or
     quieter than their peers.
 16. The HTML report escapes hostile output and does not modify the JSONL file.
+    Where PBP is observed mitigating below the activate threshold the settings
+    read returned, the report states the contradiction and directs the reader to
+    the device, without asserting which of a landing commit or a threshold set
+    outside the read xpath caused it.
 17. Unit tests and Python compilation succeed.
 18. The service starts without root privileges after documented installation.
 19. A serial-labelled trigger routes only to its configured target.
@@ -678,7 +682,11 @@ key must be backed up and restored together.
     causes folded behind one "N other causes ruled out" line, the
     non-evaluable ones behind "N causes not evaluable", and the four-step walk
     and the conclusion paragraph folded under their own names; when nothing is
-    supported the layer says so and points at the ruled-out list. Layer 3
+    supported the layer says so and points at the ruled-out list; when the
+    capture shows no pressure at all it ranks nothing, states that the trigger
+    is a threshold set at or below the firewall's resting level and that the
+    threshold configuration is what has to be reviewed, and keeps what PBP
+    ranked folded and labelled as ordinary traffic rather than a cause. Layer 3
     carries the evidence sections and the raw appendix, folded. The layered
     report is self-sufficient for a TAC case: same raw command responses, same
     capture digest, same identity block. Its Collapse all reaches the sections

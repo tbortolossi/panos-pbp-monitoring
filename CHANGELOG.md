@@ -3,6 +3,38 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.39.1] - 2026-09-01
+
+### Fixed
+
+- **A firewall at rest no longer reads as an incident.** When the capture shows
+  no shortage of buffers or descriptors, the layered report's second layer
+  stops ranking causes altogether. It states instead that there is no incident,
+  that PBP fired because its activate threshold sits at or below what the
+  firewall carries at rest, and that what has to be reviewed is the
+  packet-buffer-protection threshold configuration. What PBP ranked is kept,
+  folded, under **What PBP ranked — ordinary traffic, not a cause**. Before
+  this, a lab firewall idling at 4.5% with its threshold lowered produced a
+  report headlined *Low pressure* and immediately contradicted by a ranked list
+  of "supported causes" — the reading PBP's own designation must never be given.
+- **The report no longer blames a landing commit for a contradicted threshold
+  read.** PBP cannot mitigate below its own activate threshold; when it does,
+  the settings read did not return the thresholds in force. A commit landing
+  during the read explains that, but so does a threshold set outside the xpath
+  the collector reads, and the capture cannot tell them apart. Both reports now
+  state the contradiction and say to read the settings on the device, instead of
+  asserting a cause. The context chip reads **configured thresholds contradicted
+  by PBP · not the ones in force**.
+- **The "PBP mitigated from" figure is flagged only when it is low.** Mitigating
+  at 84% is PBP doing its job; mitigating at 4% is the threshold-setting signal,
+  and only the second is now highlighted.
+
+### Changed
+
+- The demonstration incident carries the PBP settings and per-batch PBP status a
+  real run collects, so the documentation screenshots show the configured alert
+  and activate thresholds instead of falling back to the PAN-OS defaults.
+
 ## [0.39.0] - 2026-09-01
 
 ### Added

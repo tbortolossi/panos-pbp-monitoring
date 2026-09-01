@@ -56,6 +56,24 @@ When nothing is supported, the layer says so and points at the ruled-out list
 and the evidence: real pressure with no cause named is the case for a Tech
 Support File taken close to the incident.
 
+**When there was no pressure at all**, the layer ranks nothing. PBP fires
+because its activate threshold sits at or below what the firewall carries at
+rest — a firewall idling at 4.5% with the threshold lowered to 1% mitigates
+permanently — so the layer states that there is no incident, that the machine
+has nothing to diagnose, and that what has to be reviewed is the
+packet-buffer-protection threshold configuration. What PBP ranked is kept
+folded under **What PBP ranked — ordinary traffic, not a cause**: it is the
+firewall's own designation and must not be lost, but at that pressure level it
+is the busiest ordinary traffic and never a cause.
+
+PBP cannot mitigate below its own activate threshold. When the capture shows it
+doing so, the settings read did not return the thresholds in force — a commit
+landing during the read explains it, and so does a threshold set outside the
+xpath the collector reads (`devices/entry/deviceconfig/setting/session`). The
+report states the contradiction, quotes the firewall's own congestion log when
+a trigger carried one, and tells you to read the settings on the device rather
+than naming a cause it cannot prove.
+
 **Layer 3 — The evidence.** The same evidence sections as the flat report,
 under a **The evidence** heading, then the raw appendix under
 **Appendix — the complete capture**. All folded, each stating its one-line
