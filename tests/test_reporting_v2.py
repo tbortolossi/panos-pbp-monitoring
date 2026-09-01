@@ -21,9 +21,25 @@ from pbp_monitoring.reporting_v2 import (
 )
 
 
+def _drop_blocks(rendered: str, opening: str, closing: str) -> str:
+    """Cut out every `opening`…`closing` span, by literal boundaries.
+
+    The report is written by this project, so its style and script blocks are
+    exact known strings. Matching them literally rather than with a tag pattern
+    keeps this helper a measuring tool and not a sanitizer.
+    """
+    while (start := rendered.find(opening)) != -1:
+        end = rendered.find(closing, start)
+        if end == -1:
+            return rendered[:start]
+        rendered = rendered[:start] + rendered[end + len(closing) :]
+    return rendered
+
+
 def _visible(rendered: str) -> str:
     """The text a reader meets before opening a single disclosure."""
-    body = re.sub(r"<style.*?</style>|<script.*?</script>", "", rendered, flags=re.S)
+    body = _drop_blocks(rendered, "<style>", "</style>")
+    body = _drop_blocks(body, "<script>", "</script>")
     closed = re.compile(r"<details(?![^>]*\sopen)[^>]*>(.*?)</details>", re.S)
     while True:
         def keep(match: re.Match[str]) -> str:
