@@ -249,6 +249,141 @@ class LayeredReportTests(unittest.TestCase):
         self.assertEqual(output.getvalue().strip(), str(destination))
 
 
+class ThresholdNoiseTests(unittest.TestCase):
+    """A firewall at rest whose PBP fires must never read as an incident."""
+
+    def _capture(self, directory: Path, mitigating_from: float) -> Path:
+        """A run with idle buffers where PBP mitigates all the same."""
+        records = [
+            {
+                "timestamp": "2026-08-30T18:40:00+00:00",
+                "run_id": "run-noise",
+                "target_name": "lab-fw",
+                "event": "monitor_started",
+                "device": {
+                    "device_name": "lab-fw",
+                    "model": "PA-440",
+                    "software_version": "12.2.2",
+                },
+                "pbp_settings": {
+                    "status": "parsed",
+                    "enabled": True,
+                    "alert_percent": 50.0,
+                    "activate_percent": 80.0,
+                },
+            },
+            {
+                "timestamp": "2026-08-30T18:40:05+00:00",
+                "run_id": "run-noise",
+                "elapsed_seconds": 5,
+                "percentages": {"packet_buffer_congestion": [4.51]},
+                "pbp_status": {
+                    "enabled": True,
+                    "active": True,
+                    "mode": "packet_buffer",
+                    "monitor_only": False,
+                    "congestion_percentage": mitigating_from,
+                },
+                "candidate_session_ids": [4242],
+                "candidate_entities": [
+                    {
+                        "rank": 1,
+                        "entity_type": "session",
+                        "session_id": 4242,
+                        "drop_state": True,
+                        "pbp_percentage_total": 31.0,
+                        "evidence_sources": ["packet_buffer_protection"],
+                    }
+                ],
+            },
+            {
+                "timestamp": "2026-08-30T18:40:10+00:00",
+                "run_id": "run-noise",
+                "event": "monitor_stopped",
+                "reason": "resources_recovered",
+                "elapsed_seconds": 10,
+            },
+        ]
+        capture = directory / "incident.jsonl"
+        capture.write_text(
+            "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+        )
+        return capture
+
+    def _render(self, mitigating_from: float = 4.14) -> str:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            capture = self._capture(directory, mitigating_from)
+            report = generate_html_report_v2(capture, directory / REPORT_V2_FILENAME)
+            return report.read_text(encoding="utf-8")
+
+    def test_pbp_ranking_is_never_presented_as_a_supported_cause(self):
+        """The trap: at 4.5% buffers the ranking is ordinary traffic."""
+        rendered = self._render()
+
+        self.assertNotIn('class="finding-rank"', rendered)
+        self.assertIn('<div class="threshold-noise">', rendered)
+        self.assertIn("No incident on this firewall", rendered)
+        self.assertIn("ordinary traffic, not a cause", rendered)
+        # And it is kept, folded, because it is the firewall's own designation.
+        self.assertIn("What PBP ranked", rendered)
+        self.assertIn("4242", rendered)
+
+    def test_the_layer_names_the_threshold_configuration_as_what_to_review(self):
+        rendered = self._render()
+
+        self.assertIn("packet-buffer-protection threshold configuration", rendered)
+        self.assertIn("every alert it raises is noise", rendered)
+
+    def test_mitigation_below_the_read_activate_threshold_is_called_out(self):
+        """PBP cannot mitigate below its own activate threshold."""
+        rendered = self._render(mitigating_from=4.14)
+
+        self.assertIn("alert 50% and activate 80%", rendered)
+        self.assertIn("those are not the thresholds that were in force", rendered)
+        self.assertIn("Read the packet-buffer-protection settings on the device", rendered)
+
+    def test_the_mitigation_tile_flags_only_a_lowered_threshold(self):
+        low = self._render(mitigating_from=4.14)
+        self.assertIn('<div class="proof-item" data-level="warn"><span>PBP mitigated from', low)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            capture = directory / "incident.jsonl"
+            capture.write_text(
+                "".join(
+                    json.dumps(record) + "\n"
+                    for record in [
+                        {
+                            "timestamp": "2026-08-30T18:40:00+00:00",
+                            "run_id": "run-real",
+                            "event": "monitor_started",
+                            "device": {"model": "PA-440"},
+                        },
+                        {
+                            "timestamp": "2026-08-30T18:40:05+00:00",
+                            "run_id": "run-real",
+                            "elapsed_seconds": 5,
+                            "percentages": {"packet_buffer_congestion": [84.0]},
+                            "pbp_status": {
+                                "enabled": True,
+                                "active": True,
+                                "mode": "packet_buffer",
+                                "congestion_percentage": 84.0,
+                            },
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            high = generate_html_report_v2(
+                capture, directory / REPORT_V2_FILENAME
+            ).read_text(encoding="utf-8")
+
+        self.assertIn('<div class="proof-item" data-level="ok"><span>PBP mitigated from', high)
+        self.assertNotIn('<div class="threshold-noise">', high)
+
+
 class FindingCollectionTests(unittest.TestCase):
     """`collect_findings` is what lets the report lead with what holds."""
 

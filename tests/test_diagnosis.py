@@ -357,8 +357,10 @@ class CapturedEvidenceTests(unittest.TestCase):
         self.assertIn("alert 1% / activate 2% thresholds configured on the firewall", diagnosis["conclusion"][1])
 
     def test_a_read_taken_during_a_commit_is_contradicted_by_the_mitigation(self):
-        """The lab case of 2026-08-30: monitor started mid-commit, config read
-        said 50/80 while PBP was already mitigating at 4%."""
+        """The lab case of 2026-08-30: the config read said 50/80 while PBP was
+        already mitigating at 4%. The report states the contradiction; it must
+        not name a cause the capture cannot prove, because a threshold set
+        outside that xpath explains it just as well as a landing commit."""
         diagnosis = _diagnose(
             [_cycle(1, 4.4, pbp_status={"enabled": True, "active": True, "congestion_percentage": 4.3})],
             [self._started(alert_percent=50.0, activate_percent=80.0),
@@ -370,10 +372,14 @@ class CapturedEvidenceTests(unittest.TestCase):
         self.assertEqual(context["alert_source"], "inconsistent")
         self.assertEqual(context["alert_percent"], 1.0)
         self.assertIn("yet PBP was mitigating at 4.3%, which it cannot do below its activate threshold", thresholds)
-        self.assertIn("while a commit was landing", thresholds)
+        self.assertIn("so the read does not describe the thresholds that were in force", thresholds)
+        self.assertNotIn("commit", thresholds)
         self.assertIn("congestion log says alert 1%", thresholds)
         self.assertNotIn("configured at 80%", diagnosis["steps"][0]["verdict"])
-        self.assertIn("a commit was landing when the monitor started", diagnosis["conclusion"][1])
+        self.assertIn(
+            "PBP's own mitigation contradicting the values it returned",
+            diagnosis["conclusion"][1],
+        )
 
     def test_the_read_at_stop_wins_when_the_settings_changed(self):
         reread = {"event": "pbp_settings_reread", "changed_since_start": True,

@@ -140,6 +140,18 @@ class DemoPageTests(unittest.TestCase):
                 self.assertIn("PA-440", report)
                 self.assertIn("11.1.4-h7", report)
 
+    def test_the_demonstration_exercises_the_pbp_settings_read(self):
+        """A real run reads the thresholds; the demo has to show them."""
+        for name in ("incident-report", "incident-report-v2"):
+            with self.subTest(page=name):
+                report = self.pages[name]
+
+                self.assertIn("configured alert 50% · activate 80%", report)
+                self.assertIn("PBP enabled", report)
+                # An 84% peak against an 80% activate threshold is PBP doing
+                # its job, so the report must not call it threshold noise.
+                self.assertNotIn('<div class="threshold-noise">', report)
+
     def test_the_layered_report_opens_on_its_verdict(self):
         report = self.pages["incident-report-v2"]
 

@@ -176,6 +176,18 @@ def _demo_cycle(number: int, offset_seconds: float, buffer_pct: float) -> dict[s
         "target_name": DEMO_TARGET,
         "cycle": number,
         "elapsed_seconds": float(offset_seconds),
+        # PBP mitigates only at or above its activate threshold, so the demo
+        # states it exactly where the curve crosses 80%: a status that claimed
+        # mitigation below it would make the report call the settings read
+        # inconsistent, which is a different case entirely.
+        "pbp_status": {
+            "enabled": True,
+            "active": buffer_pct >= 80.0,
+            "mode": "packet_buffer",
+            "monitor_only": False,
+            "congestion_percentage": buffer_pct,
+            "drop_probability_percentage": None,
+        },
         "percentages": {
             "packet_buffer_congestion": [buffer_pct],
             "descriptor_atomic": [round(buffer_pct * 0.7, 1)],
@@ -269,6 +281,19 @@ def demo_incident_records() -> list[dict[str, Any]]:
                 "model": "PA-440",
                 "software_version": "11.1.4-h7",
                 "system_time": "Sat Aug 29 10:00:00 UTC 2026",
+            },
+            # A real run reads the PBP thresholds from the running
+            # configuration at monitor start. Without them the report falls
+            # back to the PAN-OS defaults and never shows the threshold chips.
+            "pbp_settings": {
+                "status": "parsed",
+                "enabled": True,
+                "alert_percent": 50.0,
+                "activate_percent": 80.0,
+                "latency_alert_ms": 50.0,
+                "latency_activate_ms": 200.0,
+                "latency_max_tolerate_ms": 500.0,
+                "latency_block_countdown_ms": 500.0,
             },
             "identity_complete": True,
             "dp_core_functions": DEMO_CORE_FUNCTIONS,

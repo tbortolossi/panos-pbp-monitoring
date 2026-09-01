@@ -492,8 +492,11 @@ def _context(
         alert = configured_alert if configured_alert is not None else DEFAULT_ALERT_PERCENT
         activate = configured_activate if configured_activate is not None else DEFAULT_ACTIVATE_PERCENT
         alert_source = "configuration"
-        # PBP cannot mitigate below its activate threshold: a read that says
-        # otherwise was taken while a commit was landing. Say so and fall back.
+        # PBP cannot mitigate below its activate threshold. When it does, the
+        # read did not return the thresholds in force — a commit landing during
+        # the read is one explanation, a threshold set outside this xpath is
+        # another — so state the contradiction and fall back rather than
+        # asserting a cause the capture cannot prove.
         if mitigating_from is not None and mitigating_from < activate:
             alert_source = "inconsistent"
             alert = syslog_alert if syslog_alert is not None else alert
@@ -532,6 +535,9 @@ def _context(
         "alert_source": alert_source,
         "configured_alert_percent": configured_alert,
         "configured_activate_percent": configured_activate,
+        # What the firewall's own congestion log announced, kept beside the
+        # configuration read so a report can name the two when they disagree.
+        "syslog_alert_percent": syslog_alert,
         "settings_changed_during_run": bool(settings.get("changed_during_run")) if settings else False,
         "configured_enabled": settings.get("enabled") if settings else None,
         "latency_alert_ms": _first_number(settings.get("latency_alert_ms")) if settings else None,
@@ -605,8 +611,8 @@ def _step_pressure(cycles: Sequence[dict[str, Any]], context: dict[str, Any]) ->
             f"{_fmt(context['configured_alert_percent'] if context['configured_alert_percent'] is not None else DEFAULT_ALERT_PERCENT)}% "
             f"and activate {_fmt(context['configured_activate_percent'] if context['configured_activate_percent'] is not None else DEFAULT_ACTIVATE_PERCENT)}%, "
             f"yet PBP was mitigating at {_fmt(mitigating_from)}%, which it cannot do "
-            "below its activate threshold: the read was taken while a commit was "
-            "landing and does not describe the thresholds in force"
+            "below its activate threshold, so the read does not describe the "
+            "thresholds that were in force"
             + (
                 f"; the firewall's own congestion log says alert {_fmt(alert)}%"
                 if context["alert_percent"] is not None and syslog_alert_known(context)
@@ -2164,8 +2170,8 @@ def _conclusion(
         f"the alert {_fmt(context['alert_percent'])}% / activate "
         f"{_fmt(context['activate_percent'])}% thresholds configured on the firewall"
         if context["alert_source"] == "configuration"
-        else "thresholds the configuration read could not establish, because a commit "
-        "was landing when the monitor started"
+        else "thresholds the configuration read could not establish, PBP's own "
+        "mitigation contradicting the values it returned"
         if context["alert_source"] == "inconsistent"
         else f"the {_fmt(context['alert_percent'])}% alert threshold configured on the firewall"
         if context["alert_source"] == "firewall"
@@ -2324,7 +2330,9 @@ def render_diagnosis_context(diagnosis: dict[str, Any]) -> str:
             + (" (changed during the run)" if context["settings_changed_during_run"] else "")
         )
     elif context["alert_source"] == "inconsistent":
-        chips.append("configuration read during a commit · thresholds unreliable")
+        chips.append(
+            "configured thresholds contradicted by PBP · not the ones in force"
+        )
     elif context["alert_percent"] is not None:
         chips.append(f"alert threshold {_fmt(context['alert_percent'])}% (from the firewall)")
     if context["latency_peak_ms"] is not None:

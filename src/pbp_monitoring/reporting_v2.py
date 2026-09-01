@@ -31,6 +31,7 @@ from typing import Any, Sequence
 
 from . import __version__
 from .diagnosis import (
+    DEFAULT_ALERT_PERCENT,
     collect_findings,
     render_diagnosis_conclusion,
     render_diagnosis_context,
@@ -120,6 +121,9 @@ REPORT_V2_STYLE = """
     .finding-evidence { margin-left:auto; color:var(--accent); font-size:12px; font-weight:700; text-decoration:none; }
     .finding-evidence:hover { text-decoration:underline; }
     .finding>p { margin:8px 0 0; }
+    .threshold-noise { padding:18px 20px; border:1px solid #fcd34d; border-left:4px solid #d97706; border-radius:12px; background:#fffbeb; }
+    .threshold-noise p { margin:0 0 10px; max-width:78ch; }
+    .threshold-noise p:last-child { margin-bottom:0; }
     .no-finding { margin:0; padding:16px 18px; border:1px dashed var(--line); border-radius:12px; background:var(--surface); color:var(--muted); }
     details.dismissed { margin-top:18px; border:1px solid var(--line); border-radius:12px; background:#eef2f7; }
     details.dismissed>summary { padding:11px 16px; cursor:pointer; font-weight:600; }
@@ -178,12 +182,15 @@ def _render_proof(diagnosis: dict[str, Any], batch_count: int) -> str:
                 else "ok",
             )
         )
-    if context.get("mitigating_from_percent") is not None:
+    if (mitigating := context.get("mitigating_from_percent")) is not None:
+        # Mitigating at a high level is PBP doing its job. Mitigating below the
+        # PAN-OS alert default is the threshold-setting signal, and that is the
+        # reading this tile has to make visible at a glance.
         items.append(
             _proof_item(
                 "PBP mitigated from",
-                f"{_format_number(context['mitigating_from_percent'])}%",
-                "warn",
+                f"{_format_number(mitigating)}%",
+                "warn" if mitigating < DEFAULT_ALERT_PERCENT else "ok",
             )
         )
     items.append(
@@ -232,13 +239,120 @@ def _render_dismissed(
     )
 
 
-def _render_cause_layer(diagnosis: dict[str, Any]) -> tuple[str, str]:
-    """The second layer: what holds, then what does not, then the full walk."""
+def _threshold_noise_panel(diagnosis: dict[str, Any]) -> str:
+    """State that the trigger is a setting, not an incident.
+
+    When the firewall was never short of buffers or descriptors, PBP fired
+    because its threshold sits below what this firewall carries at rest. Every
+    entry PBP then ranked is the busiest ordinary traffic, and presenting any
+    of it as a supported cause is the misreading this panel exists to prevent.
+    """
+    context = diagnosis["context"]
+    pressure = next(
+        (step for step in diagnosis["steps"] if step["key"] == "pressure"), {}
+    )
+    buffer_peak = pressure.get("buffer_peak")
+    mitigating = context.get("mitigating_from_percent")
+
+    sentences = [
+        "<strong>No incident on this firewall.</strong> Packet buffers peaked at "
+        + (f"{_format_number(buffer_peak)}%" if buffer_peak is not None else "a level below the PAN-OS alert default")
+        + ", so the dataplane was never short of buffers or descriptors."
+    ]
+    if mitigating is not None:
+        sentences.append(
+            f"PBP was nevertheless mitigating from {_format_number(mitigating)}%, "
+            "which means its activate threshold sits at or below what this "
+            "firewall carries at rest."
+        )
+        configured_alert = context.get("configured_alert_percent")
+        configured_activate = context.get("configured_activate_percent")
+        syslog_alert = context.get("syslog_alert_percent")
+        if configured_activate is not None and mitigating < configured_activate:
+            # PBP cannot mitigate below its own activate threshold. When it did,
+            # the settings read did not return the thresholds in force, and
+            # saying so is more useful than quoting either number as fact.
+            contradiction = (
+                "The running configuration read at monitor start reports alert "
+                f"{_format_number(configured_alert)}% and activate "
+                f"{_format_number(configured_activate)}%. PBP cannot mitigate "
+                "below its own activate threshold, so those are not the "
+                "thresholds that were in force"
+            )
+            if syslog_alert is not None:
+                contradiction += (
+                    f"; the firewall's own congestion log named an alert "
+                    f"threshold of {_format_number(syslog_alert)}%"
+                )
+            contradiction += (
+                ". Read the packet-buffer-protection settings on the device "
+                "before drawing any conclusion from this run."
+            )
+            sentences.append(contradiction)
+        elif configured_activate is not None:
+            sentences.append(
+                "The running configuration reports alert "
+                f"{_format_number(configured_alert)}% and activate "
+                f"{_format_number(configured_activate)}%, far below the "
+                "50% and 80% PAN-OS defaults."
+            )
+    sentences.append(
+        "There is nothing to diagnose on the machine. What has to be reviewed is "
+        "the packet-buffer-protection threshold configuration: at this setting "
+        "PBP triggers on ordinary traffic, and every alert it raises is noise."
+    )
+    return '<div class="threshold-noise">' + "".join(
+        f"<p>{sentence}</p>" for sentence in sentences
+    ) + "</div>"
+
+
+def _render_context_ranking(findings: list[dict[str, Any]]) -> str:
+    """What PBP ranked, kept as context and named as ordinary traffic."""
+    if not findings:
+        return ""
+    items = "".join(
+        f'<li class="hypothesis hypothesis-unavailable">'
+        f'<span class="hypothesis-mark" aria-hidden="true"></span>'
+        f'<strong>{_escape(item["title"])}</strong> — {item["text"]}'
+        + (
+            '<ol class="step-named">'
+            + "".join(f"<li>{named}</li>" for named in item["named"])
+            + "</ol>"
+            if item["named"]
+            else ""
+        )
+        + "</li>"
+        for item in findings
+    )
+    return (
+        '<details class="dismissed"><summary>What PBP ranked — ordinary traffic, '
+        "not a cause</summary>"
+        '<div class="dismissed-body"><p class="muted">At this pressure level the '
+        "ranking is the busiest ordinary traffic seen through a lowered "
+        "threshold. It is kept because it is the firewall's own designation, and "
+        "it must not be read as an attack.</p>"
+        f'<ul class="hypotheses">{items}</ul></div></details>'
+    )
+
+
+def _render_cause_layer(diagnosis: dict[str, Any]) -> tuple[str, str, str]:
+    """The second layer: what holds, then what does not, then the full walk.
+
+    Returns its body, the pill for its heading, and the lead-in sentence, all
+    three of which change when the run carries no real pressure.
+    """
     findings = collect_findings(diagnosis)
     confirmed = findings["confirmed"]
     level = diagnosis["headline"]["level"]
+    pressure = next(
+        (step for step in diagnosis["steps"] if step["key"] == "pressure"), {}
+    )
+    low_significance = bool(pressure.get("low_significance"))
 
-    if confirmed:
+    if low_significance:
+        body = _threshold_noise_panel(diagnosis) + _render_context_ranking(confirmed)
+        pill = "no incident"
+    elif confirmed:
         body = '<ol class="findings">' + "".join(
             _render_finding(finding, rank, level)
             for rank, finding in enumerate(confirmed, 1)
@@ -283,10 +397,15 @@ def _render_cause_layer(diagnosis: dict[str, Any]) -> tuple[str, str]:
         f'<div class="dismissed-body">{render_diagnosis_conclusion(diagnosis)}'
         "</div></details>"
     )
-    return (
-        body + ruled_out + unavailable + walk + conclusion,
-        pill,
+    intro = (
+        "This firewall was not short of resources. The section states why PBP "
+        "fired anyway, and what PBP ranked is kept below as context only."
+        if low_significance
+        else "Only what this capture supports, most decisive first. Everything "
+        "the investigation rejected is folded below, with the step-by-step "
+        "reasoning it came from."
     )
+    return body + ruled_out + unavailable + walk + conclusion, pill, intro
 
 
 def _render_html_v2(
@@ -311,7 +430,7 @@ def _render_html_v2(
         )
         verdict_level = headline["level"]
         verdict_pill = _LEVEL_PILLS.get(verdict_level, "")
-        cause_body, cause_pill = _render_cause_layer(diagnosis)
+        cause_body, cause_pill, cause_intro = _render_cause_layer(diagnosis)
     else:
         verdict_body = (
             '<p class="headline"><strong>No batch collected.</strong> '
@@ -320,7 +439,7 @@ def _render_html_v2(
             "written.</p>"
         )
         verdict_level, verdict_pill = "none", _LEVEL_PILLS["none"]
-        cause_body, cause_pill = "", ""
+        cause_body, cause_pill, cause_intro = "", "", ""
 
     layers = [
         _render_section(
@@ -338,9 +457,7 @@ def _render_html_v2(
                 "cause-title",
                 "What explains it",
                 cause_body,
-                intro="Only what this capture supports, most decisive first. "
-                "Everything the investigation rejected is folded below, with the "
-                "step-by-step reasoning it came from.",
+                intro=cause_intro,
                 pill=cause_pill,
                 section_class="cause",
             )
