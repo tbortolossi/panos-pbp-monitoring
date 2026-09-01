@@ -49,7 +49,9 @@ from pbp_monitoring import config_store as config_store_module
 from pbp_monitoring import webui
 from pbp_monitoring.config_store import ConfigStore
 from pbp_monitoring import reporting
+from pbp_monitoring import reporting_v2
 from pbp_monitoring.reporting import generate_html_report
+from pbp_monitoring.reporting_v2 import REPORT_V2_FILENAME, generate_html_report_v2
 from pbp_monitoring.text_export import export_jsonl_text
 
 # Every identifier below is invented. The addresses come from the documentation
@@ -433,12 +435,14 @@ def _frozen_clock() -> Iterator[None]:
 
     `config_store` stamps every write with the current time, the dashboard ages
     its entries against it, and the report footer records when it was
-    generated. All three are redirected to the demo instant for the duration of
-    the build, so a regenerated image differs only when the interface does.
+    generated, in both renderers. All of them are redirected to the demo
+    instant for the duration of the build, so a regenerated image differs only
+    when the interface does.
     """
     real_utc_now = config_store_module._utc_now
     real_collect = webui.collect_dashboard_state
     real_datetime = reporting.datetime
+    real_datetime_v2 = reporting_v2.datetime
     frozen = DEMO_NOW.isoformat()
 
     def collect_at_demo_now(data_dir: Path, **kwargs: Any) -> dict[str, Any]:
@@ -452,12 +456,14 @@ def _frozen_clock() -> Iterator[None]:
     config_store_module._utc_now = lambda: frozen
     webui.collect_dashboard_state = collect_at_demo_now
     reporting.datetime = FrozenDatetime
+    reporting_v2.datetime = FrozenDatetime
     try:
         yield
     finally:
         config_store_module._utc_now = real_utc_now
         webui.collect_dashboard_state = real_collect
         reporting.datetime = real_datetime
+        reporting_v2.datetime = real_datetime_v2
 
 
 def build_demo_stack(root: Path) -> DemoStack:
@@ -478,6 +484,7 @@ def build_demo_stack(root: Path) -> DemoStack:
     # The report and the TXT exports are produced by the shipped generators, so
     # a screenshot shows what an operator actually downloads.
     generate_html_report(capture, run_dir / "report.html")
+    generate_html_report_v2(capture, run_dir / REPORT_V2_FILENAME)
     export_jsonl_text(capture, run_dir / "raw")
 
     config_db = root / "config" / "config.db"
@@ -561,6 +568,7 @@ def demo_pages(stack: DemoStack) -> list[tuple[str, str]]:
         ("dashboard", "/"),
         ("admin-configuration", f"/admin?{syslog_options}"),
         ("admin-firewall-form", f"/admin?edit={stack.target_id}&{syslog_options}"),
+        ("incident-report-v2", f"/reports/{run}/{REPORT_V2_FILENAME}"),
         ("incident-report", f"/reports/{run}/report.html"),
         ("text-exports", f"/artifacts/{run}/raw"),
     ]

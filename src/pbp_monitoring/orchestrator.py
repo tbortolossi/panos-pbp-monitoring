@@ -3984,17 +3984,27 @@ class MonitorController:
             return
 
         async def render() -> None:
-            try:
-                from .reporting import generate_html_report
+            # Both readings of the same capture are written, and one failing
+            # must not cost the other: a run that produced evidence has to
+            # leave a report behind even if a renderer raises.
+            from .reporting import generate_html_report
+            from .reporting_v2 import REPORT_V2_FILENAME, generate_html_report_v2
 
-                report = await asyncio.to_thread(
-                    generate_html_report,
-                    output_file,
-                    output_file.with_name("report.html"),
-                )
-                LOG.info("HTML report written to %s", report)
-            except Exception:
-                LOG.exception("Unable to generate HTML report for %s", output_file)
+            for label, render_report, name in (
+                ("HTML", generate_html_report, "report.html"),
+                ("layered HTML", generate_html_report_v2, REPORT_V2_FILENAME),
+            ):
+                try:
+                    report = await asyncio.to_thread(
+                        render_report,
+                        output_file,
+                        output_file.with_name(name),
+                    )
+                    LOG.info("%s report written to %s", label, report)
+                except Exception:
+                    LOG.exception(
+                        "Unable to generate %s report for %s", label, output_file
+                    )
 
         task = asyncio.create_task(render())
         self.report_tasks.add(task)

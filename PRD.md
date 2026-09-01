@@ -178,11 +178,13 @@ than create a concurrent one.
    are in the capture even when its threat log is not forwarded to the
    collector. Raw responses are preserved as evidence and a failed lookup
    never blocks the stop marker or the report.
-10. After the stop marker is written, a standalone HTML report is generated in
-   the background from the JSONL file. Its offender ranking and top-sources
-   tables are bounded to 50 rows each and state what was left out, and every
-   section, Diagnosis included, can be folded from its heading without
-   script. The report opens with the investigation itself (FR 56).
+10. After the stop marker is written, two standalone HTML reports are
+   generated in the background from the same JSONL file: the layered
+   `report-v2.html` (FR 59) and the flat `report.html`. Their offender ranking
+   and top-sources tables are bounded to 50 rows each and state what was left
+   out, and every section can be folded from its heading without script. The
+   flat report opens with the investigation itself (FR 56). One renderer
+   failing never prevents the other from writing its file.
 11. Each completed batch also writes an atomic TXT view of its command and
     session outputs. A Web UI displays bounded Syslog reception status and
     read-only artifact links. A report served by the Web UI is shown with an
@@ -271,13 +273,15 @@ reads from its bounded tail read to compare runs. Multi-target mode roots
 these files below `targets/<target-name>/` and adds `syslog-routing.jsonl` for
 probe and routing evidence.
 
-`incidents/<run_id>/report.html` is a derived view containing a summary, timeline,
+`incidents/<run_id>/report.html` and `incidents/<run_id>/report-v2.html` are
+two derived views of the same records, containing a summary, timeline,
 offender ranking, denied and dropped traffic counters, the session table
 evolution, per-dataplane CPU core charts, partial errors, and all
-collapsible raw outputs. It contains
-the JSONL SHA-256 digest; JSONL remains the source of truth. Validation mode
-similarly produces `api-checks/<run_id>/api-check.jsonl` and
-`api-checks/<run_id>/report.html`.
+collapsible raw outputs. Both contain
+the JSONL SHA-256 digest; JSONL remains the source of truth. Neither travels in
+a support archive, since both regenerate from the capture the archive carries.
+Validation mode similarly produces `api-checks/<run_id>/api-check.jsonl` and
+the same two reports.
 
 `incidents/<run_id>/raw/startup.txt` and `raw/batch-NNNN.txt` provide readable
 command-by-command exports, including result, error, exact raw XML response, and
@@ -584,11 +588,12 @@ key must be backed up and restored together.
     reading past the ordinary traffic of the other firewalls. The filter is
     carried by the URL, so it survives the page refresh, and it never applies
     to the per-firewall cards.
-54. A completed run's dashboard row opens that run's HTML report wherever it is
-    clicked, its **Delete** cell keeping its own action, and the report's
-    evidence bar carries a button back to the dashboard and offers the report
-    itself as an HTML download — the stored file, free of the bar, so it opens
-    outside the deployment. The run table lists no
+54. A completed run's dashboard row opens that run's layered report wherever it
+    is clicked, falling back to the flat one when only that exists, its
+    **Delete** cell keeping its own action, and the report's
+    evidence bar carries a button back to the dashboard and offers both
+    reports as **HTML v2** and **HTML v1** downloads — the stored files, free
+    of the bar, so they open outside the deployment. The run table lists no
     export of its own: the report page is the single place where a run's
     evidence is chosen. A run with no report to open — an active monitor, or a
     run whose report could not be produced — keeps a plain row and offers the
@@ -661,6 +666,25 @@ key must be backed up and restored together.
     open section; without the script the sections open by hand and nothing
     else changes. Expand all remains the way to unfold everything, including
     before printing.
+
+59. Each run also produces a layered report, `report-v2.html`, from the same
+    records and the same diagnosis as the flat one, so the two can never
+    disagree on a fact. It is read in three layers. Layer 1 is the verdict:
+    the headline, the peak packet-buffer and packet-descriptor levels, the
+    buffer latency and the level PBP mitigated from when collected, the batch
+    count, and the case chips; it stays open and Collapse all never folds it.
+    Layer 2 states only the causes the capture supports, ranked, each naming
+    its entities and linking to the section that proves it, with the rejected
+    causes folded behind one "N other causes ruled out" line, the
+    non-evaluable ones behind "N causes not evaluable", and the four-step walk
+    and the conclusion paragraph folded under their own names; when nothing is
+    supported the layer says so and points at the ruled-out list. Layer 3
+    carries the evidence sections and the raw appendix, folded. The layered
+    report is self-sufficient for a TAC case: same raw command responses, same
+    capture digest, same identity block. Its Collapse all reaches the sections
+    and the layer-2 blocks and stops there, never opening every raw command
+    response. It is served under its own hash-pinned script, allowed alongside
+    the flat report's in the Web UI Content-Security-Policy and nothing else.
 
 ## 12. Possible enhancements
 

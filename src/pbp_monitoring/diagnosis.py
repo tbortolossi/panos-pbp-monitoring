@@ -954,6 +954,7 @@ def _step_pbp_named(
         "number": 2,
         "key": "pbp",
         "title": "Did the firewall already name the offender?",
+        "finding_title": "Offender named by PBP",
         "state": state,
         "level": level,
         "verdict": verdict,
@@ -1078,6 +1079,7 @@ def _step_ingress_backlogs(
         "number": 3,
         "key": "backlogs",
         "title": "Does the ingress backlog hold a session?",
+        "finding_title": "Session holding the ingress backlog",
         "state": state,
         "level": level,
         "verdict": verdict,
@@ -2236,10 +2238,77 @@ def _conclusion(
     return sentences
 
 
-def render_diagnosis(diagnosis: dict[str, Any]) -> str:
-    """Render the investigation as the report's opening block."""
+#: The evidence section that proves each hypothesis, so a finding in the
+#: layered report always links to the table it was read from.
+EVIDENCE_ANCHORS = {
+    "elephant": "large-sessions-title",
+    "denied": "drop-counters-title",
+    "storm": "session-table-title",
+    "interfaces": "drop-counters-title",
+    "aggregate": "cpu-tracking-title",
+    "l2_storm": "drop-counters-title",
+    "fragmentation": "drop-counters-title",
+    "proxy_retransmit": "drop-counters-title",
+    "held_resources": "pressure-title",
+    "unprotected_flood": "attribution-title",
+    "chassis_imbalance": "pressure-title",
+    "session_collapse": "session-table-title",
+    "block_collateral": "attribution-title",
+    "recent_boot": "summary-title",
+}
+
+_FINDING_STEPS = ("pbp", "backlogs")
+
+
+def collect_findings(diagnosis: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Flatten the investigation into what it confirmed, ruled out, or could not judge.
+
+    The four-step walk is how the collector reasons; it is not how an operator
+    reads under pressure. This returns the same conclusions as one ranked list
+    of findings, so a report can lead with the handful that are supported and
+    fold the rest away without losing them.
+    """
+    findings: dict[str, list[dict[str, Any]]] = {
+        "confirmed": [],
+        "ruled_out": [],
+        "unavailable": [],
+    }
+    buckets = {
+        "positive": findings["confirmed"],
+        "negative": findings["ruled_out"],
+        "unavailable": findings["unavailable"],
+    }
+    for step in diagnosis["steps"]:
+        if step["key"] in _FINDING_STEPS and step["state"] in buckets:
+            buckets[step["state"]].append(
+                {
+                    "key": step["key"],
+                    "title": step["finding_title"],
+                    "text": step["verdict"],
+                    "named": list(step.get("named") or []),
+                    "anchor": step["anchor"],
+                    "origin": "step",
+                }
+            )
+        for hypothesis in step.get("hypotheses") or []:
+            if hypothesis["state"] not in buckets:
+                continue
+            buckets[hypothesis["state"]].append(
+                {
+                    "key": hypothesis["key"],
+                    "title": hypothesis["title"],
+                    "text": hypothesis["text"],
+                    "named": list(hypothesis.get("named") or []),
+                    "anchor": EVIDENCE_ANCHORS.get(hypothesis["key"], step["anchor"]),
+                    "origin": "hypothesis",
+                }
+            )
+    return findings
+
+
+def render_diagnosis_context(diagnosis: dict[str, Any]) -> str:
+    """The case chips: model, generation, PAN-OS, PBP state and its thresholds."""
     context = diagnosis["context"]
-    headline = diagnosis["headline"]
     chips = [
         f"model {context['model']}",
         context["generation"]["label"],
@@ -2262,10 +2331,13 @@ def render_diagnosis(diagnosis: dict[str, Any]) -> str:
         chips.append(f"buffer latency peak {_fmt(context['latency_peak_ms'])} ms")
     if context["mitigating_from_percent"] is not None:
         chips.append(f"PBP mitigating from {_fmt(context['mitigating_from_percent'])}%")
-    context_html = '<p class="chart-legend diagnosis-context">' + "".join(
+    return '<p class="chart-legend diagnosis-context">' + "".join(
         f'<span class="key">{_escape(chip)}</span>' for chip in chips
     ) + "</p>"
 
+
+def render_diagnosis_steps(diagnosis: dict[str, Any]) -> str:
+    """The four-step walk, each step with its verdict, names and facts."""
     steps_html = []
     for step in diagnosis["steps"]:
         facts_html = ""
@@ -2302,12 +2374,25 @@ def render_diagnosis(diagnosis: dict[str, Any]) -> str:
             f'<p class="step-verdict">{step["verdict"]}</p>'
             f"{named_html}{hypotheses_html}{facts_html}</li>"
         )
+    return f'<ol class="steps">{"".join(steps_html)}</ol>'
+
+
+def render_diagnosis_conclusion(diagnosis: dict[str, Any]) -> str:
+    """The sentences an operator carries into the TAC case."""
     conclusion_html = "".join(f"<p>{sentence}</p>" for sentence in diagnosis["conclusion"])
+    return (
+        '<div class="probable-cause"><h3 id="conclusion-title">Conclusion for the case</h3>'
+        f"{conclusion_html}</div>"
+    )
+
+
+def render_diagnosis(diagnosis: dict[str, Any]) -> str:
+    """Render the investigation as the report's opening block."""
+    headline = diagnosis["headline"]
     return (
         f'<p class="headline"><strong>{_escape(headline["label"])}.</strong> '
         f'{headline["text"]}</p>'
-        f"{context_html}"
-        f'<ol class="steps">{"".join(steps_html)}</ol>'
-        '<div class="probable-cause"><h3 id="conclusion-title">Conclusion for the case</h3>'
-        f"{conclusion_html}</div>"
+        f"{render_diagnosis_context(diagnosis)}"
+        f"{render_diagnosis_steps(diagnosis)}"
+        f"{render_diagnosis_conclusion(diagnosis)}"
     )

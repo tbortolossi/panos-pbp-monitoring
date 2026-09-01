@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.38.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.39.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -26,7 +26,8 @@ received logs, and the completed incident runs](docs/images/dashboard.png)
 > incident by `tools/generate_demo_stack.py`. No firewall, address, or
 > serial shown is real.
 
-More captures: the [incident report](docs/images/incident-report.png), the
+More captures: the [layered incident report](docs/images/incident-report-v2.png),
+the [flat one](docs/images/incident-report.png), the
 [configuration page](docs/images/admin-configuration.png), the
 [firewall form](docs/images/admin-firewall-form.png), the
 [first-run setup](docs/images/admin-setup.png), the
@@ -206,17 +207,21 @@ incidents is visible without opening a single report.
 | Artifact | Content |
 |---|---|
 | `incident.jsonl` | Authoritative structured records and exact raw command output |
-| `report.html` | Standalone human report, single file, no external asset, carrying the JSONL SHA-256 digest; its only script is the hash-pinned Collapse all control |
+| `report-v2.html` | The layered report: the verdict, then only the causes the capture supports, then the evidence and the raw appendix folded under them |
+| `report.html` | The original flat report, every section at the same weight |
 | `raw/startup.txt`, `raw/batch-NNNN.txt` | Human-readable export of every command and response |
 | ZIP support archive | All of the above plus the deployment environment, the redacted configuration, the Syslog messages of the run including refused ones, and `manifest.json` with version, sizes, and digests, for a TAC case |
 
-Clicking a run's row in **Recent runs** opens its report, and every one of
-those artifacts is offered by the evidence bar at the top of that report, which
-names each export by format and by weight and carries the way back to the
-dashboard. The bar also offers the report itself as an **HTML** download: the
-stored standalone file, without the bar, ready to send to someone who has no
-access to this deployment. A run with no report yet shows a **JSONL** link on its row instead,
-for the records collected so far.
+Both reports are single self-contained files with no external asset, carry the
+JSONL SHA-256 digest, and their only script is the hash-pinned fold control.
+
+Clicking a run's row in **Recent runs** opens its layered report, and every one
+of those artifacts is offered by the evidence bar at the top of that report,
+which names each export by format and by weight and carries the way back to the
+dashboard. The bar also offers each report as a download — **HTML v2** and
+**HTML v1** — the stored standalone file, without the bar, ready to send to
+someone who has no access to this deployment. A run with no report yet shows a
+**JSONL** link on its row instead, for the records collected so far.
 
 Read-only API validation runs, under `api-checks/<run_id>/`, export the same
 way: a credential, TLS or unsupported-command problem is diagnosable from an
@@ -275,15 +280,28 @@ never included in an archive: it is the one file that must never be sent.
 
 ### The incident report
 
-The report opens with a **Diagnosis** block that walks the PBP investigation
-in order — how much pressure and on which resource, against the thresholds the
-firewall itself reported; whether PBP already named the offender; whether the
-ingress backlog holds a session; and if not, which of the wider hypotheses
-(elephant session, burst of denied sessions, storm of new sessions, interface
-errors, aggregate load) the capture supports — and closes with a conclusion
-composed only from the steps that were reached. The evidence sections follow
-in the same order and the appendices start folded. The section-by-section
-reading guide is in [docs/reporting.md](docs/reporting.md).
+Every run produces two readings of the same capture, from the same diagnosis.
+
+The **layered report** (`report-v2.html`), the one a run's row opens, is built
+for a reader under pressure. It leads with the verdict: the headline, the peak
+buffer and descriptor levels, the buffer latency and the level PBP mitigated
+from, and the case context. It then states only the causes this capture
+supports, ranked, each linking to the section that proves it — everything the
+investigation ruled out folds behind a single line, as does everything it
+could not judge, the four-step walk, and the conclusion paragraph for the TAC
+case. The evidence sections and the raw appendix follow, folded. Nothing is
+dropped: it stays enough on its own to open a case.
+
+The **flat report** (`report.html`) is the original layout, every section at
+the same weight, opening with the **Diagnosis** block that walks the PBP
+investigation in order — how much pressure and on which resource, against the
+thresholds the firewall itself reported; whether PBP already named the
+offender; whether the ingress backlog holds a session; and if not, which of
+the wider hypotheses the capture supports — and closes with a conclusion
+composed only from the steps that were reached.
+
+The section-by-section reading guide is in
+[docs/reporting.md](docs/reporting.md).
 
 The dashboard, the reports, and every evidence download require the
 administrator sign-in: captures contain device serials, addresses, session
@@ -361,6 +379,7 @@ Console entry points:
 ```text
 pbp-orchestrator
 pbp-report
+pbp-report-v2
 pbp-export-text
 pbp-web
 pbp-config

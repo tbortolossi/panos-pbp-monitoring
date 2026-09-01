@@ -534,6 +534,9 @@ class _Incidents:
                     encoding="utf-8",
                 )
                 (directory / "report.html").write_text("<html>report</html>", encoding="utf-8")
+                (directory / "report-v2.html").write_text(
+                    "<html>layered report</html>", encoding="utf-8"
+                )
 
     def bundle(self, **kwargs):
         buffer = io.BytesIO()
@@ -564,7 +567,9 @@ class RecentIncidentExportTests(unittest.TestCase):
             self.assertIn(incidents + "fw-b/20260829T090000Z/incident.jsonl", names)
             # The fourth, oldest run of fw-a stays behind the per-firewall limit.
             self.assertNotIn(incidents + "fw-a/20260830T090000Z/incident.jsonl", names)
+            # Neither report travels: both regenerate from the JSONL beside them.
             self.assertFalse(any(name.endswith("report.html") for name in names))
+            self.assertFalse(any(name.endswith("report-v2.html") for name in names))
             bundled = {(run["target"], run["run_id"]) for run in runs if run["bundled"]}
             self.assertEqual(
                 bundled,
@@ -586,7 +591,8 @@ class RecentIncidentExportTests(unittest.TestCase):
             size = sum(
                 path.stat().st_size
                 for path in newest.rglob("*")
-                if path.is_file() and path.name != "report.html"
+                if path.is_file()
+                and path.name not in {"report.html", "report-v2.html"}
             )
             _manifest, archive = deployment.bundle(incident_budget_bytes=size * 2 + 1)
             with archive:

@@ -6,10 +6,75 @@ self-contained file: no external asset, the SHA-256 digest of the JSONL
 capture it was built from, and a single hash-pinned script that does nothing
 but fold the report's own sections.
 
+## Two readings of the same capture
+
+Every run writes two reports, from the same records and the same diagnosis.
+They never disagree on a fact: the aggregation, the tables and the verdicts
+come from one shared builder.
+
+**`report-v2.html`, the layered report**, is what a run's row opens. It exists
+because the diagnosis now weighs fourteen hypothesis families, and presenting
+all of them at the same weight buries the two or three that hold. It is read
+in three layers, described below.
+
+**`report.html`, the flat report**, is the original layout: the Diagnosis
+block, then the evidence sections, then the appendices, each folding from its
+heading. It is unchanged, and it stays the reference for anyone used to it.
+
+Both are offered by the evidence bar of either page, as **HTML v2** and
+**HTML v1**, and either can be regenerated from a capture:
+
+```bash
+docker compose exec collector pbp-report-v2 /data/targets/<firewall>/incidents/<run_id>/incident.jsonl
+```
+
+## The layered report, layer by layer
+
+**Layer 1 — Verdict.** The headline the diagnosis reached, the peak packet
+buffer and packet descriptor levels, the buffer latency peak and the level PBP
+mitigated from when either was collected, the number of batches, then the case
+chips: model and hardware family, PAN-OS version, PBP state and mode, and the
+configured alert and activate thresholds with where they were read from. This
+layer stays open and is never folded by **Collapse all**: it is the one screen
+the report exists for, and it carries what a TAC case needs to be opened.
+
+**Layer 2 — What explains it.** Only the causes this capture supports, ranked,
+each with the entities it names and an **evidence** link to the section that
+proves it. Under them, four folded lines:
+
+- **N other causes ruled out** — what the capture holds the evidence to
+  reject. Kept, because it is what stops a TAC engineer from testing them
+  again.
+- **N causes not evaluable** — the commands returned nothing, or were not
+  collected. Neither confirmed nor excluded.
+- **The full four-step investigation** — the reasoning the findings were drawn
+  from, exactly as the flat report states it.
+- **Conclusion for the case** — the paragraph to carry into the case. It is
+  folded because it restates every finding above it.
+
+When nothing is supported, the layer says so and points at the ruled-out list
+and the evidence: real pressure with no cause named is the case for a Tech
+Support File taken close to the incident.
+
+**Layer 3 — The evidence.** The same evidence sections as the flat report,
+under a **The evidence** heading, then the raw appendix under
+**Appendix — the complete capture**. All folded, each stating its one-line
+verdict on its summary.
+
+**Collapse all** in the layered report folds the evidence sections, the
+appendix and the four layer-2 blocks, and expands them all again — which is
+how to prepare it for printing, since a folded section prints folded. It
+deliberately stops there: it does not open every raw command response, which
+would print for hours.
+
 Related pages: [Installation](installation.md) · [Operations](operations.md) ·
 [Troubleshooting](troubleshooting.md) · [Back to the README](../README.md)
 
-![A complete incident report, from the diagnosis block through pressure over
+![The layered report: the verdict with its peak levels, the supported causes
+ranked with their evidence links, the ruled-out causes folded, then the
+evidence sections and the appendix](images/incident-report-v2.png)
+
+![The flat report, from the diagnosis block through pressure over
 time, offender attribution, the ingress backlog, dataplane CPU tracking and the
 folded appendices](images/incident-report.png)
 
@@ -20,29 +85,30 @@ folded appendices](images/incident-report.png)
 ## Opening a report from the dashboard
 
 Clicking anywhere on a completed run's row in **Recent runs** opens that run's
-report. That is the only way in, and it is why the row no longer carries a
+layered report. That is the only way in, and it is why the row no longer carries a
 column of export links: the report page itself offers them, named by weight.
 A run still being collected has no report yet, so its row stays plain and shows
 a single **JSONL** link under its status, for the records written so far.
 
 The report opened that way carries an evidence bar above it: a **Back to
 dashboard** button, the firewall and the run the page belongs to, then the
-run's exports, each named by format and by weight — **HTML** with its size,
-**JSONL** with its size, **TXT** with its number of batch files, **ZIP** as the
-support archive and **ZIP** anonymized. The bar is where you decide, having read
+run's exports, each named by format and by weight — **HTML v2** and
+**HTML v1** with their sizes, **JSONL** with its size, **TXT** with its number
+of batch files, **ZIP** as the support archive and **ZIP** anonymized. The bar is where you decide, having read
 the report, that the case needs its raw evidence.
 
-**HTML** downloads the report you are reading, as the single self-contained file
-stored beside the capture. That is the file to attach to a mail or to a TAC
-case: it opens on a workstation that has no access to this deployment, and it
-needs neither Docker nor a network. It is named for the run it documents
-(`pbp-report-<firewall>-<run_id>.html`), so several reports collected for one
+**HTML v2** and **HTML v1** download a report as the single self-contained
+file stored beside the capture. That is the file to attach to a mail or to a
+TAC case: it opens on a workstation that has no access to this deployment, and
+it needs neither Docker nor a network. Each is named for the run it documents
+and for its reading (`pbp-report-v2-<firewall>-<run_id>.html`,
+`pbp-report-<firewall>-<run_id>.html`), so several reports collected for one
 case stay distinguishable. Print it from the browser to obtain a PDF instead.
 
 Do not use the browser's own **Save page as** for this: the bar is added while
 the page is served, and a manual save would keep it, together with links that
-resolve only inside your deployment. The `report.html` file stored beside the
-capture never contains the bar, which is exactly what the **HTML** export hands
+resolve only inside your deployment. The report files stored beside the
+capture never contain the bar, which is exactly what the **HTML** export hands
 over. The bar is also hidden when the page is printed.
 
 ## Layout and conventions
@@ -54,8 +120,9 @@ the exact `raw_response` remains available in a nested section collapsed by
 default. Command status and timing fields are presented as compact metadata,
 the summary separates capture facts, incident state, and peak utilization, and
 its peak metrics are grouped into packet buffers, packet descriptors, and
-system load. Every section folds from its heading — Diagnosis included, a
-native disclosure. The Diagnosis is the only part open by default: the
+system load. In the flat report, every section folds from its heading — Diagnosis
+included, a native disclosure. The Diagnosis is the only part open by
+default: the
 evidence sections sit folded under a **Going further — the evidence** heading,
 each stating its one-line verdict on its summary ("buffers peaked at 4.5%",
 "6 sessions + 9 sources RED", "no session at 2%", "no hot core"), and the
@@ -67,7 +134,7 @@ hash-pinned script at work, and a report whose script is stripped simply
 leaves the section to be opened by hand.
 
 **Collapse all** sits at the right of the section navigation and folds every
-section at once, except Diagnosis, which is the verdict block and stays open.
+section at once, except the verdict block, which stays open.
 The same control then reads **Expand all** and opens them all — the way to
 unfold the whole report, including before printing it, since a folded section
 prints folded; each heading keeps working individually. It is the report's only script, allowed by its SHA-256
@@ -79,7 +146,10 @@ section unfolded and no dead control.
 
 ## Diagnosis: the investigation, step by step
 
-The report opens with a **Diagnosis** block that walks the questions an
+This is the flat report's opening block, and the layered report's folded
+**full four-step investigation**. Both render it from the same diagnosis.
+
+The block walks the questions an
 engineer asks when a customer's PBP fires, in order, and answers each one from
 the capture. Every step states what it found *or* that it found nothing, and
 the closing **Conclusion for the case** is composed only from the steps that

@@ -110,6 +110,7 @@ class DemoPageTests(unittest.TestCase):
                 "admin-configuration",
                 "admin-firewall-form",
                 "incident-report",
+                "incident-report-v2",
                 "text-exports",
             },
         )
@@ -131,11 +132,23 @@ class DemoPageTests(unittest.TestCase):
         self.assertIn("84", dashboard)
 
     def test_the_report_states_the_firewall_identity(self):
-        report = self.pages["incident-report"]
+        for name in ("incident-report", "incident-report-v2"):
+            with self.subTest(page=name):
+                report = self.pages[name]
 
-        self.assertNotIn("Unidentified", report)
-        self.assertIn("PA-440", report)
-        self.assertIn("11.1.4-h7", report)
+                self.assertNotIn("Unidentified", report)
+                self.assertIn("PA-440", report)
+                self.assertIn("11.1.4-h7", report)
+
+    def test_the_layered_report_opens_on_its_verdict(self):
+        report = self.pages["incident-report-v2"]
+
+        self.assertLess(
+            report.index('id="verdict-title"'), report.index('id="cause-title"')
+        )
+        self.assertLess(
+            report.index('id="cause-title"'), report.index('id="pressure-title"')
+        )
 
     def test_the_configuration_page_lists_the_demonstration_firewall(self):
         configuration = self.pages["admin-configuration"]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "panos-pbp-monitoring"
-version = "0.38.0"
+version = "0.39.0"
 description = "Read-only, event-driven diagnostic collector for Palo Alto Networks PAN-OS Packet Buffer Protection incidents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,6 +25,7 @@ Security = "https://github.com/tbortolossi/panos-pbp-monitoring/security/policy"
 [project.scripts]
 pbp-orchestrator = "pbp_monitoring.orchestrator:main"
 pbp-report = "pbp_monitoring.reporting:main"
+pbp-report-v2 = "pbp_monitoring.reporting_v2:main"
 pbp-export-text = "pbp_monitoring.text_export:main"
 pbp-web = "pbp_monitoring.webui:main"
 pbp-config = "pbp_monitoring.config_cli:main"

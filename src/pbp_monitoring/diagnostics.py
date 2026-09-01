@@ -47,8 +47,13 @@ from typing import Any, BinaryIO, Iterable
 from urllib.parse import urlsplit
 
 from . import __version__
+from .reporting_v2 import REPORT_V2_FILENAME
 
 LOG = logging.getLogger(__name__)
+
+#: Reports are left out of a support archive: both regenerate from the JSONL
+#: capture the archive already carries, and together they double its weight.
+_REGENERABLE_REPORTS = frozenset({"report.html", REPORT_V2_FILENAME})
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 LOG_FILE_MAX_BYTES = 2 * 1024 * 1024
@@ -590,6 +595,7 @@ def run_inventory(data_dir: Path) -> list[dict[str, Any]]:
                         "run_id": directory.name,
                         "capture_present": (directory / capture).is_file(),
                         "report_present": (directory / "report.html").is_file(),
+                        "report_v2_present": (directory / REPORT_V2_FILENAME).is_file(),
                         "raw_files": (
                             sum(1 for _ in (directory / "raw").glob("*"))
                             if (directory / "raw").is_dir()
@@ -752,7 +758,7 @@ def _run_files(directory: Path) -> list[tuple[Path, int]]:
     """Files of one run worth exporting: everything but the HTML report."""
     files: list[tuple[Path, int]] = []
     for path in sorted(directory.rglob("*")):
-        if not path.is_file() or path.is_symlink() or path.name == "report.html":
+        if not path.is_file() or path.is_symlink() or path.name in _REGENERABLE_REPORTS:
             continue
         try:
             files.append((path, path.stat().st_size))
@@ -996,7 +1002,7 @@ def write_support_bundle(
         if latest is None:
             continue
         for path in sorted(latest.rglob("*")):
-            if not path.is_file() or path.is_symlink() or path.name == "report.html":
+            if not path.is_file() or path.is_symlink() or path.name in _REGENERABLE_REPORTS:
                 continue
             try:
                 entries.append(

@@ -374,13 +374,17 @@ class WebUITests(unittest.TestCase):
             run_dir = Path(temporary_directory)
             (run_dir / "raw").mkdir()
             (run_dir / "report.html").write_bytes(b"x" * 2048)
+            (run_dir / "report-v2.html").write_bytes(b"x" * 3072)
             (run_dir / "incident.jsonl").write_bytes(b"x" * 4096)
             (run_dir / "raw" / "batch-0001.txt").write_text("out", encoding="utf-8")
             (run_dir / "raw" / "batch-0002.txt").write_text("out", encoding="utf-8")
             bar = render_report_evidence_bar("fw-a", "run-1", run_dir)
 
         self.assertIn(">Exports<", bar)
-        self.assertIn('>HTML<span class="pbp-bar-meta">2 KiB</span>', bar)
+        # A run keeps both readings of the same capture, so the bar names each
+        # one by its version rather than offering an ambiguous "HTML".
+        self.assertIn('>HTML v2<span class="pbp-bar-meta">3 KiB</span>', bar)
+        self.assertIn('>HTML v1<span class="pbp-bar-meta">2 KiB</span>', bar)
         self.assertIn('>JSONL<span class="pbp-bar-meta">4 KiB</span>', bar)
         self.assertIn('>TXT<span class="pbp-bar-meta">2 files</span>', bar)
         self.assertIn('>ZIP<span class="pbp-bar-meta">support archive</span>', bar)
@@ -390,7 +394,7 @@ class WebUITests(unittest.TestCase):
         self.assertIn('<a class="back" href="/">&larr; Back to dashboard</a>', bar)
 
     def test_a_completed_run_row_opens_its_report(self):
-        def run(run_id, status, report):
+        def run(run_id, status, report, report_v2=False):
             return {
                 "target": "PA-440",
                 "run_id": run_id,
@@ -401,6 +405,7 @@ class WebUITests(unittest.TestCase):
                 "peak_packet_buffer_pct": 42,
                 "top_sources": ["203.0.113.7"],
                 "report": report,
+                "report_v2": report_v2,
                 "jsonl": True,
                 "text_files": 2,
             }
@@ -434,6 +439,37 @@ class WebUITests(unittest.TestCase):
             running,
         )
         self.assertNotIn("incident.jsonl", completed)
+
+    def test_a_run_row_opens_the_layered_report_when_one_exists(self):
+        """The verdict is what an operator needs first; v1 stays one link away."""
+        page = render_dashboard(
+            {
+                "syslog_healthy": True,
+                "logs": [],
+                "runs": [
+                    {
+                        "target": "PA-440",
+                        "run_id": "run-both",
+                        "started_at": "2026-01-01T00:00:00Z",
+                        "status": "completed",
+                        "stop_reason": "resources_recovered",
+                        "cycles": 3,
+                        "peak_packet_buffer_pct": 42,
+                        "top_sources": [],
+                        "report": True,
+                        "report_v2": True,
+                        "jsonl": True,
+                        "text_files": 0,
+                    }
+                ],
+            }
+        )
+
+        self.assertIn(
+            '<a class="rowlink" href="/reports/PA-440/run-both/report-v2.html"',
+            page,
+        )
+        self.assertNotIn("run-both/report.html", page)
 
     def test_a_run_whose_report_is_missing_still_offers_its_records(self):
         page = render_dashboard(
