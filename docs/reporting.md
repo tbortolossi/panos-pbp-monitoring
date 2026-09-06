@@ -185,13 +185,18 @@ returns that pool, and the report says so instead of showing "Not collected"),
 the packet-descriptor and SW-tag peaks, the buffer latency peak, and the
 thresholds. The alert and activate thresholds come from the PBP settings read
 from the running configuration at monitor start and again at stop — the read
-at stop wins when a commit landed during the incident, and a start read that
-PBP's own mitigation contradicts (mitigating below the activate threshold it
-reports, which happens when the monitor starts mid-commit) is named as such
+at stop wins when a commit landed during the incident, a start read that
+returned no PBP configuration at all (a configuration left at the PAN-OS
+defaults reads the same way as a failed read) makes the step say the
+start-of-run settings are unknown and that the values may not describe the
+whole run, and a start read that PBP's own mitigation contradicts (mitigation
+*starting* below the activate threshold it reports, which happens when the
+monitor starts mid-commit; an incident decaying below the threshold while PBP
+is still listed active contradicts nothing) is named as such
 rather than quoted; when a capture predates that
 read, the alert threshold is taken from the firewall's own congestion log
-(`alert threshold is N%`) if a trigger carried it, and the lowest utilization
-at which PBP was seen mitigating bounds the activate threshold. The buffer
+(`alert threshold is N%`) if a trigger carried it, and the utilization of the
+first batch that caught PBP mitigating bounds the activate threshold. The buffer
 latency (`show session packet-buffer-protection buffer-latency`, per batch)
 is read against the latency thresholds: latency at or above the activate
 threshold with low buffers is the latency case, and the step says whether this
@@ -217,8 +222,12 @@ PBP threat logs of the incident window, queried once at stop, confirm the
 list: the step counts them by ID, names the sources placed in the block table
 (8509) and the sessions discarded (8508), and designates from them alone when
 no batch caught an entry marked for RED, because PBP had acted before or
-between the batches. They appear in full in a **PBP threat logs** section under
-step 2, and a failed query is stated. When PBP never activated (alert only) and
+between the batches. That holds only while the query could be bounded to the
+window on the firewall clock: when the clock could not be read, the query
+returns the device's most recent PBP threat logs of any age, and the step says
+so and treats them as corroboration — it never confirms the incident from them
+and never designates a source from them. They appear in full in a **PBP threat
+logs** section under step 2, and a failed query is stated. When PBP never activated (alert only) and
 logged nothing, the step says no offender was learned; when it activated but
 marked nothing for RED, the work was spread over many small entries.
 
@@ -263,7 +272,9 @@ the exhaustion), *decryption proxy pressure* (`tcp_fptcp_*` retransmissions —
 aggregate proxied load where blocking PBP's named sources punishes victims),
 *held resources* (occupancy decoupled from session load, a pool pinned near
 full, or a buffer-latency long tail — the leak signature, with the advice to
-capture the dataplane `pan_task` logs within minutes), *flood through an
+capture the dataplane `pan_task` logs within minutes; a packet-buffer or
+packet-descriptor pool full while the buffers themselves are under pressure is
+the flood, not a leak, and is not read as one), *flood through an
 unprotected zone* (PBP dropping while the zone flood counters stay silent —
 verify with `show zone-protection`), *single-dataplane saturation* (one DP at
 the activate threshold beside an idle chassis median), *session-table

@@ -1474,7 +1474,10 @@ def _render_pbp_threat_logs(events: list[tuple[int, dict[str, Any]]]) -> str:
         window = (
             f" since {_escape(since)} on the firewall clock"
             if since
-            else " (most recent entries, no time filter: the firewall clock could not be read)"
+            else (
+                " (most recent entries, no time filter: the firewall clock could "
+                "not be read, so they may predate this incident)"
+            )
         )
         if not entries:
             body = (

@@ -31,6 +31,10 @@ DEFAULT_ACTIVATE_PERCENT = 80.0
 # Above this share the on-chip packet descriptors are the exhausted resource
 # (PAN-OS troubleshooting guidance treats a sustained 80-90 % as critical).
 DESCRIPTOR_EXHAUSTION_PERCENT = 80.0
+# A congestion reading this far below the configured activate threshold is
+# still consistent with it: PAN-OS reports whole percents while the dataplane
+# mitigates on its own fraction, so only a clear gap contradicts the read.
+MITIGATION_THRESHOLD_MARGIN_PERCENT = 1.0
 # Ingress backlogs list a session from 2 % of the queue; that is the level at
 # which PAN-OS itself considers it worth naming.
 INGRESS_BACKLOG_PERCENT = 2.0
@@ -219,14 +223,19 @@ def _configured_settings(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     The read at stop wins over the read at start when both parsed and differ:
     a monitor started during a commit reads the old configuration while the
     dataplane already applies the new thresholds. The result says whether
-    that happened.
+    that happened, and whether the read at start returned nothing at all - in
+    which case the values are the ones in force at stop and may not describe
+    the whole run.
     """
     start: dict[str, Any] = {}
     reread: dict[str, Any] = {}
     changed = False
+    start_unknown = False
     for record in events:
         event = str(record.get("event", "")).lower()
         settings = record.get("pbp_settings")
+        if event == "pbp_settings_reread":
+            start_unknown = bool(record.get("start_settings_unknown"))
         if not isinstance(settings, dict) or settings.get("status") != "parsed":
             continue
         if event == "monitor_started" and not start:
@@ -237,11 +246,21 @@ def _configured_settings(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     chosen = reread if reread and changed else (start or reread)
     if not chosen:
         return {}
-    return {**chosen, "changed_during_run": changed}
+    return {
+        **chosen,
+        "changed_during_run": changed,
+        "start_unknown": start_unknown and not changed,
+    }
 
 
 def _threat_log_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """Count the PBP threat logs captured at monitor stop, per ID and source."""
+    """Count the PBP threat logs captured at monitor stop, per ID and source.
+
+    ``bounded`` says whether the query carried a ``receive_time`` filter. When
+    the firewall clock could not be read the query returns the most recent PBP
+    threat logs of the device, of any age: they corroborate at best, and the
+    diagnosis must never present them as confirming this incident.
+    """
     record = next(
         (
             item
@@ -254,6 +273,11 @@ def _threat_log_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "collected": record is not None,
         "ok": bool(record and record.get("ok") is True),
         "error": record.get("error") if record else None,
+        "bounded": bool(
+            record.get("time_bounded") or record.get("since_firewall_time")
+        )
+        if record
+        else False,
         "counts": {},
         "sources": {},
         "entries": [],
@@ -287,6 +311,27 @@ def syslog_alert_known(context: dict[str, Any]) -> bool:
         context.get("configured_alert_percent") is None
         or context["alert_percent"] != context["configured_alert_percent"]
     )
+
+
+_BUFFER_BACKED_POOL_MARKERS = (
+    "packet buffer",
+    "packet descriptor",
+    "descriptor",
+    "pkt buf",
+    # "pki pool dflt" is the on-chip packet pool, the congestion alert's own
+    # denominator: it fills with the buffers, by construction.
+    "pki pool",
+)
+
+
+def _is_buffer_backed_pool(pool: dict[str, Any]) -> bool:
+    """Whether a diagnostic pool is the packet buffer or descriptor memory.
+
+    Such a pool near full during buffer pressure describes the pressure, not
+    resources held by a leak, so the leak signature must not read it as one.
+    """
+    name = str(pool.get("name") or "").strip().lower()
+    return any(marker in name for marker in _BUFFER_BACKED_POOL_MARKERS)
 
 
 def _pbp_statuses(cycles: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -477,27 +522,40 @@ def _context(
         if any(status.get("enabled") is True for status in statuses)
         else "unknown"
     )
-    active_congestions = [
-        value
-        for status in statuses
-        if status.get("active") is True
-        and (value := _first_number(status.get("congestion_percentage"))) is not None
-    ]
     settings = _configured_settings(events)
     configured_alert = _first_number(settings.get("alert_percent"))
     configured_activate = _first_number(settings.get("activate_percent"))
     syslog_alert = _configured_alert_percent(events)
-    mitigating_from = min(active_congestions) if active_congestions else None
+    # The congestion of the first batch that caught PBP mitigating: the level
+    # at which mitigation started. A later batch reading lower is ordinary
+    # decay - PBP stays listed active while the congestion falls back - and
+    # says nothing about the activate threshold.
+    mitigating_from = next(
+        (
+            value
+            for status in statuses
+            if status.get("active") is True
+            and (value := _first_number(status.get("congestion_percentage")))
+            is not None
+        ),
+        None,
+    )
     if settings:
         alert = configured_alert if configured_alert is not None else DEFAULT_ALERT_PERCENT
         activate = configured_activate if configured_activate is not None else DEFAULT_ACTIVATE_PERCENT
         alert_source = "configuration"
-        # PBP cannot mitigate below its activate threshold. When it does, the
-        # read did not return the thresholds in force — a commit landing during
-        # the read is one explanation, a threshold set outside this xpath is
-        # another — so state the contradiction and fall back rather than
-        # asserting a cause the capture cannot prove.
-        if mitigating_from is not None and mitigating_from < activate:
+        # PBP cannot start mitigating below its activate threshold. When it
+        # does, the read did not return the thresholds in force — a commit
+        # landing during the read is one explanation, a threshold set outside
+        # this xpath is another — so state the contradiction and fall back
+        # rather than asserting a cause the capture cannot prove. Only the
+        # onset counts, and only beyond a rounding margin: an incident decaying
+        # below the threshold while PBP is still listed active contradicts
+        # nothing.
+        if (
+            mitigating_from is not None
+            and mitigating_from < activate - MITIGATION_THRESHOLD_MARGIN_PERCENT
+        ):
             alert_source = "inconsistent"
             alert = syslog_alert if syslog_alert is not None else alert
     elif syslog_alert is not None:
@@ -539,6 +597,10 @@ def _context(
         # configuration read so a report can name the two when they disagree.
         "syslog_alert_percent": syslog_alert,
         "settings_changed_during_run": bool(settings.get("changed_during_run")) if settings else False,
+        # The read at start returned no PBP configuration while the read at
+        # stop did: the values describe the end of the run, and the report
+        # says so rather than presenting them as the run's thresholds.
+        "settings_start_unknown": bool(settings.get("start_unknown")) if settings else False,
         "configured_enabled": settings.get("enabled") if settings else None,
         "latency_alert_ms": _first_number(settings.get("latency_alert_ms")) if settings else None,
         "latency_activate_ms": _first_number(settings.get("latency_activate_ms")) if settings else None,
@@ -602,6 +664,12 @@ def _step_pressure(cycles: Sequence[dict[str, Any]], context: dict[str, Any]) ->
             threshold_text += (
                 " at monitor stop; the values read at start differed, so a "
                 "commit landed during the incident"
+            )
+        elif context["settings_start_unknown"]:
+            threshold_text += (
+                " at monitor stop; the read at monitor start returned no PBP "
+                "configuration, so the start-of-run settings are unknown and "
+                "these values may not describe the whole run"
             )
         if context["configured_enabled"] is False:
             threshold_text += "; PBP is disabled in the configuration"
@@ -825,18 +893,31 @@ def _step_pbp_named(
         ("Entries learned", _fmt(len(learned)), "none"),
         ("Marked for RED", _fmt(len(marked)), "none"),
     ]
+    # A query the firewall clock could not bound returns the most recent PBP
+    # threat logs of the device, of any age. They stay in the report as
+    # corroboration, but nothing here may be counted as evidence of *this*
+    # incident: not the verdict, not the designations, not the level.
+    bounded = bool(threat_logs["bounded"])
+    confirming_counts = threat_logs["counts"] if bounded else {}
     if threat_logs["collected"]:
         if threat_logs["ok"]:
-            facts.append(
-                (
-                    "PBP threat logs",
-                    ", ".join(
-                        f"{count} × {threat_id} {_THREAT_LABELS.get(threat_id, '')}".strip()
-                        for threat_id, count in sorted(threat_logs["counts"].items())
-                    )
-                    or "none in the window",
-                    "bad" if threat_logs["counts"] else "ok",
+            counted = ", ".join(
+                f"{count} × {threat_id} {_THREAT_LABELS.get(threat_id, '')}".strip()
+                for threat_id, count in sorted(threat_logs["counts"].items())
+            )
+            if not counted:
+                counted = (
+                    "none in the window"
+                    if bounded
+                    else "none in the most recent entries"
                 )
+            elif not bounded:
+                counted += (
+                    " — not limited to the incident window: the firewall clock "
+                    "could not be read, so these entries may predate it"
+                )
+            facts.append(
+                ("PBP threat logs", counted, "bad" if confirming_counts else "ok")
             )
         else:
             facts.append(("PBP threat logs", f"query failed: {threat_logs['error'] or 'unknown'}", "none"))
@@ -850,7 +931,20 @@ def _step_pbp_named(
         key=lambda source: -threat_logs["sources"][source]["count"],
     )
     threat_text = ""
-    if threat_logs["ok"] and threat_logs["counts"]:
+    if threat_logs["ok"] and threat_logs["counts"] and not bounded:
+        threat_text = (
+            " The firewall's threat log holds "
+            + ", ".join(
+                f"{count} × {_THREAT_LABELS.get(threat_id, threat_id)} ({threat_id})"
+                for threat_id, count in sorted(threat_logs["counts"].items())
+            )
+            + ", but the query could not be limited to the incident window - the "
+            "firewall clock could not be read - so these are simply the most "
+            "recent PBP threat logs of the device and may belong to an earlier "
+            "episode. They corroborate at best: they neither confirm this "
+            "incident nor name a source for it."
+        )
+    elif threat_logs["ok"] and threat_logs["counts"]:
         threat_text = (
             " The firewall's own threat log confirms it: "
             + ", ".join(
@@ -875,21 +969,23 @@ def _step_pbp_named(
             )
             + "."
         )
-    if not activated and not threat_logs["counts"]:
+    if not activated and not confirming_counts:
         state, level = "negative", "ok"
         verdict = (
             "<strong>PBP never activated, so it learned no offender.</strong> An "
             "alert-only PBP reports the utilization and nothing else: no threat "
             "log, no RED, no ranked session. The culprit has to come from the "
             "ingress backlogs or from the wider evidence."
+            + threat_text
         )
-    elif not marked and not threat_logs["counts"]:
+    elif not marked and not confirming_counts:
         state, level = "negative", "ok"
         verdict = (
             f"<strong>PBP activated and learned {len(learned)} entries, but marked "
             "none for RED.</strong> The work was spread over many small entries "
             "rather than concentrated on one session or source, which points away "
             "from a single offender and towards a burst or aggregate load."
+            + threat_text
         )
     elif not marked:
         state = "positive"
@@ -1732,11 +1828,19 @@ def _step_elsewhere(
     # Held resources: buffer occupancy decoupled from session load, pools
     # pinned near full, or a latency long tail - the leak class. Positive
     # evidence that buffers are being kept, not processed.
+    # A pool backed by the packet buffer or by the packet descriptors is full
+    # *because* the buffers are full: during a flood its occupancy is the
+    # incident itself, not memory nobody frees. It is leak evidence only when
+    # the buffers were not under pressure at the same time.
+    buffers_under_pressure = (
+        buffer_peak is not None and buffer_peak >= DEFAULT_ALERT_PERCENT
+    )
     held_pools = [
         pool
         for pool in diagnostic_pools or []
         if (_first_number(pool.get("used_percentage")) or 0.0)
         >= POOL_HELD_PERCENT
+        and not (buffers_under_pressure and _is_buffer_backed_pool(pool))
     ]
     # Decoupling is judged against the PAN-OS default alert level, never a
     # lowered configured threshold: a lab firewall alerting at 1% with 4%
@@ -1963,8 +2067,15 @@ def _step_elsewhere(
     # was blocked and what that costs when the source is shared
     # infrastructure.
     threat_summary = context.get("threat_logs") or {}
+    threat_bounded = bool(
+        threat_summary.get("bounded") if isinstance(threat_summary, dict) else False
+    )
+    # Threat logs the firewall clock could not bound may predate this
+    # incident, so they never establish that PBP blocked during it.
     threat_counts = (
-        threat_summary.get("counts") if isinstance(threat_summary, dict) else {}
+        (threat_summary.get("counts") if isinstance(threat_summary, dict) else {})
+        if threat_bounded
+        else {}
     ) or {}
     blocked_hosts = _signal_total(
         pbp_counters, "flow_dos_pbp_block_host", "pkt_buf_protect_block_ip"
@@ -1977,7 +2088,7 @@ def _step_elsewhere(
         blocked_sources = [
             f"<code>{_escape(source)}</code>"
             for source, item in (
-                threat_summary.get("sources") or {}
+                (threat_summary.get("sources") or {}) if threat_bounded else {}
             ).items()
             if isinstance(item, dict) and 8509 in (item.get("ids") or set())
         ]
@@ -2049,7 +2160,11 @@ def _step_elsewhere(
         verdict = (
             "<strong>"
             + ", ".join(hypothesis["title"] for hypothesis in positives)
-            + ("</strong> would be supported" if len(positives) == 1 else "</strong> would be supported")
+            + (
+                "</strong> would be a supported finding"
+                if len(positives) == 1
+                else "</strong> would be supported findings"
+            )
             + ", but step 1 found no shortage of buffers or descriptors, so nothing "
             "here caused an incident; the signals are listed for completeness."
         )

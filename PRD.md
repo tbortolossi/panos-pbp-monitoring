@@ -176,7 +176,9 @@ than create a concurrent one.
    8509 of the incident window, expressed on the firewall clock read in the
    first batch with a one-minute margin, so the firewall's own designations
    are in the capture even when its threat log is not forwarded to the
-   collector. Raw responses are preserved as evidence and a failed lookup
+   collector. When that clock could not be parsed the query carries no time
+   filter; the record marks it unbounded so the diagnosis reads its entries as
+   corroboration rather than as designations for this incident. Raw responses are preserved as evidence and a failed lookup
    never blocks the stop marker or the report.
 10. After the stop marker is written, two standalone HTML reports are
    generated in the background from the same JSONL file: the layered
@@ -648,15 +650,26 @@ key must be backed up and restored together.
     measurement is stated. The PBP settings are read a second time at stop and
     the record says whether they moved: a monitor started while a commit is
     landing reads the old configuration while the dataplane already applies
-    the new thresholds, so the read at stop wins when it differs, and when PBP
-    was seen mitigating below the activate threshold read, the diagnosis
-    states that the read was taken during a commit and does not quote it as
-    the threshold in force. The PBP threat logs of the incident window are
-    queried once at stop and feed step 2: they confirm the entries marked for
-    RED, name the sources placed in the block table (8509) and the sessions
-    discarded (8508), and designate on their own when no batch caught a RED
-    entry, always presented as the firewall's own list and not as proof; a
-    failed query is stated. Every new command is replayable and exported with
+    the new thresholds, so the read at stop wins when it differs. A start read
+    that returned no PBP configuration cannot be compared — a configuration
+    left at the PAN-OS defaults reads exactly like a failed read — so the
+    record marks the start of the run unknown instead of claiming a commit,
+    and the diagnosis states that the values describe the end of the run and
+    may not describe the whole of it. When PBP was seen *starting* to mitigate
+    below the activate threshold read, beyond a rounding margin, the diagnosis
+    states that the read does not describe the thresholds in force and does
+    not quote it; an incident decaying below the threshold while PBP is still
+    listed active is ordinary decay and contradicts nothing. The PBP threat
+    logs of the incident window are queried once at stop and feed step 2: they
+    confirm the entries marked for RED, name the sources placed in the block
+    table (8509) and the sessions discarded (8508), and designate on their own
+    when no batch caught a RED entry, always presented as the firewall's own
+    list and not as proof. The record says whether the query could be bounded
+    to the window on the firewall clock; when it could not, the entries are
+    kept as evidence but read as corroboration only — the diagnosis states
+    that they could not be limited to the incident window, never confirms the
+    incident with them and never designates a source from them. A failed query
+    is stated. Every new command is replayable and exported with
     the capture.
 
 58. The report is two-part: the Diagnosis is the only section open by

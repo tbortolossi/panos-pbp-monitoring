@@ -3881,19 +3881,36 @@ class MonitorController:
         configuration before the commit lands, while the dataplane already
         applies the new thresholds: the startup read then contradicts the
         observed mitigation. A second read at stop, one call, settles it.
+
+        A configuration left entirely at the PAN-OS defaults returns no
+        session element and reads as unparsed, exactly as a failed read does.
+        A start read that did not parse therefore cannot be compared: when the
+        stop read returns values the two differ, but nothing says whether an
+        operator committed them during the run, so the record marks the start
+        of the run unknown instead of claiming a commit.
         """
         _, payload = await self._collect_command("pbp_settings", PBP_SETTINGS_COMMAND)
         settings = extract_pbp_settings(command_result(payload))
         compared = [key for _, key in _PBP_SETTING_FIELDS] + ["enabled"]
-        changed = (
-            settings.get("status") == "parsed"
-            and startup_settings.get("status") == "parsed"
-            and any(settings.get(key) != startup_settings.get(key) for key in compared)
+        parsed_at_stop = settings.get("status") == "parsed"
+        parsed_at_start = startup_settings.get("status") == "parsed"
+        differ = any(
+            settings.get(key) != startup_settings.get(key) for key in compared
         )
+        changed = parsed_at_stop and parsed_at_start and differ
+        start_unknown = parsed_at_stop and not parsed_at_start and differ
         if changed:
             LOG.warning(
                 "PBP settings of %s changed during monitor %s: a commit was in "
                 "progress; the report uses the values read at stop",
+                self.cfg.target_name or self.cfg.panos_url,
+                run_id,
+            )
+        elif start_unknown:
+            LOG.warning(
+                "PBP settings of %s could not be read at the start of monitor "
+                "%s; the report uses the values read at stop and states that "
+                "they may not describe the whole run",
                 self.cfg.target_name or self.cfg.panos_url,
                 run_id,
             )
@@ -3906,6 +3923,7 @@ class MonitorController:
                 "target_name": self.cfg.target_name,
                 "pbp_settings": settings,
                 "changed_since_start": bool(changed),
+                "start_settings_unknown": bool(start_unknown),
                 "commands": {"pbp_settings": payload},
             },
         )
@@ -3922,7 +3940,10 @@ class MonitorController:
         designations reach the capture this way even when its threat log is
         not forwarded to the collector; the window is expressed on the
         firewall clock read in the first batch, with a margin, or left open
-        when that clock could not be parsed.
+        when that clock could not be parsed. An unfiltered query still returns
+        evidence worth keeping, so it is kept, and the record says the entries
+        could not be limited to the incident window: the diagnosis then reads
+        them as corroboration and never as confirmation.
         """
         since = firewall_clock_query_time(firewall_clock)
         query = pbp_threat_log_query(since)
@@ -3933,6 +3954,7 @@ class MonitorController:
             "target_name": self.cfg.target_name,
             "query": query,
             "since_firewall_time": since,
+            "time_bounded": since is not None,
             "ok": False,
         }
         try:

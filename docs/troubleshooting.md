@@ -158,7 +158,9 @@ the backup window — not an attack.
 - **Held resources (leak)** — occupancy decoupled from session load, a
   diagnostic pool (`Timer Pool`, `PKI POOL DFLT`, `proxy_flow`, `ssl_st`,
   `fptcp_seg`) near full, or a buffer-latency maximum orders of magnitude
-  above the average. The proof of the root cause usually lives in the
+  above the average. A packet-buffer or packet-descriptor pool full while the
+  buffers are under pressure is not counted here: that pool is full because
+  the buffers are, which is the flood itself and not memory nobody frees. The proof of the root cause usually lives in the
   dataplane `pan_task` logs, which rotate in about a minute at debug level —
   capture them within minutes of an episode, and check later maintenance
   releases for buffer-leak fixes before blaming the traffic.

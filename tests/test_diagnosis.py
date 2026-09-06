@@ -7,7 +7,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pbp_monitoring.diagnosis import build_diagnosis, hardware_generation
+from pbp_monitoring.diagnosis import (
+    build_diagnosis,
+    collect_findings,
+    hardware_generation,
+)
 from pbp_monitoring.reporting import generate_html_report
 
 
@@ -316,7 +320,7 @@ class ElsewhereStepTests(unittest.TestCase):
         )
 
         self.assertEqual(diagnosis["steps"][3]["state"], "negative")
-        self.assertIn("would be supported", diagnosis["steps"][3]["verdict"])
+        self.assertIn("would be a supported finding", diagnosis["steps"][3]["verdict"])
         self.assertEqual(diagnosis["headline"]["label"], "Low pressure")
         self.assertNotIn("Elephant session:", " ".join(diagnosis["conclusion"]))
 
@@ -381,6 +385,96 @@ class CapturedEvidenceTests(unittest.TestCase):
             diagnosis["conclusion"][1],
         )
 
+    def test_an_incident_decaying_below_the_threshold_contradicts_nothing(self):
+        """Congestion falling back while PBP is still listed active is decay.
+
+        Only the level at which mitigation started can contradict the read; a
+        later, lower batch must not make the report call a correct settings
+        read inconsistent.
+        """
+        decaying = _diagnose(
+            [
+                _cycle(1, 85.0, pbp_status={"enabled": True, "active": True,
+                                            "congestion_percentage": 85.0}),
+                _cycle(2, 60.0, pbp_status={"enabled": True, "active": True,
+                                            "congestion_percentage": 60.0}),
+            ],
+            [self._started(alert_percent=50.0, activate_percent=80.0)],
+        )
+        rounding = _diagnose(
+            [_cycle(1, 80.0, pbp_status={"enabled": True, "active": True,
+                                         "congestion_percentage": 79.4})],
+            [self._started(alert_percent=50.0, activate_percent=80.0)],
+        )
+        lab = _diagnose(
+            [_cycle(1, 4.4, pbp_status={"enabled": True, "active": True,
+                                        "congestion_percentage": 4.3})],
+            [self._started(alert_percent=50.0, activate_percent=80.0)],
+        )
+
+        self.assertEqual(decaying["context"]["alert_source"], "configuration")
+        self.assertEqual(decaying["context"]["mitigating_from_percent"], 85.0)
+        self.assertNotIn(
+            "does not describe the thresholds that were in force",
+            decaying["steps"][0]["facts"][-1][1],
+        )
+        self.assertEqual(rounding["context"]["alert_source"], "configuration")
+        self.assertEqual(lab["context"]["alert_source"], "inconsistent")
+
+    def test_settings_unreadable_at_start_are_stated_as_an_unknown_start(self):
+        reread = {"event": "pbp_settings_reread", "changed_since_start": False,
+                  "start_settings_unknown": True,
+                  "pbp_settings": {"status": "parsed", "enabled": True,
+                                   "alert_percent": 20.0, "activate_percent": 40.0}}
+        diagnosis = _diagnose(
+            [_cycle(1, 60.0)],
+            [{"run_id": "r", "event": "monitor_started",
+              "device": {"model": "PA-5220", "software_version": "10.2.9"},
+              "pbp_settings": {"status": "unparsed"}},
+             reread],
+        )
+        context = diagnosis["context"]
+        thresholds = diagnosis["steps"][0]["facts"][-1][1]
+
+        self.assertEqual(context["alert_source"], "configuration")
+        self.assertEqual(context["activate_percent"], 40.0)
+        self.assertTrue(context["settings_start_unknown"])
+        self.assertFalse(context["settings_changed_during_run"])
+        self.assertIn("the start-of-run settings are unknown", thresholds)
+        self.assertNotIn("a commit landed during the incident", thresholds)
+
+    def test_threat_logs_without_a_time_filter_never_confirm_the_incident(self):
+        """An unbounded query returns the device's most recent PBP logs.
+
+        They may belong to an earlier episode, so they corroborate at most:
+        they must not designate a source or turn step 2 positive.
+        """
+        threat = {
+            "event": "pbp_threat_logs", "ok": True, "time_bounded": False,
+            "since_firewall_time": None,
+            "entries": [
+                {"threat_id": 8509, "source_ip": "203.0.113.9", "threat_name": "PBP IP Blocked"},
+                {"threat_id": 8507, "source_ip": "203.0.113.9", "threat_name": "PBP Packet Drop"},
+            ],
+        }
+        diagnosis = _diagnose(
+            [_cycle(1, 84.0, pbp_status={"enabled": True, "active": False})],
+            [self._started(), threat],
+        )
+        named = diagnosis["steps"][1]
+
+        self.assertEqual(named["state"], "negative")
+        self.assertEqual(named["named"], [])
+        self.assertNotIn("threat log confirms it", named["verdict"])
+        self.assertIn("could not be limited to the incident window", named["verdict"])
+        self.assertIn("corroborate at best", named["verdict"])
+        self.assertIn("not limited to the incident window", named["facts"][-1][1])
+        self.assertEqual(named["facts"][-1][2], "ok")
+        self.assertNotIn(
+            "Source blocking and its collateral",
+            [item["title"] for item in collect_findings(diagnosis)["confirmed"]],
+        )
+
     def test_the_read_at_stop_wins_when_the_settings_changed(self):
         reread = {"event": "pbp_settings_reread", "changed_since_start": True,
                   "pbp_settings": {"status": "parsed", "enabled": True, "alert_percent": 1.0, "activate_percent": 2.0}}
@@ -416,7 +510,8 @@ class CapturedEvidenceTests(unittest.TestCase):
 
     def test_threat_logs_designate_when_no_batch_caught_a_red_entry(self):
         threat = {
-            "event": "pbp_threat_logs", "ok": True,
+            "event": "pbp_threat_logs", "ok": True, "time_bounded": True,
+            "since_firewall_time": "2026/08/30 09:59:00",
             "entries": [
                 {"threat_id": 8509, "source_ip": "203.0.113.9", "threat_name": "PBP IP Blocked"},
                 {"threat_id": 8507, "source_ip": "203.0.113.9", "threat_name": "PBP Packet Drop"},
@@ -585,6 +680,41 @@ class SignatureTests(unittest.TestCase):
         self.assertIn("SSL-proxy leak class", hypothesis["text"])
         self.assertIn("Timer Pool", hypothesis["named"][0])
 
+    def test_a_full_packet_buffer_pool_under_pressure_is_the_flood_not_a_leak(self):
+        """The packet-buffer pool is full because the buffers are: that is the
+        incident, not memory nobody frees. The leak signature must not fire on
+        it while the buffers are under pressure, and must still fire on the
+        same pool when they are not."""
+        pools = [
+            {
+                "name": "Packet Buffers",
+                "dataplane": "s1dp0",
+                "used_percentage": 84.8,
+                "available": 14_785,
+                "total": 97_280,
+            }
+        ]
+        flood = _diagnose(
+            [_cycle(1, 92.0), _cycle(2, 93.0)],
+            cpu_verdicts=[{"dataplane": "s1.dp0", "state": "collective",
+                           "hottest_core": "3", "hottest_value": 95, "median": 90}],
+            signal_summary=_signal_summary(
+                arp_storm=[_signal("flow_arp_pkt_rcv", 1_534_439_152, 465_000)]
+            ),
+            diagnostic_pools=pools,
+        )
+        idle = _diagnose(
+            [_cycle(1, 12.0), _cycle(2, 12.0)],
+            diagnostic_pools=pools,
+        )
+
+        self.assertNotIn("held_resources", self._hypotheses(flood))
+        self.assertNotIn(
+            "Held resources (leak signature)",
+            [item["title"] for item in collect_findings(flood)["confirmed"]],
+        )
+        self.assertIn("held, not processed", self._hypotheses(idle)["held_resources"]["text"])
+
     def test_pbp_dropping_with_silent_zone_counters_suspects_the_zone(self):
         session_series = [
             {"allocated": 1000.0, "pps": 1000.0, "cps": 10.0, "utilization": 1.0},
@@ -634,6 +764,8 @@ class SignatureTests(unittest.TestCase):
                 "run_id": "r",
                 "event": "pbp_threat_logs",
                 "ok": True,
+                "time_bounded": True,
+                "since_firewall_time": "2026/08/30 09:59:00",
                 "entries": [{"threat_id": 8509, "source_ip": "198.51.100.9"}],
             }
         ]

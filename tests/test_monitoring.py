@@ -2113,6 +2113,83 @@ class PbpEvidenceTests(unittest.TestCase):
             self.assertEqual(reread["pbp_settings"]["activate_percent"], 2.0)
             self.assertTrue(reread["changed_since_start"])
 
+    def test_settings_absent_at_start_and_read_at_stop_flag_an_unknown_start(self):
+        """A configuration left at the PAN-OS defaults returns no session
+        element, so the start read is unparsed. An operator lowering the
+        thresholds mid-run must still be visible: the record cannot claim a
+        commit it did not observe, but it must say the start of the run is
+        unknown instead of staying silent."""
+
+        class DefaultsThenSettingsClient(self.LogClient):
+            def op_response(self, command):
+                if command == PBP_SETTINGS_COMMAND and not self.commands.count(command):
+                    self.commands.append(command)
+                    return response("<result/>")
+                return super().op_response(command)
+
+        async def scenario(cfg):
+            controller = MonitorController(cfg, DefaultsThenSettingsClient())
+            await controller._monitor("fixture-run")
+            return incident_capture_path(cfg.output_dir, "fixture-run")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_file = asyncio.run(scenario(make_config(Path(temporary_directory))))
+            records = [
+                json.loads(line)
+                for line in output_file.read_text(encoding="utf-8").splitlines()
+            ]
+            started = next(r for r in records if r.get("event") == "monitor_started")
+            reread = next(r for r in records if r.get("event") == "pbp_settings_reread")
+
+            self.assertEqual(started["pbp_settings"]["status"], "unparsed")
+            self.assertEqual(reread["pbp_settings"]["activate_percent"], 60.0)
+            self.assertFalse(reread["changed_since_start"])
+            self.assertTrue(reread["start_settings_unknown"])
+
+    def test_an_unreadable_clock_marks_the_threat_query_as_unbounded(self):
+        """Without the firewall clock the query carries no receive_time
+        filter, so the entries it returns can be of any age. The evidence is
+        kept and the record says the window could not be applied."""
+
+        class UnreadableClockClient(self.LogClient):
+            def op_response(self, command):
+                if command == CLOCK_COMMAND:
+                    with self.lock:
+                        self.commands.append(command)
+                    return response("<result>clock is not available</result>")
+                return super().op_response(command)
+
+        async def scenario(cfg):
+            client = UnreadableClockClient()
+            controller = MonitorController(cfg, client)
+            await controller._monitor("fixture-run")
+            return client, incident_capture_path(cfg.output_dir, "fixture-run")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            client, output_file = asyncio.run(
+                scenario(make_config(Path(temporary_directory)))
+            )
+            records = [
+                json.loads(line)
+                for line in output_file.read_text(encoding="utf-8").splitlines()
+            ]
+            threat = next(r for r in records if r.get("event") == "pbp_threat_logs")
+
+            self.assertEqual(
+                client.queries,
+                [
+                    (
+                        "threat",
+                        "((threatid eq 8507) or (threatid eq 8508) or (threatid eq 8509))",
+                        50,
+                    )
+                ],
+            )
+            self.assertTrue(threat["ok"])
+            self.assertIsNone(threat["since_firewall_time"])
+            self.assertFalse(threat["time_bounded"])
+            self.assertEqual(threat["entries"][0]["threat_id"], 8509)
+
     def test_a_failed_threat_query_never_blocks_the_stop_marker(self):
         async def scenario(cfg):
             controller = MonitorController(cfg, FakeClient())  # no log query method
