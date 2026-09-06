@@ -42,6 +42,9 @@ from pbp_monitoring.orchestrator import (
     unique_run_id,
     panos_csv_serial,
     select_session_lookups,
+    SESSION_FILTER_COUNT_COMMAND,
+    SESSION_FILTER_LIST_COMMAND,
+    extract_pbp_settings,
 )
 
 
@@ -2315,6 +2318,193 @@ class PbpEvidenceTests(unittest.TestCase):
             self.assertFalse(threat["ok"])
             self.assertIn("AttributeError", threat["error"])
             self.assertEqual(records[-1]["event"], "monitor_stopped")
+
+
+class StopEvidenceClient(FakeClient):
+    """A FakeClient that also answers the offender session and log-query
+    commands the four stop-time collections issue, with an optional
+    deliberate failure on one log-query type."""
+
+    def __init__(self, *, fail_log_type: str | None = None):
+        super().__init__()
+        self.fail_log_type = fail_log_type
+        self.queries: list[tuple[str, str, int]] = []
+
+    def op_response(self, command: str) -> PanOSResponse:
+        if command == SESSION_FILTER_COUNT_COMMAND.format(source="203.0.113.9"):
+            with self.lock:
+                self.commands.append(command)
+            return response("<result><member>1</member></result>")
+        if command == SESSION_FILTER_LIST_COMMAND.format(source="203.0.113.9"):
+            with self.lock:
+                self.commands.append(command)
+            return response(
+                "<result><entry><dst>198.51.100.5</dst><sport>1</sport>"
+                "<dport>2</dport><proto>udp</proto><from>outside</from>"
+                "<to>outside</to></entry></result>"
+            )
+        return super().op_response(command)
+
+    def log_query_job(self, log_type: str, query: str, nlogs: int) -> str:
+        if log_type == self.fail_log_type:
+            raise RuntimeError("job submission failed")
+        self.queries.append((log_type, query, nlogs))
+        return "60"
+
+    def log_query_result(self, job_id: str) -> PanOSResponse:
+        return PanOSResponse(
+            result_xml=(
+                "<result><job><status>FIN</status></job>"
+                '<log><logs count="1"><entry>'
+                "<receive_time>2026/08/27 10:00:20</receive_time>"
+                "<src>203.0.113.9</src><dst>0.0.0.0</dst>"
+                "<sport>0</sport><dport>0</dport><proto>udp</proto>"
+                "<app>not-applicable</app><from>outside</from>"
+                "<action>block-ip</action><sessionid>0</sessionid>"
+                "<repeatcnt>1</repeatcnt>"
+                "<threatid>PBP IP Blocked</threatid><tid>8509</tid>"
+                "<threat_name>PBP IP Blocked</threat_name>"
+                "</entry></logs></log></result>"
+            ),
+            raw_response='<response status="success"/>',
+        )
+
+
+class StopEvidenceConcurrencyTests(unittest.TestCase):
+    """The four stop-time collections (offender sessions, offender traffic
+    logs, the PBP threat-log job, and the settings re-read) are independent
+    of one another's results, so they run concurrently: a slow one must not
+    delay the others, and one failing must not cost the rest their record."""
+
+    def test_stop_collections_run_concurrently_so_a_slow_one_does_not_delay_the_others(
+        self,
+    ):
+        async def scenario(cfg) -> float:
+            client = StopEvidenceClient()
+            controller = MonitorController(cfg, client)
+            output_file = incident_capture_path(cfg.output_dir, "fixture-run")
+            startup_settings = extract_pbp_settings(
+                client.op_response(PBP_SETTINGS_COMMAND).result_xml
+            )
+
+            async def slow(*args, **kwargs) -> None:
+                await asyncio.sleep(0.3)
+
+            with patch.object(
+                controller,
+                "_collect_offender_traffic_logs",
+                new=AsyncMock(side_effect=slow),
+            ), patch.object(
+                controller, "_collect_pbp_threat_logs", new=AsyncMock(side_effect=slow)
+            ):
+                started = time.monotonic()
+                await controller._collect_stop_evidence(
+                    output_file,
+                    "fixture-run",
+                    {"203.0.113.9": 5},
+                    "Thu Aug 27 10:00:00 UTC 2026",
+                    startup_settings,
+                )
+                return time.monotonic() - started
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            elapsed = asyncio.run(scenario(make_config(Path(temporary_directory))))
+
+        # Two of the four collections are mocked to take 0.3s each. Run
+        # serially, that alone is 0.6s before the two fast ones even start;
+        # concurrent execution bounds the whole call by the slowest single
+        # one, with generous margin for scheduling overhead.
+        self.assertLess(elapsed, 0.5)
+
+    def test_a_failed_collection_does_not_suppress_the_others_records(self):
+        async def scenario(cfg) -> Path:
+            client = StopEvidenceClient(fail_log_type="threat")
+            controller = MonitorController(cfg, client)
+            output_file = incident_capture_path(cfg.output_dir, "fixture-run")
+            startup_settings = extract_pbp_settings(
+                client.op_response(PBP_SETTINGS_COMMAND).result_xml
+            )
+            await controller._collect_stop_evidence(
+                output_file,
+                "fixture-run",
+                {"203.0.113.9": 5},
+                "Thu Aug 27 10:00:00 UTC 2026",
+                startup_settings,
+            )
+            return output_file
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_file = asyncio.run(scenario(make_config(Path(temporary_directory))))
+            records = [
+                json.loads(line)
+                for line in output_file.read_text(encoding="utf-8").splitlines()
+            ]
+            events = {record.get("event") for record in records}
+
+            # The threat-log job submission fails, but the record it already
+            # writes on failure survives, and the other three collections -
+            # built from none of its output - are entirely unaffected.
+            self.assertEqual(
+                events,
+                {
+                    "offender_live_sessions",
+                    "offender_traffic_logs",
+                    "pbp_threat_logs",
+                    "pbp_settings_reread",
+                },
+            )
+            threat = next(r for r in records if r["event"] == "pbp_threat_logs")
+            self.assertFalse(threat["ok"])
+            self.assertIn("RuntimeError", threat["error"])
+            sessions = next(r for r in records if r["event"] == "offender_live_sessions")
+            self.assertTrue(sessions["sources"][0]["ok"])
+            traffic = next(r for r in records if r["event"] == "offender_traffic_logs")
+            self.assertTrue(traffic["sources"][0]["ok"])
+            reread = next(r for r in records if r["event"] == "pbp_settings_reread")
+            self.assertEqual(reread["pbp_settings"]["activate_percent"], 60.0)
+            self.assertFalse(reread["changed_since_start"])
+
+
+class SingleReportPassTests(unittest.TestCase):
+    """The stop path must read the JSONL capture once and hand the same
+    records to both the flat and the layered renderer, instead of each
+    independently re-reading and re-aggregating the whole file."""
+
+    def test_stop_path_reads_the_capture_once_for_both_reports(self):
+        import pbp_monitoring.reporting as reporting_module
+
+        real_read_jsonl = reporting_module._read_jsonl
+        calls: list[Path] = []
+
+        def counting_read_jsonl(path):
+            calls.append(path)
+            return real_read_jsonl(path)
+
+        async def exercise(output_dir: Path) -> str:
+            controller = MonitorController(
+                make_config(output_dir, generate_html_report=True), FakeClient()
+            )
+            controller.trigger(
+                "PBP Session Discarded threat-id=8508 session-id=42 src=192.0.2.9",
+                "192.0.2.1:514",
+            )
+            await controller.monitor_task
+            await controller.wait_for_reports()
+            return controller.run_id
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            with patch.object(
+                reporting_module, "_read_jsonl", side_effect=counting_read_jsonl
+            ):
+                run_id = asyncio.run(exercise(output_dir))
+
+            self.assertEqual(
+                len(calls), 1, "each report used to re-read the capture on its own"
+            )
+            run_directory = incident_capture_path(output_dir, run_id).parent
+            self.assertTrue((run_directory / "report.html").is_file())
+            self.assertTrue((run_directory / "report-v2.html").is_file())
 
 
 if __name__ == "__main__":
