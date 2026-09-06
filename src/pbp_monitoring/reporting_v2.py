@@ -550,7 +550,9 @@ def _render_html_v2(
 
 def generate_html_report_v2(jsonl_path: Path, html_path: Path | None = None) -> Path:
     """Generate an atomic, standalone layered report and return its final path."""
-    source, destination = resolve_report_destination(jsonl_path, html_path, ".v2.html")
+    source, destination = resolve_report_destination(
+        jsonl_path, html_path, REPORT_V2_FILENAME
+    )
     records, warnings, source_hash = _read_jsonl(source)
     return write_report_atomically(
         destination, _render_html_v2(source, records, warnings, source_hash)

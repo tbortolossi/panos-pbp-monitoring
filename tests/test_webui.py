@@ -20,7 +20,11 @@ from urllib.request import (
     build_opener,
 )
 
-from pbp_monitoring.reporting import REPORT_SCRIPT_CSP_HASH
+from pbp_monitoring.reporting import (
+    LEGACY_REPORT_SCRIPT_CSP_HASHES,
+    REPORT_SCRIPT_CSP_HASH,
+)
+from pbp_monitoring.reporting_v2 import REPORT_V2_SCRIPT_CSP_HASH
 from pbp_monitoring.webui import (
     annotate_report_head,
     handler_factory,
@@ -251,6 +255,42 @@ class ArtifactAuthenticationTests(unittest.TestCase):
             self.assertIn(f"script-src '{REPORT_SCRIPT_CSP_HASH}'", report_policy)
             self.assertIn("default-src 'none'", report_policy)
             self.assertIn("script-src 'none'", dashboard.headers["Content-Security-Policy"])
+
+    def test_a_report_written_before_the_upgrade_keeps_its_folding_control(self):
+        """Stored reports are never rewritten, so their scripts stay allowed.
+
+        A run collected by an earlier release keeps the report that release
+        wrote. Naming only the current script in the served policy silently
+        strips the Collapse all control from every older run reopened through
+        the dashboard, on the evidence an operator upgraded to go back to.
+        """
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            run_dir = root / "data" / "targets" / "fw-a" / "incidents" / "run-1"
+            run_dir.mkdir(parents=True)
+            (run_dir / "report.html").write_text(
+                "<html><body><h1>Incident report</h1></body></html>",
+                encoding="utf-8",
+            )
+            server, thread, setup_code = self._server(root)
+            base = f"http://127.0.0.1:{server.server_port}"
+            opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            try:
+                self._sign_in(opener, base, setup_code)
+                report = opener.open(base + "/reports/fw-a/run-1/report.html")
+                report.read()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+            policy = report.headers["Content-Security-Policy"]
+            self.assertTrue(LEGACY_REPORT_SCRIPT_CSP_HASHES)
+            for legacy in LEGACY_REPORT_SCRIPT_CSP_HASHES:
+                self.assertNotEqual(legacy, REPORT_SCRIPT_CSP_HASH)
+                self.assertIn(f"'{legacy}'", policy)
+            self.assertIn(f"'{REPORT_SCRIPT_CSP_HASH}'", policy)
+            self.assertIn(f"'{REPORT_V2_SCRIPT_CSP_HASH}'", policy)
 
     def test_a_report_heavier_than_a_chunk_still_offers_its_evidence(self):
         """A real incident report weighs tens of megabytes and must keep its exports.
@@ -893,6 +933,53 @@ class WebUITests(unittest.TestCase):
             '<li class="warn"><span class="mark"></span><span>API check:', rendered
         )
         self.assertIn("overdue, expected every 24 hours", rendered)
+
+    def test_a_check_that_lost_enrichment_evidence_is_amber_not_green_or_red(self):
+        """Reduced evidence is neither a healthy firewall nor an unreachable one.
+
+        The firewall answered every command monitoring needs, so red would send
+        an operator hunting a connectivity problem that does not exist; green
+        would hide that the reports of this firewall will be missing its
+        configured thresholds.
+        """
+        state = {
+            "syslog_healthy": True,
+            "syslog_age_seconds": 12,
+            "logs": [],
+            "runs": [],
+            "runs_total": 0,
+            "check_interval_hours": 24.0,
+            "firewalls": [
+                {
+                    "name": "fw-a",
+                    "enabled": True,
+                    "healthy": True,
+                    "last_received_at": "2026-08-28T12:00:00+00:00",
+                    "age_seconds": 12,
+                    "active_run": None,
+                    "last_check_at": "2026-08-28T11:00:00+00:00",
+                    "last_check_kind": "validation",
+                    "last_check_status": "warning",
+                    "last_check_detail": (
+                        "run 20260828T110000Z - reduced evidence: pbp_settings "
+                        "command failed, the configured PBP alert and activate "
+                        "thresholds could not be collected"
+                    ),
+                    "check_requested_at": None,
+                    "check_age_seconds": 3600,
+                }
+            ],
+            "pending_deletions": [],
+        }
+
+        rendered = render_dashboard(state)
+
+        self.assertIn(
+            '<li class="warn"><span class="mark"></span><span>API check:', rendered
+        )
+        self.assertIn("validation passed with warnings", rendered)
+        self.assertIn("reduced evidence", rendered)
+        self.assertNotIn("FAILED", rendered)
 
     def test_dashboard_reports_fresh_logs_runs_and_escaped_content(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

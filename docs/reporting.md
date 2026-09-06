@@ -26,7 +26,14 @@ Both are offered by the evidence bar of either page, as **HTML v2** and
 
 ```bash
 docker compose exec collector pbp-report-v2 /data/targets/<firewall>/incidents/<run_id>/incident.jsonl
+docker compose exec collector pbp-report /data/targets/<firewall>/incidents/<run_id>/incident.jsonl
 ```
+
+Each command rewrites, next to the capture, the very file the run's row opens —
+`report-v2.html` and `report.html` — so a regenerated report is the one the
+dashboard serves. `-o <path>` writes elsewhere instead; a report written under
+any other name is served by no page, and still travels in every run archive and
+support bundle at the expense of the raw evidence.
 
 ## The layered report, layer by layer
 

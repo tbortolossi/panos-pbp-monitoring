@@ -579,8 +579,13 @@ you already apply to your security rules, without replacing its existing destina
             return '<span class="muted">Never checked</span>'
         status = str(target.get("last_check_status") or "")
         kind = str(target.get("last_check_kind") or "check")
-        label = "Passed" if status == "ok" else "Failed"
-        colour = "#047857" if status == "ok" else "var(--bad)"
+        # A check that answered every monitoring command but lost an enrichment
+        # read is neither green nor red: the firewall is usable, the report will
+        # be missing a piece, and the detail line says which.
+        label = {"ok": "Passed", "warning": "Passed with warnings"}.get(
+            status, "Failed"
+        )
+        colour = {"ok": "#047857", "warning": "#b45309"}.get(status, "var(--bad)")
         detail = str(target.get("last_check_detail") or "")
         return (
             f'<strong style="color:{colour}">{_e(label)}</strong>'

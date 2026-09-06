@@ -22,6 +22,7 @@ from pbp_monitoring.orchestrator import (
     MultiTargetRouter,
     MonitorController,
     run_target_checks_once,
+    ApiCheckResult,
     apply_run_deletions,
     _run_directory,
     _runs_in_progress,
@@ -751,7 +752,9 @@ class MonitorTests(unittest.TestCase):
         cfg = make_config(Path("captures"), target_profiles=profiles)
 
         async def fake_check(target_cfg):
-            return target_cfg.output_dir / "api-check.jsonl", True
+            return ApiCheckResult(
+                target_cfg.output_dir / "api-check.jsonl", True, []
+            )
 
         with patch(
             "pbp_monitoring.orchestrator.run_api_check",
@@ -761,7 +764,7 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(mocked.await_count, 2)
         self.assertEqual(len(results), 2)
-        self.assertTrue(all(succeeded for _path, succeeded in results))
+        self.assertTrue(all(result.succeeded for result in results))
 
     def test_syslog_gateway_source_marker_is_normalized(self):
         metadata = extract_trigger_metadata(
@@ -1100,7 +1103,7 @@ class MonitorTests(unittest.TestCase):
             cfg = make_config(output_dir)
 
             with patch("pbp_monitoring.orchestrator.PanOSClient", return_value=client):
-                output_file, succeeded = asyncio.run(run_api_check(cfg))
+                output_file, succeeded, warnings = asyncio.run(run_api_check(cfg))
 
             records = [
                 json.loads(line)
@@ -1108,6 +1111,8 @@ class MonitorTests(unittest.TestCase):
             ]
             cycle = next(record for record in records if "cycle" in record)
             self.assertTrue(succeeded)
+            self.assertEqual(warnings, [])
+            self.assertEqual(cycle["validation_warnings"], [])
             self.assertTrue(records[0]["identity_complete"])
             self.assertEqual(records[0]["collector_version"], __version__)
             self.assertTrue(cycle["recovery_sample_eligible"])
@@ -1127,6 +1132,80 @@ class MonitorTests(unittest.TestCase):
             )
             self.assertEqual(cores[1]["sample_count"], 1)
             self.assertEqual(records[-1]["reason"], "api_check_complete")
+
+    def test_an_operational_only_api_role_still_passes_the_check_with_warnings(self):
+        """The documented least-privilege admin cannot read the running config.
+
+        `pbp_settings` is the one configuration read, and `buffer_latency` does
+        not exist on older PAN-OS. A firewall that answers every monitoring
+        command must stay green with the missing evidence named, or an upgrade
+        turns every target red with nothing changed on the firewall.
+        """
+
+        class OperationalOnlyClient(FakeClient):
+            def op_response(self, command: str) -> PanOSResponse:
+                if command == PBP_SETTINGS_COMMAND:
+                    raise PanOSAPIError(
+                        "Permission denied", raw_response="raw permission denied"
+                    )
+                if command == OP_COMMANDS["buffer_latency"]:
+                    raise PanOSAPIError(
+                        "Invalid syntax", raw_response="raw invalid syntax"
+                    )
+                return super().op_response(command)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            cfg = make_config(output_dir)
+
+            with patch(
+                "pbp_monitoring.orchestrator.PanOSClient",
+                return_value=OperationalOnlyClient(),
+            ):
+                output_file, succeeded, warnings = asyncio.run(run_api_check(cfg))
+
+            records = [
+                json.loads(line)
+                for line in output_file.read_text(encoding="utf-8").splitlines()
+            ]
+            cycle = next(record for record in records if "cycle" in record)
+
+            self.assertTrue(succeeded)
+            self.assertEqual(cycle["validation_errors"], [])
+            self.assertEqual(records[-1]["reason"], "api_check_complete")
+            self.assertEqual(sorted(warnings), sorted(cycle["validation_warnings"]))
+            self.assertEqual(len(warnings), 2)
+            self.assertTrue(
+                any("pbp_settings" in warning for warning in warnings), warnings
+            )
+            self.assertTrue(
+                any("buffer_latency" in warning for warning in warnings), warnings
+            )
+            # The raw refusal stays in the capture: it is what tells TAC which
+            # permission or which PAN-OS release is behind the missing evidence.
+            self.assertFalse(cycle["commands"]["buffer_latency"]["ok"])
+
+    def test_a_failed_monitoring_command_still_fails_the_check(self):
+        """Only enrichment is forgiven; a core read is still fatal."""
+
+        class NoSessionInfoClient(FakeClient):
+            def op_response(self, command: str) -> PanOSResponse:
+                if command == OP_COMMANDS["session_info"]:
+                    raise PanOSAPIError("unsupported", raw_response="raw failure")
+                return super().op_response(command)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            cfg = make_config(output_dir)
+
+            with patch(
+                "pbp_monitoring.orchestrator.PanOSClient",
+                return_value=NoSessionInfoClient(),
+            ):
+                _output_file, succeeded, warnings = asyncio.run(run_api_check(cfg))
+
+            self.assertFalse(succeeded)
+            self.assertEqual(warnings, [])
 
     def test_resource_monitor_window_tracks_poll_interval_with_margin(self):
         self.assertEqual(resource_monitor_window_seconds(5), 7)
@@ -1149,7 +1228,7 @@ class MonitorTests(unittest.TestCase):
                 "pbp_monitoring.orchestrator.PanOSClient",
                 return_value=OpaqueClient(),
             ):
-                output_file, succeeded = asyncio.run(run_api_check(cfg))
+                output_file, succeeded, _warnings = asyncio.run(run_api_check(cfg))
 
             records = [
                 json.loads(line)
@@ -1181,7 +1260,7 @@ class MonitorTests(unittest.TestCase):
                 "pbp_monitoring.orchestrator.PanOSClient",
                 return_value=CandidateClient(),
             ):
-                output_file, succeeded = asyncio.run(run_api_check(cfg))
+                output_file, succeeded, _warnings = asyncio.run(run_api_check(cfg))
 
             records = [
                 json.loads(line)
@@ -1921,6 +2000,35 @@ class FirewallCheckTests(unittest.TestCase):
                 self.assertIn(command, client.commands)
             captures = list((root / "data" / "targets" / "fw-a" / "api-checks").iterdir())
             self.assertEqual(len(captures), 1)
+
+    def test_a_validation_refused_the_configuration_read_is_recorded_as_a_warning(self):
+        """The admin page must show reduced evidence without reporting a failure."""
+
+        class OperationalOnlyClient(FakeClient):
+            def op_response(self, command: str) -> PanOSResponse:
+                if command == PBP_SETTINGS_COMMAND:
+                    raise PanOSAPIError(
+                        "Permission denied", raw_response="raw permission denied"
+                    )
+                return super().op_response(command)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            router, store = self._router(root, identity="PA-VM|11.2.4")
+            store.request_target_check(store.list_targets()[0]["target_id"])
+
+            with patch(
+                "pbp_monitoring.orchestrator.PanOSClient",
+                return_value=OperationalOnlyClient(),
+            ):
+                asyncio.run(run_target_checks_once(router))
+
+            recorded = store.list_targets()[0]
+            self.assertEqual(recorded["last_check_kind"], "validation")
+            self.assertEqual(recorded["last_check_status"], "warning")
+            self.assertIn("reduced evidence", recorded["last_check_detail"])
+            self.assertIn("pbp_settings", recorded["last_check_detail"])
+            self.assertIsNone(recorded["check_requested_at"])
 
     def test_a_firewall_saved_after_startup_is_checked_without_syslog_traffic(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

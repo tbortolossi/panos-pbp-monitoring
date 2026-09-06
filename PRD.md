@@ -95,7 +95,13 @@ than create a concurrent one.
    written, and a firewall with an active incident is skipped. An administrator
    can request the full validation batch for one firewall from the admin UI; the
    request travels through the configuration database because the Web service
-   mounts the evidence volume read-only and the collector exposes no port.
+   mounts the evidence volume read-only and the collector exposes no port. That
+   batch fails only on what monitoring cannot work without. The two enrichment
+   reads — the running-configuration PBP settings, which an API administrator
+   restricted to operational requests is refused, and the buffer latency, absent
+   from older PAN-OS releases — are reported as warnings: the check passes, the
+   outcome reads *passed with warnings* in amber, and the detail names the
+   evidence that will be missing from the reports.
 4. At startup, the monitor runs `show system info` once without delaying the
    first diagnostic batch, together with one read of the PBP settings of the
    running configuration (`show config running xpath
@@ -441,7 +447,9 @@ key must be backed up and restored together.
     member for the full incident; an ambiguous probe fans out without losing the
     trigger.
 23. `--check-api` validates every configured target and returns failure if any
-    target validation fails.
+    target validation fails. A refused running-configuration read or a buffer
+    latency command the release does not know is a warning on a check that
+    still passes.
 24. A matching trigger from an unlisted source, with no device serial, or with a
     serial inconsistent with that source's candidates, causes no API call,
     starts no monitor, and is journalled without its payload.

@@ -27,7 +27,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
@@ -103,6 +103,27 @@ PBP_SETTINGS_COMMAND = (
     "<show><config><running><xpath>devices/entry/deviceconfig/setting/session"
     "</xpath></running></config></show>"
 )
+
+#: Commands collected to enrich the evidence, not to decide anything. Their
+#: failure costs a piece of the report and nothing else, so the read-only API
+#: check reports them as warnings and still passes: `pbp_settings` is the one
+#: running-configuration read, which an API administrator restricted to
+#: operational requests — the least-privilege role this project documents — is
+#: not allowed to make, and `buffer_latency` does not exist on PAN-OS releases
+#: older than the one it was validated on. Neither may turn a firewall that
+#: answers every monitoring command into a failed check.
+OPTIONAL_COMMAND_EVIDENCE = {
+    "pbp_settings": "the configured PBP alert and activate thresholds",
+    "buffer_latency": "the packet buffer latency measurements",
+}
+
+
+def optional_command_warning(name: str) -> str:
+    """Say which evidence an operator loses when an enrichment read fails."""
+    lost = OPTIONAL_COMMAND_EVIDENCE.get(name, "part of the evidence")
+    return f"{name} command failed, {lost} could not be collected"
+
+
 # The PBP threat IDs: RED drop, session discard, source IP block. One bounded
 # query at monitor stop captures the firewall's own designations even when it
 # does not forward its threat log to the collector.
@@ -5001,7 +5022,22 @@ class SyslogProtocol(asyncio.DatagramProtocol):
         LOG.error("Syslog listener error: %s", exc)
 
 
-async def run_api_check(cfg: Config) -> tuple[Path, bool]:
+class ApiCheckResult(NamedTuple):
+    """Outcome of one read-only API check.
+
+    `succeeded` answers the only question the check exists for: can this
+    firewall be monitored? `warnings` carries what was collected less of —
+    an enrichment read the API role refuses, or a command this PAN-OS release
+    does not know — so the operator sees the reduced evidence without the
+    firewall being reported as unreachable.
+    """
+
+    capture: Path
+    succeeded: bool
+    warnings: list[str]
+
+
+async def run_api_check(cfg: Config) -> ApiCheckResult:
     """Run one allowlisted, read-only collection batch without opening Syslog."""
     cfg.output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     run_id = unique_run_id(cfg.output_dir, api_check_capture_path)
@@ -5101,17 +5137,20 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
         cfg.large_session_min_age_seconds,
     )
     validation_errors = list(identity_warnings)
+    validation_warnings: list[str] = []
     if not command_succeeded(system_info):
         validation_errors.append("system_info command failed")
     if not command_succeeded(pbp_settings_payload):
-        validation_errors.append("pbp_settings command failed")
+        validation_warnings.append(optional_command_warning("pbp_settings"))
     if not command_succeeded(global_counter_baseline):
         validation_errors.append("global counter baseline command failed")
-    validation_errors.extend(
-        f"{name} command failed"
-        for name, record in outputs.items()
-        if not command_succeeded(record)
-    )
+    for name, record in outputs.items():
+        if command_succeeded(record):
+            continue
+        if name in OPTIONAL_COMMAND_EVIDENCE:
+            validation_warnings.append(optional_command_warning(name))
+        else:
+            validation_errors.append(f"{name} command failed")
     if not firewall_clock:
         validation_errors.append("firewall clock could not be parsed")
     validation_errors.extend(parse_warnings)
@@ -5138,6 +5177,7 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
             "recovery_sample_eligible": measurement_complete,
             "resources_below_threshold": is_low,
             "validation_errors": validation_errors,
+            "validation_warnings": validation_warnings,
             "candidate_session_ids": ids,
             "candidate_entities": candidate_entities,
             "pbp_status": pbp_status,
@@ -5177,10 +5217,16 @@ async def run_api_check(cfg: Config) -> tuple[Path, bool]:
     )
     controller._schedule_report(output_file)
     await controller.wait_for_reports()
-    return output_file, succeeded
+    if validation_warnings:
+        LOG.warning(
+            "API check for %s passed with reduced evidence: %s",
+            cfg.target_name or cfg.panos_url,
+            "; ".join(validation_warnings),
+        )
+    return ApiCheckResult(output_file, succeeded, validation_warnings)
 
 
-async def run_configured_api_checks(cfg: Config) -> list[tuple[Path, bool]]:
+async def run_configured_api_checks(cfg: Config) -> list[ApiCheckResult]:
     target_configs = (
         [cfg.for_target(profile) for profile in cfg.target_profiles]
         if cfg.target_profiles
@@ -5267,7 +5313,7 @@ async def run_target_keepalive(cfg: Config, store: ConfigStore, target: StoredTa
 async def run_target_validation(cfg: Config, store: ConfigStore, target: StoredTarget) -> bool:
     """Run the full read-only validation batch for one firewall on request."""
     try:
-        capture, ok = await run_api_check(cfg)
+        capture, ok, warnings = await run_api_check(cfg)
     except Exception as exc:  # a failed validation must not stop the listener
         LOG.exception("Validation failed for %s", target.name)
         store.record_target_check(
@@ -5278,11 +5324,17 @@ async def run_target_validation(cfg: Config, store: ConfigStore, target: StoredT
             clear_request=True,
         )
         return False
+    # A check that collected everything monitoring needs is not a failure, even
+    # when an enrichment read was refused: it is recorded as passed, with the
+    # missing evidence named so the dashboard can show it amber rather than red.
+    detail = f"run {capture.parent.name}"
+    if ok and warnings:
+        detail = f"{detail} - reduced evidence: {'; '.join(warnings)}"
     store.record_target_check(
         target.target_id,
         kind="validation",
-        status="ok" if ok else "failed",
-        detail=f"run {capture.parent.name}",
+        status=("warning" if warnings else "ok") if ok else "failed",
+        detail=detail,
         clear_request=True,
     )
     LOG.info(
@@ -5606,9 +5658,9 @@ def cli(argv: list[str] | None = None) -> int:
         cfg = Config.from_env()
         if args.check_api:
             results = asyncio.run(run_configured_api_checks(cfg))
-            for output_file, _succeeded in results:
-                LOG.info("API validation capture written to %s", output_file)
-            return 0 if all(succeeded for _path, succeeded in results) else 1
+            for result in results:
+                LOG.info("API validation capture written to %s", result.capture)
+            return 0 if all(result.succeeded for result in results) else 1
         asyncio.run(run_daemon(cfg))
         return 0
     except (KeyError, ValueError, OSError) as exc:

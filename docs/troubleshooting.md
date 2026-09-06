@@ -54,6 +54,24 @@ reachability, certificate trust, key validity, least-privilege permissions, and
 the target's enabled state. Re-saving the firewall in the admin page repeats the
 `show system info` validation immediately.
 
+The check fails only when the firewall cannot be monitored: the identity read,
+the PBP, session, ingress, resource, dataplane-pool and global-counter reads,
+the firewall clock, or a candidate session lookup. Two reads exist to enrich the
+evidence and do not decide anything, so their failure is a warning and not a
+failure of the check:
+
+| Read | Why it may fail | What is lost |
+|---|---|---|
+| `show config running xpath …/deviceconfig/setting/session` | The collector's only running-configuration read. An API administrator restricted to operational requests is refused it | The configured PBP alert and activate thresholds; the report falls back on the Syslog text and the PAN-OS defaults |
+| `show session packet-buffer-protection buffer-latency` | Absent from PAN-OS releases older than the one it was validated on | The packet buffer latency measurements, and with them the latency case of the diagnosis |
+
+The firewall then shows **Passed with warnings** in amber on the configuration
+page and in the dashboard's API signal, and the check detail names the missing
+evidence. Grant the API administrator the configuration read, or accept the
+reduced evidence: monitoring itself is unaffected. The raw refusal PAN-OS
+returned is kept in the capture, so the permission or release behind it is
+readable from a run archive.
+
 ## Reading the collector history beyond `docker logs`
 
 Both services also write a rotating log file inside a volume, so a failure that

@@ -9,6 +9,7 @@ These two tests make the coupling fail loudly instead. They are the mechanical
 half of change rule 11 in CLAUDE.md.
 """
 
+import ast
 import json
 import re
 import tempfile
@@ -16,7 +17,7 @@ import unittest
 from pathlib import Path
 
 from pbp_monitoring import diagnostics, orchestrator
-from tools.replay_capture import PARSERS
+from tools.replay_capture import PARSERS, RAW_RESPONSE_EVENTS
 
 #: Commands collected outside the per-batch table: the clock, the startup
 #: identity, and the two collected once at monitor start.
@@ -40,6 +41,40 @@ ROOT_JOURNALS = frozenset(
 ) - {"syslog-triggers.jsonl"}
 
 
+def _events_persisting_raw_responses() -> set[str]:
+    """Journal events that store a raw PAN-OS response outside `commands`.
+
+    Read from the orchestrator's own syntax tree: any function that builds a
+    dictionary with a literal `raw_response` key and names an `event` writes
+    XML that `record["commands"]` does not carry. The replay tool has to know
+    about each of them, or that XML is unreachable from a customer archive.
+    """
+    events: set[str] = set()
+    for node in ast.walk(ast.parse(ORCHESTRATOR_SOURCE)):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        pairs = [
+            (key, value)
+            for dictionary in ast.walk(node)
+            if isinstance(dictionary, ast.Dict)
+            for key, value in zip(dictionary.keys, dictionary.values)
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        ]
+        if not any(key.value == "raw_response" for key, _ in pairs):
+            continue
+        events.update(
+            value.value
+            for key, value in pairs
+            if key.value == "event"
+            and isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+        )
+    return events
+
+
+RAW_RESPONSE_EVENT_NAMES = _events_persisting_raw_responses()
+
+
 class ReplayCoverageTests(unittest.TestCase):
     def test_every_collected_command_can_be_replayed(self):
         collected = set(orchestrator.OP_COMMANDS) | ADDITIONAL_COLLECTED_COMMANDS
@@ -52,6 +87,24 @@ class ReplayCoverageTests(unittest.TestCase):
             "replayed against the parsers, so a customer archive could not "
             "reproduce their parsing failure. Add each to PARSERS.",
         )
+
+    def test_every_event_storing_a_raw_response_can_be_replayed(self):
+        missing = sorted(RAW_RESPONSE_EVENT_NAMES - set(RAW_RESPONSE_EVENTS))
+        self.assertEqual(
+            missing,
+            [],
+            "Journal events that persist raw PAN-OS XML outside the commands "
+            "table but are absent from RAW_RESPONSE_EVENTS in "
+            "tools/replay_capture.py: the replay tool only reads "
+            "record['commands'], so their XML travels in every customer "
+            "archive and no one can replay it. Map each to its parser.",
+        )
+
+    def test_the_scraped_raw_response_event_list_still_finds_something(self):
+        # A refactor that moved those records out of a function would empty the
+        # scrape and make the coverage test above vacuous.
+        self.assertIn("pbp_threat_logs", RAW_RESPONSE_EVENT_NAMES)
+        self.assertIn("offender_traffic_logs", RAW_RESPONSE_EVENT_NAMES)
 
     def test_the_scraped_journal_list_still_finds_something(self):
         # A rename in the orchestrator would otherwise silently empty the list
