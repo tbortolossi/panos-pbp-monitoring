@@ -34,23 +34,30 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from pbp_monitoring.orchestrator import (  # noqa: E402
     extract_buffer_latency,
+    extract_congestion_log_entries,
     extract_dataplane_pool_statistics,
     extract_dp_core_functions,
     extract_firewall_clock,
     extract_global_counters,
+    extract_global_counters_raw,
+    extract_ha_state,
     extract_ingress_backlogs,
+    extract_interface_counter_table,
     extract_interface_counters,
+    extract_interface_status,
     extract_large_sessions,
     extract_pbp_offenders,
     extract_pbp_settings,
     extract_pbp_status,
     extract_pbp_threat_log_entries,
     extract_resource_cpu_cores,
+    extract_resource_monitor_history,
     extract_session_filter_count,
     extract_session_filter_entries,
     extract_session_info,
     extract_system_info,
     extract_traffic_log_entries,
+    extract_zone_protection,
 )
 
 #: Which parser owns which stored command. A command absent from this table is
@@ -70,7 +77,13 @@ PARSERS: dict[str, Callable[[str], Any]] = {
     "large_sessions": extract_large_sessions,
     "dp_core_functions": extract_dp_core_functions,
     "resource_monitor": extract_resource_cpu_cores,
+    "resource_monitor_history": extract_resource_monitor_history,
     "interface_counters": extract_interface_counters,
+    "interface_counters_all": extract_interface_counter_table,
+    "interface_status": extract_interface_status,
+    "global_counters_raw": extract_global_counters_raw,
+    "zone_protection": extract_zone_protection,
+    "ha_state": extract_ha_state,
     "session_filter_count": extract_session_filter_count,
     "session_filter_list": extract_session_filter_entries,
 }
@@ -97,6 +110,9 @@ RAW_RESPONSE_EVENTS: dict[str, RawResponseEvent] = {
     "offender_traffic_logs": RawResponseEvent(extract_traffic_log_entries, "sources"),
     "offender_live_sessions": RawResponseEvent(
         extract_session_filter_entries, "sources"
+    ),
+    "congestion_system_logs": RawResponseEvent(
+        extract_congestion_log_entries, None
     ),
 }
 

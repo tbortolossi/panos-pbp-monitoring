@@ -104,6 +104,70 @@ PBP_SETTINGS_COMMAND = (
     "</xpath></running></config></show>"
 )
 
+# Evidence collected once per incident, at monitor start, because it describes
+# the firewall's state and history rather than the current second. Each one
+# decided a root cause in the closed TAC packet-buffer corpus and none of them
+# is reachable from the per-batch commands:
+#
+# - `global_counters_raw` carries the cumulative value of every counter. The
+#   per-batch delta window can be a fraction of a second, so a decisive but
+#   low-rate counter (a handful of `flow_dos_pbp_block_host` over an hour)
+#   never appears in it. Read once at start and once at stop, the pair also
+#   gives the growth over the whole incident.
+# - `resource_monitor_history` is the same command the per-batch read uses,
+#   without the `second` window filter: PAN-OS then answers with the minute,
+#   hour, day and week blocks too. Those maxima and averages are what separates
+#   a leak (a level that only ever climbs, over days) from a burst, and their
+#   series date the onset — evidence that is already gone by the time a trigger
+#   starts the monitor.
+# - `interface_status` names the zone, the VLAN tag and the link speed of every
+#   interface, so a per-interface packet rate can be read against its link and
+#   an ingress interface can be tied to a zone.
+# - `zone_protection` states, per zone, whether flood protection is enabled at
+#   all, and counts the packets PBP dropped in that zone. A zone whose profile
+#   has every flood type disabled prints them all as off: that absence is what
+#   turns "PBP is firing" into "PBP is doing zone protection's job on an
+#   unprotected zone".
+# - `ha_state` says whether this unit is passive. A buffer at 99 % with no
+#   session means nothing until that is known, and a takeover timestamp
+#   explains a jump from 2 % to 100 % in five seconds.
+#
+# Operational XML validated read-only against the lab PA-440 (PAN-OS 12.2.2)
+# on 2026-09-06.
+INCIDENT_START_COMMANDS = {
+    "global_counters_raw": "<show><counter><global/></counter></show>",
+    "resource_monitor_history": (
+        "<show><running><resource-monitor/></running></show>"
+    ),
+    "interface_status": "<show><interface>all</interface></show>",
+    "zone_protection": "<show><zone-protection/></show>",
+    "ha_state": "<show><high-availability><state/></high-availability></show>",
+}
+
+# Every hardware port's counters in one read. Offender enrichment is
+# session-driven, so a session-less flood (a gratuitous-ARP storm) leaves it
+# empty and the only localization left is per-interface: rx-broadcast and
+# rx-multicast growing on one member of an aggregate. Validated read-only on
+# the lab PA-440 on 2026-09-06; the result has the same <hw><entry><port>
+# shape as the single-interface form, repeated per interface.
+INTERFACE_COUNTER_ALL_COMMAND = (
+    "<show><counter><interface>all</interface></counter></show>"
+)
+
+# The firewall's own congestion log. It is written once a minute while the
+# buffer is above the alert level, spans weeks, survives a reboot, and on a
+# monitor-only latency-mode device it is the only trace PBP leaves at all —
+# no threat log, no PBP counter. Bounded to one query at monitor stop.
+# Validated read-only on the lab PA-440 on 2026-09-06: system logs of subtype
+# `general` whose description carries the congestion line, each entry holding
+# `time_generated` and the `X/Y (Z%)` text in `opaque`.
+CONGESTION_LOG_QUERY = (
+    "(subtype eq general) and (description contains 'Packet buffer congestion')"
+)
+CONGESTION_LOG_NLOGS = 500
+CONGESTION_LOG_TIMEOUT_SECONDS = 30.0
+CONGESTION_LOG_ENTRY_LIMIT = 1000
+
 #: Commands collected to enrich the evidence, not to decide anything. Their
 #: failure costs a piece of the report and nothing else, so the read-only API
 #: check reports them as warnings and still passes: `pbp_settings` is the one
@@ -111,10 +175,20 @@ PBP_SETTINGS_COMMAND = (
 #: operational requests — the least-privilege role this project documents — is
 #: not allowed to make, and `buffer_latency` does not exist on PAN-OS releases
 #: older than the one it was validated on. Neither may turn a firewall that
-#: answers every monitoring command into a failed check.
+#: answers every monitoring command into a failed check. The once-per-incident
+#: reads are optional for the same reason: a firewall with no HA, no zone
+#: protection profile or a restricted role must still be monitored.
 OPTIONAL_COMMAND_EVIDENCE = {
     "pbp_settings": "the configured PBP alert and activate thresholds",
     "buffer_latency": "the packet buffer latency measurements",
+    "global_counters_raw": "the cumulative value of every global counter",
+    "resource_monitor_history": (
+        "the hour, day and week resource-utilization history"
+    ),
+    "interface_status": "the interface zone, VLAN tag and link speed map",
+    "zone_protection": "the per-zone flood protection state and PBP drops",
+    "ha_state": "the high-availability role of this unit",
+    "interface_counters_all": "the per-interface hardware counters",
 }
 
 
@@ -2907,6 +2981,496 @@ def extract_global_counters(output: str) -> dict[str, Any]:
     }
 
 
+#: A firewall answers `show counter global` with roughly five hundred counters
+#: per dataplane. Only the ones that ever moved carry information the raw
+#: response does not already hold, so the parsed view keeps those; the raw XML
+#: is persisted whole beside it, as every other command's is.
+RAW_COUNTER_LIMIT = 4000
+
+
+def extract_global_counters_raw(output: str) -> dict[str, Any]:
+    """Fold a raw `show counter global` read into one value per counter.
+
+    The per-batch delta read only lists what moved inside a window that can be
+    a fraction of a second, so a counter incrementing a dozen times an hour is
+    invisible in it while still naming the root cause: the closed TAC corpus
+    has cases decided by a cumulative `flow_dos_pbp_block_host` of fourteen.
+    This read carries every counter's value since boot, plus the rate column
+    PAN-OS computes itself.
+
+    The entries have the same shape as the delta form, so the same parser
+    reads them; only the meaning of ``value`` differs, which is why the result
+    is keyed by name and never mixed with the per-batch deltas. On a chassis
+    the same counter is reported once per dataplane: the values are summed and
+    the planes that answered are named, so a chassis total is never read as
+    one dataplane's.
+    """
+    parsed = extract_global_counters(output)
+    counters: dict[str, dict[str, Any]] = {}
+    dataplanes: list[str] = []
+    total = 0
+    for counter in parsed.get("counters") or []:
+        if not isinstance(counter, dict):
+            continue
+        name = str(counter.get("name") or "").strip()
+        if not name:
+            continue
+        total += 1
+        dataplane = counter.get("dataplane")
+        if isinstance(dataplane, str) and dataplane and dataplane not in dataplanes:
+            dataplanes.append(dataplane)
+        value = counter.get("value")
+        rate = counter.get("rate")
+        if not isinstance(value, int) or not isinstance(rate, int):
+            continue
+        if value == 0 and rate == 0:
+            continue
+        existing = counters.get(name)
+        if existing is None:
+            if len(counters) >= RAW_COUNTER_LIMIT:
+                continue
+            counters[name] = {"value": value, "rate": rate}
+        else:
+            existing["value"] += value
+            existing["rate"] += rate
+    return {
+        "parsed": bool(counters) or bool(parsed.get("parsed")),
+        "counter_count": total,
+        "dataplanes": dataplanes,
+        "counters": counters,
+    }
+
+
+#: The resource-monitor windows PAN-OS keeps beside the per-second one. The
+#: per-second window is already sampled batch by batch, and its history is
+#: exactly what a monitor started by a trigger has already missed.
+RESOURCE_HISTORY_WINDOWS = ("minute", "hour", "day", "week")
+
+#: Resource-utilization rows, mapped to the metric keys the rest of the
+#: collector already uses. PAN-OS suffixes each row with `(average)` or
+#: `(maximum)` in the historical windows.
+RESOURCE_HISTORY_METRICS = {
+    "session": "session",
+    "packet buffer": "packet_buffer",
+    "packet descriptor": "packet_descriptor",
+    "packet descriptor (on-chip)": "packet_descriptor_on_chip",
+    "sw tags descriptor": "sw_tags_descriptor",
+}
+_RESOURCE_HISTORY_ROW = re.compile(
+    r"^(?P<metric>.+?)\s*\((?P<aggregate>average|maximum)\)\s*$", re.I
+)
+#: Enough to hold a week of samples for every metric of every dataplane
+#: without letting a malformed response grow the capture without bound.
+RESOURCE_HISTORY_SAMPLE_LIMIT = 200
+
+
+def _resource_history_series(value_text: str) -> list[float]:
+    """The comma-separated sample series of one resource-monitor row.
+
+    PAN-OS prints the most recent sample first, which is what makes the tail
+    of a day or week row the onset of a slow climb.
+    """
+    return [
+        value
+        for item in re.split(r"[\s,]+", value_text.strip())
+        if (value := _float_value(item)) is not None
+    ][:RESOURCE_HISTORY_SAMPLE_LIMIT]
+
+
+def _resource_history_summary(series: list[float]) -> dict[str, Any]:
+    return {
+        "latest": series[0],
+        "oldest": series[-1],
+        "peak": max(series),
+        "mean": round(sum(series) / len(series), 3),
+        "samples": len(series),
+    }
+
+
+def extract_resource_monitor_history(output: str) -> dict[str, Any]:
+    """Parse the minute, hour, day and week resource-utilization blocks.
+
+    `show running resource-monitor` without a window filter returns every
+    window PAN-OS keeps. The maxima and averages of the hour, day and week
+    blocks are the leak-versus-burst decider: a level that only climbs over
+    days, while the session count stays flat, is a leak, and the sample where
+    the climb starts dates its onset. None of it can be recovered once the
+    incident has started, which is why it is read at monitor start.
+
+    Only the structured answer is parsed. The API returns XML for this command
+    on every release this collector was validated against, and the CLI text
+    layout of the historical windows differs enough between releases that
+    guessing it would produce a silently wrong history rather than an honest
+    gap.
+    """
+    try:
+        root = ET.fromstring(output)
+    except ET.ParseError:
+        return {"parsed": False, "windows": []}
+    dataplane_elements = [
+        element
+        for element in root.iter()
+        if re.fullmatch(r"(?:s\d+)?dp\d+", _local_tag(element), re.I)
+    ]
+    if not dataplane_elements:
+        dataplane_elements = [root]
+    windows: list[dict[str, Any]] = []
+    for dataplane in dataplane_elements:
+        dataplane_name = "dp0" if dataplane is root else _local_tag(dataplane)
+        for window in dataplane.iter():
+            window_name = _local_tag(window)
+            if window_name not in RESOURCE_HISTORY_WINDOWS:
+                continue
+            metrics: dict[str, dict[str, Any]] = {}
+            cpu: dict[str, Any] = {}
+            for container in window:
+                container_name = _local_tag(container)
+                if container_name == "resource-utilization":
+                    for entry in container:
+                        label = (_child_text(entry, "name") or "").strip()
+                        match = _RESOURCE_HISTORY_ROW.match(label)
+                        metric_label = (
+                            match.group("metric") if match else label
+                        ).strip().lower()
+                        key = RESOURCE_HISTORY_METRICS.get(metric_label)
+                        series = _resource_history_series(
+                            _child_text(entry, "value") or ""
+                        )
+                        if key is None or not series:
+                            continue
+                        aggregate = (
+                            match.group("aggregate").lower() if match else "maximum"
+                        )
+                        metric = metrics.setdefault(key, {})
+                        metric[f"{aggregate}_series"] = series
+                        metric[aggregate] = _resource_history_summary(series)
+                elif container_name in {"cpu-load-maximum", "cpu-load-average"}:
+                    aggregate = container_name.removeprefix("cpu-load-")
+                    peaks = [
+                        max(series)
+                        for entry in container
+                        if (
+                            series := _resource_history_series(
+                                _child_text(entry, "value") or ""
+                            )
+                        )
+                    ]
+                    if peaks:
+                        cpu[f"{aggregate}_peak"] = max(peaks)
+            if metrics or cpu:
+                windows.append(
+                    {
+                        "dataplane": dataplane_name,
+                        "window": window_name,
+                        "metrics": metrics,
+                        "cpu": cpu,
+                    }
+                )
+    return {"parsed": bool(windows), "windows": windows}
+
+
+#: The flood types a zone-protection profile can enable. PAN-OS reports each
+#: as True or False per zone; all false means the zone has no flood protection
+#: at all, and PBP is then the only thing between the flood and the buffers.
+ZONE_FLOOD_TYPES = (
+    "tcp-syn-cookie",
+    "tcp",
+    "udp",
+    "icmp",
+    "icmp6",
+    "ip",
+    "sctp_init",
+)
+#: The per-zone PBP counters the same command carries. They attribute PBP's
+#: mitigation to a zone, which no other read does.
+ZONE_PBP_COUNTERS = (
+    "pbp-drop",
+    "pbp-block-session",
+    "pbp-lat-block-session",
+    "pbp-cnt-block-session",
+    "pbp-both-block-session",
+    "pbp-block-host",
+    "pbp-lat-block-host",
+    "pbp-cnt-block-host",
+    "pbp-both-block-host",
+)
+ZONE_PROTECTION_LIMIT = 200
+
+
+def extract_zone_protection(output: str) -> dict[str, Any]:
+    """Per-zone flood protection state and PBP drop counts.
+
+    A zone whose profile leaves every flood type disabled is the case the
+    corpus keeps producing: PBP fires, the operator reads it as an attack the
+    firewall handled, and the real finding is that zone protection was never
+    configured on the zone the flood entered. The same rows also count the
+    packets PBP dropped per zone, which is the only per-zone attribution of
+    PBP's own mitigation.
+
+    On a chassis the table repeats per dataplane; the counters are summed and
+    the flood flags OR-ed, so a zone protected on one plane is never reported
+    as unprotected.
+    """
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return {"parsed": False, "zones": []}
+    zones: dict[tuple[str, str], dict[str, Any]] = {}
+    # PAN-OS wraps the per-zone rows in one entry per dataplane. Walking every
+    # entry would count each zone twice, once as its own container's ancestor
+    # and once as itself, so the containers are selected first.
+    containers = [
+        element for element in root.iter("entry") if element.find("dp") is not None
+    ] or [root]
+    for outer in containers:
+        dataplane = (outer.findtext("dp") or "").strip() or None
+        for entry in outer.iter("entry"):
+            zone = (entry.findtext("zone") or "").strip()
+            if not zone or entry.find("dp") is not None:
+                continue
+            vsys = (entry.findtext("vsys") or "").strip() or None
+            key = (str(vsys or ""), zone)
+            row = zones.get(key)
+            if row is None:
+                if len(zones) >= ZONE_PROTECTION_LIMIT:
+                    continue
+                row = zones[key] = {
+                    "zone": zone,
+                    "vsys": vsys,
+                    "profile": (entry.findtext("profile") or "").strip() or None,
+                    "dataplanes": [],
+                    "flood_protection": {},
+                    "pbp_counters": {},
+                }
+            if dataplane and dataplane not in row["dataplanes"]:
+                row["dataplanes"].append(dataplane)
+            for flood in ZONE_FLOOD_TYPES:
+                flag = _panos_flag((entry.findtext(flood) or "").strip() or None)
+                if flag is None:
+                    continue
+                key_name = flood.replace("-", "_")
+                row["flood_protection"][key_name] = bool(
+                    row["flood_protection"].get(key_name) or flag
+                )
+            for counter in ZONE_PBP_COUNTERS:
+                value = _int_value((entry.findtext(counter) or "").strip() or None)
+                if value is None:
+                    continue
+                key_name = counter.replace("-", "_")
+                row["pbp_counters"][key_name] = (
+                    row["pbp_counters"].get(key_name, 0) + value
+                )
+    ordered = []
+    for row in zones.values():
+        flags = row["flood_protection"]
+        row["flood_protection_enabled"] = (
+            any(flags.values()) if flags else None
+        )
+        row["pbp_drop"] = row["pbp_counters"].get("pbp_drop")
+        ordered.append(row)
+    ordered.sort(
+        key=lambda row: (-(row.get("pbp_drop") or 0), str(row.get("zone")))
+    )
+    return {"parsed": bool(ordered), "zones": ordered}
+
+
+def extract_ha_state(output: str) -> dict[str, Any]:
+    """Whether this unit is the active one, and since when.
+
+    "Buffer at 99 % with zero sessions" is a contradiction on an active unit
+    and the expected reading on a passive one, so nothing else in the capture
+    can be judged until this is known; a state duration shorter than the
+    incident dates a takeover, which is what a jump from 2 % to 100 % in five
+    seconds usually is.
+
+    The disabled answer is what the lab firewall returns and is validated on
+    it. The element names of an enabled unit come from the documented PAN-OS
+    schema and are read defensively — a field PAN-OS does not return is simply
+    absent, never guessed — because this project has no HA pair to validate
+    them against.
+
+    Neither the peer's serial nor its addresses are kept: they identify a
+    firewall the collector does not monitor, and nothing in the diagnosis
+    needs them.
+    """
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return {"parsed": False}
+    enabled = _panos_flag((root.findtext(".//enabled") or "").strip() or None)
+    state: dict[str, Any] = {"parsed": True, "enabled": enabled}
+    fields = (
+        ("local_state", ".//group/local-info/state"),
+        ("local_state_duration_seconds", ".//group/local-info/state-duration"),
+        ("mode", ".//group/local-info/mode"),
+        ("priority", ".//group/local-info/priority"),
+        ("preemptive", ".//group/local-info/preemptive"),
+        ("peer_state", ".//group/peer-info/state"),
+        ("peer_connection", ".//group/peer-info/conn-status"),
+        ("running_sync", ".//group/running-sync"),
+    )
+    for name, path in fields:
+        text = (root.findtext(path) or "").strip()
+        if not text:
+            continue
+        if name.endswith("_seconds") or name == "priority":
+            number = _int_value(text)
+            if number is not None:
+                state[name] = number
+            continue
+        state[name] = text
+    local_state = str(state.get("local_state") or "").lower()
+    state["passive"] = (
+        True
+        if local_state in {"passive", "suspended", "non-functional"}
+        else False
+        if local_state
+        else None
+    )
+    return state
+
+
+def extract_interface_counter_table(output: str) -> dict[str, dict[str, Any]]:
+    """Every hardware port's counters from one `show counter interface all`.
+
+    Same per-entry shape as the single-interface read, so the persisted
+    `interface_counters` field of a batch keeps one form whether the whole
+    table or two named interfaces were collected.
+    """
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return {}
+    table: dict[str, dict[str, Any]] = {}
+    for entry in root.iter("entry"):
+        name = (entry.findtext("name") or "").strip()
+        port = entry.find("port")
+        if not name or port is None:
+            continue
+        counters: dict[str, int] = {}
+        for child in port:
+            text = (child.text or "").strip()
+            if text.lstrip("-").isdigit():
+                counters[child.tag.replace("-", "_")] = int(text)
+        if counters:
+            table[name] = {"name": name, "counters": counters}
+    return table
+
+
+INTERFACE_STATUS_LIMIT = 400
+
+
+def extract_interface_status(output: str) -> dict[str, dict[str, Any]]:
+    """The zone, VLAN tag, link state and speed of every interface.
+
+    `show counter interface all` gives packet rates with no idea of what the
+    interface is; this read supplies the zone that ties an ingress interface
+    to the PBP threat-log zone, and the link speed a rate has to be read
+    against. MAC addresses are deliberately not kept: they identify the
+    customer's hardware and nothing here needs them.
+    """
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return {}
+    interfaces: dict[str, dict[str, Any]] = {}
+
+    def row(name: str) -> dict[str, Any] | None:
+        existing = interfaces.get(name)
+        if existing is not None:
+            return existing
+        if len(interfaces) >= INTERFACE_STATUS_LIMIT:
+            return None
+        created = interfaces[name] = {"name": name}
+        return created
+
+    for section, fields in (
+        (
+            "hw",
+            (
+                ("state", "state"),
+                ("speed", "speed"),
+                ("duplex", "duplex"),
+                ("mode", "mode"),
+            ),
+        ),
+        (
+            "ifnet",
+            (
+                ("zone", "zone"),
+                ("vsys", "vsys"),
+                ("vlan_tag", "tag"),
+                ("ip", "ip"),
+                ("forwarding", "fwd"),
+            ),
+        ),
+    ):
+        container = root.find(f".//{section}")
+        if container is None:
+            continue
+        for entry in container.iter("entry"):
+            name = (entry.findtext("name") or "").strip()
+            if not name:
+                continue
+            target = row(name)
+            if target is None:
+                continue
+            for key, tag in fields:
+                text = (entry.findtext(tag) or "").strip()
+                if text and text.upper() not in {"N/A", "UKN"}:
+                    target[key] = text
+    return interfaces
+
+
+#: The congestion line PAN-OS writes to the system log: the measure it used,
+#: the occupancy as used/total, the percentage, and the alert threshold in
+#: force when it was written. Validated against the lab firewall's own logs.
+CONGESTION_LOG_PATTERN = re.compile(
+    r"Packet buffer congestion(?:\s*\((?P<measure>[^)]*)\))?\s*is\s*"
+    r"(?P<used>\d+)\s*/\s*(?P<total>\d+)\s*\((?P<percent>\d+(?:\.\d+)?)\s*%\)"
+    r"(?:\s*\(alert threshold is\s*(?P<threshold>\d+(?:\.\d+)?)\s*%\))?",
+    re.IGNORECASE,
+)
+
+
+def extract_congestion_log_entries(output: str) -> list[dict[str, Any]]:
+    """Normalize the firewall's own packet-buffer congestion system logs.
+
+    Each line is one minute in which the buffer sat above the alert level. The
+    series survives reboots and spans weeks, so it is the only PBP trace left
+    on a monitor-only latency-mode device, and its timestamps are what expose
+    a nightly window — a scheduler, not an attack.
+    """
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return []
+    entries: list[dict[str, Any]] = []
+    for element in root.iter("entry"):
+        description = (
+            element.findtext("opaque") or element.findtext("description") or ""
+        ).strip()
+        match = CONGESTION_LOG_PATTERN.search(description)
+        if not match:
+            continue
+        entry: dict[str, Any] = {
+            "time_generated": (element.findtext("time_generated") or "").strip()
+            or None,
+            "receive_time": (element.findtext("receive_time") or "").strip() or None,
+            "severity": (element.findtext("severity") or "").strip() or None,
+            "measure": (match.group("measure") or "").strip().lower() or None,
+            "used": _int_value(match.group("used")),
+            "total": _int_value(match.group("total")),
+            "percent": _float_value(match.group("percent")),
+            "alert_threshold_percent": _float_value(match.group("threshold")),
+            "description": description[:200],
+        }
+        entries.append(entry)
+        if len(entries) >= CONGESTION_LOG_ENTRY_LIMIT:
+            break
+    return entries
+
+
 def extract_live_percentages(
     pbp: str,
     ingress: str,
@@ -4019,6 +4583,113 @@ class MonitorController:
             outcome["error"] = self._redact_secret(f"{type(exc).__name__}: {exc}")
         append_jsonl(output_file, outcome)
 
+    async def _collect_global_counters_raw(
+        self,
+        output_file: Path,
+        run_id: str,
+        started: dict[str, Any],
+    ) -> None:
+        """Read every counter's cumulative value again, closing the bracket.
+
+        The read at monitor start and this one bracket the incident, so a
+        counter that moved fourteen times over the whole run is visible as a
+        growth even though no per-batch delta window ever caught it moving.
+        The growth is computed here, once, so the report and the diagnosis
+        cannot each derive a different one.
+        """
+        _, payload = await self._collect_command(
+            "global_counters_raw", INCIDENT_START_COMMANDS["global_counters_raw"]
+        )
+        stopped = extract_global_counters_raw(command_result(payload))
+        start_counters = started.get("counters")
+        stop_counters = stopped.get("counters")
+        growth: dict[str, int] = {}
+        if isinstance(start_counters, dict) and isinstance(stop_counters, dict):
+            for name, counter in stop_counters.items():
+                stop_value = counter.get("value")
+                start_value = (start_counters.get(name) or {}).get("value")
+                if not isinstance(stop_value, int) or not isinstance(start_value, int):
+                    continue
+                # A counter reset by a dataplane restart during the incident
+                # would otherwise read as a negative movement.
+                if stop_value >= start_value:
+                    growth[name] = stop_value - start_value
+        append_jsonl(
+            output_file,
+            {
+                "timestamp": utc_now(),
+                "run_id": run_id,
+                "event": "global_counters_raw",
+                "target_name": self.cfg.target_name,
+                "global_counters_raw": stopped,
+                "growth_since_start": growth,
+                "commands": {"global_counters_raw": payload},
+            },
+        )
+
+    async def _collect_congestion_logs(
+        self,
+        output_file: Path,
+        run_id: str,
+    ) -> None:
+        """Capture the firewall's own packet-buffer congestion system logs.
+
+        One bounded, read-only query at monitor stop. PAN-OS writes this line
+        once a minute while the buffer sits above the alert level, keeps it
+        across reboots, and writes it even on a monitor-only latency-mode
+        device that produces no PBP threat log and no PBP counter at all. The
+        series is therefore both the longest history the capture can hold and,
+        on such a device, the only proof the incident is not the first one.
+
+        The query is not restricted to the incident window on purpose: weeks
+        of history are what expose a nightly window, and a scheduler is not an
+        attack.
+        """
+        outcome: dict[str, Any] = {
+            "timestamp": utc_now(),
+            "run_id": run_id,
+            "event": "congestion_system_logs",
+            "target_name": self.cfg.target_name,
+            "query": CONGESTION_LOG_QUERY,
+            "requested_entries": CONGESTION_LOG_NLOGS,
+            "ok": False,
+        }
+        try:
+            job_id = await asyncio.to_thread(
+                self.client.log_query_job,
+                "system",
+                CONGESTION_LOG_QUERY,
+                CONGESTION_LOG_NLOGS,
+            )
+            deadline = time.monotonic() + CONGESTION_LOG_TIMEOUT_SECONDS
+            response: PanOSResponse | None = None
+            status = ""
+            while time.monotonic() < deadline:
+                response = await asyncio.to_thread(self.client.log_query_result, job_id)
+                status = extract_log_job_status(response.result_xml)
+                if status == "FIN":
+                    break
+                await asyncio.sleep(OFFENDER_LOG_POLL_SECONDS)
+            if response is None or status != "FIN":
+                outcome["error"] = (
+                    f"log job {job_id} did not finish within "
+                    f"{CONGESTION_LOG_TIMEOUT_SECONDS:.0f}s"
+                )
+            else:
+                outcome.update(
+                    {
+                        "ok": True,
+                        "job_id": job_id,
+                        "entries": extract_congestion_log_entries(
+                            response.result_xml
+                        ),
+                        "raw_response": self._redact_secret(response.raw_response),
+                    }
+                )
+        except Exception as exc:  # the stop marker must follow regardless
+            outcome["error"] = self._redact_secret(f"{type(exc).__name__}: {exc}")
+        append_jsonl(output_file, outcome)
+
     async def _collect_stop_evidence(
         self,
         output_file: Path,
@@ -4026,19 +4697,22 @@ class MonitorController:
         offender_sources: dict[str, int],
         first_firewall_clock: str | None,
         startup_pbp_settings: dict[str, Any],
+        startup_global_counters_raw: dict[str, Any] | None = None,
     ) -> None:
-        """Run the four stop-time collections concurrently.
+        """Run the six stop-time collections concurrently.
 
         Live sessions and the traffic log recover flow detail for the top
         offender sources, the threat-log job asks the firewall for its own
-        PBP designations, and the PBP settings are re-read to catch a commit
-        that landed mid-run. None of the four is built from another's
-        result, each already writes its own JSONL record, and each already
-        traps its own exceptions here, so running them concurrently only
-        removes idle waiting: it does not change what gets written or in
+        PBP designations, the PBP settings are re-read to catch a commit that
+        landed mid-run, the cumulative counters are read again to close the
+        bracket opened at monitor start, and the congestion system log is
+        queried for the recurrence history. None of the six is built from
+        another's result, each already writes its own JSONL record, and each
+        already traps its own exceptions here, so running them concurrently
+        only removes idle waiting: it does not change what gets written or in
         what shape. Record order does not matter: every event carries its
         own "event" name and run_id, and nothing downstream parses the
-        capture assuming these four appear in a particular order.
+        capture assuming these appear in a particular order.
         """
 
         async def _collect_offender_sessions() -> None:
@@ -4073,12 +4747,28 @@ class MonitorController:
             except Exception:
                 LOG.exception("PBP settings re-read failed for %s", run_id)
 
+        async def _collect_counters_raw() -> None:
+            try:
+                await self._collect_global_counters_raw(
+                    output_file, run_id, startup_global_counters_raw or {}
+                )
+            except Exception:
+                LOG.exception("Raw counter read at stop failed for %s", run_id)
+
+        async def _collect_congestion() -> None:
+            try:
+                await self._collect_congestion_logs(output_file, run_id)
+            except Exception:
+                LOG.exception("Congestion system log lookup failed for %s", run_id)
+
         stop_collections = []
         if offender_sources:
             stop_collections.append(_collect_offender_sessions())
             stop_collections.append(_collect_offender_traffic())
         stop_collections.append(_collect_threat_logs())
         stop_collections.append(_collect_settings_reread())
+        stop_collections.append(_collect_counters_raw())
+        stop_collections.append(_collect_congestion())
         await asyncio.gather(*stop_collections, return_exceptions=True)
 
     async def _session_details(self, ids: list[int]) -> dict[str, dict[str, Any]]:
@@ -4193,8 +4883,17 @@ class MonitorController:
                 OP_COMMANDS["global_counters_delta"],
             )
         )
+        # State and history, read once while the incident is starting. None of
+        # it can be recovered later: the hour/day/week utilization is already
+        # rolling, and a counter that increments a dozen times an hour never
+        # shows up in a per-batch delta.
+        incident_start_tasks = {
+            name: asyncio.create_task(self._collect_command(name, command))
+            for name, command in INCIDENT_START_COMMANDS.items()
+        }
         first_firewall_clock: str | None = None
         startup_pbp_settings: dict[str, Any] = {}
+        startup_global_counters_raw: dict[str, Any] = {}
         session_rate_samples: dict[str, dict[str, Any]] = {}
         large_session_samples: dict[str, dict[str, Any]] = {}
         offender_sources: dict[str, int] = {}
@@ -4214,6 +4913,9 @@ class MonitorController:
                         )
                     )
                     _, global_counter_baseline = global_counter_primer_task.result()
+                    incident_start_payloads = dict(
+                        await asyncio.gather(*incident_start_tasks.values())
+                    )
                     device = extract_system_info(command_result(system_info))
                     identity_warnings = device_identity_warnings(device)
                     (
@@ -4226,8 +4928,21 @@ class MonitorController:
                         startup_warnings.append(
                             "dataplane core function groups could not be read"
                         )
+                    # One of these failing costs a piece of the report and
+                    # nothing else: the batch loop below has not started yet
+                    # and must not be prevented from starting.
+                    startup_warnings.extend(
+                        optional_command_warning(name)
+                        for name, payload in incident_start_payloads.items()
+                        if not command_succeeded(payload)
+                    )
                     startup_pbp_settings = extract_pbp_settings(
                         command_result(pbp_settings_payload)
+                    )
+                    startup_global_counters_raw = extract_global_counters_raw(
+                        command_result(
+                            incident_start_payloads.get("global_counters_raw")
+                        )
                     )
                     startup_record = {
                         "timestamp": started_at,
@@ -4241,6 +4956,29 @@ class MonitorController:
                         "dp_core_functions": core_functions,
                         "dp_core_functions_source": core_functions_source,
                         "pbp_settings": startup_pbp_settings,
+                        "global_counters_raw": startup_global_counters_raw,
+                        "resource_monitor_history": (
+                            extract_resource_monitor_history(
+                                command_result(
+                                    incident_start_payloads.get(
+                                        "resource_monitor_history"
+                                    )
+                                )
+                            )
+                        ),
+                        "interface_status": extract_interface_status(
+                            command_result(
+                                incident_start_payloads.get("interface_status")
+                            )
+                        ),
+                        "zone_protection": extract_zone_protection(
+                            command_result(
+                                incident_start_payloads.get("zone_protection")
+                            )
+                        ),
+                        "ha_state": extract_ha_state(
+                            command_result(incident_start_payloads.get("ha_state"))
+                        ),
                         "commands": {
                             "system_info": system_info,
                             "pbp_settings": pbp_settings_payload,
@@ -4250,6 +4988,7 @@ class MonitorController:
                                 else {}
                             ),
                             "global_counters_baseline": global_counter_baseline,
+                            **incident_start_payloads,
                         },
                     }
                     append_jsonl(output_file, startup_record)
@@ -4329,29 +5068,52 @@ class MonitorController:
                         evidence_interfaces.add(summary["ingress_interface"])
                 evidence_interfaces.update(self.trigger_interfaces)
                 interface_counters: dict[str, Any] = {}
+                interface_counters_source = "none"
                 if (
                     cycle_number == 1
                     or cycle_number % INTERFACE_COUNTER_CYCLE_STRIDE == 0
                 ):
-                    # The physical view of where the flood enters, for the
-                    # interfaces the evidence itself names. Bounded set, and
-                    # only a pattern-validated name reaches the command.
-                    selected_interfaces = sorted(
-                        name
-                        for name in evidence_interfaces
-                        if INTERFACE_NAME_PATTERN.fullmatch(name)
-                    )[:INTERFACE_COUNTER_LIMIT]
-                    for interface_name in selected_interfaces:
-                        _, payload = await self._collect_command(
-                            "interface_counters",
-                            INTERFACE_COUNTER_COMMAND.format(name=interface_name),
+                    # The physical view of where the flood enters. One read of
+                    # the whole table first: a session-less flood (an ARP
+                    # storm) never names an interface through the session
+                    # evidence, so the only localization left is which port's
+                    # rx-broadcast or rx-multicast counter is moving. Two
+                    # consecutive reads then give a per-interface rate.
+                    _, all_payload = await self._collect_command(
+                        "interface_counters_all", INTERFACE_COUNTER_ALL_COMMAND
+                    )
+                    outputs["interface_counters_all"] = all_payload
+                    if command_succeeded(all_payload):
+                        interface_counters = extract_interface_counter_table(
+                            command_result(all_payload)
                         )
-                        outputs[f"interface_counters:{interface_name}"] = payload
-                        interface_counters[interface_name] = (
-                            extract_interface_counters(command_result(payload))
-                            if command_succeeded(payload)
-                            else {"error": payload.get("error")}
-                        )
+                        interface_counters_source = "all"
+                    if not interface_counters:
+                        # Fall back to the interfaces the evidence itself
+                        # names, so a release that refuses the `all` form
+                        # still localizes the named ingress ports. Bounded
+                        # set, and only a pattern-validated name reaches the
+                        # command.
+                        selected_interfaces = sorted(
+                            name
+                            for name in evidence_interfaces
+                            if INTERFACE_NAME_PATTERN.fullmatch(name)
+                        )[:INTERFACE_COUNTER_LIMIT]
+                        for interface_name in selected_interfaces:
+                            _, payload = await self._collect_command(
+                                "interface_counters",
+                                INTERFACE_COUNTER_COMMAND.format(
+                                    name=interface_name
+                                ),
+                            )
+                            outputs[f"interface_counters:{interface_name}"] = payload
+                            interface_counters[interface_name] = (
+                                extract_interface_counters(command_result(payload))
+                                if command_succeeded(payload)
+                                else {"error": payload.get("error")}
+                            )
+                        if interface_counters:
+                            interface_counters_source = "named"
 
                 percentages = extract_live_percentages(
                     command_result(outputs.get("packet_buffer_protection")),
@@ -4418,6 +5180,7 @@ class MonitorController:
                         "session_rates": session_rates,
                         "large_sessions": large_sessions,
                         "interface_counters": interface_counters,
+                        "interface_counters_source": interface_counters_source,
                         "buffer_latency": extract_buffer_latency(
                             command_result(outputs.get("buffer_latency"))
                         ),
@@ -4473,6 +5236,7 @@ class MonitorController:
                 system_info_task,
                 pbp_settings_task,
                 global_counter_primer_task,
+                *incident_start_tasks.values(),
             ):
                 if not startup_task.done():
                     startup_task.cancel()
@@ -4484,6 +5248,7 @@ class MonitorController:
                     offender_sources,
                     first_firewall_clock,
                     startup_pbp_settings,
+                    startup_global_counters_raw,
                 )
             try:
                 append_jsonl(

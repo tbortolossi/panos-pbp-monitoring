@@ -194,6 +194,32 @@ def _demo_cycle(number: int, offset_seconds: float, buffer_pct: float) -> dict[s
             "descriptor_total": [round(buffer_pct * 0.8, 1)],
             "resource_monitor_session": [round(18 + buffer_pct * 0.2, 1)],
         },
+        # The whole-table port read. The demo flood is unicast UDP, so the
+        # unicast counter is the one that moves; a gratuitous-ARP storm would
+        # show the same table with rx-broadcast carrying the growth instead.
+        "interface_counters": {
+            "ethernet1/1": {
+                "name": "ethernet1/1",
+                "counters": {
+                    "rx_unicast": 307_000_000 + number * 4_100_000,
+                    "rx_broadcast": 645_165 + number * 12,
+                    "rx_multicast": 10_832 + number * 3,
+                    "rx_discards": number * 140,
+                    "rx_error": 0,
+                },
+            },
+            "ethernet1/2": {
+                "name": "ethernet1/2",
+                "counters": {
+                    "rx_unicast": 162_000_000 + number * 90_000,
+                    "rx_broadcast": 606,
+                    "rx_multicast": 0,
+                    "rx_discards": 0,
+                    "rx_error": 0,
+                },
+            },
+        },
+        "interface_counters_source": "all",
         "resource_monitor_cpu_cores": [
             {"dataplane": "dp0", "core_id": 0, "utilization": 6},
             {"dataplane": "dp0", "core_id": 1, "utilization": min(99, int(buffer_pct) + 12)},
@@ -298,6 +324,103 @@ def demo_incident_records() -> list[dict[str, Any]]:
             "identity_complete": True,
             "dp_core_functions": DEMO_CORE_FUNCTIONS,
             "dp_core_functions_source": "firewall",
+            # The state and history read once at monitor start. The demo is a
+            # flood, so the history spikes and recovers rather than climbing,
+            # the zone the flood entered has flood protection disabled, and
+            # the unit is standalone.
+            "resource_monitor_history": {
+                "parsed": True,
+                "windows": [
+                    {
+                        "dataplane": "dp0",
+                        "window": window,
+                        "metrics": {
+                            "packet_buffer": {
+                                "maximum_series": series,
+                                "maximum": {
+                                    "latest": series[0],
+                                    "oldest": series[-1],
+                                    "peak": max(series),
+                                    "mean": round(sum(series) / len(series), 3),
+                                    "samples": len(series),
+                                },
+                            },
+                            "session": {
+                                "maximum": {
+                                    "latest": 4.0,
+                                    "oldest": 4.0,
+                                    "peak": 6.0,
+                                    "mean": 4.2,
+                                    "samples": len(series),
+                                }
+                            },
+                        },
+                        "cpu": {"maximum_peak": 61.0},
+                    }
+                    for window, series in (
+                        ("hour", [84.0, 12.0, 11.0, 11.0, 12.0, 11.0]),
+                        ("day", [84.0, 13.0, 12.0, 11.0, 12.0]),
+                        ("week", [84.0, 12.0, 11.0]),
+                    )
+                ],
+            },
+            "interface_status": {
+                "ethernet1/1": {
+                    "name": "ethernet1/1",
+                    "zone": "INTERNET",
+                    "state": "up",
+                    "speed": "1000",
+                    "vlan_tag": "0",
+                },
+                "ethernet1/2": {
+                    "name": "ethernet1/2",
+                    "zone": "LAN",
+                    "state": "up",
+                    "speed": "1000",
+                    "vlan_tag": "0",
+                },
+            },
+            "zone_protection": {
+                "parsed": True,
+                "zones": [
+                    {
+                        "zone": "INTERNET",
+                        "vsys": "vsys1",
+                        "profile": "Default_Zone_Protection",
+                        "dataplanes": ["dp0"],
+                        "flood_protection": {
+                            "tcp": False,
+                            "udp": False,
+                            "icmp": False,
+                            "tcp_syn_cookie": False,
+                        },
+                        "flood_protection_enabled": False,
+                        "pbp_counters": {"pbp_drop": 3984, "pbp_block_host": 0},
+                        "pbp_drop": 3984,
+                    },
+                    {
+                        "zone": "LAN",
+                        "vsys": "vsys1",
+                        "profile": "lan-zone-protection",
+                        "dataplanes": ["dp0"],
+                        "flood_protection": {"tcp": True, "udp": True},
+                        "flood_protection_enabled": True,
+                        "pbp_counters": {"pbp_drop": 0},
+                        "pbp_drop": 0,
+                    },
+                ],
+            },
+            "ha_state": {"parsed": True, "enabled": False, "passive": None},
+            "global_counters_raw": {
+                "parsed": True,
+                "counter_count": 489,
+                "dataplanes": ["dp0"],
+                "counters": {
+                    "flow_dos_pbp_drop": {"value": 3984, "rate": 0},
+                    "flow_dos_pbp_block_host": {"value": 14, "rate": 0},
+                    "flow_dos_drop_ip_blocked": {"value": 1204, "rate": 0},
+                },
+            },
         },
         {
             "timestamp": _timestamp(0.5),
@@ -371,6 +494,64 @@ def demo_incident_records() -> list[dict[str, Any]]:
                     ],
                 }
             )
+    records.append(
+        {
+            "timestamp": _timestamp(158),
+            "run_id": DEMO_RUN_ID,
+            "target_name": DEMO_TARGET,
+            "event": "global_counters_raw",
+            "global_counters_raw": {
+                "parsed": True,
+                "counter_count": 489,
+                "dataplanes": ["dp0"],
+                "counters": {
+                    "flow_dos_pbp_drop": {"value": 51204, "rate": 0},
+                    "flow_dos_pbp_block_host": {"value": 17, "rate": 0},
+                    "flow_dos_drop_ip_blocked": {"value": 4612, "rate": 0},
+                },
+            },
+            # Three more hosts blocked over the whole incident: a movement no
+            # per-batch delta window is short enough to have caught.
+            "growth_since_start": {
+                "flow_dos_pbp_drop": 47220,
+                "flow_dos_pbp_block_host": 3,
+                "flow_dos_drop_ip_blocked": 3408,
+            },
+        }
+    )
+    records.append(
+        {
+            "timestamp": _timestamp(159),
+            "run_id": DEMO_RUN_ID,
+            "target_name": DEMO_TARGET,
+            "event": "congestion_system_logs",
+            "ok": True,
+            "query": (
+                "(subtype eq general) and "
+                "(description contains 'Packet buffer congestion')"
+            ),
+            "requested_entries": 500,
+            "entries": [
+                {
+                    "time_generated": f"2026/08/{day:02d} 0{hour}:{minute:02d}:34",
+                    "receive_time": f"2026/08/{day:02d} 0{hour}:{minute:02d}:34",
+                    "severity": "informational",
+                    "measure": "utilization",
+                    "used": 78000,
+                    "total": 97280,
+                    "percent": 80.0,
+                    "alert_threshold_percent": 50.0,
+                    "description": (
+                        "Packet buffer congestion (utilization) is 78000/97280 "
+                        "(80%)(alert threshold is 50%)."
+                    ),
+                }
+                for day in range(22, 30)
+                for hour in (3,)
+                for minute in (0, 20, 40)
+            ],
+        }
+    )
     records.append(
         {
             "timestamp": _timestamp(160),

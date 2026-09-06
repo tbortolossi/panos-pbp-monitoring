@@ -66,6 +66,88 @@ TRAFFIC_LOG_RECORD = {
 }
 
 
+CONGESTION_LOG_XML = (
+    '<response status="success"><result><log><logs><entry>'
+    "<time_generated>2026/08/30 03:00:34</time_generated>"
+    "<opaque>Packet buffer congestion (utilization) is 4170/97280 (72%)"
+    "(alert threshold is 50%).</opaque>"
+    "</entry></logs></log></result></response>"
+)
+
+#: The congestion system-log query keeps its XML on the journal record too. It
+#: is the only PBP trace a monitor-only latency-mode device leaves, so a
+#: customer archive that could not replay it would carry the evidence and no
+#: way to read it.
+CONGESTION_LOG_RECORD = {
+    "run_id": "20260830T080000Z",
+    "timestamp": "2026-08-30T08:07:00+00:00",
+    "event": "congestion_system_logs",
+    "ok": True,
+    "raw_response": CONGESTION_LOG_XML,
+}
+
+#: The once-per-incident state and history reads travel as ordinary commands.
+INCIDENT_STATE_RECORD = {
+    "run_id": "20260830T080000Z",
+    "timestamp": "2026-08-30T08:00:00+00:00",
+    "event": "monitor_started",
+    "commands": {
+        "zone_protection": {
+            "ok": True,
+            "error": None,
+            "result": (
+                "<result><entry><dp>dp0</dp><entries><entry>"
+                "<zone>INTERNET</zone><tcp>False</tcp>"
+                "<pbp-drop>3984</pbp-drop></entry></entries></entry></result>"
+            ),
+        },
+        "ha_state": {
+            "ok": True,
+            "error": None,
+            "result": "<result><enabled>no</enabled></result>",
+        },
+        "global_counters_raw": {
+            "ok": True,
+            "error": None,
+            "result": (
+                "<result><dp>dp0</dp><global><t>1</t><counters><entry>"
+                "<name>flow_dos_pbp_block_host</name><value>14</value>"
+                "<rate>0</rate><severity>drop</severity><category>flow</category>"
+                "<aspect>dos</aspect><desc>Blocked</desc><id>801</id>"
+                "</entry></counters></global></result>"
+            ),
+        },
+        "resource_monitor_history": {
+            "ok": True,
+            "error": None,
+            "result": (
+                "<result><resource-monitor><data-processors><dp0><day>"
+                "<resource-utilization><entry>"
+                "<name>packet buffer (maximum)</name><value>88,60,20</value>"
+                "</entry></resource-utilization></day>"
+                "</dp0></data-processors></resource-monitor></result>"
+            ),
+        },
+        "interface_status": {
+            "ok": True,
+            "error": None,
+            "result": (
+                "<result><ifnet><entry><name>ethernet1/1</name>"
+                "<zone>INTERNET</zone></entry></ifnet></result>"
+            ),
+        },
+        "interface_counters_all": {
+            "ok": True,
+            "error": None,
+            "result": (
+                "<result><hw><entry><name>ethernet1/1</name><port>"
+                "<rx-broadcast>645165</rx-broadcast></port></entry></hw></result>"
+            ),
+        },
+    },
+}
+
+
 class ReplayTests(unittest.TestCase):
     def test_stored_xml_is_parsed_by_the_shipped_parser(self):
         outcomes = {item["command"]: item for item in replay_record(RECORD, None)}
@@ -121,6 +203,51 @@ class ReplayTests(unittest.TestCase):
         outcomes = replay_record(THREAT_LOG_RECORD, {"pbp_threat_logs"})
         self.assertEqual([item["command"] for item in outcomes], ["pbp_threat_logs"])
         self.assertEqual(replay_record(THREAT_LOG_RECORD, {"system_info"}), [])
+
+    def test_the_congestion_query_is_replayed_from_its_event_record(self):
+        outcomes = {
+            item["command"]: item
+            for item in replay_record(CONGESTION_LOG_RECORD, None)
+        }
+        congestion = outcomes["congestion_system_logs"]
+
+        self.assertEqual(congestion["status"], "parsed")
+        self.assertEqual(congestion["parsed"][0]["percent"], 72.0)
+        self.assertEqual(congestion["parsed"][0]["used"], 4170)
+
+    def test_every_once_per_incident_read_is_replayed_by_its_own_parser(self):
+        outcomes = {
+            item["command"]: item
+            for item in replay_record(INCIDENT_STATE_RECORD, None)
+        }
+
+        self.assertEqual(
+            {name: item["status"] for name, item in outcomes.items()},
+            {
+                "zone_protection": "parsed",
+                "ha_state": "parsed",
+                "global_counters_raw": "parsed",
+                "resource_monitor_history": "parsed",
+                "interface_status": "parsed",
+                "interface_counters_all": "parsed",
+            },
+        )
+        self.assertEqual(
+            outcomes["zone_protection"]["parsed"]["zones"][0]["pbp_drop"], 3984
+        )
+        self.assertIs(outcomes["ha_state"]["parsed"]["enabled"], False)
+        self.assertEqual(
+            outcomes["global_counters_raw"]["parsed"]["counters"][
+                "flow_dos_pbp_block_host"
+            ]["value"],
+            14,
+        )
+        self.assertEqual(
+            outcomes["interface_counters_all"]["parsed"]["ethernet1/1"][
+                "counters"
+            ]["rx_broadcast"],
+            645165,
+        )
 
     def test_a_run_archive_and_a_bare_capture_are_both_accepted(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -351,6 +351,36 @@ class AnonymizerTests(unittest.TestCase):
         # The prefix length of an address must survive, it is diagnostic.
         self.assertIn("/64", text)
 
+    def test_an_unregistered_serial_in_an_element_is_still_tokenized(self):
+        """`show high-availability state` names a firewall we never registered.
+
+        The peer of an HA pair is not a target of this deployment, so its
+        serial is in no literal list, and a bare twelve-digit number has no
+        pattern that could be matched safely anywhere else.
+        """
+        text = self._anonymizer().apply(
+            "<peer-info><serial>098765432109</serial>"
+            "<state>active</state></peer-info>"
+        )
+
+        self.assertNotIn("098765432109", text)
+        self.assertRegex(text, r"<serial>serial-[0-9a-f]{10}</serial>")
+
+    def test_a_registered_serial_reads_the_same_inside_and_outside_an_element(self):
+        anonymizer = self._anonymizer()
+        text = anonymizer.apply(
+            "log line 021201122656 and <serial>021201122656</serial>"
+        )
+        token = anonymizer.mapping["021201122656"]
+
+        self.assertEqual(text.count(token), 2)
+
+    def test_an_already_tokenized_serial_is_never_tokenized_twice(self):
+        anonymizer = self._anonymizer()
+        once = anonymizer.apply("<serial>021201122656</serial>")
+
+        self.assertEqual(anonymizer.apply(once), once)
+
     def test_a_value_keeps_one_token_everywhere_and_across_exports(self):
         first = self._anonymizer().apply("10.0.0.253 talks to 10.0.0.253")
         second = self._anonymizer().apply("seen again: 10.0.0.253")
