@@ -194,6 +194,15 @@ configuration volume, so:
 - whoever receives the archive cannot recover the address, because the salt
   never leaves the site.
 
+A serial number carried by a `<serial>`-style XML element is tokenized too,
+even when this deployment never registered it. `show high-availability state`
+names the peer of an HA pair, which is a firewall this collector does not
+monitor and whose serial is therefore in no list of known values; a bare
+twelve-digit number has no pattern that could be matched safely anywhere else,
+so the element itself is the anchor. It uses the same token kind, so a
+registered serial reads identically whether it appeared inside an element or in
+a Syslog line.
+
 Two values are deliberately left readable, because tokenizing them would cost
 diagnosis and hide nobody: loopback and unspecified addresses, which name the
 collector's own sockets, and a firewall name or hostname equal to the platform

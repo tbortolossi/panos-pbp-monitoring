@@ -115,7 +115,37 @@ than create a concurrent one.
    and stored with the model and PAN-OS release it was captured on. An incident
    reuses it and spends no API call unless that identity no longer matches, in
    which case it is read again for that incident. A firewall that cannot answer
-   the command records a parse warning and keeps collecting.
+   the command records a parse warning and keeps collecting. At the same
+   moment, and only once, the monitor reads the firewall's state and its
+   recorded history. None of it can be recovered later: a monitor only starts
+   once a trigger has fired, so the per-second view it collects begins after
+   the interesting part, and a counter that increments a dozen times an hour
+   never appears in a delta window that can be a fraction of a second. All five
+   are read-only operational commands validated on the lab firewall, and each
+   one failing is a partial collection failure recorded in `parse_warnings` —
+   never a reason to stop a batch or a monitor:
+   - `show counter global`, the raw form: every counter's cumulative value
+     since boot, plus PAN-OS's own rate column. The same command runs again at
+     monitor stop, so the pair brackets the incident and yields the growth of
+     every counter over the run, whatever the delta windows caught.
+   - `show running resource-monitor` with no window filter, which returns the
+     minute, hour, day and week blocks. Their maxima and averages separate a
+     level that only ever climbed — buffers allocated and not released — from
+     one that spiked and recovered, and the sample where the climb starts dates
+     its onset. Only the structured answer is parsed: the CLI text layout of
+     the historical windows differs between releases, and guessing it would
+     produce a silently wrong history instead of an honest gap.
+   - `show interface all`: the zone, VLAN tag, link state and speed of every
+     interface. MAC addresses are deliberately not kept.
+   - `show zone-protection`, per zone: the flood types actually enabled, the
+     profile name, and the packets PBP dropped and the hosts it blocked in that
+     zone. A zone with every flood type disabled is a finding no counter can
+     express.
+   - `show high-availability state`. A passive unit forwards no production
+     traffic, so buffers filling on it are not explained by the sessions it
+     holds and every offender ranking is empty by construction. The peer's
+     serial and addresses are not kept: they identify a firewall the collector
+     does not monitor.
 5. At incident startup, the monitor primes the global-counter delta baseline
    separately. At the start of each batch, it starts `show clock`, then collects
    the following commands in parallel every five seconds without waiting for
@@ -162,11 +192,16 @@ than create a concurrent one.
    session index PAN-OS recycled is detected by its start time and never
    inherits the volume of its predecessor.
 8. The complete cycle, raw XML API responses, and partial errors are written to
-   a JSONL file. The ingress interfaces the evidence itself names (THREAT
-   trigger fields, enriched sessions) additionally get hardware counter
-   snapshots, bounded to two interfaces and sampled on the first batch then
-   every third batch; only a pattern-validated interface name reaches the
-   command.
+   a JSONL file. The hardware port counters are collected on the first batch
+   then every third batch, with one `show counter interface all` read: a flood
+   that creates no session — a gratuitous-ARP storm is the textbook case —
+   names no offender at all, and which port's `rx-broadcast` or `rx-multicast`
+   counter is moving is then the only localization there is. Two consecutive
+   reads give a per-interface rate. Should a release refuse the whole-table
+   form, the collector falls back to the ingress interfaces the evidence itself
+   names (THREAT trigger fields, enriched sessions), bounded to two interfaces,
+   and only a pattern-validated interface name reaches that command. The batch
+   records which of the two produced the table.
 9. The monitor stops after N consecutive complete measurements below the
    recovery threshold, after the configurable time-to-live since the last
    matching alert, or after the maximum duration. A new trigger resets the
@@ -184,7 +219,16 @@ than create a concurrent one.
    are in the capture even when its threat log is not forwarded to the
    collector. When that clock could not be parsed the query carries no time
    filter; the record marks it unbounded so the diagnosis reads its entries as
-   corroboration rather than as designations for this incident. Raw responses are preserved as evidence and a failed lookup
+   corroboration rather than as designations for this incident. Two further
+   read-only reads complete the stop: `show counter global` again, closing the
+   bracket opened at monitor start and giving the growth of every counter over
+   the run, and one bounded system-log query (500 entries) for the firewall's
+   own *Packet buffer congestion* line. That line is written once a minute
+   while the buffer sits above the alert level, survives reboots, spans weeks,
+   and on a monitor-only latency-mode device it is the only trace PBP leaves at
+   all — no threat log, no PBP counter. It is deliberately **not** limited to
+   the incident window: weeks of timestamps are what expose a recurring
+   window. Raw responses are preserved as evidence and a failed lookup
    never blocks the stop marker or the report.
 10. After the stop marker is written, two standalone HTML reports are
    generated in the background from the same JSONL file: the layered
@@ -272,9 +316,22 @@ counter views, parsing status, and raw XML command responses. A
 `monitor_started` record preserves the identity returned by `show system info`,
 the `pbp_settings` read from the running configuration, and the
 `dp_core_functions` core-to-function-group map with the
-`dp_core_functions_source` field naming where that map came from; each cycle
-carries its `buffer_latency` report; a `pbp_threat_logs` event carries the
-PBP threat logs captured at stop with the query and its window; and a
+`dp_core_functions_source` field naming where that map came from. The same
+`monitor_started` record carries the once-per-incident state and history
+reads: `global_counters_raw` (cumulative value and rate per counter, counters
+that never moved dropped), `resource_monitor_history` (the minute, hour, day
+and week utilization series and their maxima and averages per dataplane, newest
+sample first), `interface_status` (zone, VLAN tag, link state and speed per
+interface), `zone_protection` (per zone: enabled flood types, profile, PBP
+drops and host blocks) and `ha_state` (enabled, local and peer state, mode and
+sync). Each cycle carries its `buffer_latency` report, its
+`interface_counters` table and the `interface_counters_source` field naming
+whether it came from the whole-table read or the named fallback. A
+`pbp_threat_logs` event carries the PBP threat logs captured at stop with the
+query and its window; a `global_counters_raw` event carries the second raw
+counter read and the `growth_since_start` of every counter; a
+`congestion_system_logs` event carries the firewall's own congestion lines with
+their occupancy, percentage and alert threshold; and a
 `monitor_stopped` record gives the stop reason together with a run summary
 (peak packet-buffer percentage and top ranked sources) that the dashboard
 reads from its bounded tail read to compare runs. Multi-target mode roots
@@ -285,7 +342,17 @@ probe and routing evidence.
 two derived views of the same records, containing a summary, timeline,
 offender ranking, denied and dropped traffic counters, the session table
 evolution, per-dataplane CPU core charts, partial errors, and all
-collapsible raw outputs. Both contain
+collapsible raw outputs. A *Before the incident* section renders the hour, day
+and week utilization the firewall had already recorded and folds its own
+congestion log into an hour-of-day and day-of-week histogram; when at least
+40 % of the congestion events fall inside the same three hours, both the
+section and the diagnosis name it a schedule, since an attack does not keep
+office hours. A *Zones, HA role and ports* section renders the per-zone flood
+protection and PBP drops, the HA role of the unit, and the growth of each
+port's counters over the capture. The root-cause counter families gain a
+cumulative-since-boot and a during-the-incident column from the two raw
+counter reads, and list a counter that no delta window ever caught. Both
+contain
 the JSONL SHA-256 digest; JSONL remains the source of truth. Neither travels in
 a support archive, since both regenerate from the capture the archive carries.
 Validation mode similarly produces `api-checks/<run_id>/api-check.jsonl` and
@@ -388,6 +455,13 @@ key must be backed up and restored together.
   automatically.
 - Only a fixed XML allowlist is available; arbitrary `type=op` commands supplied
   by a user or log are never executed.
+- An anonymized export tokenizes a PAN-OS serial carried by a `<serial>`-style
+  XML element as well as the serials this deployment registered. The peer of an
+  HA pair is a firewall the collector does not monitor, so its serial is in no
+  literal list, and a bare twelve-digit number has no pattern that could be
+  matched safely elsewhere. The element anchor keeps it exact, and the token
+  kind is the same, so a registered serial reads identically wherever it
+  appears.
 
 ## 11. Acceptance criteria
 
@@ -721,7 +795,24 @@ key must be backed up and restored together.
 - Prometheus export and Grafana correlation.
 - Slack or email notification with an incident summary.
 - PAN-OS-family-specific XML parsers after collecting real samples.
-- Feature-probed extended diagnostic profile: PBP `buffer-latency`, initial and
-  final PBP counters, and occasional `pow performance`. It remains disabled
-  until the operational XML is validated with `debug cli on` on the target
-  release.
+- Feature-probed extended diagnostic profile: occasional `pow performance`. It
+  remains disabled until the operational XML is validated with `debug cli on`
+  on the target release. The PBP `buffer-latency` and the initial and final
+  PBP counters this line also listed are collected since v0.35.0 and v0.40.0.
+- Class-conditional evidence, deferred because each read is only meaningful on
+  a platform or an incident class the lab firewall cannot exercise, and none
+  can be validated here: `show session distribution statistics` and
+  `show chassis status` on multi-dataplane chassis, the `show arp all` header
+  to separate a storm from ARP-table exhaustion, `show running application
+  statistics` for application attribution, the SSL-decrypt session count and
+  `debug dataplane show ssl-decrypt ssl-stats` for proxy classes, and
+  `debug dataplane pow performance all` for the pre-12.x `pbp_buf_latency`
+  histogram. Each needs its own gating rule so it is not run on a platform
+  that would refuse it, and that rule cannot be written from documentation
+  alone.
+- Positive proof of a blocked source from the DoS block table. `show
+  dos-block-table` has no operational API form on PAN-OS 12.2.2 — only
+  `debug dataplane show dos block-table`, which could not be validated
+  non-empty on the lab firewall — so it stays deferred rather than shipped
+  from documented XML. The collateral of a block is meanwhile measured from
+  `flow_dos_drop_ip_blocked` and the PBP threat logs, which are validated.

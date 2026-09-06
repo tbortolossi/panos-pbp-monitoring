@@ -992,5 +992,273 @@ class CounterRegistryTests(unittest.TestCase):
         self.assertIs(_SIGNAL_COUNTER_FAMILIES, SIGNAL_COUNTER_FAMILIES)
 
 
+def _started(**extra: object) -> dict:
+    record: dict = {
+        "timestamp": "2026-08-30T09:59:00+00:00",
+        "run_id": "diagnosis-run",
+        "event": "monitor_started",
+        "device": {"model": "PA-5220", "software_version": "10.2.9"},
+    }
+    record.update(extra)
+    return record
+
+
+def _history(*, series: list[float], window: str = "day") -> dict:
+    return {
+        "parsed": True,
+        "windows": [
+            {
+                "dataplane": "dp0",
+                "window": window,
+                "metrics": {
+                    "packet_buffer": {
+                        "maximum_series": series,
+                        "maximum": {
+                            "latest": series[0],
+                            "oldest": series[-1],
+                            "peak": max(series),
+                            "mean": round(sum(series) / len(series), 3),
+                            "samples": len(series),
+                        },
+                    },
+                    "session": {
+                        "maximum": {
+                            "latest": 1.0,
+                            "oldest": 1.0,
+                            "peak": 1.0,
+                            "mean": 1.0,
+                            "samples": len(series),
+                        }
+                    },
+                },
+                "cpu": {"maximum_peak": 20.0},
+            }
+        ],
+    }
+
+
+def _congestion(times: list[str]) -> dict:
+    return {
+        "timestamp": "2026-08-30T10:30:00+00:00",
+        "run_id": "diagnosis-run",
+        "event": "congestion_system_logs",
+        "ok": True,
+        "entries": [
+            {"time_generated": moment, "percent": 72.0} for moment in times
+        ],
+    }
+
+
+class IncidentStateSignatureTests(unittest.TestCase):
+    """The findings the once-per-incident state and history reads unlock.
+
+    None of them can be derived from the per-batch loop: a leak and a flood
+    end at the same percentage, an unprotected zone is invisible to every
+    counter, and a passive unit looks exactly like a leaking active one.
+    """
+
+    def _hypothesis(self, diagnosis: dict, key: str) -> dict | None:
+        return next(
+            (
+                hypothesis
+                for step in diagnosis["steps"]
+                for hypothesis in step.get("hypotheses") or []
+                if hypothesis["key"] == key
+            ),
+            None,
+        )
+
+    def test_a_level_that_only_climbed_is_named_a_leak_not_a_flood(self):
+        diagnosis = _diagnose(
+            [_cycle(1, 91.0), _cycle(2, 92.0)],
+            [
+                _started(
+                    resource_monitor_history=_history(
+                        series=[88.0, 70.0, 52.0, 33.0, 12.0, 11.0]
+                    )
+                )
+            ],
+        )
+        finding = self._hypothesis(diagnosis, "buffer_leak_history")
+
+        self.assertIsNotNone(finding)
+        self.assertEqual(finding["state"], "positive")
+        self.assertIn("only ever rose", finding["text"])
+        self.assertIn("session table stayed near empty", finding["text"])
+        self.assertEqual(diagnosis["context"]["buffer_history"]["shape"], "climbing")
+
+    def test_a_level_that_spiked_and_recovered_is_not_called_a_leak(self):
+        diagnosis = _diagnose(
+            [_cycle(1, 91.0)],
+            [
+                _started(
+                    resource_monitor_history=_history(
+                        series=[4.0, 88.0, 5.0, 4.0, 4.0, 4.0]
+                    )
+                )
+            ],
+        )
+
+        self.assertIsNone(self._hypothesis(diagnosis, "buffer_leak_history"))
+        self.assertEqual(diagnosis["context"]["buffer_history"]["shape"], "burst")
+
+    def test_a_capture_without_the_history_claims_nothing_about_a_trend(self):
+        diagnosis = _diagnose([_cycle(1, 91.0)], [_started()])
+
+        self.assertIsNone(self._hypothesis(diagnosis, "buffer_leak_history"))
+        self.assertEqual(
+            diagnosis["context"]["buffer_history"]["shape"], "unavailable"
+        )
+
+    def test_pbp_dropping_in_a_zone_with_no_flood_protection_is_named(self):
+        diagnosis = _diagnose(
+            [_cycle(1, 91.0)],
+            [
+                _started(
+                    zone_protection={
+                        "parsed": True,
+                        "zones": [
+                            {
+                                "zone": "INTERNET",
+                                "profile": "Default_Zone_Protection",
+                                "flood_protection": {"tcp": False, "udp": False},
+                                "flood_protection_enabled": False,
+                                "pbp_drop": 3984,
+                                "pbp_counters": {"pbp_drop": 3984},
+                            }
+                        ],
+                    }
+                )
+            ],
+        )
+        finding = self._hypothesis(diagnosis, "unprotected_zone")
+
+        self.assertIsNotNone(finding)
+        self.assertIn("every flood type disabled", finding["text"])
+        self.assertIn("INTERNET", finding["named"][0])
+
+    def test_a_protected_zone_raises_no_unprotected_finding(self):
+        diagnosis = _diagnose(
+            [_cycle(1, 91.0)],
+            [
+                _started(
+                    zone_protection={
+                        "parsed": True,
+                        "zones": [
+                            {
+                                "zone": "INTERNET",
+                                "flood_protection": {"tcp": True},
+                                "flood_protection_enabled": True,
+                                "pbp_drop": 3984,
+                                "pbp_counters": {"pbp_drop": 3984},
+                            }
+                        ],
+                    }
+                )
+            ],
+        )
+
+        self.assertIsNone(self._hypothesis(diagnosis, "unprotected_zone"))
+
+    def test_the_same_three_hours_every_night_reads_as_a_schedule(self):
+        nights = [
+            f"2026/08/{day:02d} 03:{minute:02d}:34"
+            for day in range(20, 27)
+            for minute in (0, 20, 40)
+        ]
+        diagnosis = _diagnose([_cycle(1, 91.0)], [_started(), _congestion(nights)])
+        finding = self._hypothesis(diagnosis, "scheduled_recurrence")
+
+        self.assertIsNotNone(finding)
+        self.assertIn("does not keep office hours", finding["text"])
+        recurrence = diagnosis["context"]["recurrence"]
+        self.assertEqual(recurrence["dated_entries"], 21)
+        self.assertTrue(recurrence["peak_window"]["scheduled"])
+        self.assertEqual(recurrence["peak_window"]["start_hour"], 3)
+
+    def test_congestion_spread_over_the_day_is_not_called_a_schedule(self):
+        spread = [
+            f"2026/08/20 {hour:02d}:10:00" for hour in range(24)
+        ]
+        diagnosis = _diagnose([_cycle(1, 91.0)], [_started(), _congestion(spread)])
+
+        self.assertIsNone(self._hypothesis(diagnosis, "scheduled_recurrence"))
+        self.assertFalse(
+            diagnosis["context"]["recurrence"]["peak_window"]["scheduled"]
+        )
+
+    def test_a_passive_unit_is_stated_before_anything_else_is_read(self):
+        diagnosis = _diagnose(
+            [_cycle(1, 99.0)],
+            [
+                _started(
+                    ha_state={
+                        "parsed": True,
+                        "enabled": True,
+                        "local_state": "passive",
+                        "peer_state": "active",
+                        "passive": True,
+                    }
+                )
+            ],
+        )
+        finding = self._hypothesis(diagnosis, "passive_ha_unit")
+
+        self.assertIsNotNone(finding)
+        self.assertIn("forwards no production traffic", finding["text"])
+        self.assertTrue(diagnosis["context"]["ha"]["passive"])
+
+    def test_an_active_unit_raises_no_passive_finding(self):
+        diagnosis = _diagnose(
+            [_cycle(1, 99.0)],
+            [
+                _started(
+                    ha_state={
+                        "parsed": True,
+                        "enabled": True,
+                        "local_state": "active",
+                        "passive": False,
+                    }
+                )
+            ],
+        )
+
+        self.assertIsNone(self._hypothesis(diagnosis, "passive_ha_unit"))
+
+    def test_the_new_findings_all_point_at_a_section_of_the_report(self):
+        html = _render(
+            [
+                _started(
+                    resource_monitor_history=_history(
+                        series=[88.0, 70.0, 52.0, 33.0, 12.0, 11.0]
+                    ),
+                    zone_protection={
+                        "parsed": True,
+                        "zones": [
+                            {
+                                "zone": "INTERNET",
+                                "flood_protection": {"tcp": False},
+                                "flood_protection_enabled": False,
+                                "pbp_drop": 3984,
+                                "pbp_counters": {"pbp_drop": 3984},
+                            }
+                        ],
+                    },
+                    ha_state={
+                        "parsed": True,
+                        "enabled": False,
+                    },
+                ),
+                _cycle(1, 91.0),
+                _cycle(2, 92.0),
+            ]
+        )
+
+        self.assertIn('id="history-title"', html)
+        self.assertIn('id="zones-title"', html)
+        self.assertIn("only ever rose", html)
+        self.assertIn("every flood type is disabled", html)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,7 +14,10 @@ from pbp_monitoring.config_store import ConfigStore
 from pbp_monitoring.orchestrator import (
     PBP_SETTINGS_COMMAND,
     CLOCK_COMMAND,
+    CONGESTION_LOG_QUERY,
     DP_CORE_FUNCTIONS_COMMAND,
+    INCIDENT_START_COMMANDS,
+    INTERFACE_COUNTER_ALL_COMMAND,
     OP_COMMANDS,
     SYSTEM_INFO_COMMAND,
     Config,
@@ -88,6 +91,105 @@ LARGE_SESSION_RESULT = (
     "<application>rsync</application>"
     "<ingress>ethernet1/1</ingress><egress>ethernet1/2</egress></entry>"
     "</result>"
+)
+
+
+# Anonymized shapes of the once-per-incident reads, matching what the lab
+# firewall answered when their operational XML was validated.
+GLOBAL_COUNTERS_RAW_RESULT = (
+    "<result><dp>dp0</dp><global><t>174633</t><counters>"
+    "<entry><name>pkt_recv</name><value>498397976</value><rate>218</rate>"
+    "<severity>info</severity><category>packet</category>"
+    "<aspect>pktproc</aspect><desc>Packets received</desc><id>17</id></entry>"
+    "<entry><name>flow_dos_pbp_block_host</name><value>14</value><rate>0</rate>"
+    "<severity>drop</severity><category>flow</category><aspect>dos</aspect>"
+    "<desc>Packet buffer protection blocked hosts</desc><id>801</id></entry>"
+    "<entry><name>flow_dos_pbp_drop</name><value>3984</value><rate>0</rate>"
+    "<severity>drop</severity><category>flow</category><aspect>dos</aspect>"
+    "<desc>Packets dropped by packet buffer protection</desc><id>802</id></entry>"
+    "<entry><name>never_moved</name><value>0</value><rate>0</rate>"
+    "<severity>info</severity><category>packet</category>"
+    "<aspect>pktproc</aspect><desc>Idle counter</desc><id>900</id></entry>"
+    "</counters></global></result>"
+)
+RESOURCE_MONITOR_HISTORY_RESULT = (
+    "<result><resource-monitor><data-processors><dp0>"
+    "<hour><cpu-load-maximum>"
+    "<entry><coreid>1</coreid><value>79,38,48,6</value></entry>"
+    "</cpu-load-maximum><resource-utilization>"
+    "<entry><name>packet buffer (average)</name>"
+    "<value>62,58,40,12</value></entry>"
+    "<entry><name>packet buffer (maximum)</name>"
+    "<value>88,71,44,14</value></entry>"
+    "<entry><name>session (average)</name><value>3,3,3,3</value></entry>"
+    "</resource-utilization></hour>"
+    "<day><resource-utilization>"
+    "<entry><name>packet buffer (maximum)</name>"
+    "<value>88,60,41,20,9</value></entry>"
+    "</resource-utilization></day>"
+    "</dp0></data-processors></resource-monitor></result>"
+)
+INTERFACE_STATUS_RESULT = (
+    "<result><hw>"
+    "<entry><name>ethernet1/1</name><mac>00:53:00:00:00:01</mac>"
+    "<speed>1000</speed><duplex>full</duplex><state>up</state>"
+    "<mode>(autoneg)</mode></entry>"
+    "<entry><name>ethernet1/2</name><speed>ukn</speed><duplex>ukn</duplex>"
+    "<state>down</state><mode>(power-down)</mode></entry>"
+    "</hw><ifnet>"
+    "<entry><name>ethernet1/1</name><tag>0</tag><vsys>1</vsys>"
+    "<zone>INTERNET</zone><fwd>vr:default</fwd><ip>198.51.100.1/24</ip></entry>"
+    "<entry><name>ethernet1/2</name><tag>0</tag><vsys>1</vsys>"
+    "<zone>LAN</zone><fwd>vr:default</fwd><ip>N/A</ip></entry>"
+    "</ifnet></result>"
+)
+ZONE_PROTECTION_RESULT = (
+    "<result><entry><dp>dp0</dp><entries>"
+    "<entry><zone>INTERNET</zone><vsys>vsys1</vsys>"
+    "<profile>Default_Zone_Protection</profile>"
+    "<tcp-syn-cookie>False</tcp-syn-cookie><tcp>False</tcp><udp>False</udp>"
+    "<icmp>False</icmp><ip>False</ip><icmp6>False</icmp6>"
+    "<sctp_init>False</sctp_init>"
+    "<pbp-drop>3984</pbp-drop><pbp-block-session>0</pbp-block-session>"
+    "<pbp-block-host>0</pbp-block-host></entry>"
+    "<entry><zone>LAN</zone><vsys>vsys1</vsys><profile>lan-zp</profile>"
+    "<tcp-syn-cookie>True</tcp-syn-cookie><tcp>True</tcp><udp>True</udp>"
+    "<icmp>False</icmp><ip>False</ip><icmp6>False</icmp6>"
+    "<sctp_init>False</sctp_init>"
+    "<pbp-drop>0</pbp-drop></entry>"
+    "</entries></entry></result>"
+)
+HA_STATE_RESULT = (
+    "<result><enabled>no</enabled><group><local-info>"
+    "<ha1-encrypt-imported>no</ha1-encrypt-imported>"
+    "</local-info></group></result>"
+)
+INTERFACE_COUNTERS_ALL_RESULT = (
+    "<result><hw>"
+    "<entry><name>ethernet1/1</name><port>"
+    "<rx-broadcast>645165</rx-broadcast><rx-bytes>365152680491</rx-bytes>"
+    "<rx-discards>3</rx-discards><rx-error>0</rx-error>"
+    "<rx-multicast>10832</rx-multicast><rx-unicast>307116173</rx-unicast>"
+    "<tx-error>0</tx-error></port></entry>"
+    "<entry><name>ethernet1/2</name><port>"
+    "<rx-broadcast>4</rx-broadcast><rx-discards>0</rx-discards>"
+    "<rx-error>0</rx-error><tx-error>0</tx-error></port></entry>"
+    "</hw></result>"
+)
+CONGESTION_LOG_RESULT = (
+    '<result><job><status>FIN</status><id>69</id></job><log>'
+    '<logs count="2" progress="100">'
+    "<entry><receive_time>2026/08/30 03:00:34</receive_time>"
+    "<time_generated>2026/08/30 03:00:34</time_generated>"
+    "<severity>informational</severity>"
+    "<opaque>Packet buffer congestion (utilization) is 4170/97280 (72%)"
+    "(alert threshold is 50%).</opaque></entry>"
+    "<entry><receive_time>2026/08/29 03:04:10</receive_time>"
+    "<time_generated>2026/08/29 03:04:10</time_generated>"
+    "<severity>informational</severity>"
+    "<opaque>Packet buffer congestion (utilization) is 3900/97280 (64%)"
+    "(alert threshold is 50%).</opaque></entry>"
+    "</logs></log></result>"
 )
 
 
@@ -184,6 +286,18 @@ class FakeClient:
             )
         if "<min-kb>" in command:
             return response(LARGE_SESSION_RESULT)
+        if command == INCIDENT_START_COMMANDS["global_counters_raw"]:
+            return response(GLOBAL_COUNTERS_RAW_RESULT)
+        if command == INCIDENT_START_COMMANDS["resource_monitor_history"]:
+            return response(RESOURCE_MONITOR_HISTORY_RESULT)
+        if command == INCIDENT_START_COMMANDS["interface_status"]:
+            return response(INTERFACE_STATUS_RESULT)
+        if command == INCIDENT_START_COMMANDS["zone_protection"]:
+            return response(ZONE_PROTECTION_RESULT)
+        if command == INCIDENT_START_COMMANDS["ha_state"]:
+            return response(HA_STATE_RESULT)
+        if command == INTERFACE_COUNTER_ALL_COMMAND:
+            return response(INTERFACE_COUNTERS_ALL_RESULT)
         raise AssertionError(f"Unexpected command: {command}")
 
 
@@ -1437,10 +1551,16 @@ class FloodCorroborationTests(unittest.TestCase):
 
 
 class InterfaceCounterTests(unittest.TestCase):
-    """Evidence-named ingress interfaces get bounded counter snapshots."""
+    """Every port is localized from one table read, with a named fallback."""
 
-    class InterfaceClient(FakeClient):
+    class NoTableClient(FakeClient):
+        """A release that refuses `show counter interface all`."""
+
         def op_response(self, command: str) -> PanOSResponse:
+            if command == INTERFACE_COUNTER_ALL_COMMAND:
+                with self.lock:
+                    self.commands.append(command)
+                raise PanOSAPIError("unsupported", raw_response="raw failure")
             if "<show><counter><interface>" in command:
                 with self.lock:
                     self.commands.append(command)
@@ -1454,9 +1574,18 @@ class InterfaceCounterTests(unittest.TestCase):
                 )
             return super().op_response(command)
 
-    def test_trigger_named_interface_is_sampled_and_parsed(self):
+    @staticmethod
+    def _first_cycle(output_dir: Path) -> dict:
+        capture = incident_capture_path(output_dir, "fixture-run")
+        records = [
+            json.loads(line)
+            for line in capture.read_text(encoding="utf-8").splitlines()
+        ]
+        return next(record for record in records if "cycle" in record)
+
+    def test_every_port_is_localized_from_one_table_read(self):
         async def scenario(cfg):
-            client = self.InterfaceClient()
+            client = FakeClient()
             controller = MonitorController(cfg, client)
             controller.trigger_interfaces = {"ethernet1/1"}
             await controller._monitor("fixture-run")
@@ -1467,27 +1596,54 @@ class InterfaceCounterTests(unittest.TestCase):
             output_dir = Path(temporary_directory)
             client = asyncio.run(scenario(make_config(output_dir)))
 
-            counter_commands = [
+            named = [
                 command
                 for command in client.commands
                 if "<show><counter><interface>" in command
+                and command != INTERFACE_COUNTER_ALL_COMMAND
             ]
-            self.assertTrue(counter_commands)
-            self.assertIn("ethernet1/1", counter_commands[0])
-            capture = incident_capture_path(output_dir, "fixture-run")
-            records = [
-                json.loads(line)
-                for line in capture.read_text(encoding="utf-8").splitlines()
+            self.assertFalse(named, "the table read makes per-interface reads useless")
+            self.assertIn(INTERFACE_COUNTER_ALL_COMMAND, client.commands)
+            first_cycle = self._first_cycle(output_dir)
+            self.assertEqual(first_cycle["interface_counters_source"], "all")
+            counters = first_cycle["interface_counters"]
+            # A session-less flood names no interface, so every port has to be
+            # there, not only the ones the evidence happened to mention.
+            self.assertEqual(sorted(counters), ["ethernet1/1", "ethernet1/2"])
+            self.assertEqual(
+                counters["ethernet1/1"]["counters"]["rx_broadcast"], 645165
+            )
+            self.assertEqual(counters["ethernet1/1"]["counters"]["rx_discards"], 3)
+
+    def test_named_interfaces_are_sampled_when_the_table_read_fails(self):
+        async def scenario(cfg):
+            client = self.NoTableClient()
+            controller = MonitorController(cfg, client)
+            controller.trigger_interfaces = {"ethernet1/1"}
+            await controller._monitor("fixture-run")
+            await controller.wait_for_reports()
+            return client
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            client = asyncio.run(scenario(make_config(output_dir)))
+
+            named = [
+                command
+                for command in client.commands
+                if "<show><counter><interface>" in command
+                and command != INTERFACE_COUNTER_ALL_COMMAND
             ]
-            first_cycle = next(record for record in records if "cycle" in record)
+            self.assertTrue(named)
+            self.assertIn("ethernet1/1", named[0])
+            first_cycle = self._first_cycle(output_dir)
+            self.assertEqual(first_cycle["interface_counters_source"], "named")
             parsed = first_cycle["interface_counters"]["ethernet1/1"]
-            self.assertEqual(parsed["name"], "ethernet1/1")
             self.assertEqual(parsed["counters"]["rx_bytes"], 163042446082)
-            self.assertEqual(parsed["counters"]["rx_discards"], 0)
 
     def test_an_invalid_interface_name_is_never_sent_to_the_firewall(self):
         async def scenario(cfg):
-            client = self.InterfaceClient()
+            client = self.NoTableClient()
             controller = MonitorController(cfg, client)
             controller.trigger_interfaces = {"bad name<>&"}
             await controller._monitor("fixture-run")
@@ -1502,6 +1658,7 @@ class InterfaceCounterTests(unittest.TestCase):
                     command
                     for command in client.commands
                     if "<show><counter><interface>" in command
+                    and command != INTERFACE_COUNTER_ALL_COMMAND
                 ]
             )
 
@@ -2111,9 +2268,14 @@ class PbpEvidenceTests(unittest.TestCase):
 
         def log_query_job(self, log_type, query, nlogs):
             self.queries.append((log_type, query, nlogs))
-            return "60"
+            return "61" if log_type == "system" else "60"
 
         def log_query_result(self, job_id):
+            if job_id == "61":
+                return PanOSResponse(
+                    result_xml=CONGESTION_LOG_RESULT,
+                    raw_response='<response status="success"/>',
+                )
             return PanOSResponse(
                 result_xml=(
                     "<result><job><status>FIN</status></job>"
@@ -2168,17 +2330,23 @@ class PbpEvidenceTests(unittest.TestCase):
             self.assertEqual(cycle["buffer_latency"]["dataplanes"][0]["dataplane"], "s1.dp0")
             self.assertIn("buffer_latency", cycle["commands"])
             # One bounded threat query, windowed on the firewall clock of the
-            # first batch (UTC 10:00:00 minus a one-minute margin).
+            # first batch (UTC 10:00:00 minus a one-minute margin), and one
+            # deliberately unwindowed congestion query: weeks of history are
+            # what expose a nightly window.
             self.assertEqual(
-                client.queries,
-                [
-                    (
-                        "threat",
-                        "((threatid eq 8507) or (threatid eq 8508) or (threatid eq 8509))"
-                        " and (receive_time geq '2026/08/27 09:59:00')",
-                        50,
-                    )
-                ],
+                sorted(client.queries),
+                sorted(
+                    [
+                        (
+                            "threat",
+                            "((threatid eq 8507) or (threatid eq 8508) or "
+                            "(threatid eq 8509))"
+                            " and (receive_time geq '2026/08/27 09:59:00')",
+                            50,
+                        ),
+                        ("system", CONGESTION_LOG_QUERY, 500),
+                    ]
+                ),
             )
             self.assertTrue(threat["ok"])
             self.assertEqual(threat["since_firewall_time"], "2026/08/27 09:59:00")
@@ -2286,15 +2454,13 @@ class PbpEvidenceTests(unittest.TestCase):
             ]
             threat = next(r for r in records if r.get("event") == "pbp_threat_logs")
 
-            self.assertEqual(
+            self.assertIn(
+                (
+                    "threat",
+                    "((threatid eq 8507) or (threatid eq 8508) or (threatid eq 8509))",
+                    50,
+                ),
                 client.queries,
-                [
-                    (
-                        "threat",
-                        "((threatid eq 8507) or (threatid eq 8508) or (threatid eq 8509))",
-                        50,
-                    )
-                ],
             )
             self.assertTrue(threat["ok"])
             self.assertIsNone(threat["since_firewall_time"])
@@ -2442,7 +2608,7 @@ class StopEvidenceConcurrencyTests(unittest.TestCase):
             events = {record.get("event") for record in records}
 
             # The threat-log job submission fails, but the record it already
-            # writes on failure survives, and the other three collections -
+            # writes on failure survives, and the other five collections -
             # built from none of its output - are entirely unaffected.
             self.assertEqual(
                 events,
@@ -2451,6 +2617,8 @@ class StopEvidenceConcurrencyTests(unittest.TestCase):
                     "offender_traffic_logs",
                     "pbp_threat_logs",
                     "pbp_settings_reread",
+                    "global_counters_raw",
+                    "congestion_system_logs",
                 },
             )
             threat = next(r for r in records if r["event"] == "pbp_threat_logs")
@@ -2704,3 +2872,166 @@ class LargeSessionCollectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             with self.assertRaises(ValueError):
                 make_config(Path(temporary_directory), large_session_min_kb=10)
+
+
+class IncidentStateEvidenceTests(unittest.TestCase):
+    """The state and history reads that a per-batch loop can never recover.
+
+    The hour/day/week utilization is already rolling when a trigger fires, a
+    counter moving a dozen times an hour never lands in a delta window, and a
+    zone with no flood protection, a passive HA unit or a session-less flood
+    are invisible to every command the batches run.
+    """
+
+    class LoggingClient(FakeClient):
+        """A FakeClient that also answers the congestion system-log query."""
+
+        def __init__(self):
+            super().__init__()
+            self.queries: list[tuple[str, str, int]] = []
+
+        def log_query_job(self, log_type: str, query: str, nlogs: int) -> str:
+            self.queries.append((log_type, query, nlogs))
+            return "61" if log_type == "system" else "60"
+
+        def log_query_result(self, job_id: str) -> PanOSResponse:
+            if job_id == "61":
+                return PanOSResponse(
+                    result_xml=CONGESTION_LOG_RESULT,
+                    raw_response='<response status="success"/>',
+                )
+            return PanOSResponse(
+                result_xml="<result><job><status>FIN</status></job></result>",
+                raw_response='<response status="success"/>',
+            )
+
+    def _run(self, output_dir: Path):
+        async def scenario(cfg):
+            client = self.LoggingClient()
+            controller = MonitorController(cfg, client)
+            await controller._monitor("fixture-run")
+            await controller.wait_for_reports()
+            return client
+
+        client = asyncio.run(scenario(make_config(output_dir)))
+        capture = incident_capture_path(output_dir, "fixture-run")
+        records = [
+            json.loads(line)
+            for line in capture.read_text(encoding="utf-8").splitlines()
+        ]
+        return client, records
+
+    def test_the_state_and_history_reads_land_in_the_startup_record(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            client, records = self._run(Path(temporary_directory))
+            started = next(
+                record for record in records if record.get("event") == "monitor_started"
+            )
+
+            for name, command in INCIDENT_START_COMMANDS.items():
+                self.assertIn(command, client.commands, name)
+                self.assertIn(name, started["commands"])
+            self.assertEqual(started["parse_warnings"], [])
+            # The counter no delta window could ever have caught.
+            self.assertEqual(
+                started["global_counters_raw"]["counters"][
+                    "flow_dos_pbp_block_host"
+                ]["value"],
+                14,
+            )
+            hour = next(
+                window
+                for window in started["resource_monitor_history"]["windows"]
+                if window["window"] == "hour"
+            )
+            self.assertEqual(
+                hour["metrics"]["packet_buffer"]["maximum"]["oldest"], 14.0
+            )
+            self.assertEqual(
+                started["interface_status"]["ethernet1/1"]["zone"], "INTERNET"
+            )
+            internet = started["zone_protection"]["zones"][0]
+            self.assertEqual(internet["zone"], "INTERNET")
+            self.assertIs(internet["flood_protection_enabled"], False)
+            self.assertIs(started["ha_state"]["enabled"], False)
+
+    def test_the_two_raw_counter_reads_bracket_the_incident(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            client, records = self._run(Path(temporary_directory))
+            bracket = next(
+                record
+                for record in records
+                if record.get("event") == "global_counters_raw"
+            )
+
+            self.assertEqual(
+                client.commands.count(
+                    INCIDENT_START_COMMANDS["global_counters_raw"]
+                ),
+                2,
+            )
+            self.assertEqual(
+                bracket["global_counters_raw"]["counters"]["flow_dos_pbp_drop"][
+                    "value"
+                ],
+                3984,
+            )
+            # The fixture returns the same values twice, so nothing grew.
+            self.assertEqual(bracket["growth_since_start"]["flow_dos_pbp_drop"], 0)
+            self.assertIn("global_counters_raw", bracket["commands"])
+
+    def test_the_congestion_log_is_queried_unwindowed_at_stop(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            client, records = self._run(Path(temporary_directory))
+            congestion = next(
+                record
+                for record in records
+                if record.get("event") == "congestion_system_logs"
+            )
+
+            # Weeks of history are the point: a window would hide the very
+            # recurrence the query exists to expose.
+            self.assertIn(("system", CONGESTION_LOG_QUERY, 500), client.queries)
+            self.assertTrue(congestion["ok"])
+            self.assertEqual(len(congestion["entries"]), 2)
+            self.assertEqual(congestion["entries"][0]["percent"], 72.0)
+            self.assertIn("raw_response", congestion)
+
+    def test_a_refused_state_read_costs_evidence_and_never_the_monitor(self):
+        class RefusingClient(IncidentStateEvidenceTests.LoggingClient):
+            def op_response(self, command: str) -> PanOSResponse:
+                if command == INCIDENT_START_COMMANDS["zone_protection"]:
+                    with self.lock:
+                        self.commands.append(command)
+                    raise PanOSAPIError("not authorized", raw_response="denied")
+                return super().op_response(command)
+
+        async def scenario(cfg):
+            controller = MonitorController(cfg, RefusingClient())
+            await controller._monitor("fixture-run")
+            await controller.wait_for_reports()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            asyncio.run(scenario(make_config(output_dir)))
+            records = [
+                json.loads(line)
+                for line in incident_capture_path(output_dir, "fixture-run")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            started = next(
+                record for record in records if record.get("event") == "monitor_started"
+            )
+
+            self.assertIn(
+                "zone_protection command failed, the per-zone flood protection "
+                "state and PBP drops could not be collected",
+                started["parse_warnings"],
+            )
+            # Everything else in the same startup read survives, and the
+            # batches ran.
+            self.assertIs(started["ha_state"]["enabled"], False)
+            self.assertEqual(started["zone_protection"]["zones"], [])
+            self.assertTrue([record for record in records if "cycle" in record])
+            self.assertEqual(records[-1]["event"], "monitor_stopped")

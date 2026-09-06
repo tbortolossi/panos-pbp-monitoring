@@ -3,6 +3,79 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.40.0] - 2026-09-06
+
+### Added
+
+- **The firewall's state and history are now collected once per incident.**
+  Six read-only commands run while a monitor starts or stops, all validated
+  against the lab PA-440 on PAN-OS 12.2.2. They answer questions the per-batch
+  loop structurally cannot, because a monitor only starts once a trigger has
+  already fired:
+  - `show counter global` (raw, at start and again at stop). The per-batch
+    delta window can be a fraction of a second, so a counter that increments a
+    dozen times an hour never lands in it — the closed TAC corpus has cases
+    decided by a cumulative `flow_dos_pbp_block_host` of fourteen. The two
+    reads bracket the incident, and the report's counter families gain a
+    **Since boot** and a **During** column. A counter never seen moving in any
+    delta is now listed anyway, with its cumulative value.
+  - `show running resource-monitor` with no window filter, once at start. The
+    minute, hour, day and week blocks carry the maxima and averages that
+    separate a leak from a burst, and their sample series date the onset. The
+    new *Before the incident* report section states which windows only climbed
+    and roughly when the climb started; the diagnosis raises **Buffer level
+    that only climbed** on it, and says so only when the history is there.
+  - `show counter interface all` per sampled batch, replacing the two
+    per-interface reads (which stay as a fallback for a release that refuses
+    the whole-table form), and `show interface all` once at start. Offender
+    enrichment is session-driven and stays empty on a session-less flood — a
+    gratuitous-ARP storm is the textbook case — and per-port `rx-broadcast` /
+    `rx-multicast` growth beside the port's zone and link speed is then the
+    only localization there is.
+  - `show zone-protection`, once at start. A zone whose profile leaves every
+    flood type disabled is what turns "PBP is firing" into "PBP is doing zone
+    protection's job on an unprotected zone". The new *Zones, HA role and
+    ports* section lists every zone with its enabled flood types and the
+    packets PBP dropped in it, and the diagnosis raises **PBP covering an
+    unprotected zone** when the two coincide.
+  - `show high-availability state`, once at start. Buffers at 99 % with an
+    empty session table mean nothing until it is known whether the unit is
+    passive. The diagnosis now says so explicitly instead of letting an empty
+    offender ranking read as a mystery.
+  - A bounded system-log query for the firewall's own *Packet buffer
+    congestion* line, at stop. It is written once a minute while the buffer is
+    above the alert level, survives reboots, spans weeks, and on a monitor-only
+    latency-mode device it is the **only** trace PBP leaves — no threat log, no
+    PBP counter.
+- **A recurrence histogram, with no extra collection.** The congestion log
+  above is folded into an hour-of-day and day-of-week histogram. When 40 % or
+  more of the events fall inside the same three hours, the report and the
+  diagnosis name it: a backup or replication window fires at the same time on
+  different days, and an attack does not. The fix is then the schedule, the
+  bandwidth or a QoS profile — not a block.
+- Both reports gain the two sections and their navigation entries, from the
+  same shared declaration, so the flat report and the layered one cannot
+  present different tables. A capture taken before this release renders
+  exactly as before, with the new sections stating what was not collected
+  rather than implying a flat history.
+
+### Changed
+
+- A failure of any of the once-per-incident reads is a partial collection
+  failure, listed in the startup record's `parse_warnings` and named in the
+  read-only API check's optional-evidence list. It never stops a batch, a
+  monitor or the Syslog listener: a firewall with no HA, no zone-protection
+  profile, or an API role that refuses a command is still monitored.
+
+### Security
+
+- **A serial number carried by an XML element is now anonymized even when this
+  deployment never registered it.** `show high-availability state` names the
+  peer of an HA pair, which is a firewall the collector does not monitor and
+  whose serial is therefore in no literal list. Anonymized exports now
+  tokenize the content of any `<serial>`-style element, through the same token
+  kind, so a registered serial still reads identically wherever it appears.
+
 ## [0.39.2] - 2026-09-06
 
 ### Fixed

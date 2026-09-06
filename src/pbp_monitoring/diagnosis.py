@@ -23,6 +23,7 @@ import html
 import math
 import re
 import statistics
+from datetime import datetime
 from typing import Any, Iterable, Sequence
 
 # PAN-OS packet buffer protection defaults: alert at 50 %, activate at 80 %.
@@ -71,6 +72,24 @@ SESSION_COLLAPSE_FLOOR = 1000.0
 CHASSIS_IMBALANCE_MEDIAN_PERCENT = 20.0
 LATENCY_LONG_TAIL_RATIO = 100.0
 RECENT_BOOT_DAYS = 3.0
+# A resource-monitor history whose oldest sample sits this far below its newest
+# one only ever climbed: that is a leak, not a burst that recovered. The
+# per-second view a monitor collects can never show it, because the monitor
+# only starts once the trigger has already fired.
+HISTORY_CLIMB_PERCENT = 10.0
+# ...and its median has to have moved with it. A spike happening right now
+# raises the newest sample above the oldest exactly as a leak does; only a
+# leak also leaves the middle of the window elevated.
+HISTORY_CLIMB_MEDIAN_SHARE = 0.3
+# A history window whose maximum is that far above its own average is a burst:
+# the level spiked and came back.
+HISTORY_BURST_RATIO = 2.0
+# The share of congestion events that has to fall inside one three-hour window
+# before the recurrence is called a schedule rather than an accident, and the
+# number of events below which the histogram says nothing at all.
+RECURRENCE_WINDOW_HOURS = 3
+RECURRENCE_WINDOW_SHARE = 0.4
+RECURRENCE_MIN_EVENTS = 12
 # Applications whose elephant flows are the operator's own infrastructure:
 # blocking them trades an incident for an outage.
 BACKUP_APPLICATIONS = frozenset(
@@ -203,6 +222,318 @@ def latest_event(
         ),
         None,
     )
+
+
+def start_event(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """The ``monitor_started`` record, which carries the once-per-incident reads.
+
+    Everything read once while the incident was starting — the cumulative
+    counters, the utilization history, the interface map, the zone-protection
+    table and the HA role — is persisted there. Both reports and the diagnosis
+    locate it through this one helper, so none of them can disagree about
+    which record they read.
+    """
+    for record in events:
+        if str(record.get("event", "")).lower() in {"monitor_started", "started"}:
+            return record
+    return {}
+
+
+#: The resource-monitor windows, from the shortest to the longest. A capture
+#: from a firewall that does not keep one of them simply has no entry for it.
+HISTORY_WINDOW_ORDER = ("minute", "hour", "day", "week")
+#: How long one sample of each window covers, for dating an onset in words.
+HISTORY_WINDOW_SAMPLE = {
+    "minute": ("minute", 1.0 / 60.0),
+    "hour": ("hour", 1.0),
+    "day": ("day", 24.0),
+    "week": ("week", 168.0),
+}
+
+
+def history_windows(events: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The resource-monitor history blocks read at monitor start, ordered."""
+    history = start_event(events).get("resource_monitor_history")
+    if not isinstance(history, dict):
+        return []
+    windows = [
+        window
+        for window in history.get("windows") or []
+        if isinstance(window, dict)
+    ]
+    windows.sort(
+        key=lambda window: (
+            str(window.get("dataplane") or ""),
+            HISTORY_WINDOW_ORDER.index(str(window.get("window")))
+            if str(window.get("window")) in HISTORY_WINDOW_ORDER
+            else len(HISTORY_WINDOW_ORDER),
+        )
+    )
+    return windows
+
+
+def history_trend(
+    events: Sequence[dict[str, Any]], metric: str = "packet_buffer"
+) -> dict[str, Any]:
+    """Read one metric's history as a climb, a burst, or a flat level.
+
+    A leak and a flood look identical in the per-second view a monitor
+    collects: both end at a high percentage. They separate over hours and
+    days. A window whose oldest sample sits well below its newest one only
+    ever climbed, and the sample where the climb starts dates the onset; a
+    window whose maximum towers over its own average spiked and recovered.
+    """
+    verdicts: list[dict[str, Any]] = []
+    for window in history_windows(events):
+        metrics = window.get("metrics")
+        if not isinstance(metrics, dict):
+            continue
+        readings = metrics.get(metric)
+        if not isinstance(readings, dict):
+            continue
+        maximum = readings.get("maximum")
+        average = readings.get("average")
+        summary = maximum if isinstance(maximum, dict) else average
+        if not isinstance(summary, dict):
+            continue
+        latest = _first_number(summary.get("latest"))
+        oldest = _first_number(summary.get("oldest"))
+        peak = _first_number(summary.get("peak"))
+        mean = _first_number(summary.get("mean"))
+        if latest is None or oldest is None:
+            continue
+        series = readings.get("maximum_series") or readings.get("average_series")
+        samples = [
+            value
+            for item in (series if isinstance(series, list) else [])
+            if (value := _first_number(item)) is not None
+        ]
+        rise = latest - oldest
+        # A spike that is happening right now also has a high newest sample
+        # and a low oldest one, so the rise alone cannot separate a leak from
+        # a burst. What separates them is how much of the window sat high: a
+        # leak has been elevated for a good part of it, a burst has not, so
+        # the median has to have moved with the level.
+        sustained = (
+            statistics.median(samples)
+            >= oldest + rise * HISTORY_CLIMB_MEDIAN_SHARE
+            if samples
+            else False
+        )
+        shape = "flat"
+        if rise >= HISTORY_CLIMB_PERCENT and sustained:
+            shape = "climbing"
+        elif (
+            peak is not None
+            and mean is not None
+            and mean > 0
+            and peak / mean >= HISTORY_BURST_RATIO
+        ):
+            shape = "burst"
+        onset = None
+        if shape == "climbing" and isinstance(series, list) and series:
+            # The series runs newest first, so the onset is the last sample
+            # still at the old level, counted back from now.
+            floor = oldest + max(1.0, rise * 0.1)
+            index = len(series) - 1
+            for position, value in enumerate(series):
+                number = _first_number(value)
+                if number is not None and number <= floor:
+                    index = position
+                    break
+            unit, hours = HISTORY_WINDOW_SAMPLE.get(
+                str(window.get("window")), ("sample", 1.0)
+            )
+            onset = {
+                "samples_ago": index,
+                "unit": unit,
+                "hours_ago": round(index * hours, 2),
+            }
+        verdicts.append(
+            {
+                "dataplane": window.get("dataplane"),
+                "window": window.get("window"),
+                "shape": shape,
+                "latest": latest,
+                "oldest": oldest,
+                "peak": peak,
+                "mean": mean,
+                "rise": round(rise, 2),
+                "onset": onset,
+            }
+        )
+    climbing = [verdict for verdict in verdicts if verdict["shape"] == "climbing"]
+    return {
+        "metric": metric,
+        "available": bool(verdicts),
+        "windows": verdicts,
+        "shape": (
+            "climbing"
+            if climbing
+            else "burst"
+            if any(verdict["shape"] == "burst" for verdict in verdicts)
+            else "flat"
+            if verdicts
+            else "unavailable"
+        ),
+        "climbing_windows": [str(verdict["window"]) for verdict in climbing],
+    }
+
+
+_CONGESTION_TIME_FORMATS = ("%Y/%m/%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S")
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _congestion_moment(entry: dict[str, Any]) -> datetime | None:
+    for key in ("time_generated", "receive_time"):
+        text = str(entry.get(key) or "").strip()
+        if not text:
+            continue
+        for pattern in _CONGESTION_TIME_FORMATS:
+            try:
+                return datetime.strptime(text[:19], pattern)
+            except ValueError:
+                continue
+    return None
+
+
+def congestion_recurrence(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Fold the firewall's own congestion log into a recurrence histogram.
+
+    The congestion line is written once a minute while the buffer is above the
+    alert level, it survives reboots, and it is the only PBP trace a
+    monitor-only latency-mode device leaves at all. Counting its timestamps by
+    hour of day and day of week is what separates a scheduled job from an
+    attack: a backup window fires in the same three hours every night, and a
+    flood does not.
+
+    No collection of its own: the histogram is derived from the single
+    congestion query the monitor already runs at stop.
+    """
+    record = latest_event(events, "congestion_system_logs") or {}
+    entries = [
+        entry for entry in record.get("entries") or [] if isinstance(entry, dict)
+    ]
+    hours = [0] * 24
+    weekdays = [0] * 7
+    moments: list[datetime] = []
+    for entry in entries:
+        moment = _congestion_moment(entry)
+        if moment is None:
+            continue
+        moments.append(moment)
+        hours[moment.hour] += 1
+        weekdays[moment.weekday()] += 1
+    percentages = [
+        value
+        for entry in entries
+        if (value := _first_number(entry.get("percent"))) is not None
+    ]
+    counted = len(moments)
+    peak_window = None
+    if counted >= RECURRENCE_MIN_EVENTS:
+        best_start, best_total, best_head = 0, -1, -1
+        for start in range(24):
+            total = sum(
+                hours[(start + offset) % 24]
+                for offset in range(RECURRENCE_WINDOW_HOURS)
+            )
+            # Several windows can hold the same events; the one that starts on
+            # the busiest hour is the one an operator recognizes as the job's
+            # window, rather than an equally valid window starting two hours
+            # before anything happens.
+            if (total, hours[start]) > (best_total, best_head):
+                best_start, best_total, best_head = start, total, hours[start]
+        share = best_total / counted if counted else 0.0
+        peak_window = {
+            "start_hour": best_start,
+            "end_hour": (best_start + RECURRENCE_WINDOW_HOURS) % 24,
+            "events": best_total,
+            "share": round(share, 3),
+            "scheduled": share >= RECURRENCE_WINDOW_SHARE,
+        }
+    return {
+        "collected": bool(record),
+        "ok": bool(record.get("ok")),
+        "error": record.get("error"),
+        "entries": len(entries),
+        "dated_entries": counted,
+        "hours": hours,
+        "weekdays": weekdays,
+        "weekday_labels": list(_WEEKDAYS),
+        "first_seen": min(moments).isoformat(sep=" ") if moments else None,
+        "last_seen": max(moments).isoformat(sep=" ") if moments else None,
+        "span_days": (
+            round((max(moments) - min(moments)).total_seconds() / 86400.0, 2)
+            if len(moments) > 1
+            else 0.0
+        ),
+        "peak_percent": max(percentages) if percentages else None,
+        "peak_window": peak_window,
+    }
+
+
+def zone_protection_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """The per-zone flood protection state and PBP drops read at start.
+
+    The finding the corpus keeps producing is not "PBP fired": it is that PBP
+    fired in a zone where flood protection was never enabled, so PBP was doing
+    zone protection's job with a blunter tool.
+    """
+    table = start_event(events).get("zone_protection")
+    if not isinstance(table, dict):
+        return {"collected": False, "zones": [], "unprotected": []}
+    zones = [zone for zone in table.get("zones") or [] if isinstance(zone, dict)]
+    unprotected = [
+        zone
+        for zone in zones
+        if zone.get("flood_protection_enabled") is False
+        and (_first_number(zone.get("pbp_drop")) or 0.0) > 0
+    ]
+    return {
+        "collected": bool(table.get("parsed")) or bool(zones),
+        "zones": zones,
+        "unprotected": unprotected,
+        "dropping_zones": [
+            zone
+            for zone in zones
+            if (_first_number(zone.get("pbp_drop")) or 0.0) > 0
+        ],
+    }
+
+
+def ha_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """The high-availability role of the monitored unit, read once at start."""
+    state = start_event(events).get("ha_state")
+    if not isinstance(state, dict):
+        return {"collected": False}
+    return {"collected": bool(state.get("parsed")), **state}
+
+
+def raw_counter_bracket(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """The cumulative counters read at start and at stop, and their growth.
+
+    A counter that moved fourteen times over an hour never appears in a
+    per-batch delta whose window is a fraction of a second. The bracket is
+    what makes it visible, and it is computed once, at collection time, so the
+    report and the diagnosis cannot each derive a different growth.
+    """
+    started = start_event(events).get("global_counters_raw")
+    stopped = latest_event(events, "global_counters_raw") or {}
+    start_counters = (
+        started.get("counters") if isinstance(started, dict) else None
+    )
+    stop_parsed = stopped.get("global_counters_raw")
+    stop_counters = (
+        stop_parsed.get("counters") if isinstance(stop_parsed, dict) else None
+    )
+    growth = stopped.get("growth_since_start")
+    return {
+        "collected": bool(start_counters) or bool(stop_counters),
+        "start": start_counters if isinstance(start_counters, dict) else {},
+        "stop": stop_counters if isinstance(stop_counters, dict) else {},
+        "growth": growth if isinstance(growth, dict) else {},
+    }
 
 
 def _metric_peak(cycles: Sequence[dict[str, Any]], *keys: str) -> float | None:
@@ -696,6 +1027,13 @@ def _context(
         "uptime_days": uptime_days(
             device.get("uptime") if isinstance(device, dict) else None
         ),
+        # The once-per-incident state and history reads. Everything below is
+        # derived from the capture alone; a capture taken before these
+        # commands existed simply reports them as not collected.
+        "ha": ha_summary(events),
+        "zone_protection": zone_protection_summary(events),
+        "buffer_history": history_trend(events),
+        "recurrence": congestion_recurrence(events),
     }
 
 
@@ -2399,6 +2737,166 @@ def _step_elsewhere(
             }
         )
 
+    # 4h - a level that only climbed. The per-second view a monitor collects
+    # cannot tell a leak from a flood: both end high. The hour, day and week
+    # blocks read once at monitor start can, and that read is the only reason
+    # this hypothesis exists at all.
+    history = context.get("buffer_history") or {}
+    if history.get("shape") == "climbing":
+        climbing = [
+            window
+            for window in history.get("windows") or []
+            if window.get("shape") == "climbing"
+        ]
+        named_windows = [
+            f"the {_escape(window.get('window'))} history of "
+            f"{_escape(window.get('dataplane'))} rose from "
+            f"{_fmt(window.get('oldest'))}% to {_fmt(window.get('latest'))}%"
+            + (
+                f", starting about {_fmt((window.get('onset') or {}).get('samples_ago'))} "
+                f"{_escape((window.get('onset') or {}).get('unit'))}(s) ago"
+                if window.get("onset")
+                else ""
+            )
+            for window in climbing[:_MAX_NAMED]
+        ]
+        sessions_flat = any(
+            (readings := (window.get("metrics") or {}).get("session"))
+            and isinstance(readings, dict)
+            and (summary := readings.get("maximum") or readings.get("average"))
+            and isinstance(summary, dict)
+            and (peak := _first_number(summary.get("peak"))) is not None
+            and peak <= LEAK_SESSION_TABLE_PERCENT
+            for window in history_windows(events)
+        )
+        hypotheses.append(
+            {
+                "key": "buffer_leak_history",
+                "title": "Buffer level that only climbed",
+                "state": "positive",
+                "text": (
+                    "<strong>The buffer utilization this firewall recorded "
+                    "before the incident only ever rose</strong>: "
+                    + "; ".join(
+                        f"over the {_escape(window.get('window'))} window it went "
+                        f"from {_fmt(window.get('oldest'))}% to "
+                        f"{_fmt(window.get('latest'))}%"
+                        for window in climbing[:_MAX_NAMED]
+                    )
+                    + ". A flood fills the buffers and lets them drain again; a "
+                    "level that climbs and never returns is buffers that are "
+                    "allocated and not released."
+                    + (
+                        " The session table stayed near empty over the same "
+                        "windows, which rules out the load itself as the "
+                        "explanation and points at a leak rather than traffic."
+                        if sessions_flat
+                        else ""
+                    )
+                    + " Date the start of the climb against the last change on "
+                    "this firewall - a PAN-OS upgrade, a new feature, a new "
+                    "peer - before looking at the traffic of the last hour."
+                ),
+                "named": named_windows,
+            }
+        )
+
+    # 4i - PBP doing zone protection's job. The zone-protection table is the
+    # only read that says whether the zone the drops came from had any flood
+    # protection configured at all.
+    zone_protection = context.get("zone_protection") or {}
+    unprotected = zone_protection.get("unprotected") or []
+    if unprotected:
+        hypotheses.append(
+            {
+                "key": "unprotected_zone",
+                "title": "PBP covering an unprotected zone",
+                "state": "positive",
+                "text": (
+                    "<strong>PBP dropped packets in "
+                    + ("a zone" if len(unprotected) == 1 else "zones")
+                    + " whose zone-protection profile has every flood type "
+                    "disabled.</strong> PBP is a last resort that acts on the "
+                    "whole buffer: it cannot tell a flood from legitimate "
+                    "traffic and it drops both. Zone protection is the tool "
+                    "that was meant to absorb this, and on "
+                    + ("this zone" if len(unprotected) == 1 else "these zones")
+                    + " it is not enabled. Configuring SYN, UDP and ICMP flood "
+                    "protection on the zone the traffic enters is the fix; "
+                    "raising the PBP threshold is not."
+                ),
+                "named": [
+                    f"zone <code>{_escape(zone.get('zone'))}</code>"
+                    + (
+                        f" (profile <code>{_escape(zone.get('profile'))}</code>)"
+                        if zone.get("profile")
+                        else ""
+                    )
+                    + f": {_fmt(zone.get('pbp_drop'))} packets dropped by PBP, "
+                    "no flood protection enabled"
+                    for zone in unprotected[:_MAX_NAMED]
+                ],
+            }
+        )
+
+    # 4j - the same three hours every night. Zero collection of its own: the
+    # congestion query already run at stop carries weeks of timestamps.
+    recurrence = context.get("recurrence") or {}
+    peak_window = recurrence.get("peak_window") or {}
+    if peak_window.get("scheduled"):
+        hypotheses.append(
+            {
+                "key": "scheduled_recurrence",
+                "title": "A recurring window, not an attack",
+                "state": "positive",
+                "text": (
+                    "<strong>"
+                    f"{_fmt(round(float(peak_window.get('share') or 0.0) * 100))}% of "
+                    f"the {_fmt(recurrence.get('dated_entries'))} congestion events "
+                    "this firewall logged fall inside the same three hours of the "
+                    f"day ({int(peak_window.get('start_hour') or 0):02d}:00 - "
+                    f"{int(peak_window.get('end_hour') or 0):02d}:00).</strong> "
+                    "An attack does not keep office hours. A window that repeats "
+                    "at the same time on different days is a scheduled job - a "
+                    "backup, a replication, a database export - and the fix is "
+                    "the schedule, the bandwidth it is given, or a QoS profile, "
+                    "not a block. The history covers "
+                    f"{_fmt(recurrence.get('span_days'))} day(s)"
+                    + (
+                        f", from {_escape(recurrence.get('first_seen'))} to "
+                        f"{_escape(recurrence.get('last_seen'))}"
+                        if recurrence.get("first_seen")
+                        else ""
+                    )
+                    + "."
+                ),
+                "named": [],
+            }
+        )
+
+    # 4k - a passive unit. Not a cause: the fact without which the rest of the
+    # capture cannot be read at all.
+    ha = context.get("ha") or {}
+    if ha.get("enabled") and ha.get("passive"):
+        hypotheses.append(
+            {
+                "key": "passive_ha_unit",
+                "title": "Captured on the passive unit",
+                "state": "positive",
+                "text": (
+                    "<strong>This firewall was the "
+                    f"{_escape(ha.get('local_state'))} member of an HA pair while "
+                    "the capture ran.</strong> A passive unit forwards no "
+                    "production traffic, so buffers filling on it are not "
+                    "explained by the sessions it holds and every offender "
+                    "ranking here will be empty by construction. Read the "
+                    "utilization as a leak until proven otherwise, and collect "
+                    "the same evidence on the active unit before concluding."
+                ),
+                "named": [],
+            }
+        )
+
     # Recent boot or upgrade: not a cause, a context that raises the
     # known-issue hypothesis - one corpus case started 14 hours after an
     # upgrade and its nightly trigger had been self-recovering before it.
@@ -2646,6 +3144,10 @@ EVIDENCE_ANCHORS = {
     "session_collapse": "session-table-title",
     "block_collateral": "attribution-title",
     "recent_boot": "summary-title",
+    "buffer_leak_history": "history-title",
+    "scheduled_recurrence": "history-title",
+    "unprotected_zone": "zones-title",
+    "passive_ha_unit": "zones-title",
 }
 
 _FINDING_STEPS = ("pbp", "backlogs")

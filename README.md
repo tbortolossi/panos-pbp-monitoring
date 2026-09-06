@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.39.2-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.40.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -168,6 +168,29 @@ utilization.
 core, runs when a firewall is saved in the admin UI rather than during an
 incident, so a firewall already under pressure spends no API call on it.
 
+Five further read-only commands run once, while the monitor is starting, and
+describe the firewall's state and its recorded history rather than the current
+second. None of it can be recovered later, because a monitor only starts once
+a trigger has already fired:
+
+```text
+show counter global                 # again at stop: the pair brackets the run
+show running resource-monitor       # the minute, hour, day and week blocks
+show interface all
+show zone-protection
+show high-availability state
+```
+
+The raw counter reads catch what a delta window cannot: it can be a fraction
+of a second, so a counter that increments a dozen times an hour never appears
+in it, and a cumulative value of fourteen has decided a real TAC case. The
+unfiltered resource-monitor blocks are what separates a level that only ever
+climbed — a leak — from one that spiked and recovered. `show interface all`
+gives every port its zone and link speed, `show zone-protection` says whether
+the zone PBP dropped in had any flood protection at all, and the HA state says
+whether this unit forwards production traffic in the first place. Each one
+failing costs a piece of the report and nothing else.
+
 The last command hunts the elephant session: one transfer large enough and old
 enough to fill a link on its own. It needs its own query because such a session
 writes no traffic log until it closes, shows little on the management plane
@@ -180,17 +203,25 @@ batches.
 
 Candidate sessions are enriched with `show session id <session-id>`, and
 consecutive cumulative byte counters are sampled to derive c2s, s2c, and total
-bit rates without scanning the session table. The ingress interfaces named by
-the evidence additionally get `show counter interface` snapshots — at most two
-interfaces, on the first batch then every third batch — so input bytes and
-drops say where the flood enters when session evidence is thin. At monitor
+bit rates without scanning the session table. The hardware ports get a
+`show counter interface all` snapshot on the first batch then every third
+batch, so which port's broadcast or multicast counter is moving says where the
+flood enters when session evidence is thin — which is exactly the case in a
+gratuitous-ARP storm, where no session and therefore no offender exists at all.
+A release that refuses the whole-table form falls back to the two ingress
+interfaces the evidence itself names. At monitor
 stop, the top ranked sources get their live sessions listed
 (`show session all filter source <ip>`, capped) and, for what never created a
 session, one bounded traffic-log query each. One more bounded threat-log
 query then captures the PBP threat logs of the incident window (8507 RED drop,
 8508 session discarded, 8509 source blocked), so the firewall's own
 designations reach the capture even when its threat log is not forwarded to
-the collector.
+the collector. A last bounded query pulls the firewall's own *Packet buffer
+congestion* System logs — one line per minute above the alert level, surviving
+reboots and spanning weeks, and the only trace PBP leaves on a monitor-only
+latency-mode device. The report counts them by hour of day and day of week: a
+window that repeats at the same time on different days is a scheduled job, not
+an attack.
 
 ## What you get out of it
 

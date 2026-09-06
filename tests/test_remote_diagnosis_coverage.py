@@ -20,7 +20,8 @@ from pbp_monitoring import diagnostics, orchestrator
 from tools.replay_capture import PARSERS, RAW_RESPONSE_EVENTS
 
 #: Commands collected outside the per-batch table: the clock, the startup
-#: identity, and the two collected once at monitor start.
+#: identity, the ones collected once at monitor start, and the whole-table
+#: interface counter read a batch runs on its stride.
 ADDITIONAL_COLLECTED_COMMANDS = frozenset(
     {
         "clock",
@@ -29,8 +30,10 @@ ADDITIONAL_COLLECTED_COMMANDS = frozenset(
         "dp_core_functions",
         "global_counters_baseline",
         "large_sessions",
+        "interface_counters",
+        "interface_counters_all",
     }
-)
+) | frozenset(orchestrator.INCIDENT_START_COMMANDS)
 
 ORCHESTRATOR_SOURCE = Path(orchestrator.__file__).read_text(encoding="utf-8")
 

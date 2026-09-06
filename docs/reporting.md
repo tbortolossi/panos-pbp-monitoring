@@ -348,6 +348,68 @@ proxy `Timer Pool` an SSL-proxy leak consumes, the decryption load pools
 more. A pool held near full while the dataplane CPU idles means the resource
 is leaked or parked, not processed.
 
+## Before the incident
+
+A monitor only starts once a trigger has fired, so its own pressure curve
+begins after the interesting part. The **Before the incident** section is what
+the firewall had already recorded, read once while the monitor was starting.
+
+The first table is `show running resource-monitor` with no window filter: the
+minute, hour, day and week utilization blocks, one row per dataplane and
+window, with the latest sample, the window peak and the oldest sample of each
+resource. Its verdict is the one thing the per-second view can never give:
+
+- **only climbed** — the oldest sample sits at least ten points below the
+  newest one and never came back. Buffers are being allocated and not
+  released. The section names roughly how many samples ago the climb started;
+  date that against the last change on this firewall — a PAN-OS upgrade, a new
+  feature, a new peer — before looking at the traffic of the last hour.
+- **spiked and recovered** — the window maximum towers over its own average.
+  That is traffic, not a leak.
+- **flat** — nothing in the recorded history separates this incident from the
+  firewall's ordinary level.
+
+A capture from a firewall that could not answer the command says so; an absent
+history is never rendered as a flat one.
+
+Under it, **Congestion history** counts the firewall's own *Packet buffer
+congestion* system logs by hour of day and by day of week. That line is written
+once a minute while the buffer sits above the alert level, it survives reboots,
+it spans weeks, and on a device running PBP in monitor-only latency mode it is
+the only trace PBP leaves at all — no threat log, no PBP counter. When 40% or
+more of the events fall inside the same three hours, the report says so
+plainly: an attack does not keep office hours, and a window that repeats at the
+same time on different days is a scheduled job — a backup, a replication, a
+database export. The fix is then the schedule, the bandwidth it is given, or a
+QoS profile, not a block.
+
+## Zones, HA role and ports
+
+Three reads taken once per incident, each answering a question no counter can.
+
+**Zone protection** lists every zone with the flood types its profile actually
+enables, its profile name, and the packets PBP dropped and the hosts it blocked
+in that zone. A zone that shows PBP drops while every flood type is disabled is
+the finding: PBP was doing zone protection's job. PBP is a last resort that
+acts on the whole buffer — it cannot tell a flood from legitimate traffic and
+drops both — so the fix is SYN, UDP and ICMP flood protection on the zone the
+traffic enters, not a higher PBP threshold.
+
+**High availability** states whether this unit was the passive member of a
+pair. A passive unit forwards no production traffic, so buffers filling on it
+are not explained by the sessions it holds and every offender ranking in the
+report is empty by construction; read the utilization as a leak until the
+active unit has been checked. A state held for less time than the incident
+dates a takeover, which is what a jump from 2% to 100% in five seconds usually
+is.
+
+**Interfaces** shows the growth of each hardware port's counters between the
+first and the last whole-table read of the capture — not the counters since
+boot — beside the port's zone, link state and speed. This is the section that
+matters when the offender ranking is empty: a flood that creates no session, a
+gratuitous-ARP storm above all, names nobody, and which port's `rx-broadcast`
+or `rx-multicast` is moving is the only localization left.
+
 ## Denied and dropped traffic
 
 The **Denied and dropped traffic** section aggregates the `drop` severity global
@@ -381,6 +443,15 @@ flood came through a zone with flood protection disabled. When a large share
 of the PBP drops used the ingress interface's zone id
 (`flow_dos_pbp_ifp_zone`), the section warns that the zone written on PBP
 threat logs is not the session's real zone.
+
+Each family table also carries a **Since boot** and a **During** column, taken
+from the two raw `show counter global` reads that bracket the incident. They
+exist because the per-batch delta window can be a fraction of a second: a
+counter that increments a dozen times an hour never lands inside one and reads
+as a per-batch total of zero while it is naming the root cause. A counter seen
+only in the bracket is listed anyway, with no per-batch total — which is
+exactly what it is. A capture without the two raw reads says so instead of
+showing the columns.
 
 That section answers a question the offender table cannot. A UDP or GRE flood
 denied by a Security policy rule never reaches session setup, so the firewall

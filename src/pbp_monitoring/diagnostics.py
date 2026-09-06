@@ -125,6 +125,20 @@ def scrub_log_text(text: str) -> str:
 IPV4_CANDIDATE = re.compile(r"(?<![0-9A-Za-z.])\d{1,3}(?:\.\d{1,3}){3}(?![0-9A-Za-z])(?!\.\d)")
 IPV6_CANDIDATE = re.compile(r"(?<![0-9A-Za-z:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?:/\d{1,3})?(?![0-9A-Za-z:])")
 MAC_CANDIDATE = re.compile(r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f:])")
+#: A PAN-OS serial number carried by an XML element. The registered serials of
+#: the monitored firewalls are tokenized as literals, but a response can name a
+#: serial this deployment never registered — the peer of an HA pair is the one
+#: `show high-availability state` returns — and a bare twelve-digit number has
+#: no pattern that could be matched safely anywhere else. Anchoring on the
+#: element keeps it exact, and routing it through the same `serial` token kind
+#: means a registered serial reads identically whether it was matched here or
+#: as a literal.
+SERIAL_ELEMENT = re.compile(
+    r"(<(?P<tag>[a-z0-9-]*serial(?:-no)?)>)\s*"
+    r"(?P<value>[0-9A-Za-z][0-9A-Za-z_-]{5,31})\s*"
+    r"(</(?P=tag)>)",
+    re.IGNORECASE,
+)
 
 #: Values below this length are never treated as literal identifiers: a short
 #: firewall name would match fragments of unrelated words.
@@ -198,7 +212,19 @@ class Anonymizer:
         token = self.token(candidate, kind)
         return f"{token}/{prefix}" if prefix else token
 
+    def _serial_element(self, match: re.Match[str]) -> str:
+        value = match.group("value")
+        # A value already replaced would otherwise be tokenized a second time
+        # and lose the mapping back to the real serial.
+        if value.startswith("serial-"):
+            return match.group(0)
+        return f"{match.group(1)}{self.token(value, 'serial')}{match.group(4)}"
+
     def apply(self, text: str) -> str:
+        # Serials carried by an element first: a registered serial gets the
+        # same token either way, and running it before the literal pass keeps
+        # a token from being fed back through this rule.
+        text = SERIAL_ELEMENT.sub(self._serial_element, text)
         for pattern, kind in self._literals:
             text = pattern.sub(lambda match, kind=kind: self.token(match.group(0), kind), text)
         text = MAC_CANDIDATE.sub(lambda match: self.token(match.group(0), "mac"), text)

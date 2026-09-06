@@ -157,6 +157,14 @@ across weeks and reboots — and its denominator Y names the measured pool
 lines that clusters in the same window across days is a scheduler — usually
 the backup window — not an attack.
 
+Since v0.40.0 the report answers both of those without a manual read. The
+*Before the incident* section carries the hour, day and week utilization the
+firewall recorded before the trigger fired and states whether the level only
+climbed or spiked and recovered; and it counts the congestion System logs by
+hour of day and day of week, naming a schedule when 40% or more of them fall
+inside the same three hours. Reach for the CLI when the reads failed — the
+section says so — or when you need more history than one query returned.
+
 **The classes the report can name**, and what proves each:
 
 - **ARP / L2 storm** — buffers pegged, sessions and connection rate flat,
@@ -164,7 +172,9 @@ the backup window — not an attack.
   100% = gratuitous-ARP storm). PBP cannot mitigate a flood that creates no
   session, and a firewall reboot changes nothing. `show counter interface all`
   finds the port: rx-broadcast and rx-multicast dwarfing rx-unicast on one
-  interface or AE group.
+  interface or AE group. The collector runs that command itself since v0.40.0
+  and the report's *Zones, HA role and ports* section shows the growth of each
+  port's counters over the capture, beside its zone and link speed.
 - **Fragmentation pressure** — `flow_ipfrag_recv` at hundreds per second or
   many fragments per reassembled packet, with `flow_ipfrag_pkt_alloc_err` or
   `pkt_alloc_failure` tying the fragments to the exhaustion. Fragmented UDP
@@ -183,9 +193,16 @@ the backup window — not an attack.
   capture them within minutes of an episode, and check later maintenance
   releases for buffer-leak fixes before blaming the traffic.
 - **Flood through an unprotected zone** — PBP dropping hard while the
-  zone-protection flood counters stay silent. Confirm with
-  `show zone-protection`: a zone whose profile has a flood mechanism disabled
+  zone-protection flood counters stay silent. Since v0.40.0 the collector
+  reads `show zone-protection` once per incident and the report names the zone
+  directly, with the flood types its profile enables and the packets PBP
+  dropped in it; by hand, a zone whose profile has a flood mechanism disabled
   prints no line at all for it — absence means disabled, not zero.
+- **Captured on the passive unit** — buffers high with an empty session table
+  and an empty offender ranking is the expected reading on the passive member
+  of an HA pair, not a mystery. The report states the HA role of the unit, read
+  once per incident. Collect the same evidence on the active unit before
+  concluding, and read the utilization as a leak until you have.
 - **Single-dataplane saturation** — on a multi-DP chassis, one dataplane at
   the activate threshold while the median idles: a flow group pinned by its
   hash. The fix is per-flow, not capacity.

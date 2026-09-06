@@ -1784,5 +1784,203 @@ class RankedEntityDescriptionTests(unittest.TestCase):
         )
 
 
+class IncidentStateSectionTests(unittest.TestCase):
+    """The report shows what the once-per-incident reads found, or says it
+    could not: an absent history must never read as a flat one."""
+
+    def _render(self, startup_extra: dict, events: list[dict] | None = None) -> str:
+        startup = {
+            "timestamp": "2026-08-30T09:59:00+00:00",
+            "run_id": "state-run",
+            "event": "monitor_started",
+            "collector_version": "test",
+            "device": {"serial": "fixture", "model": "PA-440"},
+        }
+        startup.update(startup_extra)
+        records: list[dict] = [startup]
+        for batch in (1, 2):
+            records.append(
+                {
+                    "timestamp": f"2026-08-30T10:0{batch}:00+00:00",
+                    "run_id": "state-run",
+                    "cycle": batch,
+                    "elapsed_seconds": float(batch),
+                    "percentages": {"packet_buffer_congestion": [91]},
+                    "interface_counters": {
+                        "ethernet1/1": {
+                            "name": "ethernet1/1",
+                            "counters": {
+                                "rx_broadcast": 1000 * batch,
+                                "rx_unicast": 10,
+                            },
+                        }
+                    },
+                    "interface_counters_source": "all",
+                    "commands": {},
+                }
+            )
+        records.extend(events or [])
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "state.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            report = generate_html_report(capture, capture.with_suffix(".html"))
+            return report.read_text(encoding="utf-8")
+
+    def test_a_capture_without_the_new_reads_says_so_rather_than_inventing(self):
+        html = self._render({})
+
+        self.assertIn("The hour, day and week resource-monitor blocks", html)
+        self.assertIn("The zone-protection table was not collected", html)
+        self.assertIn("The HA state was not collected", html)
+        # An old capture still renders: the sections exist, empty and honest.
+        self.assertIn('id="history-title"', html)
+        self.assertIn('id="zones-title"', html)
+
+    def test_the_history_table_names_the_climb_and_dates_its_onset(self):
+        html = self._render(
+            {
+                "resource_monitor_history": {
+                    "parsed": True,
+                    "windows": [
+                        {
+                            "dataplane": "dp0",
+                            "window": "day",
+                            "metrics": {
+                                "packet_buffer": {
+                                    "maximum_series": [88.0, 70.0, 50.0, 12.0, 11.0],
+                                    "maximum": {
+                                        "latest": 88.0,
+                                        "oldest": 11.0,
+                                        "peak": 88.0,
+                                        "mean": 46.2,
+                                        "samples": 5,
+                                    },
+                                }
+                            },
+                            "cpu": {"maximum_peak": 31.0},
+                        }
+                    ],
+                }
+            }
+        )
+
+        self.assertIn("The packet buffer history only climbed.", html)
+        self.assertIn("allocated and not released", html)
+        self.assertIn("Onset:", html)
+
+    def test_the_interface_table_shows_growth_not_counters_since_boot(self):
+        html = self._render(
+            {
+                "interface_status": {
+                    "ethernet1/1": {
+                        "name": "ethernet1/1",
+                        "zone": "INTERNET",
+                        "state": "up",
+                        "speed": "1000",
+                    }
+                }
+            }
+        )
+
+        self.assertIn("Rx broadcast", html)
+        # 2000 - 1000 between the first and the last read, not 2000.
+        self.assertIn(">1000</td>", html)
+        self.assertIn("INTERNET", html)
+
+    def test_the_congestion_histogram_names_a_nightly_window(self):
+        html = self._render(
+            {},
+            [
+                {
+                    "timestamp": "2026-08-30T10:30:00+00:00",
+                    "run_id": "state-run",
+                    "event": "congestion_system_logs",
+                    "ok": True,
+                    "entries": [
+                        {
+                            "time_generated": f"2026/08/{day:02d} 03:{minute:02d}:34",
+                            "percent": 72.0,
+                        }
+                        for day in range(20, 27)
+                        for minute in (0, 20, 40)
+                    ],
+                }
+            ],
+        )
+
+        self.assertIn("Congestion history", html)
+        self.assertIn("That is a schedule, not an attack.", html)
+        self.assertIn("03:00", html)
+
+    def test_a_cumulative_counter_no_delta_window_caught_is_still_listed(self):
+        html = self._render(
+            {
+                "global_counters_raw": {
+                    "parsed": True,
+                    "counter_count": 489,
+                    "dataplanes": ["dp0"],
+                    "counters": {"flow_dos_pbp_block_host": {"value": 14, "rate": 0}},
+                }
+            },
+            [
+                {
+                    "timestamp": "2026-08-30T10:30:00+00:00",
+                    "run_id": "state-run",
+                    "event": "global_counters_raw",
+                    "global_counters_raw": {
+                        "parsed": True,
+                        "counters": {
+                            "flow_dos_pbp_block_host": {"value": 17, "rate": 0}
+                        },
+                    },
+                    "growth_since_start": {"flow_dos_pbp_block_host": 3},
+                }
+            ],
+        )
+
+        self.assertIn("Root-cause counter signals", html)
+        self.assertIn("flow_dos_pbp_block_host", html)
+        self.assertIn("<th>Since boot</th><th>During</th>", html)
+        # Seventeen since boot, three of them during the incident, and a
+        # per-batch total of zero because no delta window ever caught it.
+        self.assertIn('<td class="number">17</td>', html)
+        self.assertIn('<td class="number">3</td>', html)
+
+    def test_without_the_raw_reads_the_report_says_the_bracket_is_missing(self):
+        html = self._render(
+            {},
+            [
+                {
+                    "timestamp": "2026-08-30T10:00:30+00:00",
+                    "run_id": "state-run",
+                    "cycle": 3,
+                    "elapsed_seconds": 3.0,
+                    "percentages": {"packet_buffer_congestion": [91]},
+                    "global_counters_delta_status": "primed_interval",
+                    "global_counters_delta": {
+                        "counters": [
+                            {
+                                "name": "flow_dos_pbp_drop",
+                                "value": 10,
+                                "rate": 2,
+                                "severity": "drop",
+                                "category": "flow",
+                                "aspect": "dos",
+                                "description": "PBP drops",
+                            }
+                        ]
+                    },
+                    "commands": {},
+                }
+            ],
+        )
+
+        self.assertIn("are not in this capture", html)
+        self.assertNotIn("<th>Since boot</th>", html)
+
+
 if __name__ == "__main__":
     unittest.main()

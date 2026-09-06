@@ -27,8 +27,15 @@ from .diagnosis import (
     _numbers,
     build_diagnosis,
     buffer_latency_statuses,
+    congestion_recurrence,
+    ha_summary,
+    history_trend,
+    history_windows,
     latest_event,
+    raw_counter_bracket,
     render_diagnosis,
+    start_event,
+    zone_protection_summary,
 )
 
 _COMMAND_RESULT_KEYS = ("error", "result", "raw_response")
@@ -2551,13 +2558,37 @@ def _render_drop_counters(
 _SIGNAL_COUNTER_FAMILIES = SIGNAL_COUNTER_FAMILIES
 
 
+def _signal_family_for(name: str) -> dict[str, Any] | None:
+    """The root-cause family a counter name belongs to, or None."""
+    return next(
+        (
+            definition
+            for definition in _SIGNAL_COUNTER_FAMILIES
+            if name in definition["names"]
+            or (
+                definition["prefixes"]
+                and name.startswith(tuple(definition["prefixes"]))
+            )
+        ),
+        None,
+    )
+
+
 def _aggregate_signal_counters(
     cycles: list[tuple[int, dict[str, Any]]],
+    events: list[tuple[int, dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Sum the root-cause signal counters observed across the capture.
 
     Same trust rules as the drop aggregation: a batch whose delta baseline is
     untrusted has an unknown sampling window and is excluded from the totals.
+
+    The two raw counter reads that bracket the incident are folded in on top.
+    They answer the question the deltas cannot: a counter incrementing a dozen
+    times an hour never lands inside a delta window that can be a fraction of
+    a second, so it reads as absent while it is naming the root cause. A
+    counter seen only in the bracket is listed with no per-batch total, which
+    is exactly what it is.
     """
     per_family: dict[str, dict[str, dict[str, Any]]] = {}
     counted_batches = 0
@@ -2577,15 +2608,7 @@ def _aggregate_signal_counters(
             name = str(counter.get("name") or "").strip()
             if not name:
                 continue
-            family = next(
-                (
-                    definition
-                    for definition in _SIGNAL_COUNTER_FAMILIES
-                    if name in definition["names"]
-                    or name.startswith(tuple(definition["prefixes"]))
-                ),
-                None,
-            )
+            family = _signal_family_for(name)
             if family is None:
                 continue
             value = next(iter(_numbers(counter.get("value"))), None)
@@ -2613,13 +2636,58 @@ def _aggregate_signal_counters(
                     else max(float(current_peak), rate)
                 )
 
+    bracket = raw_counter_bracket([record for _, record in (events or [])])
+    for source, key in (
+        (bracket.get("start") or {}, "cumulative_start"),
+        (bracket.get("stop") or {}, "cumulative_stop"),
+        (bracket.get("growth") or {}, "growth"),
+    ):
+        for name, reading in source.items():
+            counter_name = str(name or "").strip()
+            if not counter_name:
+                continue
+            family = _signal_family_for(counter_name)
+            if family is None:
+                continue
+            value = next(
+                iter(
+                    _numbers(
+                        reading.get("value")
+                        if isinstance(reading, dict)
+                        else reading
+                    )
+                ),
+                None,
+            )
+            if value is None:
+                continue
+            bucket = per_family.setdefault(str(family["family"]), {})
+            item = bucket.get(counter_name)
+            if item is None:
+                # Never seen moving inside a delta window, but the firewall
+                # has been counting it since boot: that is the whole point of
+                # the raw read.
+                item = bucket[counter_name] = {
+                    "name": counter_name,
+                    "description": None,
+                    "total": 0.0,
+                    "peak_rate": None,
+                    "batches": 0,
+                }
+            item[key] = value
+
     families = []
     for definition in _SIGNAL_COUNTER_FAMILIES:
         bucket = per_family.get(str(definition["family"]))
         if not bucket:
             continue
         items = sorted(
-            bucket.values(), key=lambda item: (-float(item["total"]), item["name"])
+            bucket.values(),
+            key=lambda item: (
+                -float(item["total"]),
+                -float(item.get("growth") or 0.0),
+                item["name"],
+            ),
         )
         families.append(
             {
@@ -2633,9 +2701,18 @@ def _aggregate_signal_counters(
                 "totals_by_name": {
                     item["name"]: float(item["total"]) for item in items
                 },
+                "growth_by_name": {
+                    item["name"]: float(item["growth"])
+                    for item in items
+                    if item.get("growth") is not None
+                },
             }
         )
-    return {"families": families, "counted_batches": counted_batches}
+    return {
+        "families": families,
+        "counted_batches": counted_batches,
+        "bracket_collected": bool(bracket.get("collected")),
+    }
 
 
 # The interface-zone fallback threshold: above this share of the PBP drops,
@@ -2648,12 +2725,26 @@ def _render_signal_counters(summary: dict[str, Any]) -> str:
     families = summary.get("families") or []
     if not families:
         return ""
+    bracketed = bool(summary.get("bracket_collected"))
     blocks: list[str] = [
         "<h3>Root-cause counter signals</h3>",
         '<p class="muted">The counters below are not all drops - most are '
         "informational - but each family is the fingerprint of one known way a "
         "packet buffer fills. They come from the same per-batch counter deltas "
-        "as the table above.</p>",
+        "as the table above"
+        + (
+            ", plus the two raw <code>show counter global</code> reads that "
+            "bracket the incident. <strong>Since boot</strong> is the "
+            "cumulative value at monitor stop and <strong>During</strong> its "
+            "growth between the two reads: a counter that moves a few times an "
+            "hour never lands inside a delta window and shows a per-batch "
+            "total of zero while still naming the cause."
+            if bracketed
+            else ". The raw counter reads that bracket an incident are not in "
+            "this capture, so a counter too slow to land in a delta window "
+            "cannot be seen here at all."
+        )
+        + "</p>",
     ]
     for family in families:
         notes = [str(family.get("note") or "")]
@@ -2677,7 +2768,15 @@ def _render_signal_counters(summary: dict[str, Any]) -> str:
             f'<td class="number">{_escape(_format_number(item["total"]))}</td>'
             f'<td class="number">{_escape(_format_number(item["peak_rate"]))}</td>'
             f'<td class="number">{_escape(item["batches"])}</td>'
-            f'<td class="wrap">{_escape(item.get("description") or "—")}</td>'
+            + (
+                f'<td class="number">'
+                f'{_escape(_format_number(item.get("cumulative_stop")))}</td>'
+                f'<td class="number">'
+                f'{_escape(_format_number(item.get("growth")))}</td>'
+                if bracketed
+                else ""
+            )
+            + f'<td class="wrap">{_escape(item.get("description") or "—")}</td>'
             "</tr>"
             for item in family.get("counters") or []
         )
@@ -2686,10 +2785,399 @@ def _render_signal_counters(summary: dict[str, Any]) -> str:
             f'<p class="muted">{" ".join(notes)}</p>'
             '<div class="table-wrap"><table><thead><tr>'
             "<th>Counter</th><th>Packets</th><th>Peak /s</th><th>Batches</th>"
-            "<th>PAN-OS description</th>"
+            + ("<th>Since boot</th><th>During</th>" if bracketed else "")
+            + "<th>PAN-OS description</th>"
             f"</tr></thead><tbody>{rows}</tbody></table></div>"
         )
     return "".join(blocks)
+
+
+_HISTORY_METRIC_LABELS = (
+    ("packet_buffer", "Packet buffer"),
+    ("packet_descriptor", "Packet descriptor"),
+    ("packet_descriptor_on_chip", "Packet descriptor (on-chip)"),
+    ("sw_tags_descriptor", "SW tags descriptor"),
+    ("session", "Session table"),
+)
+_HISTORY_SHAPE_LABELS = {
+    "climbing": ("bad", "only climbed"),
+    "burst": ("warn", "spiked and recovered"),
+    "flat": ("ok", "flat"),
+}
+
+
+def _render_resource_history(events: list[tuple[int, dict[str, Any]]]) -> str:
+    """The hour, day and week utilization the firewall recorded before the run.
+
+    A monitor only starts once a trigger has fired, so its own curve begins
+    after the interesting part. These blocks are read once at monitor start
+    and are the only view of what the level was doing beforehand.
+    """
+    records = [record for _, record in events]
+    windows = history_windows(records)
+    if not windows:
+        return (
+            '<p class="muted">The hour, day and week resource-monitor blocks '
+            "were not collected in this capture, so nothing here can say "
+            "whether the level had been climbing for days or spiked once. "
+            "<code>show running resource-monitor</code> is read once at "
+            "monitor start from this version on.</p>"
+        )
+    trend = history_trend(records)
+    state, wording = _HISTORY_SHAPE_LABELS.get(
+        str(trend.get("shape")), ("none", "not classified")
+    )
+    verdict = (
+        f"<strong>The packet buffer history {wording}.</strong> "
+        + (
+            "A level that rises and never comes back down is buffers "
+            "allocated and not released - a leak, not a flood."
+            if trend.get("shape") == "climbing"
+            else "A level that spikes and returns is traffic, not a leak."
+            if trend.get("shape") == "burst"
+            else "Nothing in the recorded history separates this incident "
+            "from the firewall's ordinary level."
+        )
+    )
+    rows = []
+    for window in windows:
+        metrics = window.get("metrics")
+        if not isinstance(metrics, dict):
+            continue
+        cells = []
+        for key, _label in _HISTORY_METRIC_LABELS:
+            readings = metrics.get(key)
+            summary = None
+            if isinstance(readings, dict):
+                summary = readings.get("maximum") or readings.get("average")
+            if not isinstance(summary, dict):
+                cells.append('<td class="number">—</td>')
+                continue
+            latest = summary.get("latest")
+            peak = summary.get("peak")
+            oldest = summary.get("oldest")
+            cells.append(
+                f'<td class="number">{_escape(_format_number(latest))}%'
+                f'<br><span class="fact-detail">peak '
+                f"{_escape(_format_number(peak))}% · oldest "
+                f"{_escape(_format_number(oldest))}%</span></td>"
+            )
+        cpu = window.get("cpu")
+        cpu_peak = cpu.get("maximum_peak") if isinstance(cpu, dict) else None
+        rows.append(
+            "<tr>"
+            f'<td>{_escape(window.get("dataplane"))}</td>'
+            f'<td>{_escape(window.get("window"))}</td>'
+            + "".join(cells)
+            + f'<td class="number">{_escape(_format_number(cpu_peak))}</td>'
+            "</tr>"
+        )
+    headers = "".join(
+        f"<th>{_escape(label)}</th>" for _key, label in _HISTORY_METRIC_LABELS
+    )
+    onsets = [
+        f"the {_escape(window.get('window'))} window of "
+        f"{_escape(window.get('dataplane'))} started climbing about "
+        f"{_escape(_format_number((window.get('onset') or {}).get('samples_ago')))} "
+        f"{_escape((window.get('onset') or {}).get('unit'))}(s) ago"
+        for window in trend.get("windows") or []
+        if window.get("onset")
+    ]
+    onset_html = (
+        f'<p class="muted">Onset: {"; ".join(onsets)}. Date that against the '
+        "last change on this firewall.</p>"
+        if onsets
+        else ""
+    )
+    return (
+        f'<p class="verdict verdict-{state}">{verdict}</p>'
+        '<div class="table-wrap"><table><thead><tr>'
+        "<th>Dataplane</th><th>Window</th>"
+        f"{headers}<th>CPU peak %</th>"
+        f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+        f"{onset_html}"
+    )
+
+
+def _render_congestion_recurrence(
+    events: list[tuple[int, dict[str, Any]]]
+) -> str:
+    """The firewall's own congestion log, folded into a recurrence histogram."""
+    recurrence = congestion_recurrence([record for _, record in events])
+    if not recurrence.get("collected"):
+        return ""
+    if not recurrence.get("dated_entries"):
+        detail = recurrence.get("error") or (
+            "the firewall returned no packet-buffer congestion system log"
+        )
+        return (
+            "<h3>Congestion history</h3>"
+            f'<p class="muted">No congestion line could be counted: '
+            f"{_escape(detail)}.</p>"
+        )
+    peak_window = recurrence.get("peak_window") or {}
+    scheduled = bool(peak_window.get("scheduled"))
+    state = "warn" if scheduled else "ok"
+    verdict = (
+        (
+            "<strong>"
+            f"{_escape(_format_number(round(float(peak_window.get('share') or 0) * 100)))}"
+            "% of the congestion events fall in the same three hours of the "
+            f"day ({int(peak_window.get('start_hour') or 0):02d}:00 - "
+            f"{int(peak_window.get('end_hour') or 0):02d}:00).</strong> That is "
+            "a schedule, not an attack."
+        )
+        if scheduled
+        else (
+            "<strong>The congestion events are spread across the day.</strong> "
+            "Nothing here points at a recurring job."
+        )
+    )
+    hours = recurrence.get("hours") or []
+    largest = max(hours, default=0) or 1
+    bars = "".join(
+        "<tr>"
+        f"<td>{hour:02d}:00</td>"
+        f'<td class="number bar-cell"><span class="bar" style="width:'
+        f"{max(2.0, count / largest * 100.0):.0f}%\"></span>{_escape(count)}</td>"
+        "</tr>"
+        for hour, count in enumerate(hours)
+        if count
+    )
+    weekdays = recurrence.get("weekdays") or []
+    labels = recurrence.get("weekday_labels") or []
+    weekday_cells = "".join(
+        f"<td class=\"number\">{_escape(count)}</td>" for count in weekdays
+    )
+    weekday_headers = "".join(f"<th>{_escape(label)}</th>" for label in labels)
+    return (
+        "<h3>Congestion history</h3>"
+        f'<p class="verdict verdict-{state}">{verdict}</p>'
+        f'<p class="muted">{_escape(_format_number(recurrence.get("dated_entries")))} '
+        "congestion line(s) from the firewall's own system log, covering "
+        f"{_escape(_format_number(recurrence.get('span_days')))} day(s)"
+        + (
+            f" from {_escape(recurrence.get('first_seen'))} to "
+            f"{_escape(recurrence.get('last_seen'))}"
+            if recurrence.get("first_seen")
+            else ""
+        )
+        + ". This log survives reboots and is written even when PBP is in "
+        "monitor-only latency mode, where it is the only trace PBP leaves."
+        "</p>"
+        '<div class="table-wrap"><table><thead><tr><th>Hour</th>'
+        "<th>Congestion events</th></tr></thead>"
+        f"<tbody>{bars}</tbody></table></div>"
+        '<div class="table-wrap"><table><thead><tr>'
+        f"{weekday_headers}</tr></thead><tbody><tr>{weekday_cells}</tr>"
+        "</tbody></table></div>"
+    )
+
+
+def _render_zone_protection(events: list[tuple[int, dict[str, Any]]]) -> str:
+    """Per-zone flood protection state and the PBP drops attributed to it."""
+    summary = zone_protection_summary([record for _, record in events])
+    if not summary.get("collected"):
+        return (
+            '<p class="muted">The zone-protection table was not collected in '
+            "this capture, so nothing here can say whether the zone the drops "
+            "came from had flood protection enabled at all. "
+            "<code>show zone-protection</code> is read once at monitor start "
+            "from this version on.</p>"
+        )
+    unprotected = summary.get("unprotected") or []
+    state = "bad" if unprotected else "ok"
+    verdict = (
+        (
+            "<strong>PBP dropped packets in "
+            + ", ".join(
+                f"<code>{_escape(zone.get('zone'))}</code>" for zone in unprotected[:5]
+            )
+            + ", where every flood type is disabled.</strong> Zone protection "
+            "was the tool meant to absorb that traffic; PBP acted instead, and "
+            "PBP drops indiscriminately."
+        )
+        if unprotected
+        else (
+            "<strong>Every zone that PBP dropped in has flood protection "
+            "enabled.</strong>"
+            if summary.get("dropping_zones")
+            else "<strong>No zone shows PBP drops.</strong>"
+        )
+    )
+    rows = "".join(
+        "<tr>"
+        f'<td>{_escape(zone.get("zone"))}</td>'
+        f'<td>{_escape(zone.get("vsys") or "—")}</td>'
+        f'<td>{_escape(zone.get("profile") or "—")}</td>'
+        f'<td>{_escape(", ".join(sorted(name for name, on in (zone.get("flood_protection") or {}).items() if on)) or "none")}</td>'
+        f'<td class="number">{_escape(_format_number(zone.get("pbp_drop")))}</td>'
+        f'<td class="number">'
+        f'{_escape(_format_number((zone.get("pbp_counters") or {}).get("pbp_block_host")))}'
+        "</td>"
+        "</tr>"
+        for zone in (summary.get("zones") or [])[:_MAX_RENDERED_ATTRIBUTION_ROWS]
+    )
+    return (
+        f'<p class="verdict verdict-{state}">{verdict}</p>'
+        '<div class="table-wrap"><table><thead><tr>'
+        "<th>Zone</th><th>vsys</th><th>Profile</th><th>Flood types enabled</th>"
+        "<th>PBP drops</th><th>PBP host blocks</th>"
+        f"</tr></thead><tbody>{rows}</tbody></table></div>"
+    )
+
+
+def _render_ha_and_interfaces(
+    events: list[tuple[int, dict[str, Any]]],
+    cycles: list[tuple[int, dict[str, Any]]],
+) -> str:
+    """The HA role of the unit and the per-interface counters, side by side."""
+    records = [record for _, record in events]
+    ha = ha_summary(records)
+    blocks: list[str] = ["<h3>High availability</h3>"]
+    if not ha.get("collected"):
+        blocks.append(
+            '<p class="muted">The HA state was not collected in this capture. '
+            "Without it, buffers filling while the session table stays empty "
+            "cannot be told apart from a passive unit doing nothing.</p>"
+        )
+    elif ha.get("enabled") is False:
+        blocks.append(
+            '<p class="verdict verdict-ok"><strong>High availability is '
+            "disabled on this firewall</strong>, so everything the capture "
+            "shows is this unit's own traffic.</p>"
+        )
+    else:
+        passive = ha.get("passive")
+        blocks.append(
+            f'<p class="verdict verdict-{"warn" if passive else "ok"}">'
+            f"<strong>This unit was "
+            f"{_escape(ha.get('local_state') or 'in an unreported state')}"
+            "</strong>"
+            + (
+                f" (peer {_escape(ha.get('peer_state'))})"
+                if ha.get("peer_state")
+                else ""
+            )
+            + (
+                ". A passive unit forwards no production traffic, so an empty "
+                "offender ranking here proves nothing and the utilization "
+                "should be read as a leak until the active unit is checked."
+                if passive
+                else "."
+            )
+            + "</p>"
+        )
+        facts = [
+            (label, ha.get(key))
+            for key, label in (
+                ("mode", "Mode"),
+                ("local_state_duration_seconds", "State held for (s)"),
+                ("priority", "Priority"),
+                ("preemptive", "Preemptive"),
+                ("peer_connection", "Peer link"),
+                ("running_sync", "Config sync"),
+            )
+            if ha.get(key) not in (None, "")
+        ]
+        if facts:
+            blocks.append(
+                '<div class="table-wrap"><table><tbody>'
+                + "".join(
+                    f"<tr><th>{_escape(label)}</th>"
+                    f"<td>{_escape(value)}</td></tr>"
+                    for label, value in facts
+                )
+                + "</tbody></table></div>"
+            )
+    blocks.append("<h3>Interfaces</h3>")
+    interfaces = start_event(records).get("interface_status")
+    interfaces = interfaces if isinstance(interfaces, dict) else {}
+    growth = _interface_growth(cycles)
+    if not growth and not interfaces:
+        blocks.append(
+            '<p class="muted">No interface counters were collected in this '
+            "capture.</p>"
+        )
+        return "".join(blocks)
+    blocks.append(
+        '<p class="muted">A flood that creates no session - a gratuitous-ARP '
+        "storm is the textbook case - names no offender at all, and the only "
+        "localization left is which port's counters moved. The values below "
+        "are the growth between the first and the last whole-table read of "
+        "this capture, not the counters since boot.</p>"
+    )
+    names = sorted(set(growth) | set(interfaces))
+    rows = "".join(
+        "<tr>"
+        f'<td><code>{_escape(name)}</code></td>'
+        f'<td>{_escape((interfaces.get(name) or {}).get("zone") or "—")}</td>'
+        f'<td>{_escape((interfaces.get(name) or {}).get("state") or "—")}</td>'
+        f'<td>{_escape((interfaces.get(name) or {}).get("speed") or "—")}</td>'
+        + "".join(
+            f'<td class="number">'
+            f'{_escape(_format_number((growth.get(name) or {}).get(key)))}</td>'
+            for key in _INTERFACE_GROWTH_COUNTERS
+        )
+        + "</tr>"
+        for name in names[:_MAX_RENDERED_ATTRIBUTION_ROWS]
+    )
+    headers = "".join(
+        f"<th>{_escape(label)}</th>" for _key, label in _INTERFACE_GROWTH_LABELS
+    )
+    blocks.append(
+        '<div class="table-wrap"><table><thead><tr>'
+        "<th>Interface</th><th>Zone</th><th>Link</th><th>Speed</th>"
+        f"{headers}</tr></thead><tbody>{rows}</tbody></table></div>"
+    )
+    return "".join(blocks)
+
+
+_INTERFACE_GROWTH_LABELS = (
+    ("rx_unicast", "Rx unicast"),
+    ("rx_broadcast", "Rx broadcast"),
+    ("rx_multicast", "Rx multicast"),
+    ("rx_discards", "Rx discards"),
+    ("rx_error", "Rx errors"),
+)
+_INTERFACE_GROWTH_COUNTERS = tuple(key for key, _label in _INTERFACE_GROWTH_LABELS)
+
+
+def _interface_growth(
+    cycles: list[tuple[int, dict[str, Any]]],
+) -> dict[str, dict[str, float]]:
+    """Growth of each interface's counters between the first and last read.
+
+    The port counters are cumulative since boot, so only their movement during
+    the capture says anything; an interface sampled once contributes nothing.
+    """
+    first: dict[str, dict[str, float]] = {}
+    last: dict[str, dict[str, float]] = {}
+    for _, record in cycles:
+        table = record.get("interface_counters")
+        if not isinstance(table, dict):
+            continue
+        for name, payload in table.items():
+            counters = payload.get("counters") if isinstance(payload, dict) else None
+            if not isinstance(counters, dict):
+                continue
+            values = {
+                key: value
+                for key in _INTERFACE_GROWTH_COUNTERS
+                if (value := next(iter(_numbers(counters.get(key))), None))
+                is not None
+            }
+            if not values:
+                continue
+            first.setdefault(str(name), values)
+            last[str(name)] = values
+    return {
+        name: {
+            key: max(0.0, last[name].get(key, 0.0) - values.get(key, 0.0))
+            for key in values
+        }
+        for name, values in first.items()
+    }
 
 
 # Dataplane pools whose occupancy diagnoses a buffer incident even when the
@@ -3157,9 +3645,11 @@ _THREAT_LOGS_NAV_ITEM = ("pbp-threat-logs-title", "Threat logs")
 #: threat-logs entry had already drifted to a different position.
 _EVIDENCE_NAV_ITEMS: tuple[tuple[str, str], ...] = (
     ("pressure-title", "Pressure"),
+    ("history-title", "History"),
     ("attribution-title", "Offenders"),
     _THREAT_LOGS_NAV_ITEM,
     ("ingress-title", "Backlog"),
+    ("zones-title", "Zones & ports"),
     ("cpu-tracking-title", "CPU"),
     ("large-sessions-title", "Largest sessions"),
     ("drop-counters-title", "Drops"),
@@ -3210,6 +3700,10 @@ def _evidence_sections(parts: dict[str, Any]) -> str:
     alert_text = parts["alert_text"]
     activate_text = parts["activate_text"]
     pressure_pill = parts["pressure_pill"]
+    history_html = parts["history_html"]
+    history_pill = parts["history_pill"]
+    zones_html = parts["zones_html"]
+    zones_pill = parts["zones_pill"]
     attribution_html = parts["attribution_html"]
     attribution_pill = parts["attribution_pill"]
     pbp_threat_logs_html = parts["pbp_threat_logs_html"]
@@ -3248,6 +3742,18 @@ def _evidence_sections(parts: dict[str, Any]) -> str:
                 open=False,
             ),
             _render_section(
+                "history-title",
+                "Before the incident",
+                history_html,
+                intro="What this firewall had already recorded when the trigger "
+                "fired: the hour, day and week utilization blocks, and its own "
+                "congestion log. A monitor only starts after the trigger, so "
+                "this is the only view of what the level was doing beforehand - "
+                "and the only thing that separates a leak from a flood.",
+                pill=history_pill,
+                open=False,
+            ),
+            _render_section(
                 "attribution-title",
                 "Offenders named by PBP",
                 attribution_html,
@@ -3268,6 +3774,18 @@ def _evidence_sections(parts: dict[str, Any]) -> str:
                 "ingress-backlogs</code>). Independent of the PBP learning: the "
                 "queue is where the on-chip descriptors are consumed.",
                 pill=ingress_pill,
+                open=False,
+            ),
+            _render_section(
+                "zones-title",
+                "Zones, HA role and ports",
+                zones_html,
+                intro="Whether the zone the drops came from had any flood "
+                "protection at all, whether this unit was the passive member of "
+                "an HA pair, and which physical port's counters moved. The three "
+                "reads that make a session-less flood - and a firewall that "
+                "carries no traffic - readable at all.",
+                pill=zones_pill,
                 open=False,
             ),
             _render_section(
@@ -3381,7 +3899,7 @@ def _build_report_parts(
         _aggregate_top_sources(attribution)
     ) + _render_attribution_table(attribution)
     drop_counter_summary = _aggregate_drop_counters(cycles)
-    signal_counter_summary = _aggregate_signal_counters(cycles)
+    signal_counter_summary = _aggregate_signal_counters(cycles, events)
     drop_counters_html = _render_drop_counters(
         drop_counter_summary, attribution
     ) + _render_signal_counters(signal_counter_summary)
@@ -3870,6 +4388,38 @@ def _build_report_parts(
         if table_peak is not None
         else "not collected"
     )
+    history_html = _render_resource_history(events) + _render_congestion_recurrence(
+        events
+    )
+    buffer_history = history_trend([record for _, record in events])
+    recurrence = congestion_recurrence([record for _, record in events])
+    if not buffer_history.get("available"):
+        history_pill = "not collected"
+    elif buffer_history.get("shape") == "climbing":
+        history_pill = "level only climbed"
+    elif (recurrence.get("peak_window") or {}).get("scheduled"):
+        history_pill = "recurs in the same hours"
+    elif buffer_history.get("shape") == "burst":
+        history_pill = "spiked and recovered"
+    else:
+        history_pill = "no trend"
+    zones_html = _render_zone_protection(events) + _render_ha_and_interfaces(
+        events, cycles
+    )
+    zone_summary = zone_protection_summary([record for _, record in events])
+    ha = ha_summary([record for _, record in events])
+    if not zone_summary.get("collected"):
+        zones_pill = "not collected"
+    elif zone_summary.get("unprotected"):
+        unprotected_count = len(zone_summary["unprotected"])
+        zones_pill = (
+            f"{unprotected_count} unprotected "
+            f"zone{'s' if unprotected_count != 1 else ''} dropping"
+        )
+    elif ha.get("enabled") and ha.get("passive"):
+        zones_pill = "passive HA unit"
+    else:
+        zones_pill = "zones protected"
 
     return {
         "activate_text": activate_text,
@@ -3895,6 +4445,8 @@ def _build_report_parts(
         "events": events,
         "events_html": events_html,
         "generated_at": generated_at,
+        "history_html": history_html,
+        "history_pill": history_pill,
         "ingress_html": ingress_html,
         "ingress_pill": ingress_pill,
         "large_pill": large_pill,
@@ -3917,6 +4469,8 @@ def _build_report_parts(
         "warning_html": warning_html,
         "warnings": warnings,
         "source_name": source.name,
+        "zones_html": zones_html,
+        "zones_pill": zones_pill,
     }
 
 
