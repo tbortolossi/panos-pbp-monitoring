@@ -27,7 +27,7 @@ import json
 import sys
 import zipfile
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -44,11 +44,13 @@ from pbp_monitoring.orchestrator import (  # noqa: E402
     extract_pbp_offenders,
     extract_pbp_settings,
     extract_pbp_status,
+    extract_pbp_threat_log_entries,
     extract_resource_cpu_cores,
     extract_session_filter_count,
     extract_session_filter_entries,
     extract_session_info,
     extract_system_info,
+    extract_traffic_log_entries,
 )
 
 #: Which parser owns which stored command. A command absent from this table is
@@ -71,6 +73,31 @@ PARSERS: dict[str, Callable[[str], Any]] = {
     "interface_counters": extract_interface_counters,
     "session_filter_count": extract_session_filter_count,
     "session_filter_list": extract_session_filter_entries,
+}
+
+
+class RawResponseEvent(NamedTuple):
+    """How one journal event stores a raw PAN-OS response, and who parses it."""
+
+    #: The parser that owns the stored XML.
+    parser: Callable[[str], Any]
+    #: The list field holding one response per entry, or None when the event
+    #: carries a single `raw_response` at its root.
+    container: str | None
+    #: The field naming an entry of that list, for the replay line.
+    label_field: str = "source_ip"
+
+
+#: Events that keep a raw PAN-OS response outside the per-command table. The
+#: log queries run at monitor stop are not `commands`: they store their XML on
+#: the journal record itself, so replaying only `record["commands"]` would skip
+#: exactly the evidence a customer archive was collected for.
+RAW_RESPONSE_EVENTS: dict[str, RawResponseEvent] = {
+    "pbp_threat_logs": RawResponseEvent(extract_pbp_threat_log_entries, None),
+    "offender_traffic_logs": RawResponseEvent(extract_traffic_log_entries, "sources"),
+    "offender_live_sessions": RawResponseEvent(
+        extract_session_filter_entries, "sources"
+    ),
 }
 
 CAPTURE_NAMES = ("incident.jsonl", "api-check.jsonl")
@@ -112,38 +139,82 @@ def _decode(line: bytes) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _replay_one(
+    record: dict[str, Any],
+    name: str,
+    payload: dict[str, Any],
+    parser: Callable[[str], Any] | None,
+    stored_xml: Any,
+) -> dict[str, Any]:
+    """Hand one stored response to its parser and describe what came back."""
+    outcome: dict[str, Any] = {
+        "run_id": record.get("run_id"),
+        "timestamp": record.get("timestamp"),
+        "command": name,
+        "collected_ok": payload.get("ok"),
+        "collection_error": payload.get("error"),
+    }
+    if parser is None:
+        outcome["status"] = "unmapped"
+    elif not isinstance(stored_xml, str) or not stored_xml.strip():
+        outcome["status"] = "empty"
+    else:
+        try:
+            outcome["parsed"] = parser(stored_xml)
+            outcome["status"] = "parsed"
+        except Exception as exc:
+            outcome["status"] = "parser_raised"
+            outcome["parser_error"] = f"{type(exc).__name__}: {exc}"
+    return outcome
+
+
+def replay_event_raw_responses(
+    record: dict[str, Any], only: set[str] | None
+) -> list[dict[str, Any]]:
+    """Re-parse the raw responses a journal event stores outside `commands`.
+
+    The log queries run at monitor stop are the firewall's own designation of
+    the incident. They never travel as commands, so without this they would be
+    the one piece of a customer archive nobody could replay.
+    """
+    event = record.get("event")
+    mapping = RAW_RESPONSE_EVENTS.get(event) if isinstance(event, str) else None
+    if mapping is None or (only and event not in only):
+        return []
+    if mapping.container is None:
+        entries: list[tuple[str, dict[str, Any]]] = [(str(event), record)]
+    else:
+        stored = record.get(mapping.container)
+        entries = [
+            (
+                f"{event}[{entry.get(mapping.label_field) or index}]",
+                entry,
+            )
+            for index, entry in enumerate(stored if isinstance(stored, list) else [])
+            if isinstance(entry, dict)
+        ]
+    return [
+        _replay_one(record, name, entry, mapping.parser, entry.get("raw_response"))
+        for name, entry in entries
+    ]
+
+
 def replay_record(record: dict[str, Any], only: set[str] | None) -> list[dict[str, Any]]:
-    """Re-parse every stored command of one record."""
+    """Re-parse every stored response of one record, command or event."""
+    outcomes = replay_event_raw_responses(record, only)
     commands = record.get("commands")
     if not isinstance(commands, dict):
-        return []
-    outcomes: list[dict[str, Any]] = []
+        return outcomes
     for name, payload in sorted(commands.items()):
         if only and name not in only:
             continue
         if not isinstance(payload, dict):
             continue
-        outcome: dict[str, Any] = {
-            "run_id": record.get("run_id"),
-            "timestamp": record.get("timestamp"),
-            "command": name,
-            "collected_ok": payload.get("ok"),
-            "collection_error": payload.get("error"),
-        }
-        parser = PARSERS.get(name)
-        result = payload.get("result")
-        if parser is None:
-            outcome["status"] = "unmapped"
-        elif not isinstance(result, str) or not result.strip():
-            outcome["status"] = "empty"
-        else:
-            try:
-                outcome["parsed"] = parser(result)
-                outcome["status"] = "parsed"
-            except Exception as exc:
-                outcome["status"] = "parser_raised"
-                outcome["parser_error"] = f"{type(exc).__name__}: {exc}"
-        outcomes.append(outcome)
+        outcomes.append(
+            _replay_one(
+                record, name, payload, PARSERS.get(name), payload.get("result")
+            )
+        )
     return outcomes
 
 
@@ -179,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         "--command",
         action="append",
         default=[],
-        help="replay only this command; repeatable",
+        help="replay only this command or log-query event; repeatable",
     )
     parser.add_argument(
         "--format",

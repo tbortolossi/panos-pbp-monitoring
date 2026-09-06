@@ -2345,6 +2345,19 @@ REPORT_SCRIPT_CSP_HASH = "sha256-" + base64.b64encode(
     hashlib.sha256(REPORT_SCRIPT.encode("utf-8")).digest()
 ).decode("ascii")
 
+#: The same hash for every report script this collector has shipped. Reports
+#: are kept on the capture volume for as long as their run is, so an upgrade
+#: never rewrites the ones already stored: a policy naming only the current
+#: script would silently strip the Collapse all control from every report an
+#: earlier release wrote, on the very runs an operator reopens after upgrading.
+#: Each entry stays until the runs that carry it are gone. Nothing is trusted
+#: by name: an old hash still pins one exact, known script body.
+LEGACY_REPORT_SCRIPT_CSP_HASHES = (
+    # The first folding script, v0.32.0 to v0.35.1. Replaced in v0.36.0 when
+    # the report was reorganised into parts.
+    "sha256-WcwOfeifnt6TfnOtJ3jHZyjceLr0xOdYl5vnMjuP4m8=",
+)
+
 
 def _part_heading(title: str, subtitle: str) -> str:
     """A visible divider between the diagnosis, the evidence, and the appendix."""
@@ -4180,10 +4193,23 @@ def write_report_atomically(destination: Path, rendered: str) -> Path:
             temporary_path.unlink(missing_ok=True)
 
 
-def resolve_report_destination(jsonl_path: Path, html_path: Path | None, suffix: str) -> tuple[Path, Path]:
-    """Return the capture and the report path it may be written to."""
+#: The name the collector writes the flat report under, and the only name the
+#: Web UI serves it from.
+REPORT_FILENAME = "report.html"
+
+
+def resolve_report_destination(
+    jsonl_path: Path, html_path: Path | None, filename: str
+) -> tuple[Path, Path]:
+    """Return the capture and the report path it may be written to.
+
+    Without `-o`, the report is written beside the capture under the name the
+    run directory already uses. Regenerating a report by hand then refreshes
+    the file the dashboard opens, instead of leaving a second copy that no page
+    serves and that every run archive and support bundle would carry.
+    """
     source = Path(jsonl_path)
-    destination = Path(html_path) if html_path is not None else source.with_suffix(suffix)
+    destination = Path(html_path) if html_path is not None else source.with_name(filename)
 
     if source.resolve() == destination.resolve():
         raise ValueError("The HTML destination must differ from the JSONL source")
@@ -4192,7 +4218,9 @@ def resolve_report_destination(jsonl_path: Path, html_path: Path | None, suffix:
 
 def generate_html_report(jsonl_path: Path, html_path: Path | None = None) -> Path:
     """Generate an atomic, standalone HTML report and return its final path."""
-    source, destination = resolve_report_destination(jsonl_path, html_path, ".html")
+    source, destination = resolve_report_destination(
+        jsonl_path, html_path, REPORT_FILENAME
+    )
     records, warnings, source_hash = _read_jsonl(source)
     return write_report_atomically(
         destination, _render_html(source, records, warnings, source_hash)

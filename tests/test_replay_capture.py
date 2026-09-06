@@ -30,6 +30,41 @@ RECORD = {
     },
 }
 
+THREAT_LOG_XML = (
+    '<response status="success"><result><log><logs><entry>'
+    "<receive_time>2026/08/30 08:00:01</receive_time><tid>8507</tid>"
+    "<threat_name>Packet buffer protection RED drop</threat_name>"
+    "<src>198.51.100.7</src><dst>203.0.113.9</dst><proto>udp</proto>"
+    "</entry></logs></log></result></response>"
+)
+
+#: The PBP threat-log query keeps its XML on the journal record itself, not in
+#: a `commands` table, exactly as the collector writes it at monitor stop.
+THREAT_LOG_RECORD = {
+    "run_id": "20260830T080000Z",
+    "timestamp": "2026-08-30T08:05:00+00:00",
+    "event": "pbp_threat_logs",
+    "ok": True,
+    "raw_response": THREAT_LOG_XML,
+}
+
+TRAFFIC_LOG_XML = (
+    '<response status="success"><result><log><logs><entry>'
+    "<receive_time>2026/08/30 08:00:02</receive_time><src>198.51.100.7</src>"
+    "<dst>203.0.113.9</dst><proto>udp</proto><action>allow</action>"
+    "</entry></logs></log></result></response>"
+)
+
+TRAFFIC_LOG_RECORD = {
+    "run_id": "20260830T080000Z",
+    "timestamp": "2026-08-30T08:06:00+00:00",
+    "event": "offender_traffic_logs",
+    "sources": [
+        {"source_ip": "198.51.100.7", "ok": True, "raw_response": TRAFFIC_LOG_XML},
+        {"source_ip": "198.51.100.8", "ok": False, "error": "log job 3 did not finish"},
+    ],
+}
+
 
 class ReplayTests(unittest.TestCase):
     def test_stored_xml_is_parsed_by_the_shipped_parser(self):
@@ -63,6 +98,29 @@ class ReplayTests(unittest.TestCase):
     def test_a_single_command_can_be_replayed_alone(self):
         outcomes = replay_record(RECORD, {"system_info"})
         self.assertEqual([item["command"] for item in outcomes], ["system_info"])
+
+    def test_a_stop_time_log_query_is_replayed_from_its_event_record(self):
+        outcomes = {item["command"]: item for item in replay_record(THREAT_LOG_RECORD, None)}
+        threat = outcomes["pbp_threat_logs"]
+        self.assertEqual(threat["status"], "parsed")
+        self.assertEqual(threat["parsed"][0]["threat_id"], 8507)
+        self.assertEqual(threat["parsed"][0]["source_ip"], "198.51.100.7")
+
+    def test_each_offender_source_of_a_log_query_is_replayed_and_named(self):
+        outcomes = {
+            item["command"]: item for item in replay_record(TRAFFIC_LOG_RECORD, None)
+        }
+        parsed = outcomes["offender_traffic_logs[198.51.100.7]"]
+        self.assertEqual(parsed["status"], "parsed")
+        self.assertEqual(parsed["parsed"][0]["destination_ip"], "203.0.113.9")
+        unfinished = outcomes["offender_traffic_logs[198.51.100.8]"]
+        self.assertEqual(unfinished["status"], "empty")
+        self.assertEqual(unfinished["collection_error"], "log job 3 did not finish")
+
+    def test_an_event_record_can_be_replayed_alone_by_its_name(self):
+        outcomes = replay_record(THREAT_LOG_RECORD, {"pbp_threat_logs"})
+        self.assertEqual([item["command"] for item in outcomes], ["pbp_threat_logs"])
+        self.assertEqual(replay_record(THREAT_LOG_RECORD, {"system_info"}), [])
 
     def test_a_run_archive_and_a_bare_capture_are_both_accepted(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

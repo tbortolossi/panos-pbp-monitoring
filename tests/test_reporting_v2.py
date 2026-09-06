@@ -236,6 +236,28 @@ class LayeredReportTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 generate_html_report_v2(capture, capture)
 
+    def test_without_an_output_the_report_takes_the_name_the_dashboard_serves(self):
+        # A regeneration run by hand must refresh the file the run's row opens.
+        # A differently named copy would be invisible in the Web UI and would
+        # still be packed into every run archive and support bundle, evicting
+        # real evidence from their size budget.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            capture, _ = self._capture(directory, self._incident_records())
+            output = StringIO()
+            with redirect_stdout(output):
+                code = main([str(capture)])
+
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                output.getvalue().strip(), str(directory / REPORT_V2_FILENAME)
+            )
+            self.assertTrue((directory / REPORT_V2_FILENAME).is_file())
+            self.assertEqual(
+                sorted(path.name for path in directory.glob("*.html")),
+                [REPORT_V2_FILENAME],
+            )
+
     def test_the_command_line_writes_the_report_it_prints(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)

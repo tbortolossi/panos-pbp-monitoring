@@ -146,7 +146,7 @@ class ReportingTests(unittest.TestCase):
             with patch.dict(os.environ, {"PANOS_API_KEY": "must-not-leak"}):
                 report = generate_html_report(capture)
 
-            self.assertEqual(report, capture.with_suffix(".html"))
+            self.assertEqual(report, capture.with_name("report.html"))
             self.assertEqual(capture.read_bytes(), source_bytes)
             rendered = report.read_text(encoding="utf-8")
 

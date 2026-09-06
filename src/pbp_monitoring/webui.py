@@ -21,7 +21,7 @@ from typing import Any, Sequence
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from . import __version__, diagnostics
-from .reporting import REPORT_SCRIPT_CSP_HASH
+from .reporting import LEGACY_REPORT_SCRIPT_CSP_HASHES, REPORT_SCRIPT_CSP_HASH
 from .reporting_v2 import REPORT_V2_FILENAME, REPORT_V2_SCRIPT_CSP_HASH
 from .adminui import AdminController
 from .config_store import ALL_RUNS, DEFAULT_SETTINGS, TARGET_NAME, ConfigStore
@@ -472,7 +472,18 @@ _REPORT_NAMES = {
 }
 #: The script-src expression a report page is served with: the report's own
 #: folding control, named by hash and quoted as CSP requires, and nothing else.
-_REPORT_SCRIPT_SRC = f"'{REPORT_SCRIPT_CSP_HASH}' '{REPORT_V2_SCRIPT_CSP_HASH}'"
+#: The reports of runs collected before an upgrade are never rewritten, so the
+#: folding scripts earlier releases wrote are named here too; without them the
+#: Collapse all control of an older run disappears the moment it is reopened
+#: through the dashboard. Every hash pins one exact script body.
+_REPORT_SCRIPT_SRC = " ".join(
+    f"'{value}'"
+    for value in (
+        REPORT_SCRIPT_CSP_HASH,
+        REPORT_V2_SCRIPT_CSP_HASH,
+        *LEGACY_REPORT_SCRIPT_CSP_HASHES,
+    )
+)
 _BODY_TAG = re.compile(rb"<body[^>]*>", re.IGNORECASE)
 
 
@@ -837,11 +848,13 @@ def _check_signal(
     """State and text of the API signal: is the firewall still answering?
 
     Green means the last read-only check passed. Red is kept for a check that
-    actually failed. A queued validation, a firewall never checked yet, or a
-    schedule left unhonoured for more than twice the configured interval, is
-    amber: nothing proves the firewall is unreachable, only that no recent call
-    confirmed it. A run in progress is its own proof, since the collector is
-    then polling the API every few seconds.
+    actually failed. A queued validation, a firewall never checked yet, a check
+    that passed with reduced evidence, or a schedule left unhonoured for more
+    than twice the configured interval, is amber: nothing proves the firewall is
+    unreachable, only that no recent call confirmed it, or that it answered
+    everything monitoring needs and less than the report would like. A run in
+    progress is its own proof, since the collector is then polling the API every
+    few seconds.
     """
     if firewall.get("check_requested_at"):
         return "warn", "API check: validation queued"
@@ -850,13 +863,17 @@ def _check_signal(
         return "warn", "API check: never run"
     status = str(firewall.get("last_check_status") or "")
     kind = str(firewall.get("last_check_kind") or "check")
-    passed = status == "ok"
-    line = f"API check: {kind} {'passed' if passed else 'FAILED'} at {_display_utc(checked_at)}"
+    reduced = status == "warning"
+    passed = status in {"ok", "warning"}
+    outcome = "passed with warnings" if reduced else ("passed" if passed else "FAILED")
+    line = f"API check: {kind} {outcome} at {_display_utc(checked_at)}"
     detail = str(firewall.get("last_check_detail") or "")
     if detail:
         line = f"{line} - {detail}"
     if not passed:
         return "bad", line
+    if reduced:
+        return "warn", line
     age = firewall.get("check_age_seconds")
     overdue = (
         interval_hours > 0

@@ -50,6 +50,40 @@ follows [Semantic Versioning](https://semver.org/).
 - **The low-pressure verdict reads as English again**: a single supported
   signal is now "would be a supported finding" and several are "would be
   supported findings", instead of both branches printing the same text.
+- **A least-privilege API administrator no longer turns every firewall red.**
+  The read-only API check failed as soon as any command failed, including the
+  collector's single running-configuration read of the PBP thresholds — which
+  an API administrator scoped to operational requests is refused, exactly the
+  role this project documents — and the buffer-latency command, which older
+  PAN-OS releases do not have. Upgrading was enough to turn a green firewall
+  red with nothing changed on the device. Those two reads are enrichment, not
+  monitoring: they are now reported as warnings on a check that still passes.
+  The firewall reads **Passed with warnings** in amber on the configuration
+  page and in the dashboard's API signal, the detail names the evidence that
+  will be missing from the reports, and the capture keeps the raw refusal
+  PAN-OS returned. Every other command stays fatal, and the check record
+  carries a new `validation_warnings` field beside `validation_errors`.
+- **The PBP threat-log and offender log queries can be replayed from a
+  customer archive.** Those queries store their raw PAN-OS XML on the journal
+  record itself rather than in a `commands` table, and `tools/replay_capture.py`
+  read only the latter: the firewall's own 8507/8508/8509 designation of an
+  incident travelled in every archive with no way to re-parse it. The tool now
+  routes `pbp_threat_logs`, `offender_traffic_logs` and `offender_live_sessions`
+  through their parsers, naming each offender source, and a new mechanical test
+  fails on any future event that persists a raw response without a replay path.
+- **Reports written before an upgrade keep their Collapse all control.** The
+  Web UI served a Content-Security-Policy naming only the current report
+  scripts, so a report stored by v0.32.0 to v0.35.1 lost its folding control
+  the moment it was reopened through the dashboard — the file itself was
+  unchanged and still worked when opened directly. The served policy now also
+  names the folding script those releases wrote, pinned by its exact hash.
+- **`pbp-report-v2` without `-o` refreshes the report the dashboard opens.** It
+  wrote `<capture>.v2.html` next to the capture, a name no page serves: the
+  documented regeneration command appeared to do nothing, and the stray file,
+  often tens of megabytes, was then packed into run archives and into the
+  64 MB incident budget of the support bundle, evicting real evidence. Both
+  commands now default to the names the run directory uses, `report-v2.html`
+  and `report.html`.
 
 ## [0.39.1] - 2026-09-01
 

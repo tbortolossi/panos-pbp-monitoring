@@ -218,7 +218,12 @@ queued the configuration page reloads itself every five seconds so the outcome
 appears without a manual refresh; it stops reloading as soon as no validation is
 pending, and never reloads while a firewall form is open for editing. The
 **Last check** column reports when either check last ran, whether it passed, and
-a short reason when it did not.
+a short reason when it did not. A validation that collected everything
+monitoring needs but was refused one of the two enrichment reads — the running
+configuration of the PBP thresholds, or the buffer latency of a PAN-OS release
+that does not have that command — reads **Passed with warnings** in amber and
+names the missing evidence; the firewall stays usable. See
+[Troubleshooting](troubleshooting.md#pan-os-api-failure).
 
 Because HTTPS uses port 443 and Syslog uses port 514, one address covers both.
 When an earlier configuration allowed additional Syslog sources for a target,

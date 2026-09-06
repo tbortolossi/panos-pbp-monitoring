@@ -764,6 +764,22 @@ class AdminUITests(unittest.TestCase):
                 self.assertNotIn('http-equiv="refresh"', finished)
                 self.assertIn("Passed", finished)
 
+                # A check the firewall answered with less evidence than the
+                # report would like is neither Passed nor Failed.
+                store.record_target_check(
+                    target_id,
+                    kind="validation",
+                    status="warning",
+                    detail=(
+                        "run 20260829T172715Z - reduced evidence: pbp_settings "
+                        "command failed"
+                    ),
+                )
+                reduced = opener.open(base + "/admin").read().decode()
+                self.assertIn("Passed with warnings", reduced)
+                self.assertIn("reduced evidence", reduced)
+                self.assertNotIn("Failed", reduced)
+
 
 class SettingLabelTests(unittest.TestCase):
     def test_every_stored_setting_has_a_spelled_out_label(self):
