@@ -13,10 +13,23 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 from . import __version__
-from .diagnosis import build_diagnosis, buffer_latency_statuses, render_diagnosis
+from .diagnosis import (
+    DEFAULT_ACTIVATE_PERCENT,
+    DEFAULT_ALERT_PERCENT,
+    POOL_HELD_PERCENT,
+    SIGNAL_COUNTER_FAMILIES,
+    _flow_parts,
+    _ingress_candidate_entities,
+    _level,
+    _numbers,
+    build_diagnosis,
+    buffer_latency_statuses,
+    latest_event,
+    render_diagnosis,
+)
 
 _COMMAND_RESULT_KEYS = ("error", "result", "raw_response")
 _COMMAND_METADATA_KEYS = ("ok", "started_at", "finished_at", "duration_seconds")
@@ -180,34 +193,6 @@ def _contains_error(payload: Any) -> bool:
     return False
 
 
-def _numbers(value: Any) -> Iterable[float]:
-    if isinstance(value, bool) or value is None:
-        return
-    if isinstance(value, (int, float)):
-        try:
-            number = float(value)
-        except OverflowError:
-            return
-        if math.isfinite(number):
-            yield number
-        return
-    if isinstance(value, str):
-        try:
-            number = float(value.strip())
-        except (OverflowError, ValueError):
-            return
-        if math.isfinite(number):
-            yield number
-        return
-    if isinstance(value, dict):
-        for nested in value.values():
-            yield from _numbers(nested)
-        return
-    if isinstance(value, (list, tuple)):
-        for nested in value:
-            yield from _numbers(nested)
-
-
 def _metric_max(record: dict[str, Any], key: str) -> float | None:
     percentages = record.get("percentages")
     if not isinstance(percentages, dict) or key not in percentages:
@@ -225,8 +210,10 @@ def _format_number(value: float | int | None) -> str:
 
 
 # PAN-OS packet buffer protection defaults: alert at 50 %, activate at 80 %.
-_PBP_ALERT_PERCENT = 50.0
-_PBP_ACTIVATE_PERCENT = 80.0
+# Declared once in `diagnosis`, so a card, a meter and a verdict can never
+# colour the same percentage against different thresholds.
+_PBP_ALERT_PERCENT = DEFAULT_ALERT_PERCENT
+_PBP_ACTIVATE_PERCENT = DEFAULT_ACTIVATE_PERCENT
 
 _STOP_REASON_LABELS = {
     "resources_recovered": "Resources recovered",
@@ -295,17 +282,6 @@ def _human_duration(seconds: float | int | None) -> str:
 def _stop_reason_label(reason: Any) -> str:
     text = _display_text(reason)
     return _STOP_REASON_LABELS.get(text, text.replace("_", " ").capitalize())
-
-
-def _level(value: float | int | None) -> str:
-    """Classify a utilization percentage against the PBP thresholds."""
-    if value is None:
-        return "none"
-    if float(value) >= _PBP_ACTIVATE_PERCENT:
-        return "bad"
-    if float(value) >= _PBP_ALERT_PERCENT:
-        return "warn"
-    return "ok"
 
 
 def _resource_cpu_samples(record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1275,47 +1251,14 @@ def _aggregate_attribution(
 
 
 def _flow_description(item: dict[str, Any]) -> tuple[str, str]:
-    summary = item.get("session_summary")
-    ingress = item.get("ingress_detail")
-    flow: dict[str, Any] = {}
-    application = None
-    rule = None
-    if isinstance(summary, dict):
-        candidate_flow = summary.get("c2s")
-        if isinstance(candidate_flow, dict):
-            flow = candidate_flow
-        application = summary.get("application")
-        rule = summary.get("rule")
-    if not flow and isinstance(ingress, dict):
-        flow = ingress
-        application = ingress.get("application")
+    """The flow and application of a ranked entity, as two table cells.
 
-    source = flow.get("source_ip")
-    destination = flow.get("destination_ip")
-    source_port = flow.get("source_port")
-    destination_port = flow.get("destination_port")
-    protocol = flow.get("protocol")
-    if source or destination:
-        source_text = f"{source or '?'}:{source_port}" if source_port is not None else str(source or "?")
-        destination_text = (
-            f"{destination or '?'}:{destination_port}"
-            if destination_port is not None
-            else str(destination or "?")
-        )
-        tuple_text = f"{source_text} -> {destination_text}"
-        if protocol is not None:
-            tuple_text += f" / proto {protocol}"
-    else:
-        tuple_text = "—"
-    context = " · ".join(
-        value
-        for value in (
-            f"app {application}" if application else None,
-            f"rule {rule}" if rule else None,
-        )
-        if value
-    ) or "—"
-    return tuple_text, context
+    The description itself is the diagnosis's, so the verdict and the table
+    always name the same flow, the same application and the same rule; only
+    the empty cell is this renderer's business.
+    """
+    tuple_text, context = _flow_parts(item)
+    return tuple_text or "—", context or "—"
 
 
 _MAX_RENDERED_ATTRIBUTION_ROWS = 50
@@ -1472,14 +1415,7 @@ def _render_buffer_latency(cycles: list[tuple[int, dict[str, Any]]]) -> str:
 
 def _render_pbp_threat_logs(events: list[tuple[int, dict[str, Any]]]) -> str:
     """Render the PBP threat logs captured at monitor stop."""
-    record = next(
-        (
-            item
-            for _, item in reversed(events)
-            if str(item.get("event", "")).lower() == "pbp_threat_logs"
-        ),
-        None,
-    )
+    record = latest_event([item for _, item in events], "pbp_threat_logs")
     if record is None:
         return ""
     if record.get("ok") is not True:
@@ -2400,21 +2336,6 @@ def _part_heading(title: str, subtitle: str) -> str:
     )
 
 
-def _ingress_candidate_entities(attribution: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The sessions the ingress work queue named, in queue-share order."""
-    candidates = [
-        item
-        for item in attribution
-        if item.get("entity_type") == "session"
-        and (
-            "ingress_backlogs" in item.get("evidence_sources", [])
-            or item.get("ingress_percentage") is not None
-        )
-    ]
-    candidates.sort(key=lambda item: -(float(item.get("ingress_percentage") or 0.0)))
-    return candidates
-
-
 def _render_section(
     anchor: str,
     title: str,
@@ -2448,14 +2369,7 @@ def _render_section(
 
 def _render_offender_live_sessions(events: list[tuple[int, dict[str, Any]]]) -> str:
     """Render the live sessions enumerated for top offender sources at stop."""
-    record = next(
-        (
-            item
-            for _, item in reversed(events)
-            if str(item.get("event", "")).lower() == "offender_live_sessions"
-        ),
-        None,
-    )
+    record = latest_event([item for _, item in events], "offender_live_sessions")
     if record is None or not isinstance(record.get("sources"), list):
         return ""
     blocks: list[str] = []
@@ -2519,14 +2433,7 @@ def _render_offender_live_sessions(events: list[tuple[int, dict[str, Any]]]) -> 
 
 def _render_offender_traffic_logs(events: list[tuple[int, dict[str, Any]]]) -> str:
     """Render the traffic-log flows recovered for unenriched offender sources."""
-    record = next(
-        (
-            item
-            for _, item in reversed(events)
-            if str(item.get("event", "")).lower() == "offender_traffic_logs"
-        ),
-        None,
-    )
+    record = latest_event([item for _, item in events], "offender_traffic_logs")
     if record is None or not isinstance(record.get("sources"), list):
         return ""
     blocks: list[str] = []
@@ -2638,124 +2545,10 @@ def _render_drop_counters(
     )
 
 
-# Root-cause counter families, surfaced regardless of severity. The decisive
-# counters of most real packet-buffer cases are info or warn, so the
-# drop-severity table above never shows them. Names verified on anonymized
-# captures of closed TAC cases across PAN-OS 10.2.9 - 11.2.10.
-_SIGNAL_COUNTER_FAMILIES: tuple[dict[str, Any], ...] = (
-    {
-        "key": "pbp",
-        "label": "Packet buffer protection",
-        "names": (
-            "flow_dos_pbp_drop",
-            "flow_dos_pbp_cnt_drop",
-            "flow_dos_pbp_ifp_zone",
-            "flow_dos_pbp_block_host",
-            "pkt_buf_protect_red",
-            "pkt_buf_protect_discard",
-            "pkt_buf_protect_block_ip",
-        ),
-        "prefixes": (),
-        "note": (
-            "PBP's own mitigation, under both naming families: PAN-OS 10.2/11.x "
-            "counts it as flow_dos_pbp_*, other releases as pkt_buf_protect_*."
-        ),
-    },
-    {
-        "key": "block_collateral",
-        "label": "Blocked-source collateral",
-        "names": ("flow_dos_drop_ip_blocked",),
-        "prefixes": (),
-        "note": (
-            "Packets dropped because their source sits in the block table. When "
-            "a block-ip hits a NAT device, a proxy or a backup server, this "
-            "counter is the size of the silent outage it causes."
-        ),
-    },
-    {
-        "key": "arp_storm",
-        "label": "ARP / L2 storm",
-        "names": ("flow_arp_pkt_rcv", "flow_arp_rcv_gratuitous"),
-        "prefixes": (),
-        "note": (
-            "An ARP flood creates no session, so PBP can neither name nor block "
-            "it and the offender ranking stays empty while the buffer fills. A "
-            "gratuitous share near 100% is a gratuitous-ARP storm; the fix is "
-            "at layer 2, and a firewall reboot changes nothing."
-        ),
-    },
-    {
-        "key": "fragmentation",
-        "label": "IP fragmentation",
-        "names": (
-            "flow_ipfrag_recv",
-            "flow_ipfrag_merge",
-            "flow_ipfrag_fwd",
-            "flow_ipfrag_pkt_alloc_err",
-        ),
-        "prefixes": (),
-        "note": (
-            "Reassembly holds buffers until every fragment arrives. A received/"
-            "completed ratio well above the packets' natural fragment count, or "
-            "any flow_ipfrag_pkt_alloc_err, ties fragmentation directly to "
-            "buffer exhaustion."
-        ),
-    },
-    {
-        "key": "allocation_failure",
-        "label": "Buffer allocation failures",
-        "names": ("pkt_alloc_failure", "buf_alloc_fail", "hw_buf_alloc_fail"),
-        "prefixes": (),
-        "note": (
-            "The dataplane asked for a buffer and got none - exhaustion is no "
-            "longer a percentage but a fact, whatever PBP did about it."
-        ),
-    },
-    {
-        "key": "proxy_retransmit",
-        "label": "Decryption proxy retransmit",
-        "names": (
-            "tcp_fptcp_rxmt",
-            "tcp_fptcp_fast_retransmit",
-            "tcp_fptcp_max_rxmt",
-        ),
-        "prefixes": (),
-        "note": (
-            "The SSL forward proxy's own TCP stack retransmitting: each unacked "
-            "segment holds a buffer, and on ASIC platforms an on-chip "
-            "descriptor. A sustained rate under decryption is the distributed "
-            "descriptor-exhaustion signature."
-        ),
-    },
-    {
-        "key": "out_of_order",
-        "label": "Out-of-order / one-way TCP",
-        "names": (
-            "tcp_exceed_flow_seg_limit",
-            "tcp_drop_packet",
-            "tcp_out_of_sync",
-            "flow_tcp_non_syn",
-        ),
-        "prefixes": (),
-        "note": (
-            "Out-of-order queues hold buffers while reassembly waits. Sustained "
-            "rates point at an asymmetric or one-way feed - a TAP or mirror "
-            "port is the classic source, and long application timeouts keep "
-            "those queues alive."
-        ),
-    },
-    {
-        "key": "zone_flood",
-        "label": "Zone-protection flood counters",
-        "names": (),
-        "prefixes": ("flow_dos_red_", "flow_dos_syncookie_"),
-        "note": (
-            "Zone protection absorbing a flood where it is enabled. PBP RED "
-            "climbing while these stay at zero means the flood reached the "
-            "buffer through a zone whose flood protection is off."
-        ),
-    },
-)
+# The root-cause counter registry lives in `diagnosis`, beside the
+# signatures that read the same counter names: the family table below and
+# the hypothesis thresholds must never drift apart.
+_SIGNAL_COUNTER_FAMILIES = SIGNAL_COUNTER_FAMILIES
 
 
 def _aggregate_signal_counters(
@@ -2797,7 +2590,7 @@ def _aggregate_signal_counters(
                 continue
             value = next(iter(_numbers(counter.get("value"))), None)
             rate = next(iter(_numbers(counter.get("rate"))), None)
-            bucket = per_family.setdefault(str(family["key"]), {})
+            bucket = per_family.setdefault(str(family["family"]), {})
             item = bucket.get(name)
             if item is None:
                 item = bucket[name] = {
@@ -2822,7 +2615,7 @@ def _aggregate_signal_counters(
 
     families = []
     for definition in _SIGNAL_COUNTER_FAMILIES:
-        bucket = per_family.get(str(definition["key"]))
+        bucket = per_family.get(str(definition["family"]))
         if not bucket:
             continue
         items = sorted(
@@ -2830,7 +2623,9 @@ def _aggregate_signal_counters(
         )
         families.append(
             {
-                "key": definition["key"],
+                # The aggregated summary keys a family under `key`, which is
+                # what `diagnosis._signal_family_counters` reads.
+                "key": definition["family"],
                 "label": definition["label"],
                 "note": definition["note"],
                 "counters": items,
@@ -2908,7 +2703,11 @@ _DIAGNOSTIC_POOL_NAMES = {
     "ssl_st": "SSL states held by the proxy",
     "fptcp_seg": "Proxy TCP segments in flight",
 }
-_POOL_ATTENTION_PERCENT = 80.0
+# The occupancy above which a pool is worth naming. The same level the leak
+# signature reads, declared once in `diagnosis`: this aggregation pre-filters
+# the very list that signature then judges, so two constants would couple the
+# two silently.
+_POOL_ATTENTION_PERCENT = POOL_HELD_PERCENT
 
 
 def _aggregate_diagnostic_pools(
@@ -3348,11 +3147,61 @@ def _render_large_sessions(summary: dict[str, Any]) -> str:
     )
 
 
+#: The navigation entry of the threat-logs section, which exists only when the
+#: query at monitor stop returned something to render.
+_THREAT_LOGS_NAV_ITEM = ("pbp-threat-logs-title", "Threat logs")
+
+#: Every section `_evidence_sections` renders, in render order, with the label
+#: both navigation bars show for it. Declared once here: the flat report and
+#: the layered one used to hand-maintain two copies of this list, and their
+#: threat-logs entry had already drifted to a different position.
+_EVIDENCE_NAV_ITEMS: tuple[tuple[str, str], ...] = (
+    ("pressure-title", "Pressure"),
+    ("attribution-title", "Offenders"),
+    _THREAT_LOGS_NAV_ITEM,
+    ("ingress-title", "Backlog"),
+    ("cpu-tracking-title", "CPU"),
+    ("large-sessions-title", "Largest sessions"),
+    ("drop-counters-title", "Drops"),
+    ("session-table-title", "Session table"),
+)
+
+#: The same declaration for `_appendix_sections`.
+_APPENDIX_NAV_ITEMS: tuple[tuple[str, str], ...] = (
+    ("summary-title", "Summary"),
+    ("timeline-title", "Timeline"),
+    ("cycles-title", "Batches"),
+    ("events-title", "Events"),
+)
+
+
+def _evidence_nav_items(parts: dict[str, Any]) -> list[tuple[str, str]]:
+    """The evidence sections this capture actually carries, in render order."""
+    return [
+        item
+        for item in _EVIDENCE_NAV_ITEMS
+        if item != _THREAT_LOGS_NAV_ITEM or parts["pbp_threat_logs_html"]
+    ]
+
+
+def _appendix_nav_items() -> list[tuple[str, str]]:
+    """The appendix sections, which every capture carries."""
+    return list(_APPENDIX_NAV_ITEMS)
+
+
+def _render_nav(items: Sequence[tuple[str, str]]) -> str:
+    """The navigation bar, and the anchor the folding script attaches to."""
+    return '<nav class="toc" aria-label="Sections">' + "".join(
+        f'<a href="#{anchor}">{label}</a>' for anchor, label in items
+    ) + "</nav>"
+
+
 def _evidence_sections(parts: dict[str, Any]) -> str:
     """The sections that carry the detail behind the diagnosis.
 
     Shared by both renderers so the v1 report and the layered v2 report can
     never present a different table, verdict or pill for the same capture.
+    Their anchors are the ones `_EVIDENCE_NAV_ITEMS` declares.
     """
     pressure_chart_html = parts["pressure_chart_html"]
     metric_groups_html = parts["metric_groups_html"]
@@ -4071,6 +3920,67 @@ def _build_report_parts(
     }
 
 
+def render_report_page(
+    *,
+    title: str,
+    style: str,
+    script: str,
+    script_csp_hash: str,
+    nav_html: str,
+    main_html: str,
+    parts: dict[str, Any],
+    source_hash: str,
+) -> str:
+    """The page both reports are written on: chrome, identity, and warnings.
+
+    The security header, the capture identity an engineer reads before
+    anything else, and the sensitivity notice are the same page for the flat
+    report and the layered one. They are built here once so a hardening of the
+    Content-Security-Policy, or a device fact added to the header, reaches both
+    files instead of one.
+    """
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src '{script_csp_hash}'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>{_escape(title)}</title>
+  <style>
+{style}  </style>
+</head>
+<body>
+  <header>
+    <h1>{_escape(title)}</h1>
+    <p>Static report derived from the JSONL capture. The JSONL file remains the original evidence.</p>
+    <div class="facts">
+      <div class="fact"><span>Start</span><strong>{_escape(_human_timestamp(parts["started_at"]))}</strong></div>
+      <div class="fact"><span>End</span><strong>{_escape(_human_timestamp(parts["ended_at"]))}</strong></div>
+      <div class="fact"><span>Duration</span><strong>{_escape(_human_duration(parts["duration"]))}</strong></div>
+      <div class="fact"><span>Stop reason</span><strong>{parts["stop_reason_html"]}</strong></div>
+      <div class="fact"><span>Target</span><strong>{_escape(parts["target_name"])}</strong></div>
+      <div class="fact"><span>Device</span><strong>{_escape(parts["device_name"])}</strong></div>
+      <div class="fact"><span>Model</span><strong>{_escape(parts["device_model"])}</strong></div>
+      <div class="fact"><span>PAN-OS</span><strong>{_escape(parts["software_version"])}</strong></div>
+      <div class="fact"><span>Collector version</span><strong>{_escape(parts["collector_version"])}</strong></div>
+      <div class="fact"><span>Source</span><strong>{_escape(parts["source_name"])}</strong></div>
+    </div>
+  </header>
+  {nav_html}
+  <main>
+    {main_html}
+  </main>
+  <footer>
+    Generated by PBP Monitoring v{_escape(__version__)} at {_escape(parts["generated_at"])} · JSONL SHA-256: <code>{_escape(source_hash)}</code> ·
+    This report may contain sensitive IP addresses, ports, device names, and serial numbers.
+  </footer>
+  <script>{script}</script>
+</body>
+</html>
+"""
+
+
 def _render_html(
     source: Path,
     records: list[tuple[int, dict[str, Any]]],
@@ -4078,16 +3988,6 @@ def _render_html(
     source_hash: str,
 ) -> str:
     parts = _build_report_parts(source, records, warnings, source_hash)
-    collector_version = parts["collector_version"]
-    device_model = parts["device_model"]
-    device_name = parts["device_name"]
-    duration = parts["duration"]
-    ended_at = parts["ended_at"]
-    generated_at = parts["generated_at"]
-    software_version = parts["software_version"]
-    started_at = parts["started_at"]
-    stop_reason_html = parts["stop_reason_html"]
-    target_name = parts["target_name"]
     warning_html = parts["warning_html"]
     run_id = parts["run_id"]
     diagnosis = parts["diagnosis"]
@@ -4106,29 +4006,9 @@ def _render_html(
             section_class="glance",
             data_level=diagnosis["headline"]["level"],
         )
-    nav_items = [
-        ("pressure-title", "Pressure"),
-        ("attribution-title", "Offenders"),
-        ("ingress-title", "Backlog"),
-        ("cpu-tracking-title", "CPU"),
-        ("large-sessions-title", "Largest sessions"),
-        ("drop-counters-title", "Drops"),
-        ("session-table-title", "Session table"),
-        ("summary-title", "Summary"),
-        ("timeline-title", "Timeline"),
-        ("cycles-title", "Batches"),
-        ("events-title", "Events"),
-    ]
-    if parts["pbp_threat_logs_html"]:
-        nav_items.insert(2, ("pbp-threat-logs-title", "Threat logs"))
-    if glance_html:
-        nav_items.insert(0, ("glance-title", "Diagnosis"))
-    nav_html = '<nav class="toc" aria-label="Sections">' + "".join(
-        f'<a href="#{anchor}">{label}</a>' for anchor, label in nav_items
-    ) + "</nav>"
-    # The Collapse all control is added by the report's own script, so the page
-    # never shows a button that cannot work.
-    report_script = REPORT_SCRIPT
+    nav_items = [("glance-title", "Diagnosis")] if glance_html else []
+    nav_items += _evidence_nav_items(parts) + _appendix_nav_items()
+    nav_html = _render_nav(nav_items)
     sections_html = "".join(
         [
             _part_heading(
@@ -4148,48 +4028,18 @@ def _render_html(
         ]
     )
 
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="referrer" content="no-referrer">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src '{REPORT_SCRIPT_CSP_HASH}'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>{_escape(title)}</title>
-  <style>
-{REPORT_STYLE}  </style>
-</head>
-<body>
-  <header>
-    <h1>{_escape(title)}</h1>
-    <p>Static report derived from the JSONL capture. The JSONL file remains the original evidence.</p>
-    <div class="facts">
-      <div class="fact"><span>Start</span><strong>{_escape(_human_timestamp(started_at))}</strong></div>
-      <div class="fact"><span>End</span><strong>{_escape(_human_timestamp(ended_at))}</strong></div>
-      <div class="fact"><span>Duration</span><strong>{_escape(_human_duration(duration))}</strong></div>
-      <div class="fact"><span>Stop reason</span><strong>{stop_reason_html}</strong></div>
-      <div class="fact"><span>Target</span><strong>{_escape(target_name)}</strong></div>
-      <div class="fact"><span>Device</span><strong>{_escape(device_name)}</strong></div>
-      <div class="fact"><span>Model</span><strong>{_escape(device_model)}</strong></div>
-      <div class="fact"><span>PAN-OS</span><strong>{_escape(software_version)}</strong></div>
-      <div class="fact"><span>Collector version</span><strong>{_escape(collector_version)}</strong></div>
-      <div class="fact"><span>Source</span><strong>{_escape(source.name)}</strong></div>
-    </div>
-  </header>
-  {nav_html}
-  <main>
-    {warning_html}
-    {glance_html}
-    {sections_html}
-  </main>
-  <footer>
-    Generated by PBP Monitoring v{_escape(__version__)} at {_escape(generated_at)} · JSONL SHA-256: <code>{_escape(source_hash)}</code> ·
-    This report may contain sensitive IP addresses, ports, device names, and serial numbers.
-  </footer>
-  <script>{report_script}</script>
-</body>
-</html>
-"""
+    return render_report_page(
+        title=title,
+        style=REPORT_STYLE,
+        # The Collapse all control is added by the report's own script, so the
+        # page never shows a button that cannot work.
+        script=REPORT_SCRIPT,
+        script_csp_hash=REPORT_SCRIPT_CSP_HASH,
+        nav_html=nav_html,
+        main_html="\n    ".join([warning_html, glance_html, sections_html]),
+        parts=parts,
+        source_hash=source_hash,
+    )
 
 
 def write_report_atomically(destination: Path, rendered: str) -> Path:

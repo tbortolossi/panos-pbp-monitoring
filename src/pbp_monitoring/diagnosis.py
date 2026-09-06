@@ -115,17 +115,27 @@ def _escape(value: Any) -> str:
 
 
 def _numbers(value: Any) -> Iterable[float]:
+    """Every finite number reachable in a parsed JSON value.
+
+    The one copy the diagnosis and both reports read. JSON carries integers of
+    unbounded size, so a firewall response - or a corrupted capture line - can
+    hold a value ``float()`` refuses: it is skipped like any other unusable
+    reading rather than ending the report.
+    """
     if isinstance(value, bool) or value is None:
         return
     if isinstance(value, (int, float)):
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError:
+            return
         if math.isfinite(number):
             yield number
         return
     if isinstance(value, str):
         try:
             number = float(value.strip())
-        except ValueError:
+        except (OverflowError, ValueError):
             return
         if math.isfinite(number):
             yield number
@@ -153,6 +163,46 @@ def _fmt(value: float | int | None) -> str:
 
 def _pct(value: float | None) -> str:
     return f"{_fmt(value)}%" if value is not None else "not returned"
+
+
+def _level(
+    value: float | int | None,
+    alert: float = DEFAULT_ALERT_PERCENT,
+    activate: float = DEFAULT_ACTIVATE_PERCENT,
+) -> str:
+    """Classify a utilization percentage against the PBP thresholds.
+
+    The single classifier of the collector: the diagnosis passes the thresholds
+    this firewall actually runs with, the report tables call it with the PAN-OS
+    defaults, and neither can rank a percentage the other would rank
+    differently.
+    """
+    if value is None:
+        return "none"
+    if float(value) >= activate:
+        return "bad"
+    if float(value) >= alert:
+        return "warn"
+    return "ok"
+
+
+def latest_event(
+    events: Sequence[dict[str, Any]], event: str
+) -> dict[str, Any] | None:
+    """The last record of one event kind, which is the one monitor stop wrote.
+
+    Both the diagnosis and the report's own renderers read the queries taken at
+    monitor stop, so they locate them here rather than each walking the journal
+    with its own copy of the rule.
+    """
+    return next(
+        (
+            record
+            for record in reversed(events)
+            if str(record.get("event", "")).lower() == event
+        ),
+        None,
+    )
 
 
 def _metric_peak(cycles: Sequence[dict[str, Any]], *keys: str) -> float | None:
@@ -276,14 +326,7 @@ def _threat_log_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     threat logs of the device, of any age: they corroborate at best, and the
     diagnosis must never present them as confirming this incident.
     """
-    record = next(
-        (
-            item
-            for item in reversed(events)
-            if str(item.get("event", "")).lower() == "pbp_threat_logs"
-        ),
-        None,
-    )
+    record = latest_event(events, "pbp_threat_logs")
     summary: dict[str, Any] = {
         "collected": record is not None,
         "ok": bool(record and record.get("ok") is True),
@@ -357,8 +400,36 @@ def _pbp_statuses(cycles: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def _flow_text(item: dict[str, Any]) -> tuple[str, str]:
-    """Describe an attributed entity's flow and its application context."""
+def _ingress_candidate_entities(
+    attribution: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """The sessions the ingress work queue named, in queue-share order.
+
+    Step 3 of the investigation and the Ingress backlog table list the same
+    sessions in the same order because they call this one selector.
+    """
+    candidates = [
+        item
+        for item in attribution
+        if item.get("entity_type") == "session"
+        and (
+            "ingress_backlogs" in item.get("evidence_sources", [])
+            or item.get("ingress_percentage") is not None
+        )
+    ]
+    candidates.sort(key=lambda item: -(float(item.get("ingress_percentage") or 0.0)))
+    return candidates
+
+
+def _flow_parts(item: dict[str, Any]) -> tuple[str, str]:
+    """Describe an attributed entity's flow and its application context.
+
+    The single description of a ranked entity: the diagnosis names the entity
+    in a sentence and the report puts the same two strings in its table cells,
+    so a session can never be shown with one application in the verdict and
+    another in the evidence. Both are empty when nothing was parsed; the caller
+    decides what an empty cell looks like.
+    """
     summary = item.get("session_summary")
     ingress = item.get("ingress_detail")
     flow: dict[str, Any] = {}
@@ -372,6 +443,9 @@ def _flow_text(item: dict[str, Any]) -> tuple[str, str]:
         rule = summary.get("rule")
     if not flow and isinstance(ingress, dict):
         flow = ingress
+        # The session summary wins when it named an application; the ingress
+        # backlog entry only fills the gap. Overwriting with the backlog's
+        # value would blank an application `show session id` did return.
         application = application or ingress.get("application")
     source = flow.get("source_ip")
     destination = flow.get("destination_ip")
@@ -408,7 +482,7 @@ def _flow_text(item: dict[str, Any]) -> tuple[str, str]:
 def _entity_html(item: dict[str, Any]) -> str:
     kind = "session" if item.get("entity_type") == "session" else "source IP"
     text = f"{kind} <code>{_escape(item.get('identifier'))}</code>"
-    tuple_text, context = _flow_text(item)
+    tuple_text, context = _flow_parts(item)
     details = [part for part in (tuple_text, context) if part]
     zones = ", ".join(str(zone) for zone in item.get("zones", []) if zone)
     if zones:
@@ -420,14 +494,7 @@ def _entity_html(item: dict[str, Any]) -> str:
 
 def _traffic_log_summary(events: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Count, per unenriched source, what its traffic log said (rule, action)."""
-    record = next(
-        (
-            item
-            for item in reversed(events)
-            if str(item.get("event", "")).lower() == "offender_traffic_logs"
-        ),
-        None,
-    )
+    record = latest_event(events, "offender_traffic_logs")
     summary: dict[str, dict[str, Any]] = {}
     if record is None or not isinstance(record.get("sources"), list):
         return summary
@@ -484,13 +551,17 @@ def build_diagnosis(
     them, for the same reason.
     """
     steps: list[dict[str, Any]] = []
-    context = _context(cycles, events, device)
+    # The threat logs taken at monitor stop are read once, here, and handed to
+    # every step that needs them: two scans could not disagree, but one scan
+    # makes it impossible for a later change to make them.
+    threat_logs = _threat_log_summary(events)
+    context = _context(cycles, events, device, threat_logs)
 
     pressure = _step_pressure(cycles, context)
     steps.append(pressure)
     low_significance = pressure["low_significance"]
 
-    named = _step_pbp_named(cycles, attribution, events, low_significance)
+    named = _step_pbp_named(cycles, attribution, events, low_significance, threat_logs)
     steps.append(named)
 
     backlogs = _step_ingress_backlogs(cycles, attribution, context)
@@ -519,6 +590,7 @@ def _context(
     cycles: Sequence[dict[str, Any]],
     events: Sequence[dict[str, Any]],
     device: dict[str, Any],
+    threat_logs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     model = device.get("model") if isinstance(device, dict) else None
     statuses = _pbp_statuses(cycles)
@@ -615,7 +687,9 @@ def _context(
         "latency_max_tolerate_ms": _first_number(settings.get("latency_max_tolerate_ms")) if settings else None,
         "latency_peak_ms": max(latency_values) if latency_values else None,
         "latency_status": latency_status,
-        "threat_logs": _threat_log_summary(events),
+        "threat_logs": threat_logs
+        if threat_logs is not None
+        else _threat_log_summary(events),
         "uptime": str(device.get("uptime"))
         if isinstance(device, dict) and device.get("uptime")
         else None,
@@ -639,9 +713,18 @@ def _step_pressure(cycles: Sequence[dict[str, Any]], context: dict[str, Any]) ->
     latency_peak = context["latency_peak_ms"]
     latency_activate = context["latency_activate_ms"] or DEFAULT_LATENCY_ACTIVATE_MS
     mitigating_from = context["mitigating_from_percent"]
+    descriptor_worst = max(
+        (value for value in (on_chip_peak, descriptor_peak) if value is not None),
+        default=None,
+    )
+    # The severity of each resource, decided once against the thresholds this
+    # firewall runs with. The step states these levels, the layered report's
+    # proof tiles show the same ones, and neither re-derives them.
+    buffer_level = _level(buffer_peak, alert)
+    descriptor_level = _level(descriptor_worst, alert, DESCRIPTOR_EXHAUSTION_PERCENT)
 
     facts: list[tuple[str, str, str]] = [
-        ("Packet buffer peak", _pct(buffer_peak), _level(buffer_peak, alert)),
+        ("Packet buffer peak", _pct(buffer_peak), buffer_level),
     ]
     if generation["on_chip_descriptors"] is False:
         on_chip_text = f"none on this {generation['label']}"
@@ -732,10 +815,6 @@ def _step_pressure(cycles: Sequence[dict[str, Any]], context: dict[str, Any]) ->
     elif context["latency_status"] == "disabled":
         facts.append(("Buffer latency", "measurement disabled on the firewall", "none"))
 
-    descriptor_worst = max(
-        (value for value in (on_chip_peak, descriptor_peak) if value is not None),
-        default=None,
-    )
     low_significance = False
     if buffer_peak is None and descriptor_worst is None and latency_peak is None:
         state, level = "unavailable", "none"
@@ -863,18 +942,12 @@ def _step_pressure(cycles: Sequence[dict[str, Any]], context: dict[str, Any]) ->
         "anchor": "pressure-title",
         "buffer_peak": buffer_peak,
         "descriptor_peak": descriptor_worst,
+        "latency_peak_ms": latency_peak,
+        "buffer_level": buffer_level,
+        "descriptor_level": descriptor_level,
+        "latency_level": latency_level,
         "low_significance": low_significance,
     }
-
-
-def _level(value: float | None, alert: float, activate: float = DEFAULT_ACTIVATE_PERCENT) -> str:
-    if value is None:
-        return "none"
-    if value >= activate:
-        return "bad"
-    if value >= alert:
-        return "warn"
-    return "ok"
 
 
 def _step_pbp_named(
@@ -882,9 +955,11 @@ def _step_pbp_named(
     attribution: Sequence[dict[str, Any]],
     events: Sequence[dict[str, Any]],
     low_significance: bool,
+    threat_logs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     statuses = _pbp_statuses(cycles)
-    threat_logs = _threat_log_summary(events)
+    if threat_logs is None:
+        threat_logs = _threat_log_summary(events)
     pbp_seen = any("packet_buffer_protection" in item.get("evidence_sources", []) for item in attribution)
     activated = any(status.get("active") is True for status in statuses) or pbp_seen
     learned = [
@@ -1073,6 +1148,11 @@ def _step_pbp_named(
         "sessions": sessions,
         "sources": sources,
         "anchor": "attribution-title",
+        # What this step reports is PBP's own ranking. Under the low pressure
+        # of step 1 that ranking is the busiest ordinary traffic, and a report
+        # must be able to tell it apart from an observation made independently
+        # of PBP.
+        "ranking_derived": True,
     }
 
 
@@ -1094,16 +1174,7 @@ def _step_ingress_backlogs(
                 atomic_peak = atomic if atomic_peak is None else max(atomic_peak, atomic)
             if total is not None:
                 total_peak = total if total_peak is None else max(total_peak, total)
-    candidates = [
-        item
-        for item in attribution
-        if item.get("entity_type") == "session"
-        and (
-            "ingress_backlogs" in item.get("evidence_sources", [])
-            or item.get("ingress_percentage") is not None
-        )
-    ]
-    candidates.sort(key=lambda item: -(float(item.get("ingress_percentage") or 0.0)))
+    candidates = _ingress_candidate_entities(attribution)
     facts: list[tuple[str, str, str]] = [
         ("Batches with the command", _fmt(len(collected)), "none"),
         ("Queue peak (ATOMIC / TOTAL)", f"{_pct(atomic_peak)} / {_pct(total_peak)}", "none"),
@@ -1196,6 +1267,9 @@ def _step_ingress_backlogs(
         "facts": facts,
         "named": named,
         "anchor": "ingress-title",
+        # The work queue is read independently of the PBP learning, so this
+        # step never reports what PBP ranked.
+        "ranking_derived": False,
     }
 
 
@@ -1257,6 +1331,166 @@ def _flood_corroborations(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return {"count": count, "destinations": sorted(destinations)}
 
 
+# Root-cause counter families, surfaced regardless of severity. The decisive
+# counters of most real packet-buffer cases are info or warn, so a
+# drop-severity table never shows them. Names verified on anonymized captures
+# of closed TAC cases across PAN-OS 10.2.9 - 11.2.10.
+#
+# This is the one registry of counter names in the collector: the report's
+# family table renders it, and the signatures below read their thresholds from
+# the same names, so a counter renamed here can never leave a threshold
+# silently summing nothing. The field is called ``family`` because the
+# aggregated summary a report hands back keys each family under ``key``.
+SIGNAL_COUNTER_FAMILIES: tuple[dict[str, Any], ...] = (
+    {
+        "family": "pbp",
+        "label": "Packet buffer protection",
+        "names": (
+            "flow_dos_pbp_drop",
+            "flow_dos_pbp_cnt_drop",
+            "flow_dos_pbp_ifp_zone",
+            "flow_dos_pbp_block_host",
+            "pkt_buf_protect_red",
+            "pkt_buf_protect_discard",
+            "pkt_buf_protect_block_ip",
+        ),
+        "prefixes": (),
+        "note": (
+            "PBP's own mitigation, under both naming families: PAN-OS 10.2/11.x "
+            "counts it as flow_dos_pbp_*, other releases as pkt_buf_protect_*."
+        ),
+    },
+    {
+        "family": "block_collateral",
+        "label": "Blocked-source collateral",
+        "names": ("flow_dos_drop_ip_blocked",),
+        "prefixes": (),
+        "note": (
+            "Packets dropped because their source sits in the block table. When "
+            "a block-ip hits a NAT device, a proxy or a backup server, this "
+            "counter is the size of the silent outage it causes."
+        ),
+    },
+    {
+        "family": "arp_storm",
+        "label": "ARP / L2 storm",
+        "names": ("flow_arp_pkt_rcv", "flow_arp_rcv_gratuitous"),
+        "prefixes": (),
+        "note": (
+            "An ARP flood creates no session, so PBP can neither name nor block "
+            "it and the offender ranking stays empty while the buffer fills. A "
+            "gratuitous share near 100% is a gratuitous-ARP storm; the fix is "
+            "at layer 2, and a firewall reboot changes nothing."
+        ),
+    },
+    {
+        "family": "fragmentation",
+        "label": "IP fragmentation",
+        "names": (
+            "flow_ipfrag_recv",
+            "flow_ipfrag_merge",
+            "flow_ipfrag_fwd",
+            "flow_ipfrag_pkt_alloc_err",
+        ),
+        "prefixes": (),
+        "note": (
+            "Reassembly holds buffers until every fragment arrives. A received/"
+            "completed ratio well above the packets' natural fragment count, or "
+            "any flow_ipfrag_pkt_alloc_err, ties fragmentation directly to "
+            "buffer exhaustion."
+        ),
+    },
+    {
+        "family": "allocation_failure",
+        "label": "Buffer allocation failures",
+        "names": ("pkt_alloc_failure", "buf_alloc_fail", "hw_buf_alloc_fail"),
+        "prefixes": (),
+        "note": (
+            "The dataplane asked for a buffer and got none - exhaustion is no "
+            "longer a percentage but a fact, whatever PBP did about it."
+        ),
+    },
+    {
+        "family": "proxy_retransmit",
+        "label": "Decryption proxy retransmit",
+        "names": (
+            "tcp_fptcp_rxmt",
+            "tcp_fptcp_fast_retransmit",
+            "tcp_fptcp_max_rxmt",
+        ),
+        "prefixes": (),
+        "note": (
+            "The SSL forward proxy's own TCP stack retransmitting: each unacked "
+            "segment holds a buffer, and on ASIC platforms an on-chip "
+            "descriptor. A sustained rate under decryption is the distributed "
+            "descriptor-exhaustion signature."
+        ),
+    },
+    {
+        "family": "out_of_order",
+        "label": "Out-of-order / one-way TCP",
+        "names": (
+            "tcp_exceed_flow_seg_limit",
+            "tcp_drop_packet",
+            "tcp_out_of_sync",
+            "flow_tcp_non_syn",
+        ),
+        "prefixes": (),
+        "note": (
+            "Out-of-order queues hold buffers while reassembly waits. Sustained "
+            "rates point at an asymmetric or one-way feed - a TAP or mirror "
+            "port is the classic source, and long application timeouts keep "
+            "those queues alive."
+        ),
+    },
+    {
+        "family": "zone_flood",
+        "label": "Zone-protection flood counters",
+        "names": (),
+        "prefixes": ("flow_dos_red_", "flow_dos_syncookie_"),
+        "note": (
+            "Zone protection absorbing a flood where it is enabled. PBP RED "
+            "climbing while these stay at zero means the flood reached the "
+            "buffer through a zone whose flood protection is off."
+        ),
+    },
+)
+
+
+def _family_names(family: str) -> tuple[str, ...]:
+    """Every counter name one root-cause family declares."""
+    for definition in SIGNAL_COUNTER_FAMILIES:
+        if definition["family"] == family:
+            return tuple(definition["names"])
+    return ()
+
+
+#: The counters each signature reads, per family. Kept beside the registry so
+#: a test can prove no signature reads a name the family table does not
+#: collect: a threshold reading a counter nobody aggregates is a signature
+#: that can never fire, and nothing in the output would say so.
+HYPOTHESIS_COUNTERS: dict[str, dict[str, tuple[str, ...]]] = {
+    "arp_storm": {
+        "received": ("flow_arp_pkt_rcv",),
+        "gratuitous": ("flow_arp_rcv_gratuitous",),
+    },
+    "fragmentation": {
+        "received": ("flow_ipfrag_recv",),
+        "merged": ("flow_ipfrag_merge",),
+        "allocation_errors": ("flow_ipfrag_pkt_alloc_err",),
+    },
+    "allocation_failure": {"failures": _family_names("allocation_failure")},
+    "proxy_retransmit": {
+        "retransmits": ("tcp_fptcp_rxmt", "tcp_fptcp_fast_retransmit"),
+    },
+    "pbp": {
+        "drops": ("flow_dos_pbp_drop", "pkt_buf_protect_red"),
+        "blocked_hosts": ("flow_dos_pbp_block_host", "pkt_buf_protect_block_ip"),
+    },
+    "block_collateral": {"collateral": _family_names("block_collateral")},
+}
+
+
 def _signal_family_counters(
     signal_summary: dict[str, Any] | None, key: str
 ) -> dict[str, dict[str, Any]]:
@@ -1271,21 +1505,32 @@ def _signal_family_counters(
     return {}
 
 
-def _signal_total(counters: dict[str, dict[str, Any]], *names: str) -> float:
+def _signal_total(
+    counters: dict[str, dict[str, Any]], name: str, *more: str
+) -> float:
+    """Sum the named counters of one family.
+
+    The names are required. Summing whatever the family happened to carry
+    would turn a renamed or uncollected counter into a zero reading instead of
+    the collection gap it is.
+    """
     return sum(
         value
-        for name in (names or counters.keys())
-        if (counter := counters.get(name)) is not None
+        for candidate in (name, *more)
+        if (counter := counters.get(candidate)) is not None
         and (value := _first_number(counter.get("total"))) is not None
     )
 
 
-def _signal_peak_rate(counters: dict[str, dict[str, Any]], *names: str) -> float:
+def _signal_peak_rate(
+    counters: dict[str, dict[str, Any]], name: str, *more: str
+) -> float:
+    """The fastest per-second rate any of the named counters reached."""
     return max(
         (
             value
-            for name in (names or counters.keys())
-            if (counter := counters.get(name)) is not None
+            for candidate in (name, *more)
+            if (counter := counters.get(candidate)) is not None
             and (value := _first_number(counter.get("peak_rate"))) is not None
         ),
         default=0.0,
@@ -1709,12 +1954,13 @@ def _step_elsewhere(
 
     # ARP / L2 storm: a flood that never creates a session, so every
     # session-driven view above stays empty while the buffer fills.
+    arp_counters = HYPOTHESIS_COUNTERS["arp_storm"]
     arp = _signal_family_counters(signal_summary, "arp_storm")
-    arp_rate = _signal_peak_rate(arp, "flow_arp_pkt_rcv")
-    arp_total = _signal_total(arp, "flow_arp_pkt_rcv")
+    arp_rate = _signal_peak_rate(arp, *arp_counters["received"])
+    arp_total = _signal_total(arp, *arp_counters["received"])
     if arp_rate >= ARP_STORM_RATE_PER_SECOND:
         gratuitous_share = (
-            _signal_total(arp, "flow_arp_rcv_gratuitous") / arp_total
+            _signal_total(arp, *arp_counters["gratuitous"]) / arp_total
             if arp_total > 0
             else None
         )
@@ -1746,13 +1992,15 @@ def _step_elsewhere(
     # Fragmentation pressure: reassembly holds buffers until the last
     # fragment arrives, and allocation errors inside the defrag path tie the
     # fragments directly to the exhaustion.
+    frag_counters = HYPOTHESIS_COUNTERS["fragmentation"]
     frag = _signal_family_counters(signal_summary, "fragmentation")
-    frag_rate = _signal_peak_rate(frag, "flow_ipfrag_recv")
-    frag_received = _signal_total(frag, "flow_ipfrag_recv")
-    frag_completed = _signal_total(frag, "flow_ipfrag_merge")
-    frag_alloc_errors = _signal_total(frag, "flow_ipfrag_pkt_alloc_err")
+    frag_rate = _signal_peak_rate(frag, *frag_counters["received"])
+    frag_received = _signal_total(frag, *frag_counters["received"])
+    frag_completed = _signal_total(frag, *frag_counters["merged"])
+    frag_alloc_errors = _signal_total(frag, *frag_counters["allocation_errors"])
     allocation_failures = _signal_total(
-        _signal_family_counters(signal_summary, "allocation_failure")
+        _signal_family_counters(signal_summary, "allocation_failure"),
+        *HYPOTHESIS_COUNTERS["allocation_failure"]["failures"],
     )
     frag_ratio = frag_received / frag_completed if frag_completed > 0 else None
     if frag_rate >= FRAGMENTATION_RATE_PER_SECOND or (
@@ -1798,7 +2046,7 @@ def _step_elsewhere(
     # victims.
     fptcp = _signal_family_counters(signal_summary, "proxy_retransmit")
     fptcp_rate = _signal_peak_rate(
-        fptcp, "tcp_fptcp_rxmt", "tcp_fptcp_fast_retransmit"
+        fptcp, *HYPOTHESIS_COUNTERS["proxy_retransmit"]["retransmits"]
     )
     on_chip_peak = _metric_peak(
         cycles,
@@ -1953,12 +2201,9 @@ def _step_elsewhere(
     # protection's job. Worded as a suspicion to verify, not a verdict:
     # the capture does not read `show zone-protection`.
     pbp_counters = _signal_family_counters(signal_summary, "pbp")
-    pbp_drop_total = _signal_total(
-        pbp_counters, "flow_dos_pbp_drop", "pkt_buf_protect_red"
-    )
-    pbp_drop_rate = _signal_peak_rate(
-        pbp_counters, "flow_dos_pbp_drop", "pkt_buf_protect_red"
-    )
+    pbp_drop_names = HYPOTHESIS_COUNTERS["pbp"]["drops"]
+    pbp_drop_total = _signal_total(pbp_counters, *pbp_drop_names)
+    pbp_drop_rate = _signal_peak_rate(pbp_counters, *pbp_drop_names)
     zone_flood_counters = _signal_family_counters(signal_summary, "zone_flood")
     if (
         pbp_drop_total >= DENIED_BURST_TOTAL_PACKETS
@@ -2102,11 +2347,12 @@ def _step_elsewhere(
         else {}
     ) or {}
     blocked_hosts = _signal_total(
-        pbp_counters, "flow_dos_pbp_block_host", "pkt_buf_protect_block_ip"
+        pbp_counters, *HYPOTHESIS_COUNTERS["pbp"]["blocked_hosts"]
     )
     block_events = _first_number(threat_counts.get(8509)) or 0.0
     block_collateral = _signal_total(
-        _signal_family_counters(signal_summary, "block_collateral")
+        _signal_family_counters(signal_summary, "block_collateral"),
+        *HYPOTHESIS_COUNTERS["block_collateral"]["collateral"],
     )
     if blocked_hosts > 0 or block_events > 0:
         blocked_sources = [
@@ -2412,6 +2658,14 @@ def collect_findings(diagnosis: dict[str, Any]) -> dict[str, list[dict[str, Any]
     reads under pressure. This returns the same conclusions as one ranked list
     of findings, so a report can lead with the handful that are supported and
     fold the rest away without losing them.
+
+    Every finding carries two facts about its weight, so no consumer has to
+    re-derive them: ``low_significance`` says step 1 found no shortage of
+    buffers or descriptors, and ``ranking_derived`` says the finding is PBP's
+    own ranking rather than an observation made independently of it. Under low
+    pressure only the ranking-derived findings are "what PBP ranked"; calling
+    an independent observation - a recent boot, an interface counter - by that
+    name would be plainly false.
     """
     findings: dict[str, list[dict[str, Any]]] = {
         "confirmed": [],
@@ -2423,6 +2677,9 @@ def collect_findings(diagnosis: dict[str, Any]) -> dict[str, list[dict[str, Any]
         "negative": findings["ruled_out"],
         "unavailable": findings["unavailable"],
     }
+    low_significance = any(
+        bool(step.get("low_significance")) for step in diagnosis["steps"]
+    )
     for step in diagnosis["steps"]:
         if step["key"] in _FINDING_STEPS and step["state"] in buckets:
             buckets[step["state"]].append(
@@ -2433,6 +2690,8 @@ def collect_findings(diagnosis: dict[str, Any]) -> dict[str, list[dict[str, Any]
                     "named": list(step.get("named") or []),
                     "anchor": step["anchor"],
                     "origin": "step",
+                    "ranking_derived": bool(step.get("ranking_derived")),
+                    "low_significance": low_significance,
                 }
             )
         for hypothesis in step.get("hypotheses") or []:
@@ -2446,6 +2705,10 @@ def collect_findings(diagnosis: dict[str, Any]) -> dict[str, list[dict[str, Any]
                     "named": list(hypothesis.get("named") or []),
                     "anchor": EVIDENCE_ANCHORS.get(hypothesis["key"], step["anchor"]),
                     "origin": "hypothesis",
+                    # A signature reads the counters, the pools, the session
+                    # table or the uptime. None of them is PBP's ranking.
+                    "ranking_derived": bool(hypothesis.get("ranking_derived")),
+                    "low_significance": low_significance,
                 }
             )
     return findings

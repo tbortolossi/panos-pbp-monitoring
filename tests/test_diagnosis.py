@@ -8,11 +8,16 @@ import unittest
 from pathlib import Path
 
 from pbp_monitoring.diagnosis import (
+    HYPOTHESIS_COUNTERS,
+    SIGNAL_COUNTER_FAMILIES,
     build_diagnosis,
     collect_findings,
     hardware_generation,
 )
-from pbp_monitoring.reporting import generate_html_report
+from pbp_monitoring.reporting import (
+    _SIGNAL_COUNTER_FAMILIES,
+    generate_html_report,
+)
 
 
 def _cycle(number: int, buffer_pct: float, **extra: object) -> dict:
@@ -911,6 +916,80 @@ class SignatureTests(unittest.TestCase):
         self.assertIn("netbackup", elephant["text"])
         self.assertIn("backup window", elephant["text"])
         self.assertIn("media server", elephant["text"])
+
+
+class UnusableNumberTests(unittest.TestCase):
+    """A number no float can hold is skipped, never fatal."""
+
+    def test_an_integer_too_large_to_convert_does_not_lose_the_report(self):
+        """JSON integers have no upper bound; a float has one.
+
+        A corrupted line, or a firewall answering with an absurd value, used to
+        render fine in the evidence tables of the flat report and abort the
+        diagnosis of the very same capture.
+        """
+        oversized = int("9" * 400)
+        diagnosis = _diagnose(
+            [
+                _cycle(1, 61.0),
+                {
+                    "timestamp": "2026-08-30T10:02:00+00:00",
+                    "run_id": "diagnosis-run",
+                    "cycle": 2,
+                    "elapsed_seconds": 20.0,
+                    "percentages": {"packet_buffer_congestion": [oversized]},
+                    "commands": {},
+                },
+            ]
+        )
+
+        pressure = next(s for s in diagnosis["steps"] if s["key"] == "pressure")
+        self.assertEqual(pressure["buffer_peak"], 61.0)
+
+    def test_the_flat_report_renders_the_same_capture(self):
+        html = _render(
+            [
+                _cycle(1, 61.0),
+                {
+                    "timestamp": "2026-08-30T10:02:00+00:00",
+                    "run_id": "diagnosis-run",
+                    "cycle": 2,
+                    "elapsed_seconds": 20.0,
+                    "percentages": {"packet_buffer_congestion": [int("9" * 400)]},
+                    "commands": {},
+                },
+            ]
+        )
+
+        self.assertIn("PBP Report", html)
+
+
+class CounterRegistryTests(unittest.TestCase):
+    """The signatures and the family table read one registry of counters."""
+
+    def test_no_signature_reads_a_counter_the_family_table_ignores(self):
+        """A threshold on a counter nobody aggregates can never fire.
+
+        Nothing in a report would say so: the signature would simply stay
+        silent, and the incident class it encodes would go unnamed.
+        """
+        declared = {
+            str(definition["family"]): set(definition["names"])
+            for definition in SIGNAL_COUNTER_FAMILIES
+        }
+
+        self.assertTrue(HYPOTHESIS_COUNTERS)
+        for family, groups in HYPOTHESIS_COUNTERS.items():
+            self.assertIn(family, declared)
+            for role, names in groups.items():
+                self.assertTrue(names, f"{family}.{role}")
+                for name in names:
+                    with self.subTest(family=family, role=role, counter=name):
+                        self.assertIn(name, declared[family])
+
+    def test_the_report_family_table_reads_the_same_registry(self):
+        """One registry, not a second copy the report keeps for itself."""
+        self.assertIs(_SIGNAL_COUNTER_FAMILIES, SIGNAL_COUNTER_FAMILIES)
 
 
 if __name__ == "__main__":

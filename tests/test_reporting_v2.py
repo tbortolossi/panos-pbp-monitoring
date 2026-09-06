@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -11,7 +12,13 @@ from unittest.mock import patch
 
 from pbp_monitoring import __version__
 from pbp_monitoring.diagnosis import EVIDENCE_ANCHORS, collect_findings
-from pbp_monitoring.reporting import generate_html_report
+from pbp_monitoring.reporting import (
+    REPORT_SCRIPT,
+    REPORT_SCRIPT_CSP_HASH,
+    _build_report_parts,
+    _read_jsonl,
+    generate_html_report,
+)
 from pbp_monitoring.reporting_v2 import (
     REPORT_V2_FILENAME,
     REPORT_V2_SCRIPT,
@@ -404,6 +411,255 @@ class ThresholdNoiseTests(unittest.TestCase):
 
         self.assertIn('<div class="proof-item" data-level="ok"><span>PBP mitigated from', high)
         self.assertNotIn('<div class="threshold-noise">', high)
+
+
+class ProofTileTests(unittest.TestCase):
+    """A tile states the severity the diagnosis decided, never its own."""
+
+    def _render(self, records: list[dict]) -> str:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            capture = directory / "incident.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            report = generate_html_report_v2(capture, directory / REPORT_V2_FILENAME)
+            return report.read_text(encoding="utf-8")
+
+    def test_default_latency_thresholds_still_colour_the_latency_tile(self):
+        """A 300 ms queue is exhaustion whether or not the read named a limit.
+
+        The firewall answered the settings read with nothing, so the diagnosis
+        judges the latency against the PAN-OS defaults and calls step 1 latency
+        exhaustion. A tile that only reacted to an explicitly configured alert
+        level printed a calm green 300 ms directly above that verdict.
+        """
+        rendered = self._render(
+            [
+                {
+                    "timestamp": "2026-09-01T10:00:00+00:00",
+                    "run_id": "run-latency",
+                    "event": "monitor_started",
+                    "device": {"model": "PA-3220", "software_version": "11.1.4"},
+                },
+                {
+                    "timestamp": "2026-09-01T10:00:05+00:00",
+                    "run_id": "run-latency",
+                    "elapsed_seconds": 5,
+                    "percentages": {"packet_buffer_congestion": [12]},
+                    "buffer_latency": {
+                        "status": "enabled",
+                        "peak_ms": 300,
+                        "dataplanes": [{"last_max_ms": 300, "last_avg_ms": 3}],
+                    },
+                },
+            ]
+        )
+
+        self.assertIn(
+            '<div class="proof-item" data-level="bad"><span>Buffer latency</span>'
+            "<strong>300 ms</strong></div>",
+            rendered,
+        )
+        self.assertIn("Dataplane latency reached 300 ms", rendered)
+
+    def test_a_lowered_alert_threshold_colours_the_buffer_tile(self):
+        """The tiles read the thresholds this firewall runs with.
+
+        With the alert level configured at 5%, a 30% buffer is above it and
+        step 1 says so. A tile ranking the same number against the 50% PAN-OS
+        default would call it nominal.
+        """
+        rendered = self._render(
+            [
+                {
+                    "timestamp": "2026-09-01T10:00:00+00:00",
+                    "run_id": "run-lowered",
+                    "event": "monitor_started",
+                    "device": {"model": "PA-440", "software_version": "11.1.4"},
+                    "pbp_settings": {
+                        "status": "parsed",
+                        "enabled": True,
+                        "alert_percent": 5.0,
+                        "activate_percent": 90.0,
+                    },
+                },
+                {
+                    "timestamp": "2026-09-01T10:00:05+00:00",
+                    "run_id": "run-lowered",
+                    "elapsed_seconds": 5,
+                    "percentages": {"packet_buffer_congestion": [30]},
+                },
+            ]
+        )
+
+        self.assertIn(
+            '<div class="proof-item" data-level="warn"><span>Packet buffers</span>'
+            "<strong>30%</strong></div>",
+            rendered,
+        )
+
+
+#: An idle firewall whose PBP fires all the same, freshly rebooted. The
+#: recent-boot signal is appended to step 4 from the device uptime alone: it is
+#: not something PBP ranked, and must not be filed under the label that says so.
+_LOW_SIGNIFICANCE_RECORDS = [
+    {
+                "timestamp": "2026-09-01T18:40:00+00:00",
+                "run_id": "run-boot",
+                "target_name": "lab-fw",
+                "event": "monitor_started",
+                "device": {
+                    "device_name": "lab-fw",
+                    "model": "PA-440",
+                    "software_version": "11.1.4",
+                    "uptime": "0 days, 5:11:02",
+                },
+                "pbp_settings": {
+                    "status": "parsed",
+                    "enabled": True,
+                    "alert_percent": 50.0,
+                    "activate_percent": 80.0,
+                },
+            },
+            {
+                "timestamp": "2026-09-01T18:40:05+00:00",
+                "run_id": "run-boot",
+                "elapsed_seconds": 5,
+                "percentages": {"packet_buffer_congestion": [4.51]},
+                "pbp_status": {
+                    "enabled": True,
+                    "active": True,
+                    "mode": "packet_buffer",
+                    "congestion_percentage": 4.14,
+                },
+                "candidate_session_ids": [4242],
+                "candidate_entities": [
+                    {
+                        "rank": 1,
+                        "entity_type": "session",
+                        "session_id": 4242,
+                        "drop_state": True,
+                        "pbp_percentage_total": 31.0,
+                        "evidence_sources": ["packet_buffer_protection"],
+                    }
+                ],
+            },
+]
+
+_LOW_SIGNIFICANCE_CAPTURE = "".join(
+    json.dumps(record) + "\n" for record in _LOW_SIGNIFICANCE_RECORDS
+)
+
+
+class LowSignificanceLabellingTests(unittest.TestCase):
+    """Only PBP's ranking may be presented as what PBP ranked."""
+
+    def _render(self) -> str:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            capture = directory / "incident.jsonl"
+            capture.write_text(_LOW_SIGNIFICANCE_CAPTURE, encoding="utf-8")
+            report = generate_html_report_v2(capture, directory / REPORT_V2_FILENAME)
+            return report.read_text(encoding="utf-8")
+
+    def test_a_recent_boot_is_not_filed_as_something_pbp_ranked(self):
+        rendered = self._render()
+        ranked = rendered.index("What PBP ranked")
+        others = rendered.index("Other signals observed")
+
+        self.assertLess(ranked, others)
+        self.assertIn("Offender named by PBP", rendered[ranked:others])
+        self.assertNotIn("Recent boot or upgrade", rendered[ranked:others])
+        self.assertIn("Recent boot or upgrade", rendered[others:])
+
+    def test_the_findings_themselves_say_which_are_the_ranking(self):
+        """Any consumer, not only this renderer, can tell the two apart."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            capture = directory / "incident.jsonl"
+            capture.write_text(_LOW_SIGNIFICANCE_CAPTURE, encoding="utf-8")
+            records, warnings, source_hash = _read_jsonl(capture)
+            parts = _build_report_parts(capture, records, warnings, source_hash)
+
+        findings = collect_findings(parts["diagnosis"])
+        by_key = {item["key"]: item for item in findings["confirmed"]}
+
+        self.assertTrue(by_key["pbp"]["ranking_derived"])
+        self.assertFalse(by_key["recent_boot"]["ranking_derived"])
+        self.assertTrue(all(item["low_significance"] for item in by_key.values()))
+
+
+class NavigationTests(unittest.TestCase):
+    """Every link in a report's navigation opens a section of that report."""
+
+    def _reports(self, directory: Path) -> dict[str, str]:
+        capture = directory / "incident.jsonl"
+        capture.write_text(_LOW_SIGNIFICANCE_CAPTURE, encoding="utf-8")
+        return {
+            "v1": generate_html_report(
+                capture, directory / "report.html"
+            ).read_text(encoding="utf-8"),
+            "v2": generate_html_report_v2(
+                capture, directory / REPORT_V2_FILENAME
+            ).read_text(encoding="utf-8"),
+        }
+
+    def test_no_navigation_link_points_at_a_section_the_page_lacks(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            reports = self._reports(Path(temporary_directory))
+
+        for name, rendered in reports.items():
+            navigation = rendered[
+                rendered.index('<nav class="toc"') : rendered.index("</nav>")
+            ]
+            anchors = re.findall(r'href="#([a-z0-9-]+)"', navigation)
+            self.assertTrue(anchors, name)
+            for anchor in anchors:
+                with self.subTest(report=name, anchor=anchor):
+                    self.assertIn(f'id="{anchor}"', rendered)
+
+
+class ScriptPinningTests(unittest.TestCase):
+    """A report's policy names the exact script that report carries."""
+
+    def test_each_report_pins_the_folding_script_it_embeds(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            capture = directory / "incident.jsonl"
+            capture.write_text(_LOW_SIGNIFICANCE_CAPTURE, encoding="utf-8")
+            rendered = [
+                generate_html_report(
+                    capture, directory / "report.html"
+                ).read_text(encoding="utf-8"),
+                generate_html_report_v2(
+                    capture, directory / REPORT_V2_FILENAME
+                ).read_text(encoding="utf-8"),
+            ]
+
+        for page in rendered:
+            script = page[
+                page.rindex("<script>") + len("<script>") : page.rindex("</script>")
+            ]
+            digest = "sha256-" + base64.b64encode(
+                hashlib.sha256(script.encode("utf-8")).digest()
+            ).decode("ascii")
+            with self.subTest(digest=digest):
+                self.assertIn(f"script-src '{digest}'", page)
+                self.assertIn(
+                    digest,
+                    (REPORT_SCRIPT_CSP_HASH, REPORT_V2_SCRIPT_CSP_HASH),
+                )
+
+    def test_the_layered_script_is_the_flat_one_with_a_wider_selector(self):
+        self.assertNotEqual(REPORT_SCRIPT, REPORT_V2_SCRIPT)
+        self.assertEqual(
+            REPORT_V2_SCRIPT.replace(
+                ",details.dismissed", ""
+            ).replace("folds", "sections"),
+            REPORT_SCRIPT,
+        )
 
 
 class FindingCollectionTests(unittest.TestCase):
