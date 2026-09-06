@@ -1250,6 +1250,28 @@ class PbpEvidenceParsingTests(unittest.TestCase):
         )
         self.assertEqual(extract_buffer_latency("<result/>")["status"], "unparsed")
 
+    def test_slotless_dataplane_tags_keep_their_own_label(self):
+        """A fixed-slot firewall (no "sN." prefix) must not have every
+        dataplane collapse onto the "dp0" fallback: that would make a
+        multi-DP incident's latency attribution indistinguishable."""
+        latency = extract_buffer_latency(
+            "<result><sw.comm.dp0.packet-buffer-latency-report>"
+            "<buffer-latency-enabled>True</buffer-latency-enabled>"
+            "<latest>10</latest><last-max><member>12</member></last-max>"
+            "<last-avg><member>9</member></last-avg>"
+            "</sw.comm.dp0.packet-buffer-latency-report>"
+            "<sw.comm.dp1.packet-buffer-latency-report>"
+            "<buffer-latency-enabled>True</buffer-latency-enabled>"
+            "<latest>90</latest><last-max><member>95</member></last-max>"
+            "<last-avg><member>80</member></last-avg>"
+            "</sw.comm.dp1.packet-buffer-latency-report></result>"
+        )
+
+        self.assertEqual(
+            [dp["dataplane"] for dp in latency["dataplanes"]], ["dp0", "dp1"]
+        )
+        self.assertEqual(latency["dataplanes"][1]["last_max_ms"], [95.0])
+
     def test_pbp_threat_log_entries_keep_the_id_and_the_designated_source(self):
         entries = extract_pbp_threat_log_entries(
             "<result><job><status>FIN</status></job><log><logs count=\"1\">"

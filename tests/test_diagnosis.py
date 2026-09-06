@@ -565,6 +565,68 @@ class CapturedEvidenceTests(unittest.TestCase):
         self.assertIn("buffer latency peak 7 ms", html)
         self.assertIn("configured alert 50% · activate 80%", html)
 
+    def test_rows_collected_before_a_disabled_batch_are_not_dropped(self):
+        """One batch reporting "disabled" late in the run must not make the
+        report throw away per-dataplane rows already collected from earlier
+        batches: that is the same evidence the diagnosis used for
+        latency_peak_ms, and the two must not disagree about whether latency
+        was measured."""
+        html = _render(
+            [
+                self._started(),
+                _cycle(1, 60.0, buffer_latency={
+                    "status": "parsed", "peak_ms": 7.0, "latest_ms": 3.0,
+                    "dataplanes": [{"dataplane": "s1.dp0", "enabled": True, "latest_ms": 3.0,
+                                    "last_avg_ms": [2.0, 1.0], "last_max_ms": [7.0, 4.0]}],
+                }),
+                _cycle(2, 61.0, buffer_latency={"status": "disabled", "dataplanes": []}),
+            ]
+        )
+
+        self.assertIn("<h3>Buffer latency</h3>", html)
+        self.assertIn("<td>s1.dp0</td>", html)
+        self.assertIn("buffer latency peak 7 ms", html)
+        self.assertIn("Measurement status changed during the run", html)
+
+    def test_ingress_backlog_peak_table_names_each_metrics_own_batch(self):
+        """ATOMIC and TOTAL must peak independently. Batch 2 has the real
+        ATOMIC peak (90) and batch 5 has the real TOTAL peak (70); a single
+        shared "Peak batch" column stamped by whichever metric moved last
+        would print batch 5 next to a 90 it never reached."""
+        html = _render(
+            [
+                self._started(),
+                _cycle(1, 10.0, ingress_backlogs={
+                    "dataplanes": [{"slot": "1", "dp": "0", "atomic_percentage": 20, "total_percentage": 10}],
+                    "candidates": [],
+                }),
+                _cycle(2, 10.0, ingress_backlogs={
+                    "dataplanes": [{"slot": "1", "dp": "0", "atomic_percentage": 90, "total_percentage": 40}],
+                    "candidates": [],
+                }),
+                _cycle(3, 10.0, ingress_backlogs={
+                    "dataplanes": [{"slot": "1", "dp": "0", "atomic_percentage": 30, "total_percentage": 20}],
+                    "candidates": [],
+                }),
+                _cycle(4, 10.0, ingress_backlogs={
+                    "dataplanes": [{"slot": "1", "dp": "0", "atomic_percentage": 10, "total_percentage": 30}],
+                    "candidates": [],
+                }),
+                _cycle(5, 10.0, ingress_backlogs={
+                    "dataplanes": [{"slot": "1", "dp": "0", "atomic_percentage": 40, "total_percentage": 70}],
+                    "candidates": [],
+                }),
+            ]
+        )
+
+        self.assertIn("Peak ATOMIC %", html)
+        self.assertIn("Peak TOTAL %", html)
+        self.assertNotIn("<th>Peak batch</th>", html)
+        queue_table = html[html.index("Peak ATOMIC %") : html.index("Peak ATOMIC %") + 800]
+        self.assertIn(">90<br><span class=\"muted\">batch 2</span>", queue_table)
+        self.assertIn(">70<br><span class=\"muted\">batch 5</span>", queue_table)
+        self.assertNotIn(">90<br><span class=\"muted\">batch 5</span>", queue_table)
+
 
 def _signal_summary(**families: list[dict]) -> dict:
     return {
@@ -744,6 +806,33 @@ class SignatureTests(unittest.TestCase):
         hypothesis = self._hypotheses(diagnosis)["chassis_imbalance"]
         self.assertIn("s2dp1", hypothesis["text"])
         self.assertIn("not capacity", hypothesis["text"])
+
+    def test_two_dataplane_chassis_can_fire_the_imbalance_signature(self):
+        """The median must describe the peer dataplanes only. Folding the
+        saturated dataplane into its own baseline means a 2-DP chassis's
+        median can never fall at or below the imbalance threshold (95 and 3
+        average to 49), so the textbook case — one DP pinned, the other
+        idle — could never be named at all."""
+        record = _cycle(1, 95.0)
+        record["percentages"]["resource_monitor_dataplanes"] = [
+            {"dataplane": "dp0", "packet_buffer": 95.0},
+            {"dataplane": "dp1", "packet_buffer": 3.0},
+        ]
+        diagnosis = _diagnose([record])
+
+        hypothesis = self._hypotheses(diagnosis)["chassis_imbalance"]
+        self.assertIn("dp0", hypothesis["text"])
+        self.assertIn("95", hypothesis["text"])
+
+    def test_a_balanced_two_dataplane_chassis_does_not_fire_the_imbalance_signature(self):
+        record = _cycle(1, 90.0)
+        record["percentages"]["resource_monitor_dataplanes"] = [
+            {"dataplane": "dp0", "packet_buffer": 90.0},
+            {"dataplane": "dp1", "packet_buffer": 85.0},
+        ]
+        diagnosis = _diagnose([record])
+
+        self.assertNotIn("chassis_imbalance", self._hypotheses(diagnosis))
 
     def test_sessions_draining_under_a_pinned_buffer_is_terminal(self):
         session_series = [

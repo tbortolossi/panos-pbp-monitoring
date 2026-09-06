@@ -84,6 +84,38 @@ follows [Semantic Versioning](https://semver.org/).
   64 MB incident budget of the support bundle, evicting real evidence. Both
   commands now default to the names the run directory uses, `report-v2.html`
   and `report.html`.
+- **Single-dataplane saturation can now be named on a 2-DP chassis.** The
+  signature compared the worst dataplane's buffer percentage against the
+  median of *all* dataplanes, including that same worst one — on a 2-DP
+  chassis the median can never fall at or below the imbalance threshold
+  (95% and 3% average to 49%), so the textbook case of one DP pinned beside
+  an idle peer could never fire, and a middle reading on a 3+ DP chassis
+  could mask a real imbalance. The median is now computed from the peer
+  dataplanes only, excluding the saturated one.
+- **Multi-DP buffer latency is no longer collapsed onto a single `dp0`
+  row.** `extract_buffer_latency` required a slot prefix
+  (`sN.dpN`) to read a dataplane's tag, so a fixed-slot firewall's slotless
+  tags (`sw.comm.dp1.packet-buffer-latency-report`) never matched and every
+  dataplane's rows fell back to the same `dp0` label, making a multi-DP
+  incident's latency attribution indistinguishable. The parser now accepts
+  both forms, matching the resource-monitor parser: a chassis keeps its
+  combined `sN.dpN` label, and a slotless firewall keeps `dpN`.
+- **A buffer latency table no longer disappears when measurement is
+  disabled partway through a run.** The report kept only the *last*
+  non-empty status across batches, so one batch reporting "disabled" made
+  the early return render only the disabled-measurement message and drop
+  every per-dataplane row already collected from earlier batches — evidence
+  the diagnosis itself used for the latency peak figure. The report now
+  renders any rows it collected and adds a note when the status changed
+  during the run, and both the diagnosis and the report use the same
+  first-reported status so the two can no longer disagree about whether
+  latency was measured.
+- **The ingress-backlog peak table no longer names the wrong batch for a
+  metric.** ATOMIC and TOTAL usage were merged into a single "Peak batch"
+  column stamped by whichever metric last rose, so a peak ATOMIC of 90%
+  reached in batch 2 could be shown next to "Peak batch 5" — the batch where
+  TOTAL actually peaked, whose real ATOMIC reading was only 40%. Each
+  metric's peak batch is now tracked and shown beside its own percentage.
 
 ## [0.39.1] - 2026-09-01
 
