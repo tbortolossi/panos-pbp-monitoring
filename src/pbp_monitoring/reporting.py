@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from . import __version__
-from .diagnosis import build_diagnosis, render_diagnosis
+from .diagnosis import build_diagnosis, buffer_latency_statuses, render_diagnosis
 
 _COMMAND_RESULT_KEYS = ("error", "result", "raw_response")
 _COMMAND_METADATA_KEYS = ("ok", "started_at", "finished_at", "duration_seconds")
@@ -1403,12 +1403,10 @@ def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
 def _render_buffer_latency(cycles: list[tuple[int, dict[str, Any]]]) -> str:
     """Tabulate the buffer latency per batch, the measurement latency PBP acts on."""
     rows: list[str] = []
-    status = None
     for batch_number, (_, record) in enumerate(cycles, 1):
         latency = record.get("buffer_latency")
         if not isinstance(latency, dict):
             continue
-        status = latency.get("status") or status
         for dataplane in latency.get("dataplanes") or []:
             if not isinstance(dataplane, dict):
                 continue
@@ -1423,8 +1421,40 @@ def _render_buffer_latency(cycles: list[tuple[int, dict[str, Any]]]) -> str:
                 f'<td class="number">{_escape(_format_number(max(maxima) if maxima else None))}</td>'
                 "</tr>"
             )
-    if status is None:
+    # Use the same first-status rule the diagnosis uses (buffer_latency_statuses
+    # in diagnosis.py), so the two can never name a different status for the
+    # same run.
+    statuses = buffer_latency_statuses([record for _, record in cycles])
+    if not statuses:
         return ""
+    status = statuses[0]
+    if rows:
+        # Rows already collected from earlier batches must survive even when
+        # a later batch reported "disabled" (e.g. measurement was turned off
+        # partway through the run): that data is evidence the diagnosis
+        # itself used for latency_peak_ms, and dropping it here would also
+        # make this section disagree with that figure.
+        note = ""
+        if len(set(statuses)) > 1:
+            note = (
+                '<p class="muted">Measurement status changed during the run '
+                f"(from <code>{_escape(statuses[0])}</code> to "
+                f"<code>{_escape(statuses[-1])}</code>), for example latency "
+                "measurement was disabled partway through. The rows below are "
+                "from the batches where a per-dataplane report was still "
+                "returned.</p>"
+            )
+        return (
+            "<h3>Buffer latency</h3>"
+            '<p class="muted">The dataplane processing latency PAN-OS measures every '
+            "millisecond, in ms: the latest reading and the average and maximum of "
+            "the last ten seconds at the time of each batch. Latency-based PBP acts "
+            "on this figure; buffer-based PBP does not see it.</p>"
+            + note
+            + '<div class="table-wrap"><table><thead><tr><th>Batch</th><th>Dataplane</th>'
+            "<th>Latest ms</th><th>10 s avg ms (max)</th><th>10 s max ms</th>"
+            f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+        )
     if status == "disabled":
         return (
             "<h3>Buffer latency</h3>"
@@ -1432,22 +1462,11 @@ def _render_buffer_latency(cycles: list[tuple[int, dict[str, Any]]]) -> str:
             "firewall (<code>set session packet-buffer-latency-measurement</code>), "
             "so latency-based PBP cannot act and no reading is available.</p>"
         )
-    if not rows:
-        return (
-            "<h3>Buffer latency</h3>"
-            '<p class="muted">The buffer latency command answered but no '
-            "per-dataplane report could be parsed; the raw response is in the "
-            "batch details.</p>"
-        )
     return (
         "<h3>Buffer latency</h3>"
-        '<p class="muted">The dataplane processing latency PAN-OS measures every '
-        "millisecond, in ms: the latest reading and the average and maximum of "
-        "the last ten seconds at the time of each batch. Latency-based PBP acts "
-        "on this figure; buffer-based PBP does not see it.</p>"
-        '<div class="table-wrap"><table><thead><tr><th>Batch</th><th>Dataplane</th>'
-        "<th>Latest ms</th><th>10 s avg ms (max)</th><th>10 s max ms</th>"
-        f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+        '<p class="muted">The buffer latency command answered but no '
+        "per-dataplane report could be parsed; the raw response is in the "
+        "batch details.</p>"
     )
 
 
@@ -1563,33 +1582,46 @@ def _render_ingress_backlogs(
                     total,
                 )
             )
-    peaks: dict[str, tuple[float | None, float | None, int]] = {}
+    # ATOMIC and TOTAL peak independently: a single shared "Peak batch" column
+    # would name whichever batch last raised EITHER value, which can be a
+    # batch where neither displayed percentage was actually reached. Track
+    # each metric's peak batch on its own so a TAC engineer cross-checking
+    # the raw output against a batch number is never misled.
+    peaks: dict[str, dict[str, tuple[float, int] | None]] = {}
     for batch_number, label, atomic, total in queue_rows:
-        current = peaks.get(label)
-        if current is None:
-            peaks[label] = (atomic, total, batch_number)
-            continue
-        best_atomic, best_total, best_batch = current
-        if (atomic or 0.0) > (best_atomic or 0.0) or (total or 0.0) > (best_total or 0.0):
-            peaks[label] = (
-                max(atomic or 0.0, best_atomic or 0.0),
-                max(total or 0.0, best_total or 0.0),
-                batch_number,
-            )
+        current = peaks.setdefault(label, {"atomic": None, "total": None})
+        if atomic is not None and (
+            current["atomic"] is None or atomic > current["atomic"][0]
+        ):
+            current["atomic"] = (atomic, batch_number)
+        if total is not None and (
+            current["total"] is None or total > current["total"][0]
+        ):
+            current["total"] = (total, batch_number)
     queue_html = ""
     if peaks:
+
+        def _peak_cell(entry: tuple[float, int] | None) -> str:
+            if entry is None:
+                return '<td class="number">—</td>'
+            value, batch = entry
+            return (
+                f'<td class="number" data-level="{_level(value)}">'
+                f"{_escape(_format_number(value))}"
+                f'<br><span class="muted">batch {_escape(batch)}</span></td>'
+            )
+
         queue_html = (
             '<div class="table-wrap"><table><thead><tr><th>Dataplane</th>'
-            "<th>Peak ATOMIC %</th><th>Peak TOTAL %</th><th>Peak batch</th>"
+            "<th>Peak ATOMIC %</th><th>Peak TOTAL %</th>"
             "</tr></thead><tbody>"
             + "".join(
                 "<tr>"
                 f"<td>{_escape(label)}</td>"
-                f'<td class="number" data-level="{_level(atomic)}">{_escape(_format_number(atomic))}</td>'
-                f'<td class="number" data-level="{_level(total)}">{_escape(_format_number(total))}</td>'
-                f'<td class="number">{_escape(batch)}</td>'
-                "</tr>"
-                for label, (atomic, total, batch) in sorted(peaks.items())
+                + _peak_cell(metrics["atomic"])
+                + _peak_cell(metrics["total"])
+                + "</tr>"
+                for label, metrics in sorted(peaks.items())
             )
             + "</tbody></table></div>"
         )
@@ -3512,7 +3544,6 @@ def _build_report_parts(
     session_series = _session_series(cycles)
     pressure_chart_html = _render_pressure_chart(cycles, events)
     session_table_html = _render_session_table(session_series)
-    large_sessions_html = ""
     core_functions = next(
         (
             record["dp_core_functions"]

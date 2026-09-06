@@ -170,6 +170,21 @@ def _metric_returned(cycles: Sequence[dict[str, Any]], *keys: str) -> bool:
     return _metric_peak(cycles, *keys) is not None
 
 
+def buffer_latency_statuses(cycles: Sequence[dict[str, Any]]) -> list[str]:
+    """Every non-empty ``buffer_latency`` status, in batch order.
+
+    Shared by the diagnosis (which reports the first status a batch carried)
+    and the HTML report's Buffer latency section, so the two can never name a
+    different status for the same run.
+    """
+    return [
+        str(record["buffer_latency"].get("status"))
+        for record in cycles
+        if isinstance(record.get("buffer_latency"), dict)
+        and record["buffer_latency"].get("status")
+    ]
+
+
 def uptime_days(value: Any) -> float | None:
     """Parse PAN-OS's own uptime wording (``60 days, 4:22:03``) into days."""
     if not isinstance(value, str):
@@ -568,15 +583,8 @@ def _context(
         if isinstance(record.get("buffer_latency"), dict)
         and (value := _first_number(record["buffer_latency"].get("peak_ms"))) is not None
     ]
-    latency_status = next(
-        (
-            str(record["buffer_latency"].get("status"))
-            for record in cycles
-            if isinstance(record.get("buffer_latency"), dict)
-            and record["buffer_latency"].get("status")
-        ),
-        None,
-    )
+    latency_statuses = buffer_latency_statuses(cycles)
+    latency_status = latency_statuses[0] if latency_statuses else None
     return {
         "model": str(model or "—"),
         "generation": hardware_generation(model),
@@ -2001,16 +2009,30 @@ def _step_elsewhere(
         ]
         if len(readings) < 2:
             continue
-        worst_name, worst_value = max(readings, key=lambda item: item[1])
-        median_value = statistics.median(value for _, value in readings)
+        # The median must describe the OTHER dataplanes, not the saturated
+        # one: folding the worst reading into its own baseline drags the
+        # median up (on a 2-DP chassis it could never fall at or below the
+        # threshold at all, so the signature could never fire) and a middle
+        # value on 3+ DPs can mask a real imbalance. Exclude the worst
+        # reading by position, not by value, so a tie at the worst value does
+        # not remove more than the one saturated dataplane.
+        ordered = sorted(readings, key=lambda item: item[1], reverse=True)
+        worst_name, worst_value = ordered[0]
+        peer_values = [value for _, value in ordered[1:]]
+        if not peer_values:
+            # No peers to compare against (a single dataplane slipped past
+            # the len(readings) < 2 guard above cannot happen, but stay
+            # defensive): there is no imbalance to name.
+            continue
+        median_value = statistics.median(peer_values)
         if (
             worst_value >= activate_percent
             and median_value <= CHASSIS_IMBALANCE_MEDIAN_PERCENT
             and (imbalance is None or worst_value > imbalance[1])
         ):
-            imbalance = (worst_name, worst_value, median_value, len(readings))
+            imbalance = (worst_name, worst_value, median_value, len(peer_values))
     if imbalance is not None:
-        worst_name, worst_value, median_value, dataplane_count = imbalance
+        worst_name, worst_value, median_value, peer_count = imbalance
         hypotheses.append(
             {
                 "key": "chassis_imbalance",
@@ -2019,7 +2041,9 @@ def _step_elsewhere(
                 "text": (
                     f"<strong>Dataplane {_escape(worst_name)} reached "
                     f"{_fmt(worst_value)}% packet buffer while the median of "
-                    f"{dataplane_count} dataplanes stayed at {_fmt(median_value)}%"
+                    f"the other {peer_count} dataplane"
+                    f"{'s' if peer_count != 1 else ''} stayed at "
+                    f"{_fmt(median_value)}%"
                     "</strong>. Sessions are pinned to a dataplane by their flow "
                     "hash, so one heavy flow group saturates its dataplane while "
                     "the chassis as a whole has headroom. The remedy is per-flow "

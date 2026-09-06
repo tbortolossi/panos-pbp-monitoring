@@ -208,8 +208,10 @@ latency (`show session packet-buffer-protection buffer-latency`, per batch)
 is read against the latency thresholds: latency at or above the activate
 threshold with low buffers is the latency case, and the step says whether this
 firewall runs latency-based PBP, which acts on it, or buffer-based PBP, which
-does not see it. A disabled measurement is stated. The Pressure section
-tabulates the latency per batch and dataplane. Pressure is judged against the
+does not see it. A disabled measurement is stated; if it was only disabled
+partway through the run, the per-dataplane rows already collected from the
+earlier batches are kept and a note says the status changed. The Pressure
+section tabulates the latency per batch and dataplane. Pressure is judged against the
 PAN-OS levels: buffers at or above 80% are *exhausted*, descriptors at or
 above 80% with low buffers are *the latency case* the PBP TOI describes,
 buffers between 50% and 80% are *elevated*, and anything below 50% is *low
@@ -240,7 +242,9 @@ marked nothing for RED, the work was spread over many small entries.
 
 **Step 3 — Does the ingress backlog hold a session?** The sessions holding at
 least 2% of the work queue in `show running resource-monitor
-ingress-backlogs`, with the queue's peak ATOMIC and TOTAL usage. This view is
+ingress-backlogs`, with the queue's peak ATOMIC and TOTAL usage, each named
+with the batch it peaked in — the two metrics can peak in different batches,
+so each is tied to its own. This view is
 independent of the PBP learning: it is the queue of packets waiting for a
 dataplane core, where the on-chip descriptors are consumed. An `undecided` or
 `unknown` application at a high share is called out as the signature of attack

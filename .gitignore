@@ -35,6 +35,7 @@ certs/*
 
 # Working documents that must not be published
 docs/private/
+TSF/
 
 # Local editor and operating-system files
 .idea/

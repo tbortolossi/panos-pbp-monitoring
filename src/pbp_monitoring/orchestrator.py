@@ -1126,8 +1126,18 @@ def extract_buffer_latency(output: str) -> dict[str, Any]:
         tag = _local_tag(element)
         if not tag.endswith("packet-buffer-latency-report"):
             continue
-        match = re.search(r"(s\d+)\.(dp\d+)", tag)
-        dataplane = f"{match.group(1)}.{match.group(2)}" if match else "dp0"
+        # A chassis with slots tags this sw.comm.s<slot>.dp<n>...; a
+        # fixed-slot firewall tags it sw.comm.dp<n>... with no slot at all.
+        # Matching the slot as optional (instead of requiring it) keeps the
+        # combined "sN.dpN" label on a chassis and still recovers "dpN" on a
+        # slotless firewall, instead of every dataplane falling back to the
+        # same "dp0" label and collapsing multi-DP latency attribution.
+        match = re.search(r"(?:(s\d+)\.)?(dp\d+)", tag, re.IGNORECASE)
+        if match:
+            slot, dp_name = match.group(1), match.group(2)
+            dataplane = f"{slot}.{dp_name}" if slot else dp_name
+        else:
+            dataplane = "dp0"
         entry: dict[str, Any] = {
             "dataplane": dataplane,
             "enabled": _panos_flag(_child_text(element, "buffer-latency-enabled")),
