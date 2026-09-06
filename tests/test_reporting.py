@@ -1709,5 +1709,80 @@ class LargeSessionSectionTests(unittest.TestCase):
         self.assertIn("predates largest-session tracking", html)
 
 
+class RankedEntityDescriptionTests(unittest.TestCase):
+    """The table and the diagnosis describe a ranked entity identically."""
+
+    def _render(self) -> str:
+        """A session `show session id` named but whose flow only the queue has.
+
+        PAN-OS answers `show session id` with the application and the rule
+        while the c2s flow itself comes from the ingress backlog entry. The
+        report used to overwrite the application with the backlog's - which
+        carries none - and print a dash, while the diagnosis named the
+        application in the same breath, for the same session.
+        """
+        records = [
+            {
+                "timestamp": "2026-09-01T10:00:00+00:00",
+                "run_id": "flow-run",
+                "event": "monitor_started",
+                "collector_version": "test",
+                "device": {"serial": "fixture", "model": "PA-fixture"},
+            },
+            {
+                "timestamp": "2026-09-01T10:00:05+00:00",
+                "run_id": "flow-run",
+                "elapsed_seconds": 5,
+                "percentages": {"packet_buffer_congestion": [88]},
+                "candidate_session_ids": [777],
+                "candidate_entities": [
+                    {
+                        "rank": 1,
+                        "entity_type": "session",
+                        "session_id": 777,
+                        "drop_state": True,
+                        "ingress_percentage_max": 61.0,
+                        "evidence_sources": ["ingress_backlogs"],
+                    }
+                ],
+                "ingress_backlogs": {
+                    "candidates": [
+                        {
+                            "session_id": 777,
+                            "source_ip": "203.0.113.9",
+                            "destination_ip": "198.51.100.4",
+                            "protocol": 17,
+                            "percentage": 61.0,
+                        }
+                    ]
+                },
+                "session_summaries": {
+                    "777": {
+                        "status": "parsed",
+                        "application": "netbackup",
+                        "rule": "allow-backup",
+                    }
+                },
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "flow.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            report = generate_html_report(capture, capture.with_suffix(".html"))
+            return report.read_text(encoding="utf-8")
+
+    def test_an_application_from_the_session_survives_a_backlog_only_flow(self):
+        html = self._render()
+
+        self.assertIn(
+            "<code>203.0.113.9 -&gt; 198.51.100.4 / proto 17</code><br>"
+            '<span class="muted">app netbackup · rule allow-backup</span>',
+            html,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

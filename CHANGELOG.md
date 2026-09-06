@@ -116,8 +116,57 @@ follows [Semantic Versioning](https://semver.org/).
   reached in batch 2 could be shown next to "Peak batch 5" — the batch where
   TOTAL actually peaked, whose real ATOMIC reading was only 40%. Each
   metric's peak batch is now tracked and shown beside its own percentage.
+- **A calm proof tile no longer sits above a verdict calling the same number
+  exhaustion.** The layered report re-derived the severity of its verdict
+  tiles from the raw values: the buffer and descriptor tiles ranked them
+  against a hardcoded 50/80, ignoring the thresholds read from the firewall,
+  and the buffer-latency tile turned amber only when a latency alert level had
+  been explicitly configured. A firewall running the PAN-OS latency defaults
+  and peaking at 300 ms therefore showed a green "300 ms" directly above a
+  step-1 verdict naming latency exhaustion. Every tile now shows the level the
+  diagnosis itself decided, against the thresholds in force on that firewall.
+- **A recent boot is no longer presented as something PBP ranked.** On a run
+  where the firewall was never short of buffers, the layered report filed
+  every supported finding under *What PBP ranked — ordinary traffic, not a
+  cause*, including findings read independently of PBP's ranking: a firewall
+  up for five hours had its *Recent boot or upgrade* signal labelled as part
+  of that ranking, which the capture never said. Findings now carry whether
+  they come from PBP's ranking, so that label covers only what PBP itself
+  designated; the rest is folded under *Other signals observed — no incident
+  to explain*.
+- **A number too large for a float no longer aborts the diagnosis.** JSON
+  integers have no upper bound; a corrupted capture line or an absurd firewall
+  reading rendered fine in the flat report's evidence tables and made the
+  diagnosis of the same capture fail outright. Such a value is now skipped
+  like any other unusable reading, in both.
+- **The layered report's threshold panel and step 1 can no longer disagree
+  about the settings read.** The panel ran its own test for "PBP mitigated
+  below its own activate threshold", the plain one the diagnosis had already
+  refined to the mitigation onset with a one-point rounding margin. It now
+  reads the diagnosis's verdict instead of re-testing it.
+- **The navigation of the layered report follows the document again.** Its
+  *Threat logs* entry was inserted one position too early and pointed past the
+  *Offenders* section it comes after. Both reports now build their navigation
+  from the one declaration the evidence and appendix sections are rendered
+  from.
+- **A ranked session no longer loses its application in the offender table.**
+  When `show session id` named the application and the rule but the flow came
+  from the ingress backlog entry, the table overwrote the application with the
+  backlog's — which carries none — and printed a dash, while the diagnosis
+  named the application for the same session in the same report.
 
 ### Changed
+
+- **One source of truth behind the diagnosis and both reports.** The PBP
+  threshold defaults and their level classification, the root-cause counter
+  registry, the pool-attention level, the flow description of a ranked
+  entity, the ingress-backlog selection, the numeric parsing, the
+  monitor-stop event lookup, the page chrome, the section navigation and the
+  folding script each existed as two copies shared between the diagnosis, the
+  flat report and the layered one, and several had already drifted apart.
+  Each is now declared once and read by every consumer, so the same capture
+  can no longer be described differently by two parts of the same file. No
+  output changes beyond the fixes listed above.
 
 - **A monitor's stop path reads its JSONL capture once instead of twice.**
   Generating the flat and the layered report each independently re-read the

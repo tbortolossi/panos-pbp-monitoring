@@ -25,12 +25,11 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import __version__
 from .diagnosis import (
+    DEFAULT_ACTIVATE_PERCENT,
     DEFAULT_ALERT_PERCENT,
     collect_findings,
     render_diagnosis_conclusion,
@@ -38,18 +37,20 @@ from .diagnosis import (
     render_diagnosis_steps,
 )
 from .reporting import (
+    REPORT_SCRIPT,
     REPORT_STYLE,
+    _appendix_nav_items,
     _appendix_sections,
     _build_report_parts,
     _escape,
+    _evidence_nav_items,
     _evidence_sections,
     _format_number,
-    _human_duration,
-    _human_timestamp,
-    _level,
     _part_heading,
     _read_jsonl,
+    _render_nav,
     _render_section,
+    render_report_page,
     resolve_report_destination,
     write_report_atomically,
 )
@@ -60,35 +61,15 @@ REPORT_V2_FILENAME = "report-v2.html"
 #: The layered report folds inside its second layer, not only at section
 #: level, so its own control reaches those blocks too. It deliberately stops
 #: there: opening every raw command response would print hundreds of pages.
-REPORT_V2_SCRIPT = """(function(){
-var folds=document.querySelectorAll("section:not(.glance)>details.section-fold,details.dismissed");
-var nav=document.querySelector("nav.toc");
-if(!folds.length||!nav){return;}
-var button=document.createElement("button");
-button.type="button";
-button.className="fold-all";
-button.textContent="Collapse all";
-button.addEventListener("click",function(){
-var collapse=false,i;
-for(i=0;i<folds.length;i++){if(folds[i].open){collapse=true;break;}}
-for(i=0;i<folds.length;i++){folds[i].open=!collapse;}
-button.textContent=collapse?"Expand all":"Collapse all";
-});
-nav.appendChild(button);
-function reveal(){
-var id=window.location.hash.replace("#","");
-if(!id){return;}
-var heading=document.getElementById(id);
-var element=heading;
-while(element){
-if(element.tagName==="DETAILS"){element.open=true;}
-element=element.parentElement;
-}
-if(heading){heading.scrollIntoView();}
-}
-window.addEventListener("hashchange",reveal);
-reveal();
-})();"""
+#:
+#: It is the v1 folding script with a wider selector, derived from it rather
+#: than copied: the two are pinned separately in the Web UI's
+#: Content-Security-Policy, so a fix applied to one copy alone would leave the
+#: other page with a control the policy still allows but that no longer works.
+REPORT_V2_SCRIPT = REPORT_SCRIPT.replace(
+    '"section:not(.glance)>details.section-fold"',
+    '"section:not(.glance)>details.section-fold,details.dismissed"',
+).replace("sections", "folds")
 
 #: The Content-Security-Policy source expression the Web UI must allow for a
 #: layered report page, alongside the v1 one and nothing else.
@@ -150,7 +131,14 @@ def _proof_item(label: str, value: str, level: str) -> str:
 
 
 def _render_proof(diagnosis: dict[str, Any], batch_count: int) -> str:
-    """The handful of numbers that carry the verdict, before any table."""
+    """The handful of numbers that carry the verdict, before any table.
+
+    Every tile shows the severity step 1 already decided, against the
+    thresholds this firewall runs with - the configured ones where they were
+    read, the PAN-OS defaults otherwise. Re-deriving them here is how a calm
+    green tile ended up sitting directly above a verdict calling the same run
+    latency exhaustion.
+    """
     context = diagnosis["context"]
     pressure = next(
         (step for step in diagnosis["steps"] if step["key"] == "pressure"), {}
@@ -161,14 +149,14 @@ def _render_proof(diagnosis: dict[str, Any], batch_count: int) -> str:
             f"{_format_number(pressure.get('buffer_peak'))}%"
             if pressure.get("buffer_peak") is not None
             else "Not collected",
-            _level(pressure.get("buffer_peak")),
+            pressure.get("buffer_level", "none"),
         ),
         _proof_item(
             "Packet descriptors",
             f"{_format_number(pressure.get('descriptor_peak'))}%"
             if pressure.get("descriptor_peak") is not None
             else "Not collected",
-            _level(pressure.get("descriptor_peak")),
+            pressure.get("descriptor_level", "none"),
         ),
     ]
     if context.get("latency_peak_ms") is not None:
@@ -176,10 +164,7 @@ def _render_proof(diagnosis: dict[str, Any], batch_count: int) -> str:
             _proof_item(
                 "Buffer latency",
                 f"{_format_number(context['latency_peak_ms'])} ms",
-                "warn"
-                if context.get("latency_alert_ms") is not None
-                and context["latency_peak_ms"] >= context["latency_alert_ms"]
-                else "ok",
+                pressure.get("latency_level", "none"),
             )
         )
     if (mitigating := context.get("mitigating_from_percent")) is not None:
@@ -217,19 +202,34 @@ def _render_finding(finding: dict[str, Any], rank: int, level: str) -> str:
 
 
 def _render_dismissed(
-    findings: list[dict[str, Any]], state: str, summary: str, note: str
+    findings: list[dict[str, Any]],
+    state: str,
+    summary: str,
+    note: str,
+    *,
+    include_named: bool = False,
 ) -> str:
-    """Fold everything the investigation rejected behind a single line.
+    """Fold a list of findings that must not compete with what holds.
 
     A ruled-out cause is not noise: it is what keeps a TAC engineer from
-    re-testing it. It just must not compete with the findings that hold.
+    re-testing it. Neither is the ranking of a firewall that was never short of
+    buffers - which is why that list keeps the entities it designated, and this
+    one does not.
     """
     if not findings:
         return ""
     items = "".join(
         f'<li class="hypothesis hypothesis-{_escape(state)}">'
         f'<span class="hypothesis-mark" aria-hidden="true"></span>'
-        f'<strong>{_escape(finding["title"])}</strong> — {finding["text"]}</li>'
+        f'<strong>{_escape(finding["title"])}</strong> — {finding["text"]}'
+        + (
+            '<ol class="step-named">'
+            + "".join(f"<li>{named}</li>" for named in finding["named"])
+            + "</ol>"
+            if include_named and finding["named"]
+            else ""
+        )
+        + "</li>"
         for finding in findings
     )
     return (
@@ -268,10 +268,13 @@ def _threshold_noise_panel(diagnosis: dict[str, Any]) -> str:
         configured_alert = context.get("configured_alert_percent")
         configured_activate = context.get("configured_activate_percent")
         syslog_alert = context.get("syslog_alert_percent")
-        if configured_activate is not None and mitigating < configured_activate:
+        if context.get("alert_source") == "inconsistent":
             # PBP cannot mitigate below its own activate threshold. When it did,
             # the settings read did not return the thresholds in force, and
             # saying so is more useful than quoting either number as fact.
+            # The diagnosis has already made that call - onset only, and beyond
+            # a rounding margin - and publishes it as `alert_source`; testing it
+            # again here is how this panel and step 1 came to disagree.
             contradiction = (
                 "The running configuration read at monitor start reports alert "
                 f"{_format_number(configured_alert)}% and activate "
@@ -294,7 +297,8 @@ def _threshold_noise_panel(diagnosis: dict[str, Any]) -> str:
                 "The running configuration reports alert "
                 f"{_format_number(configured_alert)}% and activate "
                 f"{_format_number(configured_activate)}%, far below the "
-                "50% and 80% PAN-OS defaults."
+                f"{_format_number(DEFAULT_ALERT_PERCENT)}% and "
+                f"{_format_number(DEFAULT_ACTIVATE_PERCENT)}% PAN-OS defaults."
             )
     sentences.append(
         "There is nothing to diagnose on the machine. What has to be reviewed is "
@@ -306,33 +310,35 @@ def _threshold_noise_panel(diagnosis: dict[str, Any]) -> str:
     ) + "</div>"
 
 
-def _render_context_ranking(findings: list[dict[str, Any]]) -> str:
-    """What PBP ranked, kept as context and named as ordinary traffic."""
-    if not findings:
-        return ""
-    items = "".join(
-        f'<li class="hypothesis hypothesis-unavailable">'
-        f'<span class="hypothesis-mark" aria-hidden="true"></span>'
-        f'<strong>{_escape(item["title"])}</strong> — {item["text"]}'
-        + (
-            '<ol class="step-named">'
-            + "".join(f"<li>{named}</li>" for named in item["named"])
-            + "</ol>"
-            if item["named"]
-            else ""
-        )
-        + "</li>"
-        for item in findings
+def _render_low_significance_block(
+    findings: list[dict[str, Any]], summary: str, note: str
+) -> str:
+    """One folded list of findings that a low-pressure run cannot support.
+
+    The entities stay listed: they are the firewall's own designation, and an
+    operator asked about them needs to see which ones they were.
+    """
+    return _render_dismissed(
+        findings, "unavailable", summary, note, include_named=True
     )
-    return (
-        '<details class="dismissed"><summary>What PBP ranked — ordinary traffic, '
-        "not a cause</summary>"
-        '<div class="dismissed-body"><p class="muted">At this pressure level the '
-        "ranking is the busiest ordinary traffic seen through a lowered "
-        "threshold. It is kept because it is the firewall's own designation, and "
-        "it must not be read as an attack.</p>"
-        f'<ul class="hypotheses">{items}</ul></div></details>'
-    )
+
+
+#: What a low-pressure run may say about the entries PBP itself ranked.
+_PBP_RANKING_SUMMARY = "What PBP ranked — ordinary traffic, not a cause"
+_PBP_RANKING_NOTE = (
+    "At this pressure level the ranking is the busiest ordinary traffic seen "
+    "through a lowered threshold. It is kept because it is the firewall's own "
+    "designation, and it must not be read as an attack."
+)
+#: And what it may say about everything it observed independently of PBP. A
+#: recent boot, an interface counter or a fragmentation rate is not something
+#: PBP ranked, so it must never be filed under the label above.
+_OTHER_SIGNAL_SUMMARY = "Other signals observed — no incident to explain"
+_OTHER_SIGNAL_NOTE = (
+    "These were read independently of PBP's ranking and would be supported "
+    "findings during a real shortage. Step 1 found none, so they are listed "
+    "for completeness and none of them caused an incident here."
+)
 
 
 def _render_cause_layer(diagnosis: dict[str, Any]) -> tuple[str, str, str]:
@@ -350,7 +356,23 @@ def _render_cause_layer(diagnosis: dict[str, Any]) -> tuple[str, str, str]:
     low_significance = bool(pressure.get("low_significance"))
 
     if low_significance:
-        body = _threshold_noise_panel(diagnosis) + _render_context_ranking(confirmed)
+        # Only what PBP itself ranked may be presented as its ranking. A
+        # positive read from the counters, the pools or the device uptime is an
+        # independent observation, and calling it "what PBP ranked" would state
+        # something the capture never said.
+        body = (
+            _threshold_noise_panel(diagnosis)
+            + _render_low_significance_block(
+                [item for item in confirmed if item.get("ranking_derived")],
+                _PBP_RANKING_SUMMARY,
+                _PBP_RANKING_NOTE,
+            )
+            + _render_low_significance_block(
+                [item for item in confirmed if not item.get("ranking_derived")],
+                _OTHER_SIGNAL_SUMMARY,
+                _OTHER_SIGNAL_NOTE,
+            )
+        )
         pill = "no incident"
     elif confirmed:
         body = '<ol class="findings">' + "".join(
@@ -418,7 +440,6 @@ def _render_html_v2(
     diagnosis = parts["diagnosis"]
     run_id = parts["run_id"]
     title = f"PBP Report v2 — {run_id}"
-    generated_at = datetime.now(timezone.utc).isoformat()
 
     if diagnosis is not None:
         headline = diagnosis["headline"]
@@ -484,68 +505,20 @@ def _render_html_v2(
     nav_items = [("verdict-title", "Verdict")]
     if cause_body:
         nav_items.append(("cause-title", "Cause"))
-    nav_items.extend(
-        [
-            ("pressure-title", "Pressure"),
-            ("attribution-title", "Offenders"),
-            ("ingress-title", "Backlog"),
-            ("cpu-tracking-title", "CPU"),
-            ("large-sessions-title", "Largest sessions"),
-            ("drop-counters-title", "Drops"),
-            ("session-table-title", "Session table"),
-            ("summary-title", "Summary"),
-            ("timeline-title", "Timeline"),
-            ("cycles-title", "Batches"),
-            ("events-title", "Events"),
-        ]
-    )
-    if parts["pbp_threat_logs_html"]:
-        nav_items.insert(3 if cause_body else 2, ("pbp-threat-logs-title", "Threat logs"))
-    nav_html = '<nav class="toc" aria-label="Sections">' + "".join(
-        f'<a href="#{anchor}">{label}</a>' for anchor, label in nav_items
-    ) + "</nav>"
+    # The evidence and appendix entries come from the same declaration the
+    # sections are rendered from, so both reports navigate the same document.
+    nav_items += _evidence_nav_items(parts) + _appendix_nav_items()
 
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="referrer" content="no-referrer">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src '{REPORT_V2_SCRIPT_CSP_HASH}'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>{_escape(title)}</title>
-  <style>
-{REPORT_STYLE}{REPORT_V2_STYLE}  </style>
-</head>
-<body>
-  <header>
-    <h1>{_escape(title)}</h1>
-    <p>Static report derived from the JSONL capture. The JSONL file remains the original evidence.</p>
-    <div class="facts">
-      <div class="fact"><span>Start</span><strong>{_escape(_human_timestamp(parts["started_at"]))}</strong></div>
-      <div class="fact"><span>End</span><strong>{_escape(_human_timestamp(parts["ended_at"]))}</strong></div>
-      <div class="fact"><span>Duration</span><strong>{_escape(_human_duration(parts["duration"]))}</strong></div>
-      <div class="fact"><span>Stop reason</span><strong>{parts["stop_reason_html"]}</strong></div>
-      <div class="fact"><span>Target</span><strong>{_escape(parts["target_name"])}</strong></div>
-      <div class="fact"><span>Device</span><strong>{_escape(parts["device_name"])}</strong></div>
-      <div class="fact"><span>Model</span><strong>{_escape(parts["device_model"])}</strong></div>
-      <div class="fact"><span>PAN-OS</span><strong>{_escape(parts["software_version"])}</strong></div>
-      <div class="fact"><span>Collector version</span><strong>{_escape(parts["collector_version"])}</strong></div>
-      <div class="fact"><span>Source</span><strong>{_escape(parts["source_name"])}</strong></div>
-    </div>
-  </header>
-  {nav_html}
-  <main>
-    {parts["warning_html"]}
-    {layers_html}
-  </main>
-  <footer>
-    Generated by PBP Monitoring v{_escape(__version__)} at {_escape(generated_at)} · JSONL SHA-256: <code>{_escape(source_hash)}</code> ·
-    This report may contain sensitive IP addresses, ports, device names, and serial numbers.
-  </footer>
-  <script>{REPORT_V2_SCRIPT}</script>
-</body>
-</html>
-"""
+    return render_report_page(
+        title=title,
+        style=REPORT_STYLE + REPORT_V2_STYLE,
+        script=REPORT_V2_SCRIPT,
+        script_csp_hash=REPORT_V2_SCRIPT_CSP_HASH,
+        nav_html=_render_nav(nav_items),
+        main_html="\n    ".join([parts["warning_html"], layers_html]),
+        parts=parts,
+        source_hash=source_hash,
+    )
 
 
 def generate_html_report_v2(jsonl_path: Path, html_path: Path | None = None) -> Path:

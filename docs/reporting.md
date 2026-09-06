@@ -39,7 +39,11 @@ support bundle at the expense of the raw evidence.
 
 **Layer 1 — Verdict.** The headline the diagnosis reached, the peak packet
 buffer and packet descriptor levels, the buffer latency peak and the level PBP
-mitigated from when either was collected, the number of batches, then the case
+mitigated from when either was collected — each coloured against the same
+thresholds step 1 judged it with, the ones configured on this firewall where
+the read returned them and the PAN-OS defaults otherwise, so a tile can never
+read calm above a verdict that calls the same number exhaustion — the number
+of batches, then the case
 chips: model and hardware family, PAN-OS version, PBP state and mode, and the
 configured alert and activate thresholds with where they were read from. This
 layer stays open and is never folded by **Collapse all**: it is the one screen
@@ -72,6 +76,12 @@ packet-buffer-protection threshold configuration. What PBP ranked is kept
 folded under **What PBP ranked — ordinary traffic, not a cause**: it is the
 firewall's own designation and must not be lost, but at that pressure level it
 is the busiest ordinary traffic and never a cause.
+
+Anything the capture observed *independently* of that ranking — a recent boot,
+an interface counter, a fragmentation rate — is folded separately under
+**Other signals observed — no incident to explain**. Those readings would be
+supported findings during a real shortage; they are not something PBP ranked,
+and the report never presents them as such.
 
 PBP cannot mitigate below its own activate threshold. When the capture shows it
 doing so, the settings read did not return the thresholds in force — a commit
