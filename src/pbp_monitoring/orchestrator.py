@@ -4019,6 +4019,68 @@ class MonitorController:
             outcome["error"] = self._redact_secret(f"{type(exc).__name__}: {exc}")
         append_jsonl(output_file, outcome)
 
+    async def _collect_stop_evidence(
+        self,
+        output_file: Path,
+        run_id: str,
+        offender_sources: dict[str, int],
+        first_firewall_clock: str | None,
+        startup_pbp_settings: dict[str, Any],
+    ) -> None:
+        """Run the four stop-time collections concurrently.
+
+        Live sessions and the traffic log recover flow detail for the top
+        offender sources, the threat-log job asks the firewall for its own
+        PBP designations, and the PBP settings are re-read to catch a commit
+        that landed mid-run. None of the four is built from another's
+        result, each already writes its own JSONL record, and each already
+        traps its own exceptions here, so running them concurrently only
+        removes idle waiting: it does not change what gets written or in
+        what shape. Record order does not matter: every event carries its
+        own "event" name and run_id, and nothing downstream parses the
+        capture assuming these four appear in a particular order.
+        """
+
+        async def _collect_offender_sessions() -> None:
+            try:
+                await self._collect_offender_session_listing(
+                    output_file, run_id, offender_sources
+                )
+            except Exception:
+                LOG.exception("Offender session listing failed for %s", run_id)
+
+        async def _collect_offender_traffic() -> None:
+            try:
+                await self._collect_offender_traffic_logs(
+                    output_file, run_id, offender_sources
+                )
+            except Exception:
+                LOG.exception("Offender traffic log lookup failed for %s", run_id)
+
+        async def _collect_threat_logs() -> None:
+            try:
+                await self._collect_pbp_threat_logs(
+                    output_file, run_id, first_firewall_clock
+                )
+            except Exception:
+                LOG.exception("PBP threat log lookup failed for %s", run_id)
+
+        async def _collect_settings_reread() -> None:
+            try:
+                await self._reread_pbp_settings(
+                    output_file, run_id, startup_pbp_settings
+                )
+            except Exception:
+                LOG.exception("PBP settings re-read failed for %s", run_id)
+
+        stop_collections = []
+        if offender_sources:
+            stop_collections.append(_collect_offender_sessions())
+            stop_collections.append(_collect_offender_traffic())
+        stop_collections.append(_collect_threat_logs())
+        stop_collections.append(_collect_settings_reread())
+        await asyncio.gather(*stop_collections, return_exceptions=True)
+
     async def _session_details(self, ids: list[int]) -> dict[str, dict[str, Any]]:
         semaphore = asyncio.Semaphore(4)
 
@@ -4037,21 +4099,47 @@ class MonitorController:
             return
 
         async def render() -> None:
-            # Both readings of the same capture are written, and one failing
-            # must not cost the other: a run that produced evidence has to
-            # leave a report behind even if a renderer raises.
-            from .reporting import generate_html_report
-            from .reporting_v2 import REPORT_V2_FILENAME, generate_html_report_v2
+            # Both reports are written, and one failing must not cost the
+            # other: a run that produced evidence has to leave a report
+            # behind even if a renderer raises. They used to each re-read
+            # the whole JSONL (full file read + SHA-256 + json.loads per
+            # line) and re-run the full aggregation and diagnosis; both
+            # already accept the same records/parts, so the capture is read
+            # once here and handed to each renderer instead. The standalone
+            # `pbp-report` / `pbp-report-v2` commands keep doing their own
+            # single read each, through generate_html_report(_v2).
+            from .reporting import (
+                REPORT_FILENAME,
+                _read_jsonl,
+                _render_html,
+                resolve_report_destination,
+                write_report_atomically,
+            )
+            from .reporting_v2 import REPORT_V2_FILENAME, _render_html_v2
 
-            for label, render_report, name in (
-                ("HTML", generate_html_report, "report.html"),
-                ("layered HTML", generate_html_report_v2, REPORT_V2_FILENAME),
+            try:
+                records, warnings, source_hash = await asyncio.to_thread(
+                    _read_jsonl, output_file
+                )
+            except Exception:
+                LOG.exception(
+                    "Unable to read capture %s for report generation", output_file
+                )
+                return
+
+            for label, render_html, name in (
+                ("HTML", _render_html, REPORT_FILENAME),
+                ("layered HTML", _render_html_v2, REPORT_V2_FILENAME),
             ):
                 try:
+                    _, destination = resolve_report_destination(
+                        output_file, output_file.with_name(name), name
+                    )
+                    rendered = await asyncio.to_thread(
+                        render_html, output_file, records, warnings, source_hash
+                    )
                     report = await asyncio.to_thread(
-                        render_report,
-                        output_file,
-                        output_file.with_name(name),
+                        write_report_atomically, destination, rendered
                     )
                     LOG.info("%s report written to %s", label, report)
                 except Exception:
@@ -4389,39 +4477,14 @@ class MonitorController:
                 if not startup_task.done():
                     startup_task.cancel()
                     await asyncio.gather(startup_task, return_exceptions=True)
-            if stop_reason != "cancelled" and offender_sources:
-                # Live sessions first (volatile), then the traffic log for
-                # what never created a session: together they recover the
-                # destination/port/application detail of the top sources.
-                try:
-                    await self._collect_offender_session_listing(
-                        output_file, run_id, offender_sources
-                    )
-                except Exception:
-                    LOG.exception(
-                        "Offender session listing failed for %s", run_id
-                    )
-                try:
-                    await self._collect_offender_traffic_logs(
-                        output_file, run_id, offender_sources
-                    )
-                except Exception:
-                    LOG.exception(
-                        "Offender traffic log lookup failed for %s", run_id
-                    )
             if stop_reason != "cancelled":
-                try:
-                    await self._collect_pbp_threat_logs(
-                        output_file, run_id, first_firewall_clock
-                    )
-                except Exception:
-                    LOG.exception("PBP threat log lookup failed for %s", run_id)
-                try:
-                    await self._reread_pbp_settings(
-                        output_file, run_id, startup_pbp_settings
-                    )
-                except Exception:
-                    LOG.exception("PBP settings re-read failed for %s", run_id)
+                await self._collect_stop_evidence(
+                    output_file,
+                    run_id,
+                    offender_sources,
+                    first_firewall_clock,
+                    startup_pbp_settings,
+                )
             try:
                 append_jsonl(
                     output_file,

@@ -117,6 +117,33 @@ follows [Semantic Versioning](https://semver.org/).
   TOTAL actually peaked, whose real ATOMIC reading was only 40%. Each
   metric's peak batch is now tracked and shown beside its own percentage.
 
+### Changed
+
+- **A monitor's stop path reads its JSONL capture once instead of twice.**
+  Generating the flat and the layered report each independently re-read the
+  whole capture (full file read, SHA-256 hash, and one `json.loads` per line)
+  and re-ran the full offender/drop/CPU aggregation and diagnosis from
+  scratch. The stop path now reads the capture and builds that shared
+  aggregation once, then hands the same records and parts to both renderers;
+  a renderer that fails still cannot cost the other its report. The
+  standalone `pbp-report` and `pbp-report-v2` commands are unchanged and
+  still do their own single read each.
+- **The v1-only diagnosis walk no longer renders twice per report.** The
+  aggregation both renderers share used to also render the full "at a
+  glance" diagnosis HTML, the navigation bar, and the page title and script —
+  all of it discarded and rebuilt in its own form by the layered v2 report.
+  That rendering now happens only while building the flat report, halving
+  the report-CPU cost of a layered-only render.
+- **The four stop-time collections now run concurrently instead of one
+  after another.** Offender live sessions, offender traffic logs, the PBP
+  threat-log job (polled up to 20s), and the PBP settings re-read are each
+  built from the batches already collected during the run, not from one
+  another's result, yet used to run strictly in sequence. A firewall slow to
+  answer the threat-log job no longer adds its full duration on top of the
+  other three before `monitor_stopped` is written. Each collection still
+  writes its own JSONL record and traps its own exception, so one failing
+  still cannot suppress the others.
+
 ## [0.39.1] - 2026-09-01
 
 ### Fixed

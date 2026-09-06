@@ -3698,7 +3698,6 @@ def _build_report_parts(
     )
 
     generated_at = datetime.now(timezone.utc).isoformat()
-    title = f"PBP Report — {run_id}"
 
     warning_html = ""
     if warnings:
@@ -3923,8 +3922,13 @@ def _build_report_parts(
         f"<th>{_escape(label)} %</th>" for _, label in timeline_metrics
     )
 
+    # The diagnosis dict is shared: both the flat v1 report and the layered
+    # v2 report walk the same facts and must never disagree. Only v1 renders
+    # it as the "glance" HTML block (render_diagnosis is the heaviest walk in
+    # this module); v2 renders the same dict in its own layered form. That
+    # HTML, and the v1-only nav/title/script that wrap it, are built in
+    # _render_html instead of here so a v2 render never pays for it.
     diagnosis: dict[str, Any] | None = None
-    glance_html = ""
     if cycles:
         diagnosis = build_diagnosis(
             cycles=[record for _, record in cycles],
@@ -3938,37 +3942,6 @@ def _build_report_parts(
             signal_summary=signal_counter_summary,
             diagnostic_pools=diagnostic_pools,
         )
-        glance_html = _render_section(
-            "glance-title",
-            "Diagnosis",
-            render_diagnosis(diagnosis),
-            section_class="glance",
-            data_level=diagnosis["headline"]["level"],
-        )
-
-    nav_items = [
-        ("pressure-title", "Pressure"),
-        ("attribution-title", "Offenders"),
-        ("ingress-title", "Backlog"),
-        ("cpu-tracking-title", "CPU"),
-        ("large-sessions-title", "Largest sessions"),
-        ("drop-counters-title", "Drops"),
-        ("session-table-title", "Session table"),
-        ("summary-title", "Summary"),
-        ("timeline-title", "Timeline"),
-        ("cycles-title", "Batches"),
-        ("events-title", "Events"),
-    ]
-    if pbp_threat_logs_html:
-        nav_items.insert(2, ("pbp-threat-logs-title", "Threat logs"))
-    if glance_html:
-        nav_items.insert(0, ("glance-title", "Diagnosis"))
-    nav_html = '<nav class="toc" aria-label="Sections">' + "".join(
-        f'<a href="#{anchor}">{label}</a>' for anchor, label in nav_items
-    ) + "</nav>"
-    # The Collapse all control is added by the report's own script, so the page
-    # never shows a button that cannot work.
-    report_script = REPORT_SCRIPT
 
     alert_text = _escape(_format_number(_PBP_ALERT_PERCENT))
     activate_text = _escape(_format_number(_PBP_ACTIVATE_PERCENT))
@@ -4073,18 +4046,15 @@ def _build_report_parts(
         "events": events,
         "events_html": events_html,
         "generated_at": generated_at,
-        "glance_html": glance_html,
         "ingress_html": ingress_html,
         "ingress_pill": ingress_pill,
         "large_pill": large_pill,
         "large_sessions_html": large_sessions_html,
         "metric_groups_html": metric_groups_html,
-        "nav_html": nav_html,
         "offender_logs_html": offender_logs_html,
         "pbp_threat_logs_html": pbp_threat_logs_html,
         "pressure_chart_html": pressure_chart_html,
         "pressure_pill": pressure_pill,
-        "report_script": report_script,
         "run_id": run_id,
         "session_pill": session_pill,
         "session_table_html": session_table_html,
@@ -4095,7 +4065,6 @@ def _build_report_parts(
         "summary_groups": summary_groups,
         "target_name": target_name,
         "timeline_html": timeline_html,
-        "title": title,
         "warning_html": warning_html,
         "warnings": warnings,
         "source_name": source.name,
@@ -4115,15 +4084,51 @@ def _render_html(
     duration = parts["duration"]
     ended_at = parts["ended_at"]
     generated_at = parts["generated_at"]
-    glance_html = parts["glance_html"]
-    nav_html = parts["nav_html"]
-    report_script = parts["report_script"]
     software_version = parts["software_version"]
     started_at = parts["started_at"]
     stop_reason_html = parts["stop_reason_html"]
     target_name = parts["target_name"]
-    title = parts["title"]
     warning_html = parts["warning_html"]
+    run_id = parts["run_id"]
+    diagnosis = parts["diagnosis"]
+    title = f"PBP Report — {run_id}"
+
+    # v1-only: the full diagnosis walk (the heaviest HTML this module builds)
+    # and the nav/script that wrap it. v2 renders the same `diagnosis` dict
+    # from `parts` in its own layered form, so none of this belongs in
+    # _build_report_parts.
+    glance_html = ""
+    if parts["cycles"]:
+        glance_html = _render_section(
+            "glance-title",
+            "Diagnosis",
+            render_diagnosis(diagnosis),
+            section_class="glance",
+            data_level=diagnosis["headline"]["level"],
+        )
+    nav_items = [
+        ("pressure-title", "Pressure"),
+        ("attribution-title", "Offenders"),
+        ("ingress-title", "Backlog"),
+        ("cpu-tracking-title", "CPU"),
+        ("large-sessions-title", "Largest sessions"),
+        ("drop-counters-title", "Drops"),
+        ("session-table-title", "Session table"),
+        ("summary-title", "Summary"),
+        ("timeline-title", "Timeline"),
+        ("cycles-title", "Batches"),
+        ("events-title", "Events"),
+    ]
+    if parts["pbp_threat_logs_html"]:
+        nav_items.insert(2, ("pbp-threat-logs-title", "Threat logs"))
+    if glance_html:
+        nav_items.insert(0, ("glance-title", "Diagnosis"))
+    nav_html = '<nav class="toc" aria-label="Sections">' + "".join(
+        f'<a href="#{anchor}">{label}</a>' for anchor, label in nav_items
+    ) + "</nav>"
+    # The Collapse all control is added by the report's own script, so the page
+    # never shows a button that cannot work.
+    report_script = REPORT_SCRIPT
     sections_html = "".join(
         [
             _part_heading(
