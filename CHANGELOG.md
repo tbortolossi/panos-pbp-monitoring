@@ -3,6 +3,54 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.39.2] - 2026-09-06
+
+### Fixed
+
+- **A full packet-buffer pool during a flood is no longer read as a memory
+  leak.** The *Held resources (leak signature)* hypothesis fired whenever any
+  diagnostic pool was at least 80% used — including the packet-buffer and
+  packet-descriptor pools, which are full precisely because the buffers are.
+  A capture with buffers at 92%, busy dataplane cores and a named flood cause
+  therefore also confirmed a software leak, and the report sent to TAC asked
+  for `pan_task` logs and PAN-OS maintenance releases for an incident that was
+  plain congestion. Those pools now count as leak evidence only when the
+  buffers themselves were not under pressure; a non-buffer pool held near full
+  (`Timer Pool`, `proxy_flow`, `ssl_st`, `fptcp_seg`) still raises the
+  signature exactly as before.
+- **An incident that decays no longer contradicts a correct settings read.**
+  The threshold check compared the *lowest* congestion of every batch where
+  PBP was still listed active against the configured activate threshold. An
+  ordinary incident falling from 85% to 60% while the active flag lingered, or
+  a reading a fraction below the threshold, was enough for the report to state
+  that "the read does not describe the thresholds that were in force" about a
+  perfectly correct configuration read. The comparison now uses the congestion
+  of the first batch that caught PBP mitigating — the level at which
+  mitigation started — with a one-point rounding margin. The genuine case, a
+  firewall mitigating far below its configured threshold from the start, is
+  still flagged.
+- **Thresholds committed during a run are no longer invisible.** The
+  settings-moved flag required both the start and the stop read to have
+  parsed. A configuration left at the PAN-OS defaults returns no session
+  element and reads as unparsed, so an operator lowering the thresholds and
+  committing mid-run was never mentioned. The stop record now carries
+  `start_settings_unknown`, and step 1 states that the start-of-run settings
+  are unknown and that the values read at stop may not describe the whole run
+  — without claiming a commit the capture did not observe.
+- **Threat logs that could not be limited to the incident window no longer
+  confirm it.** When `show clock` could not be parsed, the PBP threat-log
+  query was issued with no `receive_time` filter, and the diagnosis presented
+  up to 50 arbitrarily old 8507/8508/8509 entries as "the firewall's own
+  threat log confirms it", naming source addresses that could belong to an
+  earlier episode. The capture now records `time_bounded` for that query, the
+  entries are kept as evidence, and step 2 reads them as corroboration only:
+  it says the query could not be limited to the incident window, designates no
+  source from them, and no longer escalates the *Source blocking and its
+  collateral* finding on them.
+- **The low-pressure verdict reads as English again**: a single supported
+  signal is now "would be a supported finding" and several are "would be
+  supported findings", instead of both branches printing the same text.
+
 ## [0.39.1] - 2026-09-01
 
 ### Fixed
