@@ -20,6 +20,7 @@ import re
 import shutil
 import signal
 import ssl
+import statistics
 import sys
 import tempfile
 import time
@@ -162,6 +163,35 @@ PBP_SETTINGS_COMMAND = (
 #   turning it on before the next incident. The collector only reads this
 #   state: `set session inflight_monitoring yes` is a configuration change on
 #   the firewall and stays the operator's gesture.
+# - `arp_table` reads only the header of `show arp all`: how many ARP entries
+#   the table holds against how many it supports. An ARP flood creates no
+#   session, so every session-driven view stays empty while the buffers fill,
+#   and the header is what separates the two shapes of that class - a packet
+#   flood the counters see, and a table filling towards its own limit until
+#   resolution itself starts failing. The entries are dropped before the
+#   answer is persisted: the collector needs the counts, not the customer's
+#   address-to-MAC map, and a full table on a large platform would otherwise
+#   write megabytes of addresses into every capture.
+# - `application_statistics` names what this firewall carries. The counters
+#   are cumulative since boot, so they never attribute the incident by
+#   themselves; they say which applications this firewall is built around,
+#   which is the context a reader needs before deciding whether an offender is
+#   an anomaly or the site's daily business.
+# - `session_distribution` gives the per-dataplane active and dispatched
+#   session counts on a multi-dataplane platform. The resource monitor already
+#   shows one dataplane saturated while its peers idle; this says whether the
+#   dispatcher was also sending it more sessions, which separates a hashing
+#   imbalance from one heavy flow group.
+# - `chassis_status` states which slots are populated, up and carrying
+#   traffic. A line card that dropped out concentrates the same traffic on the
+#   remaining ones, which is a capacity explanation the buffer levels alone
+#   never give.
+# - `pow_performance` carries the dataplane's own timing table, one row per
+#   processing function per dataplane. Its `pbp_buf_latency` row is the
+#   packet-buffer latency measurement PAN-OS releases before 12.0 do not
+#   expose through `show session packet-buffer-protection`, so on those
+#   releases it is the only place the buffer latency PBP acts on can be read
+#   at all.
 #
 # Operational XML validated read-only against the lab PA-440 (PAN-OS 12.2.2)
 # on 2026-09-06.
@@ -178,6 +208,27 @@ INCIDENT_START_COMMANDS = {
     "inflight_monitoring": (
         "<show><system><state><filter>cfg.session.*</filter></state>"
         "</system></show>"
+    ),
+    # Validated read-only through the XML API on the lab PA-440 (PAN-OS
+    # 12.2.2) and on the lab PA-VM (PAN-OS 11.2.3-h3) on 2026-09-07. Both
+    # answered `arp_table` and `application_statistics`. `session_distribution`
+    # is accepted on 11.2.3-h3 and rejected as an unknown node on 12.2.2, and
+    # `chassis_status` is rejected on both because neither is a chassis, so
+    # both are declared platform-dependent below and their content shape comes
+    # from the anonymized PA-5250 and PA-7080 tech support files in the TAC
+    # corpus. `pow_performance` was accepted on both lab platforms, and its
+    # table shape is the one those same tech support files carry.
+    "arp_table": "<show><arp><entry name='all'/></arp></show>",
+    "application_statistics": (
+        "<show><running><application><statistics/></application></running></show>"
+    ),
+    "session_distribution": (
+        "<show><session><distribution><statistics/></distribution></session></show>"
+    ),
+    "chassis_status": "<show><chassis><status/></chassis></show>",
+    "pow_performance": (
+        "<debug><dataplane><pow><performance><all/></performance></pow>"
+        "</dataplane></debug>"
     ),
 }
 
@@ -227,6 +278,11 @@ OPTIONAL_COMMAND_EVIDENCE = {
     "ha_state": "the high-availability role of this unit",
     "interface_counters_all": "the per-interface hardware counters",
     "inflight_monitoring": "the on-box ingress-backlog auto-collection state",
+    "arp_table": "the ARP table occupancy against the platform limit",
+    "application_statistics": "the applications this firewall carries",
+    "session_distribution": "the per-dataplane session distribution",
+    "chassis_status": "the chassis slot and line-card state",
+    "pow_performance": "the per-dataplane processing latency table",
 }
 
 
@@ -3602,6 +3658,481 @@ def extract_inflight_monitoring(output: str) -> dict[str, Any]:
     return state
 
 
+#: Bounds for the once-per-incident device reads. None of these outputs is
+#: read for its individual rows, and each of them can be arbitrarily long on a
+#: large platform: a chassis dataplane table, an application table with one
+#: line per App-ID, a dataplane timing table with one line per function.
+TOP_APPLICATION_LIMIT = 10
+SESSION_DISTRIBUTION_LIMIT = 64
+CHASSIS_SLOT_LIMIT = 32
+CHASSIS_SUMMARY_SLOT_LIMIT = 32
+POW_DATAPLANE_LIMIT = 32
+POW_SLOWEST_LIMIT = 5
+ARP_DATAPLANE_LIMIT = 32
+
+#: The ARP table itself, and the marker left in its place. `show arp all`
+#: answers with the header this collector reads and then one entry per
+#: address the firewall has resolved: up to 128000 of them on a chassis,
+#: which is megabytes of the customer's address-to-MAC map written into every
+#: capture, twice, for evidence nobody reads. The entries are removed before
+#: the answer is persisted, and the marker says so rather than leaving a
+#: reader to conclude that the firewall returned an empty table.
+_ARP_ENTRIES_ELEMENT = re.compile(r"<entries\b.*?</entries>", re.DOTALL)
+ARP_ENTRIES_OMITTED_MARKER = (
+    "<!-- ARP entries removed by the collector: only the header is kept -->"
+)
+
+
+def trim_arp_entries(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop the ARP table from a stored `show arp all` answer, keep the header.
+
+    Applied to the persisted record only. The parser reads nothing but the
+    header elements, so a replayed capture parses to exactly what the live
+    read parsed, and the raw response still shows what PAN-OS answered
+    everywhere the collector did not deliberately remove.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    trimmed = dict(payload)
+    for key in ("result", "raw_response"):
+        value = trimmed.get(key)
+        if isinstance(value, str) and value:
+            trimmed[key] = _ARP_ENTRIES_ELEMENT.sub(
+                ARP_ENTRIES_OMITTED_MARKER, value
+            )
+    return trimmed
+
+
+def extract_arp_table_header(output: str) -> dict[str, Any]:
+    """Read how full the ARP table is, never what is in it.
+
+    PAN-OS answers `show arp all` with `<dp>`, `<timeout>`, `<total>` and
+    `<max>` beside the `<entries>` element the collector removes before
+    persisting. A platform that answers with one such block per dataplane is
+    summed rather than guessed at: the occupancy of the whole firewall is the
+    question, and a shape this parser does not recognise leaves `parsed`
+    false, which reads as evidence not collected rather than as a full table.
+    """
+    header: dict[str, Any] = {
+        "dataplanes": [],
+        "entries": None,
+        "maximum_entries": None,
+        "timeout_seconds": None,
+        "utilization_percent": None,
+        "parsed": False,
+    }
+    try:
+        root = parse_untrusted_xml(output)
+    except ET.ParseError:
+        return header
+    names: list[str] = []
+    totals: list[int] = []
+    maxima: list[int] = []
+    timeouts: list[int] = []
+    for node in root.iter():
+        text = (node.text or "").strip()
+        if not text:
+            continue
+        if node.tag == "dp":
+            if text not in names and len(names) < ARP_DATAPLANE_LIMIT:
+                names.append(text)
+        elif node.tag == "total":
+            value = _int_value(text)
+            if value is not None:
+                totals.append(value)
+        elif node.tag == "max":
+            value = _int_value(text)
+            if value is not None:
+                maxima.append(value)
+        elif node.tag == "timeout":
+            value = _int_value(text)
+            if value is not None:
+                timeouts.append(value)
+    header["dataplanes"] = names
+    if totals:
+        header["entries"] = sum(totals)
+    if maxima:
+        header["maximum_entries"] = sum(maxima)
+    if timeouts:
+        header["timeout_seconds"] = max(timeouts)
+    entries, maximum = header["entries"], header["maximum_entries"]
+    if entries is not None and maximum:
+        header["utilization_percent"] = round(entries * 100.0 / maximum, 1)
+    header["parsed"] = entries is not None
+    return header
+
+
+#: The five numeric columns `show running application statistics` prints per
+#: application, in the order PAN-OS prints them.
+_APPLICATION_COLUMNS = ("sessions", "packets", "bytes", "app_changed", "threats")
+
+
+def _application_row(line: str) -> tuple[str, dict[str, int]] | None:
+    """One `App (report-as) sessions packets bytes app-changed threats` row.
+
+    The application name overflows its column on the long App-IDs, so the row
+    is read from the right: the last five fields are the counters and whatever
+    precedes them is the name.
+    """
+    parts = line.split()
+    if len(parts) < len(_APPLICATION_COLUMNS) + 1:
+        return None
+    values = [_int_value(part) for part in parts[-len(_APPLICATION_COLUMNS):]]
+    if any(value is None for value in values):
+        return None
+    name = " ".join(parts[: -len(_APPLICATION_COLUMNS)])
+    if not name:
+        return None
+    return name, dict(zip(_APPLICATION_COLUMNS, [int(value) for value in values]))
+
+
+def extract_application_statistics(output: str) -> dict[str, Any]:
+    """What this firewall carries, by application.
+
+    The counters are cumulative since boot, not for the incident: they
+    describe the deployment, and the report says so. Only the ranked heads of
+    the table are kept, so a firewall with two thousand App-IDs persists the
+    same handful of rows as one with twelve.
+    """
+    summary: dict[str, Any] = {
+        "vsys_count": 0,
+        "application_count": 0,
+        "reported_application_count": None,
+        "totals": {},
+        "top_by_bytes": [],
+        "top_by_sessions": [],
+        "parsed": False,
+    }
+    text = panos_result_text(output)
+    applications: dict[str, dict[str, int]] = {}
+    totals: dict[str, int] = {column: 0 for column in _APPLICATION_COLUMNS}
+    totals_seen = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or set(stripped) <= {"-"}:
+            continue
+        lowered = stripped.lower()
+        if lowered.startswith("vsys:"):
+            summary["vsys_count"] += 1
+            continue
+        if lowered.startswith("number of apps"):
+            reported = _int_value(stripped.partition(":")[2])
+            if reported is not None:
+                summary["reported_application_count"] = (
+                    summary["reported_application_count"] or 0
+                ) + reported
+            continue
+        if lowered.startswith("app ("):
+            continue
+        row = _application_row(stripped)
+        if row is None:
+            continue
+        name, counters = row
+        if name.lower() == "total":
+            totals_seen = True
+            for column, value in counters.items():
+                totals[column] += value
+            continue
+        entry = applications.setdefault(
+            name, {column: 0 for column in _APPLICATION_COLUMNS}
+        )
+        for column, value in counters.items():
+            entry[column] += value
+    if not applications:
+        return summary
+
+    def ranked(column: str) -> list[dict[str, Any]]:
+        ordered = sorted(
+            applications.items(), key=lambda item: -item[1][column]
+        )[:TOP_APPLICATION_LIMIT]
+        return [
+            {"application": name, **counters}
+            for name, counters in ordered
+            if counters[column] > 0
+        ]
+
+    summary["application_count"] = len(applications)
+    summary["totals"] = totals if totals_seen else {
+        column: sum(entry[column] for entry in applications.values())
+        for column in _APPLICATION_COLUMNS
+    }
+    summary["top_by_bytes"] = ranked("bytes")
+    summary["top_by_sessions"] = ranked("sessions")
+    summary["parsed"] = True
+    return summary
+
+
+#: A dataplane name in the distribution and timing tables: `dp0` on a single
+#: dataplane, `s1dp0` per slot on a chassis. Requiring the shape keeps a line
+#: of prose from being read as a table row.
+_DATAPLANE_NAME = re.compile(r"^[a-z][a-z0-9]*dp[0-9]+$", re.IGNORECASE)
+
+
+def extract_session_distribution(output: str) -> dict[str, Any]:
+    """Per-dataplane active and dispatched sessions on a multi-dataplane box.
+
+    `DP / Active / Dispatched / Dispatched per second`, one row per dataplane.
+    A single-dataplane firewall has nothing to distribute and PAN-OS answers
+    either with an empty result or by refusing the node, which the
+    platform-dependent declaration turns into a note.
+    """
+    summary: dict[str, Any] = {
+        "dataplanes": [],
+        "dataplane_count": 0,
+        "active_total": None,
+        "busiest": None,
+        "busiest_active": None,
+        "median_active": None,
+        "imbalance_ratio": None,
+        "parsed": False,
+    }
+    text = panos_result_text(output)
+    rows: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or not _DATAPLANE_NAME.match(parts[0]):
+            continue
+        active = _int_value(parts[1])
+        dispatched = _int_value(parts[2])
+        if active is None or dispatched is None:
+            continue
+        rows.append(
+            {
+                "dataplane": parts[0],
+                "active": active,
+                "dispatched": dispatched,
+                "dispatched_per_second": (
+                    _int_value(parts[3]) if len(parts) > 3 else None
+                ),
+            }
+        )
+        if len(rows) >= SESSION_DISTRIBUTION_LIMIT:
+            break
+    if not rows:
+        return summary
+    summary["dataplanes"] = rows
+    summary["dataplane_count"] = len(rows)
+    summary["active_total"] = sum(row["active"] for row in rows)
+    ordered = sorted(rows, key=lambda row: -row["active"])
+    summary["busiest"] = ordered[0]["dataplane"]
+    summary["busiest_active"] = ordered[0]["active"]
+    peers = [row["active"] for row in ordered[1:]]
+    if peers:
+        # The median describes the OTHER dataplanes, exactly as the
+        # single-dataplane saturation signature does: folding the busiest one
+        # into its own baseline hides the imbalance it is meant to measure.
+        median = statistics.median(peers)
+        summary["median_active"] = median
+        if median > 0:
+            summary["imbalance_ratio"] = round(ordered[0]["active"] / median, 2)
+    summary["parsed"] = True
+    return summary
+
+
+#: The summary lines `show chassis status` prints under the slot table, and
+#: the field each is kept under.
+_CHASSIS_SUMMARY_LINES = {
+    "inserted slots": "inserted_slots",
+    "powered slots": "powered_slots",
+    "config ready slots": "config_ready_slots",
+    "config done slots": "config_done_slots",
+    "traffic enabled slots": "traffic_enabled_slots",
+}
+#: The one slot-table value that says the card is carrying traffic.
+CHASSIS_CARD_UP = "up"
+
+
+def extract_chassis_status(output: str) -> dict[str, Any]:
+    """Which chassis slots hold a card, and which of those cards are up.
+
+    Read from the `Slot / Component / Card Status / Config Status` table and
+    the slot lists printed under it. Nothing here identifies a network: slot
+    numbers and Palo Alto card model names.
+    """
+    summary: dict[str, Any] = {
+        "slots": [],
+        "populated_slots": 0,
+        "slots_up": 0,
+        "slots_not_up": [],
+        "parsed": False,
+    }
+    for field in _CHASSIS_SUMMARY_LINES.values():
+        summary[field] = []
+    text = panos_result_text(output)
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or set(stripped) <= {"-"}:
+            continue
+        label, separator, value = stripped.partition(":")
+        if separator:
+            field = _CHASSIS_SUMMARY_LINES.get(label.strip().lower())
+            if field is not None:
+                summary[field] = [
+                    number
+                    for number in (_int_value(part) for part in value.split())
+                    if number is not None
+                ][:CHASSIS_SUMMARY_SLOT_LIMIT]
+                continue
+        parts = stripped.split()
+        slot = _int_value(parts[0])
+        if slot is None or len(summary["slots"]) >= CHASSIS_SLOT_LIMIT:
+            continue
+        component = parts[1] if len(parts) > 1 else ""
+        if not component or component.lower() == "empty":
+            summary["slots"].append(
+                {
+                    "slot": slot,
+                    "component": None,
+                    "card_status": None,
+                    "config_status": None,
+                }
+            )
+            continue
+        summary["slots"].append(
+            {
+                "slot": slot,
+                "component": component,
+                "card_status": parts[2] if len(parts) > 2 else None,
+                "config_status": parts[3] if len(parts) > 3 else None,
+            }
+        )
+    populated = [slot for slot in summary["slots"] if slot["component"]]
+    summary["populated_slots"] = len(populated)
+    summary["slots_up"] = sum(
+        1
+        for slot in populated
+        if str(slot["card_status"] or "").lower() == CHASSIS_CARD_UP
+    )
+    summary["slots_not_up"] = [
+        slot["slot"]
+        for slot in populated
+        if str(slot["card_status"] or "").lower() != CHASSIS_CARD_UP
+    ]
+    summary["parsed"] = bool(summary["slots"])
+    return summary
+
+
+#: The dataplane timing rows worth keeping by name. `pbp_buf_latency` is the
+#: measurement PBP acts on, and the only place to read it before PAN-OS 12.0;
+#: the others frame it - how long a packet spent being forwarded, and the
+#: split between the fastpath and the serial slowpath.
+POW_NAMED_FUNCTIONS = (
+    "pbp_buf_latency",
+    "pkt_rx_tx_latency",
+    "flow_fastpath",
+    "flow_slowpath",
+)
+#: The distribution of the same measurement, printed further down the answer
+#: as one `<function> (func)` section per function: how many packets fell in
+#: each latency bucket, rather than one average that a single slow packet
+#: skews. Only the `pbp_buf_latency` one is kept.
+POW_HISTOGRAM_FUNCTION = "pbp_buf_latency"
+POW_HISTOGRAM_LIMIT = 24
+_POW_DATAPLANE_HEADER = re.compile(r"^DP\s+(\S+?):$")
+_POW_HISTOGRAM_HEADER = re.compile(r"^(\S+)\s+\(func\)$")
+#: A processing-function name, so the numeric first column of a histogram
+#: bucket is never read as one.
+_POW_FUNCTION_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+
+def extract_pow_performance(output: str) -> dict[str, Any]:
+    """The dataplane timing table, reduced to what a buffer incident needs.
+
+    One section per dataplane, each a `name max-us avg-us count total-us`
+    table, then one bucket histogram per function. The whole answer is tens of
+    kilobytes of function names and microseconds; what is persisted is the
+    named rows above, the slowest few per dataplane and the packet-buffer
+    latency histogram, all bounded.
+    """
+    summary: dict[str, Any] = {
+        "dataplanes": [],
+        "peak_pbp_buffer_latency_us": None,
+        "peak_pbp_buffer_latency_dataplane": None,
+        "parsed": False,
+    }
+    text = panos_result_text(output)
+    dataplanes: list[dict[str, Any]] = []
+    rows_by_dataplane: list[list[dict[str, Any]]] = []
+    in_histogram = False
+
+    def open_dataplane(name: str | None) -> None:
+        dataplanes.append(
+            {"dataplane": name, "functions": {}, "latency_histogram": []}
+        )
+        rows_by_dataplane.append([])
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        header = _POW_DATAPLANE_HEADER.match(stripped)
+        if header:
+            if len(dataplanes) >= POW_DATAPLANE_LIMIT:
+                break
+            open_dataplane(header.group(1))
+            in_histogram = False
+            continue
+        histogram = _POW_HISTOGRAM_HEADER.match(stripped)
+        if histogram:
+            in_histogram = histogram.group(1) == POW_HISTOGRAM_FUNCTION
+            continue
+        parts = stripped.split()
+        if len(parts) < 5:
+            continue
+        if in_histogram:
+            # `col avg-ticks avg-us count total-us`, one row per bucket.
+            avg_us = _float_value(parts[2])
+            count = _int_value(parts[3])
+            total_us = _int_value(parts[4])
+            if _int_value(parts[0]) is None or None in (avg_us, count, total_us):
+                continue
+            if not dataplanes:
+                open_dataplane(None)
+            buckets = dataplanes[-1]["latency_histogram"]
+            if len(buckets) < POW_HISTOGRAM_LIMIT:
+                buckets.append(
+                    {"avg_us": avg_us, "count": count, "total_us": total_us}
+                )
+            continue
+        if not _POW_FUNCTION_NAME.match(parts[0]):
+            continue
+        max_us = _int_value(parts[1])
+        avg_us = _float_value(parts[2])
+        count = _int_value(parts[3])
+        total_us = _int_value(parts[4])
+        if None in (max_us, avg_us, count, total_us):
+            continue
+        if not dataplanes:
+            # A single-dataplane platform need not print a `DP <name>:`
+            # header. The rows still belong to a dataplane, unnamed.
+            open_dataplane(None)
+        row = {
+            "function": parts[0],
+            "max_us": max_us,
+            "avg_us": avg_us,
+            "count": count,
+            "total_us": total_us,
+        }
+        if parts[0] in POW_NAMED_FUNCTIONS:
+            dataplanes[-1]["functions"][parts[0]] = row
+        if count > 0:
+            rows_by_dataplane[-1].append(row)
+    for dataplane, rows in zip(dataplanes, rows_by_dataplane):
+        dataplane["slowest"] = sorted(rows, key=lambda row: -row["avg_us"])[
+            :POW_SLOWEST_LIMIT
+        ]
+    summary["dataplanes"] = dataplanes
+    latencies = [
+        (dataplane["functions"]["pbp_buf_latency"]["max_us"], dataplane["dataplane"])
+        for dataplane in dataplanes
+        if "pbp_buf_latency" in dataplane["functions"]
+    ]
+    if latencies:
+        peak, name = max(latencies, key=lambda item: item[0])
+        summary["peak_pbp_buffer_latency_us"] = peak
+        summary["peak_pbp_buffer_latency_dataplane"] = name
+    summary["parsed"] = bool(dataplanes)
+    return summary
+
+
 def extract_interface_counter_table(output: str) -> dict[str, dict[str, Any]]:
     """Every hardware port's counters from one `show counter interface all`.
 
@@ -5182,6 +5713,17 @@ class MonitorController:
                     incident_start_payloads = dict(
                         await asyncio.gather(*incident_start_tasks.values())
                     )
+                    # The ARP table is parsed for its header and then dropped
+                    # from what is persisted: the counts are the evidence, the
+                    # customer's address-to-MAC map is not, and on a large
+                    # platform it would be megabytes of it per incident.
+                    arp_table = extract_arp_table_header(
+                        command_result(incident_start_payloads.get("arp_table"))
+                    )
+                    if "arp_table" in incident_start_payloads:
+                        incident_start_payloads["arp_table"] = trim_arp_entries(
+                            incident_start_payloads["arp_table"]
+                        )
                     device = extract_system_info(command_result(system_info))
                     identity_warnings = device_identity_warnings(device)
                     (
@@ -5197,11 +5739,20 @@ class MonitorController:
                     # One of these failing costs a piece of the report and
                     # nothing else: the batch loop below has not started yet
                     # and must not be prevented from starting.
-                    startup_warnings.extend(
-                        optional_command_warning(name)
-                        for name, payload in incident_start_payloads.items()
-                        if not command_succeeded(payload)
-                    )
+                    # A command the firewall refuses as a node it does not
+                    # have costs no evidence that existed: a single-dataplane
+                    # firewall has no session distribution and no chassis. It
+                    # is recorded as what it is, so an operator does not go
+                    # looking for a collection fault on their platform.
+                    for name, payload in incident_start_payloads.items():
+                        if command_succeeded(payload):
+                            continue
+                        if name in PLATFORM_DEPENDENT_COMMAND_EVIDENCE and (
+                            command_node_unsupported(payload)
+                        ):
+                            startup_warnings.append(unsupported_command_note(name))
+                        else:
+                            startup_warnings.append(optional_command_warning(name))
                     startup_pbp_settings = extract_pbp_settings(
                         command_result(pbp_settings_payload)
                     )
@@ -5248,6 +5799,27 @@ class MonitorController:
                         "inflight_monitoring": extract_inflight_monitoring(
                             command_result(
                                 incident_start_payloads.get("inflight_monitoring")
+                            )
+                        ),
+                        "arp_table": arp_table,
+                        "application_statistics": extract_application_statistics(
+                            command_result(
+                                incident_start_payloads.get("application_statistics")
+                            )
+                        ),
+                        "session_distribution": extract_session_distribution(
+                            command_result(
+                                incident_start_payloads.get("session_distribution")
+                            )
+                        ),
+                        "chassis_status": extract_chassis_status(
+                            command_result(
+                                incident_start_payloads.get("chassis_status")
+                            )
+                        ),
+                        "pow_performance": extract_pow_performance(
+                            command_result(
+                                incident_start_payloads.get("pow_performance")
                             )
                         ),
                         "commands": {

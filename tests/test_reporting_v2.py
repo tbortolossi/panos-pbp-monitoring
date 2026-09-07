@@ -275,6 +275,49 @@ class LayeredReportTests(unittest.TestCase):
             self.assertIn("set session inflight_monitoring yes", rendered)
             self.assertIn("On-box auto-collection", rendered)
 
+    def test_both_reports_carry_the_device_section_identically(self):
+        # The layered report reuses the flat report's evidence fragments, so a
+        # chassis card that was down, or an ARP table at its limit, cannot be
+        # visible in one report and missing from the other.
+        records = self._incident_records()
+        records[0]["arp_table"] = {
+            "parsed": True,
+            "entries": 2940,
+            "maximum_entries": 3000,
+            "utilization_percent": 98.0,
+        }
+        records[0]["chassis_status"] = {
+            "parsed": True,
+            "populated_slots": 1,
+            "slots_up": 0,
+            "slots_not_up": [2],
+            "slots": [
+                {
+                    "slot": 2,
+                    "component": "PA-7000-DPC-A",
+                    "card_status": "Down",
+                    "config_status": "Success",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            capture, _ = self._capture(directory, records)
+            flat = generate_html_report(
+                capture, directory / "report.html"
+            ).read_text(encoding="utf-8")
+            layered = generate_html_report_v2(
+                capture, directory / REPORT_V2_FILENAME
+            ).read_text(encoding="utf-8")
+
+        for rendered in (flat, layered):
+            self.assertIn("Device and traffic context", rendered)
+            self.assertIn("stops resolving addresses it does not", rendered)
+            self.assertIn("PA-7000-DPC-A", rendered)
+            # The two findings the section proves are linked to it by name.
+            self.assertIn("ARP table near its limit", rendered)
+            self.assertIn("Line card not up", rendered)
+
     def _both_reports(self, inflight: dict) -> tuple[str, str]:
         records = self._incident_records()
         records[0]["inflight_monitoring"] = inflight

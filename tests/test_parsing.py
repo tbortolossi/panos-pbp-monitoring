@@ -3,6 +3,9 @@ import unittest
 from pbp_monitoring.orchestrator import (
     TRIGGER_REGEX,
     annotate_large_sessions,
+    extract_application_statistics,
+    extract_arp_table_header,
+    extract_chassis_status,
     extract_congestion_log_entries,
     extract_global_counters_raw,
     extract_ha_state,
@@ -10,13 +13,16 @@ from pbp_monitoring.orchestrator import (
     extract_interface_counter_table,
     extract_interface_status,
     extract_large_sessions,
+    extract_pow_performance,
     extract_resource_monitor_history,
+    extract_session_distribution,
     extract_zone_protection,
     extract_live_percentages,
     extract_session_ids,
     large_session_command,
     parse_panos_time,
     summarize_large_sessions,
+    trim_arp_entries,
 )
 
 
@@ -551,3 +557,234 @@ class TsfCorpusEvidenceParsingTests(unittest.TestCase):
         self.assertEqual(entries[0]["alert_threshold_percent"], 50.0)
         self.assertEqual(entries[0]["measure"], "utilization")
         self.assertEqual(entries[0]["time_generated"], "2026/08/30 03:00:34")
+
+
+# The Tier 2 device reads, shaped as the lab firewalls and the anonymized TAC
+# tech support files answer them. Every address and MAC below is
+# documentation-range; the chassis and dataplane names are the hardware's own.
+ARP_TABLE_RESULT = """<result>
+  <dp>dp0</dp>
+  <timeout>1800</timeout>
+  <total>2</total>
+  <entries>
+    <entry>
+      <interface>ethernet1/1</interface>
+      <ip>192.0.2.10</ip>
+      <mac>00:53:00:11:22:33</mac>
+      <port>ethernet1/1</port>
+      <status>  c  </status>
+      <ttl>1670</ttl>
+    </entry>
+    <entry>
+      <interface>ethernet1/2</interface>
+      <ip>198.51.100.7</ip>
+      <mac>00:53:00:44:55:66</mac>
+      <port>ethernet1/2</port>
+      <status>  c  </status>
+      <ttl>90</ttl>
+    </entry>
+  </entries>
+  <max>3000</max>
+</result>"""
+
+APPLICATION_STATISTICS_RESULT = """<result>Vsys: 1
+Number of apps: 4
+App (report-as) sessions   packets    bytes        app changed threats
+--------------- ---------- ---------- ------------ ----------- -------
+undecided       0          0          0            0           2
+ssl             500        239658     247864083    0           124
+active-directory-base 25    9948       6525908      35          0
+web-browsing    120        4501       9930221      12          3
+--------------- ---------- ---------- ------------ ----------- -------
+Total           645        254107     264320212    47          129
+</result>"""
+
+SESSION_DISTRIBUTION_RESULT = """<result>
+DP         Active               Dispatched           Dispatched/sec
+--------------------------------------------------------------------------------
+s1dp0      264453               89997427             1189
+s1dp1      212443               90063088             1190
+</result>"""
+
+CHASSIS_STATUS_RESULT = """<result>
+Slot  Component        Card Status         Config Status Disabled
+1     PA-7000-100G-NPC-A Up                  Success
+2     PA-7000-DPC-A    Down                Success
+3     empty
+
+--------------------------------------------------------------------------------
+Chassis autocommit ready : True
+Inserted slots           : 1 2
+Powered slots            : 1 2
+Config ready slots       : 1 2
+Config done slots        : 1 2
+Traffic enabled slots    : 1
+</result>"""
+
+POW_PERFORMANCE_RESULT = """<result>
+DP s1dp0:
+
+group                                 max-us   avg-us        count     total-us
+flow_fastpath                          14478     74.2      7665961    569011460
+flow_slowpath                            222     82.2       656571     53976194
+
+func                                  max-us   avg-us        count     total-us
+pbp_buf_latency                          670      2.4       161525       393629
+pkt_rx_tx_latency                      43119    125.0      4688049    586312319
+
+pbp_buf_latency (func)
+col    avg-ticks   avg-us        count     total-us
+ 11         3457        2       113315       244850
+ 20      1073522      670            1          670
+
+mi_proxy (func)
+col    avg-ticks   avg-us        count     total-us
+ 13        15446        9         2131        20572
+
+DP s1dp1:
+
+func                                  max-us   avg-us        count     total-us
+pbp_buf_latency                           22      2.8       161221       456326
+</result>"""
+
+
+class ArpTableHeaderTests(unittest.TestCase):
+    """`show arp all` is read for its header and never for its table."""
+
+    def test_the_header_gives_the_occupancy_of_the_table(self):
+        parsed = extract_arp_table_header(ARP_TABLE_RESULT)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["entries"], 2)
+        self.assertEqual(parsed["maximum_entries"], 3000)
+        self.assertEqual(parsed["timeout_seconds"], 1800)
+        self.assertEqual(parsed["utilization_percent"], 0.1)
+        self.assertEqual(parsed["dataplanes"], ["dp0"])
+
+    def test_the_stored_answer_keeps_the_header_and_drops_every_address(self):
+        stored = trim_arp_entries(
+            {
+                "ok": True,
+                "result": ARP_TABLE_RESULT,
+                "raw_response": f"<response status='success'>{ARP_TABLE_RESULT}</response>",
+            }
+        )
+
+        for value in (stored["result"], stored["raw_response"]):
+            self.assertNotIn("192.0.2.10", value)
+            self.assertNotIn("00:53:00:11:22:33", value)
+            self.assertIn("<total>2</total>", value)
+            self.assertIn("removed by the collector", value)
+        # A replayed capture must parse to what the live read parsed, so the
+        # trimming may never cost the header the parser reads.
+        self.assertEqual(
+            extract_arp_table_header(stored["result"]),
+            extract_arp_table_header(ARP_TABLE_RESULT),
+        )
+
+    def test_an_empty_or_rejected_answer_is_not_an_empty_table(self):
+        for output in ("", "<result />"):
+            parsed = extract_arp_table_header(output)
+            self.assertFalse(parsed["parsed"])
+            self.assertIsNone(parsed["entries"])
+
+
+class ApplicationStatisticsTests(unittest.TestCase):
+    def test_the_table_is_ranked_and_bounded(self):
+        parsed = extract_application_statistics(APPLICATION_STATISTICS_RESULT)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["vsys_count"], 1)
+        self.assertEqual(parsed["reported_application_count"], 4)
+        self.assertEqual(parsed["totals"]["bytes"], 264320212)
+        self.assertEqual(parsed["top_by_bytes"][0]["application"], "ssl")
+        self.assertEqual(parsed["top_by_sessions"][0]["application"], "ssl")
+        # An application name wider than its column keeps its counters.
+        names = [entry["application"] for entry in parsed["top_by_bytes"]]
+        self.assertIn("active-directory-base", names)
+        # `Total` is the table's own summary line, never an application.
+        self.assertNotIn("Total", names)
+        # An application that carried nothing is not ranked as if it had.
+        self.assertNotIn("undecided", names)
+
+    def test_an_empty_answer_reports_nothing_collected(self):
+        parsed = extract_application_statistics("<result />")
+
+        self.assertFalse(parsed["parsed"])
+        self.assertEqual(parsed["top_by_bytes"], [])
+
+
+class SessionDistributionTests(unittest.TestCase):
+    def test_the_per_dataplane_counts_and_the_imbalance(self):
+        parsed = extract_session_distribution(SESSION_DISTRIBUTION_RESULT)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["dataplane_count"], 2)
+        self.assertEqual(parsed["busiest"], "s1dp0")
+        self.assertEqual(parsed["busiest_active"], 264453)
+        self.assertEqual(parsed["median_active"], 212443)
+        self.assertEqual(parsed["imbalance_ratio"], 1.24)
+        self.assertEqual(parsed["dataplanes"][1]["dispatched_per_second"], 1190)
+
+    def test_a_single_dataplane_answer_carries_no_distribution(self):
+        # A PA-VM answers the command with an empty result, a PA-440 refuses
+        # the node: neither is a table, and neither may read as one.
+        for output in ("<result />", ""):
+            parsed = extract_session_distribution(output)
+            self.assertFalse(parsed["parsed"])
+            self.assertEqual(parsed["dataplanes"], [])
+
+
+class ChassisStatusTests(unittest.TestCase):
+    def test_the_slot_table_and_the_cards_that_are_not_up(self):
+        parsed = extract_chassis_status(CHASSIS_STATUS_RESULT)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["populated_slots"], 2)
+        self.assertEqual(parsed["slots_up"], 1)
+        self.assertEqual(parsed["slots_not_up"], [2])
+        self.assertEqual(parsed["traffic_enabled_slots"], [1])
+        self.assertEqual(parsed["inserted_slots"], [1, 2])
+        empty = [slot for slot in parsed["slots"] if slot["component"] is None]
+        self.assertEqual([slot["slot"] for slot in empty], [3])
+
+    def test_a_platform_without_a_chassis_parses_to_nothing(self):
+        parsed = extract_chassis_status("<result />")
+
+        self.assertFalse(parsed["parsed"])
+        self.assertEqual(parsed["slots"], [])
+
+
+class PowPerformanceTests(unittest.TestCase):
+    def test_the_named_rows_and_the_buffer_wait_histogram(self):
+        parsed = extract_pow_performance(POW_PERFORMANCE_RESULT)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(
+            [entry["dataplane"] for entry in parsed["dataplanes"]],
+            ["s1dp0", "s1dp1"],
+        )
+        first = parsed["dataplanes"][0]
+        self.assertEqual(first["functions"]["pbp_buf_latency"]["max_us"], 670)
+        self.assertEqual(first["functions"]["flow_slowpath"]["avg_us"], 82.2)
+        # Only the packet-buffer histogram is kept, and its buckets are the
+        # measurement, not the bucket numbers PAN-OS indexes them by.
+        self.assertEqual(
+            first["latency_histogram"],
+            [
+                {"avg_us": 2.0, "count": 113315, "total_us": 244850},
+                {"avg_us": 670.0, "count": 1, "total_us": 670},
+            ],
+        )
+        # A histogram bucket is never read as a processing function.
+        self.assertTrue(
+            all(row["function"].isidentifier() for row in first["slowest"])
+        )
+        self.assertEqual(parsed["peak_pbp_buffer_latency_us"], 670)
+        self.assertEqual(parsed["peak_pbp_buffer_latency_dataplane"], "s1dp0")
+
+    def test_a_release_that_returns_nothing_parses_to_nothing(self):
+        for output in ("", "<result />"):
+            parsed = extract_pow_performance(output)
+            self.assertFalse(parsed["parsed"])
+            self.assertIsNone(parsed["peak_pbp_buffer_latency_us"])

@@ -333,6 +333,114 @@ class SupportBundleTests(unittest.TestCase):
             },
         )
 
+    def test_no_address_or_mac_of_the_device_reads_survives_anonymization(self):
+        """The Tier 2 reads travel, and name no address, MAC or hostname.
+
+        `arp_table` is the read that could carry the customer's whole layer-2
+        map: the collector drops the entries before persisting them, and
+        anything that did slip through - here a raw answer kept verbatim, a
+        hostname in an application row - must be tokenized by the anonymizer
+        before the bundle leaves the site.
+        """
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deployment = _Deployment(Path(temporary_directory))
+            incident = (
+                deployment.data
+                / "targets"
+                / "paris-edge"
+                / "incidents"
+                / "20260830T090000Z"
+                / "incident.jsonl"
+            )
+            incident.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-30T09:00:00+00:00",
+                        "event": "monitor_started",
+                        "arp_table": {
+                            "parsed": True,
+                            "dataplanes": ["dp0"],
+                            "entries": 2,
+                            "maximum_entries": 3000,
+                            "utilization_percent": 0.1,
+                        },
+                        "session_distribution": {
+                            "parsed": True,
+                            "busiest": "s1dp0",
+                            "busiest_active": 264453,
+                        },
+                        "chassis_status": {
+                            "parsed": True,
+                            "slots": [
+                                {
+                                    "slot": 1,
+                                    "component": "PA-7000-100G-NPC-A",
+                                    "card_status": "Up",
+                                }
+                            ],
+                        },
+                        "pow_performance": {
+                            "parsed": True,
+                            "peak_pbp_buffer_latency_us": 670,
+                        },
+                        "commands": {
+                            "arp_table": {
+                                "ok": True,
+                                "result": (
+                                    "<result><dp>dp0</dp><total>2</total>"
+                                    "<entries><entry><ip>192.0.2.10</ip>"
+                                    "<mac>00:53:00:11:22:33</mac></entry>"
+                                    "<entry><ip>2001:db8::7</ip>"
+                                    "<mac>00:53:00:44:55:66</mac></entry>"
+                                    "</entries><max>3000</max></result>"
+                                ),
+                            },
+                            "application_statistics": {
+                                "ok": True,
+                                "result": (
+                                    "<result>Vsys: 1\n"
+                                    "web-browsing 1 1 1 0 0\n</result>"
+                                ),
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            _manifest, archive = deployment.bundle(
+                anonymizer=build_anonymizer(deployment.store, [])
+            )
+            with archive:
+                name = next(
+                    item
+                    for item in archive.namelist()
+                    if item.endswith("incident.jsonl")
+                )
+                exported = archive.read(name).decode("utf-8")
+            started = json.loads(exported)
+
+        for identifier in (
+            "192.0.2.10",
+            "2001:db8::7",
+            "00:53:00:11:22:33",
+            "00:53:00:44:55:66",
+        ):
+            self.assertNotIn(identifier, exported)
+        # An App-ID is not an identifier of the site and must survive, or the
+        # application evidence would leave with nothing readable in it.
+        self.assertIn("web-browsing", exported)
+        # What decides something is not tokenized away with them: the counts,
+        # the dataplane and slot names, and the buffer wait all survive.
+        self.assertEqual(started["arp_table"]["entries"], 2)
+        self.assertEqual(started["arp_table"]["maximum_entries"], 3000)
+        self.assertEqual(started["session_distribution"]["busiest"], "s1dp0")
+        self.assertEqual(
+            started["chassis_status"]["slots"][0]["component"],
+            "PA-7000-100G-NPC-A",
+        )
+        self.assertEqual(started["pow_performance"]["peak_pbp_buffer_latency_us"], 670)
+
     def test_an_unreadable_configuration_still_produces_a_bundle(self):
         class _Broken:
             def get_settings(self):

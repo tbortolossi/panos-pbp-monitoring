@@ -168,7 +168,7 @@ utilization.
 core, runs when a firewall is saved in the admin UI rather than during an
 incident, so a firewall already under pressure spends no API call on it.
 
-Six further read-only commands run once, while the monitor is starting, and
+Eleven further read-only commands run once, while the monitor is starting, and
 describe the firewall's state and its recorded history rather than the current
 second. None of it can be recovered later, because a monitor only starts once
 a trigger has already fired:
@@ -180,6 +180,11 @@ show interface all
 show zone-protection
 show high-availability state
 show system state filter cfg.session.*   # on-box ingress-backlog collection
+show arp all                        # the header only; the entries are dropped
+show running application statistics
+show session distribution statistics     # multi-dataplane platforms
+show chassis status                      # chassis platforms
+debug dataplane pow performance all      # the dataplane's own timing table
 ```
 
 The raw counter reads catch what a delta window cannot: it can be a fraction
@@ -197,6 +202,24 @@ reach. The collector only reads that state; enabling it is a configuration
 change and stays the operator's gesture, described in
 [docs/troubleshooting.md](docs/troubleshooting.md). Each one failing costs a
 piece of the report and nothing else.
+
+The last five describe the device rather than the incident. `show arp all` is
+read for its header alone — how many entries the table holds against how many
+the platform supports — which is what separates an ARP flood the counters see
+from a table filling towards its own limit until resolution itself fails; the
+entries are removed before the answer is persisted, so the customer's
+address-to-MAC map never enters a capture. `show running application
+statistics` says what the deployment carries, cumulative since boot, which is
+the context for judging whether an offender is an anomaly or the site's daily
+business. `show session distribution statistics` and `show chassis status`
+exist only on multi-dataplane and chassis platforms: they say whether the
+dispatcher was giving one dataplane more sessions than its peers, and whether a
+line card had dropped out and concentrated its traffic on the others. `debug
+dataplane pow performance all` carries the dataplane's own timing table, whose
+`pbp_buf_latency` row is the packet-buffer latency measurement PAN-OS releases
+before 12.0 do not expose anywhere else. A platform that does not have one of
+these answers by refusing the node, which the report states as a platform note
+rather than as a failed read.
 
 The last command hunts the elephant session: one transfer large enough and old
 enough to fill a link on its own. It needs its own query because such a session
@@ -457,8 +480,12 @@ distributions.
   ingress evidence is still preserved.
 - Derived per-session throughput is a delta between cumulative byte counters,
   not a native instantaneous PAN-OS rate.
-- `buffer-latency` and `pow performance` remain outside the short batch until
-  their model/release-specific operational XML and load are validated.
+- `buffer-latency` and `pow performance` stay out of the five-second batch and
+  are read once per incident, `pow performance` at monitor start: both are too
+  large, and too stable inside one incident, to be worth a poll.
+- `debug dataplane show ssl-decrypt ssl-stats` and `debug dataplane show dos
+  block-table` are not collected. See [PRD.md](PRD.md) §12 for what is still
+  missing before either can ship.
 
 ## License
 

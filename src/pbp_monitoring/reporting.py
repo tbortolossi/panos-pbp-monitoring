@@ -17,6 +17,7 @@ from typing import Any, Sequence
 
 from . import __version__
 from .diagnosis import (
+    ARP_TABLE_FULL_PERCENT,
     DEFAULT_ACTIVATE_PERCENT,
     DEFAULT_ALERT_PERCENT,
     INFLIGHT_MONITORING_ABSENT,
@@ -39,6 +40,9 @@ from .diagnosis import (
     read_failed_everywhere,
     session_totals_counted,
     congestion_recurrence,
+    application_statistics_summary,
+    arp_table_summary,
+    chassis_status_summary,
     ha_summary,
     history_trend,
     history_windows,
@@ -47,8 +51,10 @@ from .diagnosis import (
     inflight_monitoring_summary,
     latest_event,
     merge_special_fields,
+    pow_performance_summary,
     raw_counter_bracket,
     render_diagnosis,
+    session_distribution_summary,
     special_tag_label,
     start_event,
     zone_protection_summary,
@@ -230,6 +236,13 @@ def _format_number(value: float | int | None) -> str:
     if float(value).is_integer():
         return str(int(value))
     return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _format_percent(value: float | int | None) -> str:
+    """A percentage, or an em dash when the firewall did not return one."""
+    if value is None:
+        return "—"
+    return f"{_format_number(value)}%"
 
 
 # PAN-OS packet buffer protection defaults: alert at 50 %, activate at 80 %.
@@ -3157,6 +3170,272 @@ def _render_zone_protection(events: list[tuple[int, dict[str, Any]]]) -> str:
     )
 
 
+def _render_arp_table(events: list[tuple[int, dict[str, Any]]]) -> str:
+    """How full the ARP table was, which is all of it the collector keeps."""
+    summary = arp_table_summary([record for _, record in events])
+    if not summary.get("collected"):
+        return (
+            '<p class="muted">The ARP table header was not collected in this '
+            "capture, so an ARP flood cannot be told apart from an ARP table "
+            "filling towards its own limit. <code>show arp all</code> is read "
+            "once at monitor start from this version on.</p>"
+        )
+    entries = summary.get("entries")
+    maximum = summary.get("maximum_entries")
+    percent = summary.get("utilization_percent")
+    full = isinstance(percent, (int, float)) and percent >= ARP_TABLE_FULL_PERCENT
+    verdict = (
+        (
+            f"<strong>The ARP table held {_escape(_format_number(entries))} of "
+            f"{_escape(_format_number(maximum))} entries "
+            f"({_escape(_format_percent(percent))})</strong>: at that "
+            "occupancy the firewall stops resolving addresses it does not "
+            "already know, and packets wait on buffers for a resolution that "
+            "never completes."
+        )
+        if full
+        else (
+            f"<strong>The ARP table held {_escape(_format_number(entries))} of "
+            f"{_escape(_format_number(maximum))} entries"
+            + (
+                f" ({_escape(_format_percent(percent))})"
+                if percent is not None
+                else ""
+            )
+            + "</strong>, far from the platform limit, so table exhaustion is "
+            "not what filled the buffers."
+        )
+    )
+    rows = "".join(
+        f"<tr><td>{_escape(label)}</td>"
+        f'<td class="number">{_escape(value)}</td></tr>'
+        for label, value in (
+            ("Entries in the table", _format_number(entries)),
+            ("Entries the platform supports", _format_number(maximum)),
+            ("Occupancy", _format_percent(percent)),
+            ("Default entry timeout", f"{_format_number(summary.get('timeout_seconds'))} s"),
+            ("Dataplanes reporting", _escape(", ".join(summary.get("dataplanes") or [])) or "—"),
+        )
+    )
+    return (
+        f'<p class="verdict verdict-{"bad" if full else "ok"}">{verdict}</p>'
+        '<div class="table-wrap"><table><thead><tr><th>ARP table</th>'
+        f"<th>Value</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        '<p class="muted">Only the header is collected. The address-to-MAC '
+        "entries stay on the firewall: the counts are the evidence, and a full "
+        "table would otherwise write the customer's whole layer-2 map into "
+        "every capture. Read them on the device with "
+        "<code>show arp all</code>.</p>"
+    )
+
+
+def _render_application_statistics(events: list[tuple[int, dict[str, Any]]]) -> str:
+    """What this firewall carries, by application, cumulative since boot."""
+    summary = application_statistics_summary([record for _, record in events])
+    if not summary.get("collected"):
+        return (
+            '<p class="muted">The application statistics were not collected in '
+            "this capture. <code>show running application statistics</code> is "
+            "read once at monitor start from this version on.</p>"
+        )
+    totals = summary.get("totals") or {}
+    total_bytes = totals.get("bytes")
+    rows = "".join(
+        "<tr>"
+        f'<td><code>{_escape(entry.get("application"))}</code></td>'
+        f'<td class="number">{_escape(_format_number(entry.get("sessions")))}</td>'
+        f'<td class="number">{_escape(_format_number(entry.get("bytes")))}</td>'
+        f'<td class="number">'
+        + _escape(
+            _format_percent(
+                round(entry["bytes"] * 100.0 / total_bytes, 1)
+                if isinstance(entry.get("bytes"), int) and total_bytes
+                else None
+            )
+        )
+        + "</td>"
+        f'<td class="number">{_escape(_format_number(entry.get("threats")))}</td>'
+        "</tr>"
+        for entry in (summary.get("top_by_bytes") or [])
+    )
+    return (
+        '<p class="muted">Cumulative since the firewall booted, not for this '
+        "incident: this says what the deployment is built around, which is the "
+        "context for deciding whether an offender above is an anomaly or the "
+        "site's daily business. "
+        f"{_escape(_format_number(summary.get('reported_application_count') or summary.get('application_count')))}"
+        " applications were seen in total.</p>"
+        '<div class="table-wrap"><table><thead><tr><th>Application</th>'
+        "<th>Sessions</th><th>Bytes</th><th>Share of bytes</th><th>Threats</th>"
+        f"</tr></thead><tbody>{rows}</tbody></table></div>"
+    )
+
+
+def _render_session_distribution(events: list[tuple[int, dict[str, Any]]]) -> str:
+    """Per-dataplane active and dispatched sessions, on a platform that has them."""
+    summary = session_distribution_summary([record for _, record in events])
+    if not summary.get("collected"):
+        return (
+            '<p class="muted">No per-dataplane session distribution: this '
+            "firewall has a single dataplane, or the PAN-OS release refused "
+            "the command. Nothing to spread unevenly, and nothing lost.</p>"
+        )
+    ratio = summary.get("imbalance_ratio")
+    uneven = isinstance(ratio, (int, float)) and ratio >= 2.0
+    verdict = (
+        f"<strong>The dispatcher held {_escape(_format_number(summary.get('busiest_active')))} "
+        f"active sessions on <code>{_escape(summary.get('busiest'))}</code>, "
+        f"{_escape(_format_number(ratio))}x the median of its peers.</strong> "
+        "One dataplane was given more work than the others, which is a hashing "
+        "or a policy question rather than a capacity one."
+        if uneven
+        else "<strong>Sessions were spread evenly across the dataplanes.</strong> "
+        "A dataplane that saturated anyway did so on what its sessions cost, "
+        "not on how many it was given."
+    )
+    rows = "".join(
+        "<tr>"
+        f'<td><code>{_escape(row.get("dataplane"))}</code></td>'
+        f'<td class="number">{_escape(_format_number(row.get("active")))}</td>'
+        f'<td class="number">{_escape(_format_number(row.get("dispatched")))}</td>'
+        f'<td class="number">{_escape(_format_number(row.get("dispatched_per_second")))}</td>'
+        "</tr>"
+        for row in (summary.get("dataplanes") or [])
+    )
+    return (
+        f'<p class="verdict verdict-{"bad" if uneven else "ok"}">{verdict}</p>'
+        '<div class="table-wrap"><table><thead><tr><th>Dataplane</th>'
+        "<th>Active sessions</th><th>Dispatched</th><th>Dispatched/s</th>"
+        f"</tr></thead><tbody>{rows}</tbody></table></div>"
+    )
+
+
+def _render_chassis_status(events: list[tuple[int, dict[str, Any]]]) -> str:
+    """Which chassis slots held a card, and which of those cards were up."""
+    summary = chassis_status_summary([record for _, record in events])
+    if not summary.get("collected"):
+        return (
+            '<p class="muted">No chassis status: this platform is not a '
+            "chassis, so there are no slots to describe.</p>"
+        )
+    down = summary.get("slots_not_up") or []
+    verdict = (
+        "<strong>"
+        + _escape(
+            ", ".join(f"slot {slot}" for slot in down[:8])
+        )
+        + " held a card that was not up.</strong> The traffic those cards "
+        "carried is redistributed over the ones that remain."
+        if down
+        else f"<strong>All {_escape(_format_number(summary.get('populated_slots')))} "
+        "populated slots were up.</strong>"
+    )
+    rows = "".join(
+        "<tr>"
+        f'<td class="number">{_escape(slot.get("slot"))}</td>'
+        f'<td>{_escape(slot.get("component") or "empty")}</td>'
+        f'<td>{_escape(slot.get("card_status") or "—")}</td>'
+        f'<td>{_escape(slot.get("config_status") or "—")}</td>'
+        "</tr>"
+        for slot in (summary.get("slots") or [])
+    )
+    traffic = summary.get("traffic_enabled_slots") or []
+    return (
+        f'<p class="verdict verdict-{"bad" if down else "ok"}">{verdict}</p>'
+        '<div class="table-wrap"><table><thead><tr><th>Slot</th>'
+        "<th>Component</th><th>Card status</th><th>Config status</th>"
+        f"</tr></thead><tbody>{rows}</tbody></table></div>"
+        + (
+            '<p class="muted">Slots carrying traffic: '
+            + _escape(", ".join(str(slot) for slot in traffic))
+            + ".</p>"
+            if traffic
+            else ""
+        )
+    )
+
+
+def _render_pow_performance(events: list[tuple[int, dict[str, Any]]]) -> str:
+    """The dataplane's own timing table, reduced to the buffer wait."""
+    summary = pow_performance_summary([record for _, record in events])
+    if not summary.get("collected"):
+        return (
+            '<p class="muted">The dataplane processing-latency table was not '
+            "collected in this capture. <code>debug dataplane pow performance "
+            "all</code> is read once at monitor start from this version on; on "
+            "a PAN-OS release older than 12.0 it is the only place the "
+            "packet-buffer latency exists at all.</p>"
+        )
+    peak = summary.get("peak_pbp_buffer_latency_us")
+    dataplane = summary.get("peak_pbp_buffer_latency_dataplane")
+    rows = "".join(
+        "<tr>"
+        f'<td><code>{_escape(entry.get("dataplane") or "dp0")}</code></td>'
+        f'<td><code>{_escape(name)}</code></td>'
+        f'<td class="number">{_escape(_format_number((entry.get("functions") or {}).get(name, {}).get("max_us")))}</td>'
+        f'<td class="number">{_escape(_format_number((entry.get("functions") or {}).get(name, {}).get("avg_us")))}</td>'
+        f'<td class="number">{_escape(_format_number((entry.get("functions") or {}).get(name, {}).get("count")))}</td>'
+        "</tr>"
+        for entry in (summary.get("dataplanes") or [])
+        for name in sorted(entry.get("functions") or {})
+    )
+    histogram_rows = "".join(
+        "<tr>"
+        f'<td><code>{_escape(entry.get("dataplane") or "dp0")}</code></td>'
+        f'<td class="number">{_escape(_format_number(bucket.get("avg_us")))}</td>'
+        f'<td class="number">{_escape(_format_number(bucket.get("count")))}</td>'
+        "</tr>"
+        for entry in (summary.get("dataplanes") or [])
+        for bucket in (entry.get("latency_histogram") or [])
+    )
+    verdict = (
+        f"<strong>The longest a packet waited on a buffer was "
+        f"{_escape(_format_number(peak))} µs"
+        + (f" on <code>{_escape(dataplane)}</code>" if dataplane else "")
+        + ".</strong> This is the measurement PBP acts on in latency mode, "
+        "read from the dataplane's own counters."
+        if peak is not None
+        else "<strong>The table was read but carries no packet-buffer latency "
+        "row on this platform.</strong>"
+    )
+    return (
+        f'<p class="verdict verdict-none">{verdict}</p>'
+        '<div class="table-wrap"><table><thead><tr><th>Dataplane</th>'
+        "<th>Function</th><th>Max µs</th><th>Avg µs</th><th>Samples</th>"
+        f"</tr></thead><tbody>{rows}</tbody></table></div>"
+        + (
+            "<h4>Buffer wait distribution</h4>"
+            '<div class="table-wrap"><table><thead><tr><th>Dataplane</th>'
+            "<th>Bucket (µs)</th><th>Packets</th></tr></thead>"
+            f"<tbody>{histogram_rows}</tbody></table></div>"
+            if histogram_rows
+            else ""
+        )
+    )
+
+
+def _render_device_context(events: list[tuple[int, dict[str, Any]]]) -> str:
+    """The once-per-incident device reads, in one section.
+
+    Each of these describes the firewall rather than the second the trigger
+    landed on: how full its ARP table is, how its dataplanes were loaded, what
+    its chassis holds and what it carries. They frame the findings above; none
+    of them attributes an incident on its own.
+    """
+    return (
+        "<h3>ARP table</h3>"
+        + _render_arp_table(events)
+        + "<h3>Session distribution</h3>"
+        + _render_session_distribution(events)
+        + "<h3>Chassis</h3>"
+        + _render_chassis_status(events)
+        + "<h3>Dataplane processing latency</h3>"
+        + _render_pow_performance(events)
+        + "<h3>Applications carried</h3>"
+        + _render_application_statistics(events)
+    )
+
+
 def _render_ha_and_interfaces(
     events: list[tuple[int, dict[str, Any]]],
     cycles: list[tuple[int, dict[str, Any]]],
@@ -3778,6 +4057,7 @@ _EVIDENCE_NAV_ITEMS: tuple[tuple[str, str], ...] = (
     _THREAT_LOGS_NAV_ITEM,
     ("ingress-title", "Backlog"),
     ("zones-title", "Zones & ports"),
+    ("device-title", "Device"),
     ("cpu-tracking-title", "CPU"),
     ("large-sessions-title", "Largest sessions"),
     ("drop-counters-title", "Drops"),
@@ -3878,6 +4158,8 @@ def _evidence_sections(parts: dict[str, Any]) -> str:
     history_pill = parts["history_pill"]
     zones_html = parts["zones_html"]
     zones_pill = parts["zones_pill"]
+    device_html = parts["device_html"]
+    device_pill = parts["device_pill"]
     attribution_html = parts["attribution_html"]
     attribution_pill = parts["attribution_pill"]
     pbp_threat_logs_html = parts["pbp_threat_logs_html"]
@@ -3959,6 +4241,19 @@ def _evidence_sections(parts: dict[str, Any]) -> str:
                 "reads that make a session-less flood - and a firewall that "
                 "carries no traffic - readable at all.",
                 pill=zones_pill,
+                open=False,
+            ),
+            _render_section(
+                "device-title",
+                "Device and traffic context",
+                device_html,
+                intro="What this firewall is and what it normally carries, read "
+                "once at monitor start: how full its ARP table was, how its "
+                "dataplanes were loaded, which chassis slots held a card, how "
+                "long a packet waited on a buffer, and the applications the "
+                "deployment is built around. Context for the findings above; "
+                "none of it attributes an incident on its own.",
+                pill=device_pill,
                 open=False,
             ),
             _render_section(
@@ -4107,6 +4402,42 @@ def _build_report_parts(
     ) + _render_inflight_monitoring(events)
     buffer_latency_html = _render_buffer_latency(cycles)
     pbp_threat_logs_html = _render_pbp_threat_logs(events)
+    # The once-per-incident device reads, in one section: what the firewall is
+    # and what it normally carries, which frames every finding above.
+    device_html = _render_device_context(events)
+    device_records = [record for _, record in events]
+    device_arp = arp_table_summary(device_records)
+    device_chassis = chassis_status_summary(device_records)
+    device_distribution = session_distribution_summary(device_records)
+    device_arp_percent = device_arp.get("utilization_percent")
+    device_notes: list[str] = []
+    if device_chassis.get("slots_not_up"):
+        device_notes.append(
+            f"{len(device_chassis['slots_not_up'])} card(s) not up"
+        )
+    if (
+        isinstance(device_arp_percent, (int, float))
+        and device_arp_percent >= ARP_TABLE_FULL_PERCENT
+    ):
+        device_notes.append(f"ARP table {_format_percent(device_arp_percent)} full")
+    if not device_notes:
+        collected = [
+            name
+            for name, summary in (
+                ("ARP", device_arp),
+                ("distribution", device_distribution),
+                ("chassis", device_chassis),
+                ("applications", application_statistics_summary(device_records)),
+                ("dataplane latency", pow_performance_summary(device_records)),
+            )
+            if summary.get("collected")
+        ]
+        device_notes.append(
+            f"{len(collected)} of 5 reads · context only"
+            if collected
+            else "not collected"
+        )
+    device_pill = " · ".join(device_notes)
     cpu_needs_attention = any(
         marker in cpu_charts_html for marker in ("verdict-isolated", "verdict-mixed")
     )
@@ -4637,6 +4968,8 @@ def _build_report_parts(
         "device_model": device_model,
         "device_name": device_name,
         "diagnosis": diagnosis,
+        "device_html": device_html,
+        "device_pill": device_pill,
         "diagnostic_pools_html": diagnostic_pools_html,
         "drop_counters_html": drop_counters_html,
         "drops_pill": drops_pill,
