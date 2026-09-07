@@ -173,6 +173,92 @@ than create a concurrent one.
      enable — or `not_collected` when the read itself failed and the question
      stays open. The read is optional evidence and never a reason to stop
      monitoring.
+   - `show arp all`, for its header only: the number of ARP entries the table
+     holds, the number the platform supports, and the default entry timeout.
+     An ARP flood and an ARP table filling towards its own limit are the same
+     incident class seen from two sides, and only the header separates them: a
+     table at its limit stops resolving addresses that are not already in it,
+     and the dataplane holds packets waiting for a resolution that never
+     completes. **The entries are removed before the answer is persisted.** The
+     collector needs the counts, not the customer's address-to-MAC map, and a
+     full table on a large platform would otherwise write megabytes of
+     addresses into every capture; the stored answer carries the header and a
+     marker saying the collector removed the rest. Validated read-only on the
+     lab PA-440 (PAN-OS 12.2.2) and PA-VM (11.2.3-h3) on 2026-09-07.
+   - `show running application statistics`: the applications this firewall
+     carries, with their sessions, packets, bytes and threat counts. The
+     counters are cumulative since boot, so they never attribute an incident on
+     their own; they say what the deployment is built around, which is the
+     context for judging whether a named offender is an anomaly or the site's
+     daily business. Only the ranked heads of the table are kept, by bytes and
+     by sessions. Validated read-only on both lab platforms on 2026-09-07.
+   - `show session distribution statistics`, on a multi-dataplane platform: the
+     active and dispatched session counts per dataplane. The resource monitor
+     already shows one dataplane saturated beside idle peers; this says whether
+     the dispatcher was also giving it more sessions, which separates a hashing
+     imbalance from one heavy flow group. Accepted on the lab PA-VM
+     (11.2.3-h3), which returns an empty result as a single-dataplane platform,
+     and refused as an unknown node by the lab PA-440 (12.2.2); its content
+     shape is the one the anonymized PA-5250 and PA-7080 tech support files of
+     the TAC corpus carry.
+   - `show chassis status`, on a chassis: which slots hold a card, which cards
+     are up, and which slots carry traffic. A line card that dropped out
+     concentrates its traffic on the cards that remain, which is a capacity
+     explanation the buffer levels alone never give. Refused as an unknown node
+     by both lab platforms, neither being a chassis; its content shape comes
+     from the anonymized PA-7080 tech support file.
+   - `debug dataplane pow performance all`: the dataplane's own timing table,
+     one row per processing function per dataplane, plus a bucket histogram per
+     function. Its `pbp_buf_latency` row is the packet-buffer latency
+     measurement PAN-OS releases before 12.0 do not expose through `show
+     session packet-buffer-protection`, so on those releases it is the only
+     place that measurement exists at all. The answer is tens of kilobytes;
+     what is persisted is bounded — the named rows, the slowest few functions
+     per dataplane and the packet-buffer latency histogram. Accepted read-only
+     on both lab platforms on 2026-09-07.
+
+   The last three are declared platform-dependent: a firewall that refuses one
+   as a node it does not have costs no evidence that existed there, and the
+   report states it as a platform note rather than as a failed read. A read
+   that failed for any other reason, or that never answered, is stated as
+   what it is; the three are never confused.
+
+   These five describe the firewall rather than the incident, and on a chassis
+   they can take ten seconds each. **They are therefore never on the monitor's
+   critical path**: they start once the first batch has been collected, run in
+   the background, and are journalled in their own `context_collected` record
+   when they answer. The batch loop never waits for them, so the five-second
+   cadence that catches the first seconds of an incident is untouched. At
+   monitor stop the collector gives them a bounded moment and then records
+   what did not answer as not collected. Both records are read the same way by
+   the diagnosis, so a capture that carries a read in either place is
+   diagnosed identically.
+
+   Every once-per-incident read is bounded to three in flight. Monitor start
+   would otherwise open eleven state reads and a whole batch at once, and on a
+   management plane already under pressure the first
+   `show session packet-buffer-protection` snapshot - the one measurement
+   nothing can recover - would queue behind them.
+
+   What each read persists is what a reader consumes, and no more; the raw
+   answer travels beside it for everything else. `arp_table` carries the
+   occupancy per dataplane and the fullest of them (`entries`,
+   `maximum_entries`, `timeout_seconds`, `utilization_percent`, `dataplane`);
+   `application_statistics` the ten applications with the most bytes, the
+   table totals and the application count PAN-OS reported;
+   `session_distribution` the per-dataplane active and dispatched counts, the
+   busiest dataplane, the median of its peers and their ratio;
+   `chassis_status` the slot table and the traffic-enabled slot list;
+   `pow_performance` four named timing rows per dataplane, the packet-buffer
+   latency histogram and the peak wait. Each carries `parsed`.
+
+   `show arp all` is read under two bounds of its own. The answer is streamed
+   and each `<entry>` is dropped as it arrives, so the transfer may reach
+   64 MB - a 128000-entry table on a chassis is around 24 MB, well past the
+   8 MB ceiling every other command is read with - while what is retained
+   stays under that ceiling and holds no address at all. Reading it whole
+   would refuse the answer from roughly a third of the table onwards, which is
+   to say exactly when the ARP evidence matters.
 5. At incident startup, the monitor primes the global-counter delta baseline
    separately. At the start of each batch, it starts `show clock`, then collects
    the following commands in parallel every five seconds without waiting for
@@ -467,9 +553,15 @@ the collector is not running, and to a host-only archive when the image is
 absent.
 
 Every support export, bundle and run archive alike, is also offered in an
-anonymized form. Addresses, MAC addresses, serial numbers and firewall names are
-replaced by tokens in the contents, the archive paths and the manifest, which
-records which form it describes. Tokens derive from a salt generated once per
+anonymized form. Addresses, MAC addresses, serial numbers, firewall names and
+application names that are not PAN-OS's own are replaced by tokens in the
+contents, the archive paths and the manifest, which records which form it
+describes. The application rule fails closed: a name is kept readable only when
+it belongs to a compact list of predefined App-IDs, because a custom
+application is named by the person who created it and `acme-payroll-erp`
+identifies a site as surely as its management address. It is applied to the
+parsed evidence and to the raw table alike, with one token for one name, so
+the two still describe the same traffic. Tokens derive from a salt generated once per
 installation and held in the configuration volume, so a value keeps one token
 within an export and across successive exports, and the recipient cannot invert
 it. Loopback and unspecified addresses, and a name equal to the platform model,
@@ -881,24 +973,33 @@ key must be backed up and restored together.
 - Prometheus export and Grafana correlation.
 - Slack or email notification with an incident summary.
 - PAN-OS-family-specific XML parsers after collecting real samples.
-- Feature-probed extended diagnostic profile: occasional `pow performance`. It
-  remains disabled until the operational XML is validated with `debug cli on`
-  on the target release. The PBP `buffer-latency` and the initial and final
-  PBP counters this line also listed are collected since v0.35.0 and v0.40.0.
-- Class-conditional evidence, deferred because each read is only meaningful on
-  a platform or an incident class the lab firewall cannot exercise, and none
-  can be validated here: `show session distribution statistics` and
-  `show chassis status` on multi-dataplane chassis, the `show arp all` header
-  to separate a storm from ARP-table exhaustion, `show running application
-  statistics` for application attribution, the SSL-decrypt session count and
-  `debug dataplane show ssl-decrypt ssl-stats` for proxy classes, and
-  `debug dataplane pow performance all` for the pre-12.x `pbp_buf_latency`
-  histogram. Each needs its own gating rule so it is not run on a platform
-  that would refuse it, and that rule cannot be written from documentation
-  alone.
+- Class-conditional evidence. Five of these reads ship since v0.44.0, once per
+  incident at monitor start: the `show arp all` header, `show running
+  application statistics`, `show session distribution statistics`, `show
+  chassis status` and `debug dataplane pow performance all`, the last carrying
+  the `pbp_buf_latency` row and its bucket histogram, which is the
+  packet-buffer latency measurement on a release older than 12.0. What was
+  deferred here was never the usefulness of these reads but the gating rule:
+  a second lab platform (PA-VM, PAN-OS 11.2.3-h3) beside the PA-440 (12.2.2)
+  established that PAN-OS refuses a command it does not have by name, which the
+  `command_node_unsupported` mechanism, whose platform-note treatment
+  arrived in v0.42.0, already turns into a
+  platform note. The gate is therefore keyed on the firewall's own answer and
+  not on the model. The two chassis-only reads were validated for content
+  against the anonymized PA-5250 and PA-7080 tech support files of the TAC
+  corpus rather than against a lab chassis, which the lab does not have.
+- The SSL-decrypt statistics of a proxy-heavy deployment, from `debug dataplane
+  show ssl-decrypt ssl-stats`. The request form answers on both lab platforms,
+  but this read stays out of v0.44.0: the decrypt classes it would serve are
+  not exercised by either lab firewall, and no capture in the corpus ties a
+  buffer incident to those counters. It ships when a capture makes the reading
+  of them decidable.
 - Positive proof of a blocked source from the DoS block table. `show
   dos-block-table` has no operational API form on PAN-OS 12.2.2 — only
-  `debug dataplane show dos block-table`, which could not be validated
-  non-empty on the lab firewall — so it stays deferred rather than shipped
-  from documented XML. The collateral of a block is meanwhile measured from
-  `flow_dos_drop_ip_blocked` and the PBP threat logs, which are validated.
+  `debug dataplane show dos block-table`, which is accepted on both lab
+  platforms and returns an empty table on each, since no source is blocked
+  there. The request form is therefore confirmed on two releases and the shape
+  of a *non-empty* table is still unvalidated, so the maintainer's decision
+  stands: do not ship a parser written from documentation. The collateral of a
+  block is meanwhile measured from `flow_dos_drop_ip_blocked` and the PBP
+  threat logs, which are validated.

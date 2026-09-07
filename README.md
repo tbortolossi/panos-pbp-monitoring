@@ -168,10 +168,10 @@ utilization.
 core, runs when a firewall is saved in the admin UI rather than during an
 incident, so a firewall already under pressure spends no API call on it.
 
-Six further read-only commands run once, while the monitor is starting, and
-describe the firewall's state and its recorded history rather than the current
-second. None of it can be recovered later, because a monitor only starts once
-a trigger has already fired:
+Eleven further read-only commands run once per incident and describe the
+firewall's state and its recorded history rather than the current second. None
+of it can be recovered later, because a monitor only starts once a trigger has
+already fired:
 
 ```text
 show counter global                 # again at stop: the pair brackets the run
@@ -180,6 +180,13 @@ show interface all
 show zone-protection
 show high-availability state
 show system state filter cfg.session.*   # on-box ingress-backlog collection
+
+# and, in the background once the first batch is collected:
+show arp all                        # the header only; the entries are dropped
+show running application statistics
+show session distribution statistics     # multi-dataplane platforms
+show chassis status                      # chassis platforms
+debug dataplane pow performance all      # the dataplane's own timing table
 ```
 
 The raw counter reads catch what a delta window cannot: it can be a fraction
@@ -197,6 +204,31 @@ reach. The collector only reads that state; enabling it is a configuration
 change and stays the operator's gesture, described in
 [docs/troubleshooting.md](docs/troubleshooting.md). Each one failing costs a
 piece of the report and nothing else.
+
+The last five describe the device rather than the incident, and on a chassis
+each can take ten seconds, so they never sit on the monitor's critical path:
+they start once the first batch is collected, run in the background and land in
+their own record when they answer. Every once-per-incident read is bounded to
+three at a time, so the first packet-buffer snapshot never queues behind them.
+
+`show arp all` is read for its header alone — how many entries the table holds
+against how many the platform supports — which is what separates an ARP flood
+the counters see from a table filling towards its own limit until resolution
+itself fails. The answer is streamed and each entry is dropped as it arrives,
+so the customer's address-to-MAC map never enters a capture and never has to
+fit in memory: a full table on a chassis is around 24 MB, three times what the
+collector will read of any other command. `show running application
+statistics` says what the deployment carries, cumulative since boot, which is
+the context for judging whether an offender is an anomaly or the site's daily
+business. `show session distribution statistics` and `show chassis status`
+exist only on multi-dataplane and chassis platforms: they say whether the
+dispatcher was giving one dataplane more sessions than its peers, and whether a
+line card had dropped out and concentrated its traffic on the others. `debug
+dataplane pow performance all` carries the dataplane's own timing table, whose
+`pbp_buf_latency` row is the packet-buffer latency measurement PAN-OS releases
+before 12.0 do not expose anywhere else. A platform that does not have one of
+these answers by refusing the node, which the report states as a platform note
+rather than as a failed read.
 
 The last command hunts the elephant session: one transfer large enough and old
 enough to fill a link on its own. It needs its own query because such a session
@@ -457,8 +489,13 @@ distributions.
   ingress evidence is still preserved.
 - Derived per-session throughput is a delta between cumulative byte counters,
   not a native instantaneous PAN-OS rate.
-- `buffer-latency` and `pow performance` remain outside the short batch until
-  their model/release-specific operational XML and load are validated.
+- `pow performance` stays out of the five-second batch and is read once per
+  incident, in the background: it is too large, and too stable inside one
+  incident, to be worth a poll. The PBP `buffer-latency` reading is collected
+  every batch, with the rest of the batch.
+- `debug dataplane show ssl-decrypt ssl-stats` and `debug dataplane show dos
+  block-table` are not collected. See [PRD.md](PRD.md) §12 for what is still
+  missing before either can ship.
 
 ## License
 

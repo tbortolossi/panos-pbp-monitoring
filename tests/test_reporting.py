@@ -2172,6 +2172,235 @@ class IncidentStateSectionTests(unittest.TestCase):
         )
 
 
+class DeviceContextSectionTests(unittest.TestCase):
+    """The device section carries the Tier 2 reads, or says why it cannot."""
+
+    # The same capture builder as the other once-per-incident reads, without
+    # inheriting that class's tests and running them a second time. The device
+    # reads answer on their own record, so they are passed as an event.
+    _render_records = IncidentStateSectionTests._render
+
+    def _render(self, context: dict, commands: dict | None = None) -> str:
+        record = {
+            "run_id": "state-run",
+            "event": "context_collected",
+            **context,
+            "commands": commands or {},
+        }
+        return self._render_records({}, [record])
+
+    def test_the_arp_header_is_shown_without_a_single_address(self):
+        html = self._render(
+            {
+                "arp_table": {
+                    "parsed": True,
+                    "dataplane": "dp0",
+                    "dataplanes": [
+                        {
+                            "dataplane": "dp0",
+                            "entries": 38,
+                            "maximum_entries": 3000,
+                            "utilization_percent": 1.3,
+                            "timeout_seconds": 1800,
+                        }
+                    ],
+                    "entries": 38,
+                    "maximum_entries": 3000,
+                    "timeout_seconds": 1800,
+                    "utilization_percent": 1.3,
+                }
+            }
+        )
+
+        self.assertIn("Device and traffic context", html)
+        self.assertIn("ARP table", html)
+        self.assertIn("38 of 3000 entries (1.3%)", html)
+        self.assertIn("far from the platform limit", html)
+        self.assertIn("dropped as the answer streams", html)
+
+    def test_a_nearly_full_arp_table_reads_as_a_finding_in_the_section(self):
+        html = self._render(
+            {
+                "arp_table": {
+                    "parsed": True,
+                    "entries": 2940,
+                    "maximum_entries": 3000,
+                    "utilization_percent": 98.0,
+                    "dataplanes": [],
+                }
+            }
+        )
+
+        self.assertIn("verdict-bad", html)
+        self.assertIn("stops resolving addresses it does not", html)
+
+    def test_a_table_without_a_platform_limit_leaves_the_question_open(self):
+        html = self._render(
+            {
+                "arp_table": {
+                    "parsed": True,
+                    "entries": 2940,
+                    "maximum_entries": None,
+                    "utilization_percent": None,
+                    "dataplanes": [],
+                }
+            }
+        )
+
+        self.assertIn("did not return the number of entries", html)
+        self.assertNotIn("far from the platform limit", html)
+
+    def test_a_table_close_to_its_limit_is_not_called_far_from_it(self):
+        html = self._render(
+            {
+                "arp_table": {
+                    "parsed": True,
+                    "entries": 2550,
+                    "maximum_entries": 3000,
+                    "utilization_percent": 85.0,
+                    "dataplanes": [],
+                }
+            }
+        )
+
+        self.assertIn("close to the platform limit", html)
+        self.assertNotIn("far from the platform limit", html)
+
+    def test_the_applications_are_labelled_as_cumulative_since_boot(self):
+        html = self._render(
+            {
+                "application_statistics": {
+                    "parsed": True,
+                    "reported_application_count": 2,
+                    "totals": {"bytes": 1000, "sessions": 10},
+                    "top_by_bytes": [
+                        {
+                            "application": "ssl",
+                            "sessions": 8,
+                            "bytes": 900,
+                            "threats": 3,
+                        }
+                    ],
+                }
+            }
+        )
+
+        self.assertIn("Applications carried", html)
+        self.assertIn("<code>ssl</code>", html)
+        self.assertIn("Cumulative since the firewall booted", html)
+
+    def test_the_session_distribution_and_the_chassis_are_tabulated(self):
+        html = self._render(
+            {
+                "session_distribution": {
+                    "parsed": True,
+                    "dataplane_count": 2,
+                    "busiest": "s1dp0",
+                    "busiest_active": 264453,
+                    "median_active": 12443,
+                    "imbalance_ratio": 21.25,
+                    "dataplanes": [
+                        {
+                            "dataplane": "s1dp0",
+                            "active": 264453,
+                            "dispatched": 89997427,
+                            "dispatched_per_second": 1189,
+                        },
+                        {
+                            "dataplane": "s1dp1",
+                            "active": 12443,
+                            "dispatched": 90063088,
+                            "dispatched_per_second": 1190,
+                        },
+                    ],
+                },
+                "chassis_status": {
+                    "parsed": True,
+                    "traffic_enabled_slots": [1],
+                    "slots": [
+                        {
+                            "slot": 1,
+                            "component": "PA-7000-100G-NPC-A",
+                            "card_status": "Up",
+                            "config_status": "Success",
+                        },
+                        {
+                            "slot": 2,
+                            "component": "PA-7000-DPC-A",
+                            "card_status": "Powered Off",
+                            "config_status": "Success",
+                        },
+                    ],
+                },
+            }
+        )
+
+        self.assertIn("<code>s1dp0</code>", html)
+        self.assertIn("21.25x the median of its peers", html)
+        self.assertIn("PA-7000-DPC-A", html)
+        self.assertIn("slot 2 holds a traffic card", html)
+
+    def test_the_dataplane_latency_table_states_the_longest_buffer_wait(self):
+        html = self._render(
+            {
+                "pow_performance": {
+                    "parsed": True,
+                    "peak_pbp_buffer_latency_us": 670,
+                    "peak_pbp_buffer_latency_dataplane": "s1dp0",
+                    "dataplanes": [
+                        {
+                            "dataplane": "s1dp0",
+                            "functions": {
+                                "pbp_buf_latency": {
+                                    "max_us": 670,
+                                    "avg_us": 2.4,
+                                    "count": 161525,
+                                }
+                            },
+                            "latency_histogram": [{"avg_us": 2.0, "count": 113315}],
+                        }
+                    ],
+                }
+            }
+        )
+
+        self.assertIn("Dataplane processing latency", html)
+        self.assertIn("<code>pbp_buf_latency</code>", html)
+        self.assertIn("670 µs longest buffer wait", html)
+        self.assertIn("Buffer wait distribution", html)
+
+    def test_a_platform_that_does_not_have_a_read_is_told_from_one_that_failed(self):
+        """A refused node is a platform fact; a timeout is a missing read."""
+        html = self._render(
+            {},
+            {
+                "chassis_status": {
+                    "ok": False,
+                    "error": "TimeoutError: the read timed out",
+                    "result": "",
+                },
+                "session_distribution": {
+                    "ok": False,
+                    "error": (
+                        "PanOSAPIError: show -> session -> distribution  is "
+                        "unexpected"
+                    ),
+                    "result": "",
+                },
+            },
+        )
+
+        self.assertIn("Chassis failed on this firewall", html)
+        self.assertIn("the read timed out", html)
+        self.assertNotIn("Chassis is not available on this platform", html)
+        self.assertIn("Session distribution is not available on this platform", html)
+
+    def test_a_read_this_version_never_ran_says_so(self):
+        html = self._render({})
+
+        self.assertIn("was not collected in this capture", html)
+
+
 class IngressBacklogPlatformTests(unittest.TestCase):
     """The ingress backlog reads differently per platform, and a rejected
     node is a capability gap rather than a collection error."""

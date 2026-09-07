@@ -461,6 +461,114 @@ def demo_incident_records() -> list[dict[str, Any]]:
         start=1,
     ):
         records.append(_demo_cycle(number, offset, buffer_pct))
+        if number == 1:
+            # The device reads answer after the first batch, on their own
+            # record, so the demo report shows the section as a real capture
+            # carries it.
+            records.append(
+                {
+                    "timestamp": _timestamp(offset + 2),
+                    "run_id": DEMO_RUN_ID,
+                    "event": "context_collected",
+                    "target_name": DEMO_TARGET,
+                    # The device reads as a single-dataplane PA-440 answers
+                    # them: an ARP table with room to spare, no session
+                    # distribution and no chassis - the firewall refuses both
+                    # nodes - and the dataplane's own buffer-wait counters.
+                    "parse_warnings": [
+                        "session_distribution is not supported on this "
+                        "platform or PAN-OS release, the per-dataplane session "
+                        "distribution do not exist here",
+                        "chassis_status is not supported on this platform or "
+                        "PAN-OS release, the chassis slot and line-card state "
+                        "do not exist here",
+                    ],
+                    "arp_table": {
+                        "parsed": True,
+                        "dataplane": "dp0",
+                        "dataplanes": [
+                            {
+                                "dataplane": "dp0",
+                                "entries": 38,
+                                "maximum_entries": 3000,
+                                "timeout_seconds": 1800,
+                                "utilization_percent": 1.3,
+                            }
+                        ],
+                        "entries": 38,
+                        "maximum_entries": 3000,
+                        "timeout_seconds": 1800,
+                        "utilization_percent": 1.3,
+                    },
+                    "application_statistics": {
+                        "parsed": True,
+                        "reported_application_count": 3,
+                        "totals": {
+                            "sessions": 789,
+                            "packets": 244694,
+                            "bytes": 257854636,
+                            "app_changed": 12,
+                            "threats": 127,
+                        },
+                        "top_by_bytes": [
+                            {
+                                "application": "ssl",
+                                "sessions": 500,
+                                "packets": 239658,
+                                "bytes": 247864083,
+                                "app_changed": 0,
+                                "threats": 124,
+                            },
+                            {
+                                "application": "web-browsing",
+                                "sessions": 120,
+                                "packets": 4501,
+                                "bytes": 9930221,
+                                "app_changed": 12,
+                                "threats": 3,
+                            },
+                        ],
+                    },
+                    "session_distribution": {"parsed": False},
+                    "chassis_status": {"parsed": False},
+                    "pow_performance": {
+                        "parsed": True,
+                        "peak_pbp_buffer_latency_us": 670,
+                        "peak_pbp_buffer_latency_dataplane": "dp0",
+                        "dataplanes": [
+                            {
+                                "dataplane": "dp0",
+                                "functions": {
+                                    "pbp_buf_latency": {
+                                        "max_us": 670,
+                                        "avg_us": 2.4,
+                                        "count": 161525,
+                                    }
+                                },
+                                "latency_histogram": [
+                                    {"avg_us": 2.0, "count": 113315},
+                                    {"avg_us": 670.0, "count": 1},
+                                ],
+                            }
+                        ],
+                    },
+                    "commands": {
+                        "session_distribution": {
+                            "ok": False,
+                            "result": "",
+                            "error": (
+                                "PanOSAPIError: show -> session -> "
+                                "distribution  is unexpected"
+                            ),
+                        },
+                        "chassis_status": {
+                            "ok": False,
+                            "result": "",
+                            "error": "PanOSAPIError: show -> chassis  is unexpected",
+                        },
+                    },
+                }
+            )
         if number == 2:
             records.append(
                 {

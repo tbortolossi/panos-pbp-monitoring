@@ -9,6 +9,7 @@ from pathlib import Path
 
 from pbp_monitoring.diagnosis import (
     HYPOTHESIS_COUNTERS,
+    render_diagnosis,
     SIGNAL_COUNTER_FAMILIES,
     build_diagnosis,
     collect_findings,
@@ -1923,3 +1924,301 @@ class IncidentStateSignatureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeviceContextEvidenceTests(unittest.TestCase):
+    """The once-per-incident device reads state a fact where they decide one."""
+
+    def _started(self, **state: object) -> dict:
+        record = {
+            "run_id": "diagnosis-run",
+            "event": "monitor_started",
+            "device": {"model": "PA-5220", "software_version": "10.2.9"},
+        }
+        record.update(state)
+        return record
+
+    def _context(self, **state: object) -> dict:
+        """The record the background device reads write when they answer."""
+        return {"run_id": "diagnosis-run", "event": "context_collected", **state}
+
+    def _step(self, number: int, **state: object) -> dict:
+        diagnosis = _diagnose(
+            [_cycle(1, 92.0)], [self._started(), self._context(**state)]
+        )
+        return diagnosis["steps"][number]
+
+    def _hypotheses(self, **state: object) -> dict[str, dict]:
+        step = self._step(3, **state)
+        return {hypothesis["key"]: hypothesis for hypothesis in step["hypotheses"]}
+
+    def test_a_device_read_is_found_in_the_context_record(self):
+        # They answer after the first batch, on their own record. A capture
+        # that carries them in the start record - what a firewall answering
+        # instantly produced before they were split out - reads identically.
+        for events in (
+            [self._started(), self._context(arp_table=_ARP_TABLE)],
+            [self._started(arp_table=_ARP_TABLE)],
+        ):
+            diagnosis = _diagnose([_cycle(1, 92.0)], events)
+            self.assertIn(
+                ("ARP table", "38 of 3000 entries (1.3%)", "none"),
+                diagnosis["steps"][3]["facts"],
+            )
+
+    def test_the_buffer_wait_from_the_dataplane_counters_is_a_pressure_fact(self):
+        step = self._step(
+            0,
+            pow_performance={
+                "parsed": True,
+                "peak_pbp_buffer_latency_us": 670,
+                "peak_pbp_buffer_latency_dataplane": "s1dp0",
+                "dataplanes": [],
+            },
+        )
+
+        labels = dict(_facts(step))
+        self.assertIn("Buffer wait (dataplane counters)", labels)
+        self.assertIn("670 µs", labels["Buffer wait (dataplane counters)"])
+        self.assertIn("s1dp0", labels["Buffer wait (dataplane counters)"])
+
+    def test_a_capture_without_the_dataplane_timing_table_states_no_wait(self):
+        self.assertNotIn("Buffer wait (dataplane counters)", dict(_facts(self._step(0))))
+
+    def test_the_facts_are_plain_text_and_never_markup(self):
+        """`render_diagnosis` escapes a fact value, so markup would print."""
+        rendered = render_diagnosis(
+            _diagnose(
+                [_cycle(1, 92.0)],
+                [
+                    self._started(),
+                    self._context(
+                        arp_table=_ARP_TABLE,
+                        session_distribution=_DISTRIBUTION,
+                        application_statistics=_APPLICATIONS,
+                        pow_performance={
+                            "parsed": True,
+                            "peak_pbp_buffer_latency_us": 670,
+                            "peak_pbp_buffer_latency_dataplane": "s1dp0",
+                            "dataplanes": [],
+                        },
+                    ),
+                ],
+            )
+        )
+
+        self.assertNotIn("&lt;code&gt;", rendered)
+        self.assertIn("38 of 3000 entries", rendered)
+        self.assertIn("s1dp0", rendered)
+
+    def test_the_arp_table_occupancy_is_a_fact_of_the_wider_step(self):
+        step = self._step(3, arp_table=_ARP_TABLE)
+
+        self.assertIn(("ARP table", "38 of 3000 entries (1.3%)", "none"), step["facts"])
+
+    def test_a_nearly_full_arp_table_is_named_as_its_own_finding(self):
+        hypotheses = self._hypotheses(
+            arp_table={
+                "parsed": True,
+                "entries": 2940,
+                "maximum_entries": 3000,
+                "utilization_percent": 98.0,
+            }
+        )
+
+        self.assertIn("arp_table_full", hypotheses)
+        self.assertEqual(hypotheses["arp_table_full"]["state"], "positive")
+        self.assertIn("2940 of 3000 entries (98%)", hypotheses["arp_table_full"]["text"])
+        self.assertIn("stops resolving", hypotheses["arp_table_full"]["text"])
+        # The entries themselves are never in the capture, and the report says
+        # where to read them instead.
+        self.assertIn("show arp all", hypotheses["arp_table_full"]["text"])
+
+    def test_a_table_with_room_to_spare_names_no_finding(self):
+        self.assertNotIn("arp_table_full", self._hypotheses(arp_table=_ARP_TABLE))
+
+    def test_an_unknown_platform_limit_never_reads_as_a_full_table(self):
+        # No maximum, no occupancy: the question stays open, and a finding
+        # would be an answer.
+        hypotheses = self._hypotheses(
+            arp_table={"parsed": True, "entries": 2940, "maximum_entries": None}
+        )
+
+        self.assertNotIn("arp_table_full", hypotheses)
+
+    def test_the_busiest_application_is_stated_as_a_share_since_boot(self):
+        step = self._step(3, application_statistics=_APPLICATIONS)
+
+        value = dict(_facts(step))["Top application"]
+        self.assertIn("ssl", value)
+        self.assertIn("90%", value)
+        # Cumulative counters never attribute the incident on their own.
+        self.assertIn("since boot", value)
+
+    def test_an_uneven_session_distribution_is_marked_in_the_fact_table(self):
+        step = self._step(3, session_distribution=_DISTRIBUTION)
+
+        _, value, level = next(
+            fact for fact in step["facts"] if fact[0] == "Session distribution"
+        )
+        self.assertIn("s1dp0", value)
+        self.assertIn("21.25x the median of its peers", value)
+        self.assertEqual(level, "bad")
+
+    def test_idle_peers_are_named_rather_than_read_as_an_even_spread(self):
+        # Two dataplanes, one holding every session: the median is zero and
+        # the ratio does not exist. Reporting "spread evenly" there would be
+        # the exact opposite of what the firewall answered.
+        step = self._step(
+            3,
+            session_distribution={
+                "parsed": True,
+                "dataplane_count": 2,
+                "busiest": "dp0",
+                "busiest_active": 200000,
+                "median_active": 0,
+                "imbalance_ratio": None,
+                "dataplanes": [
+                    {"dataplane": "dp0", "active": 200000, "dispatched": 1},
+                    {"dataplane": "dp1", "active": 0, "dispatched": 1},
+                ],
+            },
+        )
+
+        _, value, level = next(
+            fact for fact in step["facts"] if fact[0] == "Session distribution"
+        )
+        self.assertIn("its peers held no session at all", value)
+        self.assertEqual(level, "bad")
+
+    def test_the_distribution_says_whether_the_saturated_dataplane_was_given_more(self):
+        record = _cycle(1, 95.0)
+        record["percentages"]["resource_monitor_dataplanes"] = [
+            {"dataplane": "dp0", "packet_buffer": 95.0},
+            {"dataplane": "dp1", "packet_buffer": 3.0},
+        ]
+        diagnosis = _diagnose(
+            [record],
+            [
+                self._started(),
+                self._context(
+                    session_distribution={
+                        "parsed": True,
+                        "dataplane_count": 2,
+                        "busiest": "dp0",
+                        "busiest_active": 200_000,
+                        "median_active": 20_000,
+                        "imbalance_ratio": 10.0,
+                        "dataplanes": [
+                            {"dataplane": "dp0", "active": 200_000, "dispatched": 1},
+                            {"dataplane": "dp1", "active": 20_000, "dispatched": 1},
+                        ],
+                    }
+                ),
+            ],
+        )
+        hypothesis = next(
+            item
+            for item in diagnosis["steps"][3]["hypotheses"]
+            if item["key"] == "chassis_imbalance"
+        )
+
+        self.assertIn("200000 active sessions", hypothesis["text"])
+        self.assertIn("the imbalance is in what it was given", hypothesis["text"])
+
+    def test_a_traffic_card_the_chassis_does_not_dispatch_to_is_a_finding(self):
+        hypotheses = self._hypotheses(chassis_status=_CHASSIS)
+
+        self.assertIn("chassis_slot", hypotheses)
+        self.assertIn("slot 2", hypotheses["chassis_slot"]["text"])
+        self.assertIn("PA-7000-DPC-A", hypotheses["chassis_slot"]["text"])
+        self.assertIn("redistributed", hypotheses["chassis_slot"]["text"])
+
+    def test_the_management_and_log_cards_are_not_a_finding(self):
+        # An SMC and an LFC are populated, healthy, and absent from the
+        # traffic-enabled list by design. Reading that as a fault would raise
+        # a finding on every healthy chassis in the field.
+        hypotheses = self._hypotheses(
+            chassis_status={
+                "parsed": True,
+                "traffic_enabled_slots": [1],
+                "slots": [
+                    {"slot": 1, "component": "PA-7000-100G-NPC-A", "card_status": "Up"},
+                    {"slot": 6, "component": "PA-7080-SMC-B", "card_status": "Up"},
+                    {"slot": 7, "component": "PA-7000-LFC-A", "card_status": "Up"},
+                ],
+            }
+        )
+
+        self.assertNotIn("chassis_slot", hypotheses)
+
+    def test_a_card_that_is_booting_is_not_a_finding_on_its_own(self):
+        # The firewall's own verdict is the traffic-enabled list. A status
+        # this collector does not recognise is not a fault it may declare.
+        hypotheses = self._hypotheses(
+            chassis_status={
+                "parsed": True,
+                "traffic_enabled_slots": [1, 2],
+                "slots": [
+                    {"slot": 1, "component": "PA-7000-100G-NPC-A", "card_status": "Up"},
+                    {
+                        "slot": 2,
+                        "component": "PA-7000-DPC-A",
+                        "card_status": "Booting",
+                    },
+                ],
+            }
+        )
+
+        self.assertNotIn("chassis_slot", hypotheses)
+
+    def test_a_capture_without_the_device_reads_states_none_of_them(self):
+        self.assertEqual(self._step(3)["facts"], [])
+
+
+#: The three device states these tests reuse, in the shape the parsers write.
+_ARP_TABLE = {
+    "parsed": True,
+    "dataplane": "dp0",
+    "dataplanes": [{"dataplane": "dp0", "entries": 38, "maximum_entries": 3000}],
+    "entries": 38,
+    "maximum_entries": 3000,
+    "timeout_seconds": 1800,
+    "utilization_percent": 1.3,
+}
+_DISTRIBUTION = {
+    "parsed": True,
+    "dataplane_count": 2,
+    "busiest": "s1dp0",
+    "busiest_active": 264453,
+    "median_active": 12443,
+    "imbalance_ratio": 21.25,
+    "dataplanes": [
+        {"dataplane": "s1dp0", "active": 264453, "dispatched": 1},
+        {"dataplane": "s1dp1", "active": 12443, "dispatched": 1},
+    ],
+}
+_APPLICATIONS = {
+    "parsed": True,
+    "reported_application_count": 2,
+    "totals": {"bytes": 1000},
+    "top_by_bytes": [{"application": "ssl", "bytes": 900, "sessions": 5}],
+}
+_CHASSIS = {
+    "parsed": True,
+    "traffic_enabled_slots": [1],
+    "slots": [
+        {
+            "slot": 1,
+            "component": "PA-7000-100G-NPC-A",
+            "card_status": "Up",
+            "config_status": "Success",
+        },
+        {
+            "slot": 2,
+            "component": "PA-7000-DPC-A",
+            "card_status": "Powered Off",
+            "config_status": "Success",
+        },
+    ],
+}

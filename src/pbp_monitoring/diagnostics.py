@@ -133,6 +133,49 @@ MAC_CANDIDATE = re.compile(r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{
 #: element keeps it exact, and routing it through the same `serial` token kind
 #: means a registered serial reads identically whether it was matched here or
 #: as a literal.
+#: The App-IDs whose name says nothing about the customer. Everything else is
+#: tokenized on the way out: a custom application is named by the person who
+#: wrote it, and `acme-payroll-erp` identifies the site as surely as its
+#: management address. The list is deliberately short and conservative - a
+#: predefined App-ID missing from it costs a token in an export, while a
+#: custom one wrongly kept costs the customer's name - and it holds the
+#: application names PAN-OS itself prints for traffic it could not classify.
+PREDEFINED_APPLICATIONS = frozenset(
+    """
+    total undecided unknown-tcp unknown-udp unknown-p2p incomplete
+    insufficient-data not-applicable
+    web-browsing ssl quic http-proxy http-video http-audio websocket
+    dns dns-base dns-over-https ntp dhcp snmp snmp-base syslog ftp tftp sftp
+    ssh telnet ping icmp icmp6 traceroute
+    smtp smtp-base imap pop3 ldap ldap-base kerberos radius tacacs-plus
+    ms-rdp rdp vnc citrix ms-ds-smb smb ms-netlogon ms-dtc ms-scheduler
+    active-directory-base ms-update ms-office365-base office365-base
+    ms-onedrive-base ms-teams-base sharepoint-base outlook-web-online
+    ike ipsec-esp ipsec-esp-udp ssl-vpn paloalto-globalprotect gre l2tp pptp
+    bgp ospf eigrp rip vrrp hsrp lldp stp igmp pim mdns netbios-ns netbios-dg
+    netbios-ss rpc portmapper nfs iscsi rsync scp
+    google-base gmail-base youtube-base facebook-base twitter-base
+    linkedin-base instagram-base whatsapp zoom webex ms-lync-base slack
+    dropbox box-base apple-update apple-push-notifications icloud-base
+    amazon-aws-console github git docker jenkins
+    mysql ms-sql-db oracle postgres mongodb redis memcached
+    paloalto-updates paloalto-wildfire-cloud paloalto-logging-service
+    paloalto-shared-services paloalto-pae-discovery-service
+    open-vpn wireguard bittorrent rtsp rtp sip h.323 slp
+    """.split()
+)
+#: Where an application name is written, and nowhere else. A bare word is not
+#: tokenized on sight: `ssl` appears in half the counters of a capture, and
+#: the point is to protect a name, not to redact the language. The JSON field
+#: the parsed evidence uses, and the table row PAN-OS prints - a name followed
+#: by exactly the five integer columns of `show running application
+#: statistics` - are the two places one can be.
+_APPLICATION_FIELD = re.compile(r'("application":\s*")([^"\\]{1,64})(")')
+_APPLICATION_ROW = re.compile(
+    r"(?:^|\n|\\n)([A-Za-z][A-Za-z0-9._-]{1,63})(?=(?:[ \t]+\d+){5}(?:[ \t]|$|\\n))",
+    re.MULTILINE,
+)
+
 SERIAL_ELEMENT = re.compile(
     r"(<(?P<tag>[a-z0-9-]*serial(?:-no)?)>)\s*"
     r"(?P<value>[0-9A-Za-z][0-9A-Za-z_-]{5,31})\s*"
@@ -227,10 +270,34 @@ class Anonymizer:
         text = SERIAL_ELEMENT.sub(self._serial_element, text)
         for pattern, kind in self._literals:
             text = pattern.sub(lambda match, kind=kind: self.token(match.group(0), kind), text)
+        text = self._applications(text)
         text = MAC_CANDIDATE.sub(lambda match: self.token(match.group(0), "mac"), text)
         text = IPV4_CANDIDATE.sub(lambda match: self._address(match, "ip"), text)
         text = IPV6_CANDIDATE.sub(lambda match: self._address(match, "ip6"), text)
         return text
+
+    def _application(self, name: str) -> str:
+        """Keep a predefined App-ID, tokenize anything a customer could name."""
+        return name if name.lower() in PREDEFINED_APPLICATIONS else self.token(name, "app")
+
+    def _applications(self, text: str) -> str:
+        """Tokenize every application name that is not a known predefined one.
+
+        Fails closed: a name this collector does not recognise is treated as a
+        custom App-ID, because that is the one that carries the customer's
+        vocabulary. Applied to the parsed evidence and to the raw table alike,
+        so the anonymized export cannot carry in one what it removed from the
+        other.
+        """
+        text = _APPLICATION_FIELD.sub(
+            lambda match: f"{match.group(1)}{self._application(match.group(2))}{match.group(3)}",
+            text,
+        )
+        return _APPLICATION_ROW.sub(
+            lambda match: match.group(0)[: -len(match.group(1))]
+            + self._application(match.group(1)),
+            text,
+        )
 
     def apply_bytes(self, payload: bytes) -> bytes:
         return self.apply(payload.decode("utf-8", errors="replace")).encode("utf-8")

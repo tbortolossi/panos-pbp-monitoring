@@ -16,7 +16,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pbp_monitoring import diagnostics, orchestrator
+from pbp_monitoring import diagnosis, diagnostics, orchestrator, text_export
+from tools import replay_capture
 from tools.replay_capture import PARSERS, RAW_RESPONSE_EVENTS
 
 #: Commands collected outside the per-batch table: the clock, the startup
@@ -90,6 +91,57 @@ class ReplayCoverageTests(unittest.TestCase):
             "replayed against the parsers, so a customer archive could not "
             "reproduce their parsing failure. Add each to PARSERS.",
         )
+
+    def test_the_start_read_table_drives_the_replay_and_the_evidence(self):
+        """A read in the table is parsed, replayable and declared, or fails here.
+
+        `START_READS` is what the monitor collects. A read that reaches a
+        capture with no parser in the replay tool is XML nobody can reproduce
+        from a customer archive, and one with no evidence entry turns a
+        firewall that answered everything into a failed API check.
+        """
+        for name, read in orchestrator.START_READS.items():
+            self.assertIs(PARSERS.get(name), read.parse, name)
+            self.assertEqual(
+                orchestrator.OPTIONAL_COMMAND_EVIDENCE.get(name), read.evidence, name
+            )
+            if read.platform_dependent:
+                self.assertEqual(
+                    orchestrator.PLATFORM_DEPENDENT_COMMAND_EVIDENCE.get(name),
+                    read.evidence,
+                    name,
+                )
+
+    def test_the_deferred_reads_travel_in_their_own_record(self):
+        """The context record is a capture record like any other.
+
+        The device reads answer after the first batch, on their own journal
+        line. It carries its raw responses under `commands`, which is what the
+        replay tool walks, and the text export writes it beside the batches.
+        """
+        self.assertEqual(orchestrator.CONTEXT_EVENT, diagnosis.CONTEXT_EVENT)
+        self.assertEqual(
+            set(orchestrator.DEFERRED_START_READS) | set(orchestrator.IMMEDIATE_START_READS),
+            set(orchestrator.START_READS),
+        )
+        record = {
+            "event": orchestrator.CONTEXT_EVENT,
+            "commands": {
+                "arp_table": {
+                    "ok": True,
+                    "result": "<result><dp>dp0</dp><total>2</total><max>3000</max></result>",
+                }
+            },
+        }
+        replayed = replay_capture.replay_record(record, None)
+        self.assertEqual([item["command"] for item in replayed], ["arp_table"])
+        self.assertEqual(replayed[0]["parsed"]["entries"], 2)
+        with tempfile.TemporaryDirectory() as temporary:
+            written = text_export.write_record_text_export(
+                Path(temporary) / "incident.jsonl", record
+            )
+        self.assertIsNotNone(written)
+        self.assertEqual(written.name, "context.txt")
 
     def test_every_once_per_incident_read_is_declared_optional(self):
         """A start command missing from the evidence tables fails a check.

@@ -1,8 +1,17 @@
 import unittest
+from unittest.mock import patch
+
+from pbp_monitoring import orchestrator
 
 from pbp_monitoring.orchestrator import (
+    ARP_ENTRIES_OMITTED_MARKER,
     TRIGGER_REGEX,
+    _kv_lines,
+    read_arp_response,
     annotate_large_sessions,
+    extract_application_statistics,
+    extract_arp_table_header,
+    extract_chassis_status,
     extract_congestion_log_entries,
     extract_global_counters_raw,
     extract_ha_state,
@@ -10,13 +19,16 @@ from pbp_monitoring.orchestrator import (
     extract_interface_counter_table,
     extract_interface_status,
     extract_large_sessions,
+    extract_pow_performance,
     extract_resource_monitor_history,
+    extract_session_distribution,
     extract_zone_protection,
     extract_live_percentages,
     extract_session_ids,
     large_session_command,
     parse_panos_time,
     summarize_large_sessions,
+    trim_arp_entries,
 )
 
 
@@ -551,3 +563,364 @@ class TsfCorpusEvidenceParsingTests(unittest.TestCase):
         self.assertEqual(entries[0]["alert_threshold_percent"], 50.0)
         self.assertEqual(entries[0]["measure"], "utilization")
         self.assertEqual(entries[0]["time_generated"], "2026/08/30 03:00:34")
+
+
+
+
+# The Tier 2 device reads, shaped as the lab firewalls and the anonymized TAC
+# tech support files answer them. Every address and MAC below is
+# documentation-range; the chassis and dataplane names are the hardware's own.
+ARP_TABLE_RESULT = """<result>
+  <dp>dp0</dp>
+  <timeout>1800</timeout>
+  <total>2</total>
+  <entries>
+    <entry>
+      <interface>ethernet1/1</interface>
+      <ip>192.0.2.10</ip>
+      <mac>00:53:00:11:22:33</mac>
+      <port>ethernet1/1</port>
+      <status>  c  </status>
+      <ttl>1670</ttl>
+    </entry>
+    <entry>
+      <interface>ethernet1/2</interface>
+      <ip>198.51.100.7</ip>
+      <mac>00:53:00:44:55:66</mac>
+      <port>ethernet1/2</port>
+      <status>  c  </status>
+      <ttl>90</ttl>
+    </entry>
+  </entries>
+  <max>3000</max>
+</result>"""
+
+#: Two dataplanes, the first holding no entry at all. Each block is a replica
+#: of the same table, so the occupancy is the fullest block's and never their
+#: sum, and an empty `<entries/>` must not swallow the block behind it.
+ARP_TABLE_MULTI_DP_RESULT = """<result>
+  <dataplane>
+    <dp>s1dp0</dp>
+    <timeout>1800</timeout>
+    <total>0</total>
+    <entries/>
+    <max>128000</max>
+  </dataplane>
+  <dataplane>
+    <dp>s1dp1</dp>
+    <timeout>1800</timeout>
+    <total>120000</total>
+    <entries>
+      <entry><ip>192.0.2.10</ip><mac>00:53:00:11:22:33</mac></entry>
+    </entries>
+    <max>128000</max>
+  </dataplane>
+</result>"""
+
+APPLICATION_STATISTICS_RESULT = """<result>Vsys: 1
+Number of apps: 4
+App (report-as) sessions   packets    bytes        app changed threats
+--------------- ---------- ---------- ------------ ----------- -------
+undecided       0          0          0            0           2
+ssl             500        239658     247864083    0           124
+active-directory-base 25    9948       6525908      35          0
+web-browsing    120        4501       9930221      12          3
+--------------- ---------- ---------- ------------ ----------- -------
+Total           645        254107     264320212    47          129
+</result>"""
+
+SESSION_DISTRIBUTION_RESULT = """<result>
+DP         Active               Dispatched           Dispatched/sec
+--------------------------------------------------------------------------------
+s1dp0      264453               89997427             1189
+s1dp1      212443               90063088             1190
+</result>"""
+
+#: A PA-5260 has four dataplanes and no slots: its rows are `dp0` to `dp3`.
+SESSION_DISTRIBUTION_SLOTLESS_RESULT = """<result>
+DP         Active               Dispatched           Dispatched/sec
+--------------------------------------------------------------------------------
+dp0        200000               89997427             1189
+dp1        0                    90063088             1190
+</result>"""
+
+CHASSIS_STATUS_RESULT = """<result>
+Slot  Component        Card Status         Config Status Disabled
+1     PA-7000-100G-NPC-A Up                  Success
+2     PA-7000-DPC-A    Powered Off         Config Failed
+3     empty
+6     PA-7080-SMC-B    Up                  Success
+
+================================================================================
+Chassis autocommit ready : True
+Inserted slots           : 1 2 6
+Powered slots            : 1 2 6
+Traffic enabled slots    : 1
+</result>"""
+
+POW_PERFORMANCE_RESULT = """<result>
+DP s1dp0:
+
+group                                 max-us   avg-us        count     total-us
+flow_fastpath                          14478     74.2      7665961    569011460
+flow_slowpath                            222     82.2       656571     53976194
+
+func                                  max-us   avg-us        count     total-us
+pbp_buf_latency                          670      2.4       161525       393629
+pkt_rx_tx_latency                      43119    125.0      4688049    586312319
+
+pbp_buf_latency (func)
+col    avg-ticks   avg-us        count     total-us
+ 11         3457        2       113315       244850
+ 20      1073522      670            1          670
+
+mi_proxy (func)
+col    avg-ticks   avg-us        count     total-us
+ 13        15446        9         2131        20572
+
+DP s1dp1:
+
+func                                  max-us   avg-us        count     total-us
+pbp_buf_latency                           22      2.8       161221       456326
+</result>"""
+
+
+class KeyValueLineTests(unittest.TestCase):
+    """One reader for the labelled values half the text commands answer with."""
+
+    def test_separators_and_spacing_are_not_read_as_labels(self):
+        text = (
+            "Slot  Component\n"
+            "--------------------------------------------------\n"
+            "================================================\n"
+            "\n"
+            "Traffic enabled slots    : 1 2\n"
+            "Chassis autocommit ready : True\n"
+            "TCP: 90 secs, UDP: 60 secs\n"
+        )
+
+        self.assertEqual(
+            list(_kv_lines(text)),
+            [
+                ("traffic enabled slots", "1 2"),
+                ("chassis autocommit ready", "True"),
+                ("tcp", "90 secs, UDP: 60 secs"),
+            ],
+        )
+
+
+class ArpTableHeaderTests(unittest.TestCase):
+    """`show arp all` is read for its header and never for its table."""
+
+    def test_the_header_gives_the_occupancy_of_the_table(self):
+        parsed = extract_arp_table_header(ARP_TABLE_RESULT)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["entries"], 2)
+        self.assertEqual(parsed["maximum_entries"], 3000)
+        self.assertEqual(parsed["timeout_seconds"], 1800)
+        self.assertEqual(parsed["utilization_percent"], 0.1)
+        self.assertEqual(parsed["dataplane"], "dp0")
+
+    def test_the_occupancy_of_a_chassis_is_the_fullest_dataplane_not_the_sum(self):
+        # Each block is a replica of the same table. Adding them would report
+        # 120000 of 256000 entries on a firewall whose table is 94% full.
+        parsed = extract_arp_table_header(ARP_TABLE_MULTI_DP_RESULT)
+
+        self.assertEqual(parsed["entries"], 120000)
+        self.assertEqual(parsed["maximum_entries"], 128000)
+        self.assertEqual(parsed["utilization_percent"], 93.8)
+        self.assertEqual(parsed["dataplane"], "s1dp1")
+        self.assertEqual([row["dataplane"] for row in parsed["dataplanes"]], ["s1dp0", "s1dp1"])
+
+    def test_the_stored_answer_keeps_the_header_and_drops_every_address(self):
+        stored = trim_arp_entries(
+            {
+                "ok": True,
+                "result": ARP_TABLE_RESULT,
+                "raw_response": f"<response status='success'>{ARP_TABLE_RESULT}</response>",
+            }
+        )
+
+        for value in (stored["result"], stored["raw_response"]):
+            self.assertNotIn("192.0.2.10", value)
+            self.assertNotIn("00:53:00:11:22:33", value)
+            self.assertIn("<total>2</total>", value)
+            self.assertIn("removed by the collector", value)
+        # A replayed capture must parse to what the live read parsed, so the
+        # trimming may never cost the header the parser reads.
+        self.assertEqual(
+            extract_arp_table_header(stored["result"]),
+            extract_arp_table_header(ARP_TABLE_RESULT),
+        )
+
+    def test_an_empty_entries_element_does_not_swallow_the_next_block(self):
+        stored = trim_arp_entries({"result": ARP_TABLE_MULTI_DP_RESULT})
+
+        self.assertEqual(
+            extract_arp_table_header(stored["result"]),
+            extract_arp_table_header(ARP_TABLE_MULTI_DP_RESULT),
+        )
+        self.assertNotIn("192.0.2.10", stored["result"])
+
+    def test_an_empty_or_rejected_answer_is_not_an_empty_table(self):
+        for output in ("", "<result />"):
+            parsed = extract_arp_table_header(output)
+            self.assertFalse(parsed["parsed"])
+            self.assertIsNone(parsed["entries"])
+
+
+class ArpStreamingReadTests(unittest.TestCase):
+    """The table is dropped as it arrives, not after it has been read."""
+
+    class _Body:
+        def __init__(self, payload: bytes, chunk: int = 64):
+            self._payload = payload
+            self._chunk = chunk
+            self.largest_read = 0
+
+        def read(self, size: int) -> bytes:
+            self.largest_read = max(self.largest_read, size)
+            head, self._payload = self._payload[:size], self._payload[size:]
+            return head
+
+    def _envelope(self, entries: int) -> bytes:
+        rows = "".join(
+            "<entry><interface>ethernet1/1</interface>"
+            f"<ip>192.0.2.{index % 250}</ip>"
+            "<mac>00:53:00:11:22:33</mac><ttl>1670</ttl></entry>"
+            for index in range(entries)
+        )
+        return (
+            '<response status="success"><result><dp>dp0</dp>'
+            f"<timeout>1800</timeout><total>{entries}</total>"
+            f"<entries>{rows}</entries><max>128000</max>"
+            "</result></response>"
+        ).encode("utf-8")
+
+    def test_the_header_survives_and_no_address_is_ever_held(self):
+        body = self._Body(self._envelope(500), chunk=61)
+
+        text = read_arp_response(body)
+
+        self.assertIn("<total>500</total>", text)
+        self.assertIn("<max>128000</max>", text)
+        self.assertIn(ARP_ENTRIES_OMITTED_MARKER, text)
+        self.assertNotIn("192.0.2.", text)
+        self.assertNotIn("00:53:00:11:22:33", text)
+        # A tag split across two chunks is still a tag.
+        self.assertEqual(extract_arp_table_header(text)["entries"], 500)
+
+    def test_a_table_larger_than_the_transfer_cap_is_refused(self):
+        class _Endless:
+            def read(self, size: int) -> bytes:
+                return b"<entry>x</entry>" * (size // 16)
+
+        with patch.object(orchestrator, "ARP_TRANSFER_LIMIT_BYTES", 64 * 1024):
+            with self.assertRaises(ValueError):
+                read_arp_response(_Endless())
+
+
+class ApplicationStatisticsTests(unittest.TestCase):
+    def test_the_table_is_ranked_and_bounded(self):
+        parsed = extract_application_statistics(APPLICATION_STATISTICS_RESULT)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["reported_application_count"], 4)
+        self.assertEqual(parsed["totals"]["bytes"], 264320212)
+        self.assertEqual(parsed["top_by_bytes"][0]["application"], "ssl")
+        # An application name wider than its column keeps its counters.
+        names = [entry["application"] for entry in parsed["top_by_bytes"]]
+        self.assertIn("active-directory-base", names)
+        # `Total` is the table's own summary line, never an application, and
+        # an application that carried nothing is not ranked as if it had.
+        self.assertNotIn("Total", names)
+        self.assertNotIn("undecided", names)
+
+    def test_an_empty_answer_reports_nothing_collected(self):
+        parsed = extract_application_statistics("<result />")
+
+        self.assertFalse(parsed["parsed"])
+        self.assertEqual(parsed["top_by_bytes"], [])
+
+
+class SessionDistributionTests(unittest.TestCase):
+    def test_the_per_dataplane_counts_and_the_imbalance(self):
+        parsed = extract_session_distribution(SESSION_DISTRIBUTION_RESULT)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["dataplane_count"], 2)
+        self.assertEqual(parsed["busiest"], "s1dp0")
+        self.assertEqual(parsed["busiest_active"], 264453)
+        self.assertEqual(parsed["median_active"], 212443)
+        self.assertEqual(parsed["imbalance_ratio"], 1.24)
+        self.assertEqual(parsed["dataplanes"][1]["dispatched_per_second"], 1190)
+
+    def test_a_platform_without_slots_names_its_dataplanes_dp0_and_dp1(self):
+        # A PA-5260 and a PA-5450 have several dataplanes and no chassis: a
+        # pattern requiring the slot prefix reads nothing at all on them.
+        parsed = extract_session_distribution(SESSION_DISTRIBUTION_SLOTLESS_RESULT)
+
+        self.assertEqual([row["dataplane"] for row in parsed["dataplanes"]], ["dp0", "dp1"])
+        self.assertEqual(parsed["busiest"], "dp0")
+        # Idle peers: the ratio does not exist, and the median is what says so.
+        self.assertEqual(parsed["median_active"], 0)
+        self.assertIsNone(parsed["imbalance_ratio"])
+
+    def test_a_single_dataplane_answer_carries_no_distribution(self):
+        # A PA-VM answers the command with an empty result, a PA-440 refuses
+        # the node: neither is a table, and neither may read as one.
+        for output in ("<result />", ""):
+            parsed = extract_session_distribution(output)
+            self.assertFalse(parsed["parsed"])
+            self.assertEqual(parsed["dataplanes"], [])
+
+
+class ChassisStatusTests(unittest.TestCase):
+    def test_a_multi_word_status_is_one_status(self):
+        parsed = extract_chassis_status(CHASSIS_STATUS_RESULT)
+
+        self.assertTrue(parsed["parsed"])
+        slots = {slot["slot"]: slot for slot in parsed["slots"]}
+        self.assertEqual(slots[1]["component"], "PA-7000-100G-NPC-A")
+        self.assertEqual(slots[1]["card_status"], "Up")
+        # Split on whitespace, `Powered Off  Config Failed` reads as
+        # `Powered` / `Off`, which is a status no firewall ever printed.
+        self.assertEqual(slots[2]["card_status"], "Powered Off")
+        self.assertEqual(slots[2]["config_status"], "Config Failed")
+        self.assertIsNone(slots[3]["component"])
+        self.assertEqual(parsed["traffic_enabled_slots"], [1])
+
+    def test_a_platform_without_a_chassis_parses_to_nothing(self):
+        parsed = extract_chassis_status("<result />")
+
+        self.assertFalse(parsed["parsed"])
+        self.assertEqual(parsed["slots"], [])
+
+
+class PowPerformanceTests(unittest.TestCase):
+    def test_the_named_rows_and_the_buffer_wait_histogram(self):
+        parsed = extract_pow_performance(POW_PERFORMANCE_RESULT)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(
+            [entry["dataplane"] for entry in parsed["dataplanes"]],
+            ["s1dp0", "s1dp1"],
+        )
+        first = parsed["dataplanes"][0]
+        self.assertEqual(first["functions"]["pbp_buf_latency"]["max_us"], 670)
+        self.assertEqual(first["functions"]["flow_slowpath"]["avg_us"], 82.2)
+        # Only the packet-buffer histogram is kept, and its buckets are the
+        # measurement, not the bucket numbers PAN-OS indexes them by.
+        self.assertEqual(
+            first["latency_histogram"],
+            [{"avg_us": 2.0, "count": 113315}, {"avg_us": 670.0, "count": 1}],
+        )
+        self.assertEqual(parsed["peak_pbp_buffer_latency_us"], 670)
+        self.assertEqual(parsed["peak_pbp_buffer_latency_dataplane"], "s1dp0")
+
+    def test_a_release_that_returns_nothing_parses_to_nothing(self):
+        for output in ("", "<result />"):
+            parsed = extract_pow_performance(output)
+            self.assertFalse(parsed["parsed"])
+            self.assertIsNone(parsed["peak_pbp_buffer_latency_us"])

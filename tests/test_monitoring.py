@@ -9,12 +9,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from pbp_monitoring import __version__
+from pbp_monitoring import __version__, orchestrator
 from pbp_monitoring.config_store import ConfigStore
 from pbp_monitoring.orchestrator import (
     PBP_SETTINGS_COMMAND,
     CLOCK_COMMAND,
     CONGESTION_LOG_QUERY,
+    CONTEXT_EVENT,
+    DEFERRED_START_READS,
+    IMMEDIATE_START_READS,
     DP_CORE_FUNCTIONS_COMMAND,
     INCIDENT_START_COMMANDS,
     INTERFACE_COUNTER_ALL_COMMAND,
@@ -187,6 +190,72 @@ INFLIGHT_MONITORING_RESULT = (
     "cfg.session.ingress_backlogs_threshold: 80\n"
     "cfg.session.ingress_backlogs_trigger: False\n</result>"
 )
+# The five Tier 2 device reads, shaped exactly as the lab PA-440 (PAN-OS
+# 12.2.2), the lab PA-VM (11.2.3-h3) and the anonymized PA-5250 / PA-7080 tech
+# support files answer them. Every address and MAC is documentation-range.
+ARP_TABLE_RESULT = (
+    "<result>\n  <dp>dp0</dp>\n  <timeout>1800</timeout>\n  <total>2</total>\n"
+    "  <entries>\n    <entry>\n      <interface>ethernet1/1</interface>\n"
+    "      <ip>192.0.2.10</ip>\n      <mac>00:53:00:11:22:33</mac>\n"
+    "      <port>ethernet1/1</port>\n      <status>  c  </status>\n"
+    "      <ttl>1670</ttl>\n    </entry>\n    <entry>\n"
+    "      <interface>ethernet1/2</interface>\n      <ip>198.51.100.7</ip>\n"
+    "      <mac>00:53:00:44:55:66</mac>\n      <port>ethernet1/2</port>\n"
+    "      <status>  c  </status>\n      <ttl>90</ttl>\n    </entry>\n"
+    "  </entries>\n  <max>3000</max>\n</result>"
+)
+APPLICATION_STATISTICS_RESULT = (
+    "<result>Vsys: 1\n"
+    "Number of apps: 3\n"
+    "App (report-as) sessions   packets    bytes        app changed threats\n"
+    "--------------- ---------- ---------- ------------ ----------- -------\n"
+    "ssl             500        239658     247864083    0           124    \n"
+    "web-browsing    120        4501       9930221      12          3      \n"
+    "dns-base        169        535        60332        0           0      \n"
+    "--------------- ---------- ---------- ------------ ----------- -------\n"
+    "Total           789        244694     257854636    12          127\n</result>"
+)
+SESSION_DISTRIBUTION_RESULT = (
+    "<result>\n"
+    "DP         Active               Dispatched           Dispatched/sec\n"
+    "----------------------------------------------------------------\n"
+    "s1dp0      264453               89997427             1189\n"
+    "s1dp1      212443               90063088             1190\n</result>"
+)
+CHASSIS_STATUS_RESULT = (
+    "<result>\n"
+    "Slot  Component        Card Status         Config Status Disabled\n"
+    "1     PA-7000-100G-NPC-A Up                  Success               \n"
+    "2     PA-7000-DPC-A    Up                  Success               \n"
+    "3     empty                                                      \n"
+    "----------------------------------------------------------------\n"
+    "Chassis autocommit ready : True      \n"
+    "Inserted slots           : 1 2\n"
+    "Powered slots            : 1 2\n"
+    "Config ready slots       : 1 2\n"
+    "Config done slots        : 1 2\n"
+    "Traffic enabled slots    : 1 2\n</result>"
+)
+POW_PERFORMANCE_RESULT = (
+    "<result>\n"
+    "DP s1dp0:\n\n"
+    "group                                 max-us   avg-us        count"
+    "     total-us  ac-max-us  ac-avg-us         ac-count      ac-total-us\n"
+    "flow_fastpath                          14478     74.2      7665961"
+    "    569011460     208420       52.6       3010844267     158500263519\n"
+    "flow_slowpath                            222     82.2       656571"
+    "     53976194      27512       81.6        169458579      13842248012\n\n"
+    "func                                  max-us   avg-us        count"
+    "     total-us  ac-max-us  ac-avg-us         ac-count      ac-total-us\n"
+    "pbp_buf_latency                          670      2.4       161525"
+    "       393629     118096        2.7         37677754        101839454\n"
+    "pkt_rx_tx_latency                      43119    125.0      4688049"
+    "    586312319     180939      700.5       2590130794    1814639124090\n\n"
+    "pbp_buf_latency (func)\n"
+    "col    avg-ticks   avg-us        count     total-us\n"
+    " 11         3457        2       113315       244850\n"
+    " 20      1073522      670            1          670\n</result>"
+)
 INTERFACE_COUNTERS_ALL_RESULT = (
     "<result><hw>"
     "<entry><name>ethernet1/1</name><port>"
@@ -321,6 +390,16 @@ class FakeClient:
             return response(HA_STATE_RESULT)
         if command == INCIDENT_START_COMMANDS["inflight_monitoring"]:
             return response(INFLIGHT_MONITORING_RESULT)
+        if command == INCIDENT_START_COMMANDS["arp_table"]:
+            return response(ARP_TABLE_RESULT)
+        if command == INCIDENT_START_COMMANDS["application_statistics"]:
+            return response(APPLICATION_STATISTICS_RESULT)
+        if command == INCIDENT_START_COMMANDS["session_distribution"]:
+            return response(SESSION_DISTRIBUTION_RESULT)
+        if command == INCIDENT_START_COMMANDS["chassis_status"]:
+            return response(CHASSIS_STATUS_RESULT)
+        if command == INCIDENT_START_COMMANDS["pow_performance"]:
+            return response(POW_PERFORMANCE_RESULT)
         if command == INTERFACE_COUNTER_ALL_COMMAND:
             return response(INTERFACE_COUNTERS_ALL_RESULT)
         raise AssertionError(f"Unexpected command: {command}")
@@ -3367,8 +3446,8 @@ class IncidentStateEvidenceTests(unittest.TestCase):
                 record for record in records if record.get("event") == "monitor_started"
             )
 
-            for name, command in INCIDENT_START_COMMANDS.items():
-                self.assertIn(command, client.commands, name)
+            for name in IMMEDIATE_START_READS:
+                self.assertIn(INCIDENT_START_COMMANDS[name], client.commands, name)
                 self.assertIn(name, started["commands"])
             self.assertEqual(started["parse_warnings"], [])
             # The counter no delta window could ever have caught.
@@ -3399,6 +3478,141 @@ class IncidentStateEvidenceTests(unittest.TestCase):
             self.assertEqual(inflight["threshold_percent"], 80)
             self.assertEqual(inflight["duration_seconds"], 3)
             self.assertIs(inflight["trigger_pending"], False)
+
+    def test_the_tier_two_device_reads_land_in_the_context_record(self):
+        """They describe the firewall, so they answer on their own record."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, records = self._run(Path(temporary_directory))
+            context = next(
+                record for record in records if record.get("event") == CONTEXT_EVENT
+            )
+
+            self.assertEqual(context["arp_table"]["entries"], 2)
+            self.assertEqual(context["arp_table"]["maximum_entries"], 3000)
+            self.assertEqual(
+                context["application_statistics"]["top_by_bytes"][0]["application"],
+                "ssl",
+            )
+            self.assertEqual(context["session_distribution"]["busiest"], "s1dp0")
+            self.assertEqual(context["chassis_status"]["traffic_enabled_slots"], [1, 2])
+            self.assertEqual(
+                context["pow_performance"]["peak_pbp_buffer_latency_us"], 670
+            )
+            self.assertEqual(context["parse_warnings"], [])
+
+    def test_the_first_batch_is_issued_before_the_device_reads(self):
+        """The five-second cadence is never delayed by a device read.
+
+        An ARP table or a dataplane timing table can take ten seconds on a
+        chassis. Collected on the critical path they would push the first
+        snapshots past the seconds that matter, and those cannot be taken
+        again.
+        """
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            client, _ = self._run(Path(temporary_directory))
+
+            first_batch = max(
+                client.commands.index(command)
+                for command in OP_COMMANDS.values()
+                if command in client.commands
+            )
+            for name in DEFERRED_START_READS:
+                self.assertGreater(
+                    client.commands.index(INCIDENT_START_COMMANDS[name]),
+                    first_batch,
+                    name,
+                )
+
+    def test_the_stored_arp_answer_carries_the_header_and_no_address(self):
+        """The capture keeps how full the table was, never who is in it."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, records = self._run(Path(temporary_directory))
+            context = next(
+                record for record in records if record.get("event") == CONTEXT_EVENT
+            )
+            stored = json.dumps(context["commands"]["arp_table"])
+
+            self.assertIn("<total>2</total>", stored)
+            self.assertIn("removed by the collector", stored)
+            self.assertNotIn("192.0.2.10", stored)
+            self.assertNotIn("00:53:00:11:22:33", stored)
+
+    def test_a_refused_device_read_is_a_platform_note_not_a_failure(self):
+        """A PA-440 has no chassis: refusing the node costs no evidence."""
+
+        class SingleDataplaneClient(self.LoggingClient):
+            def op_response(self, command_xml: str) -> PanOSResponse:
+                if command_xml in (
+                    INCIDENT_START_COMMANDS["chassis_status"],
+                    INCIDENT_START_COMMANDS["session_distribution"],
+                ):
+                    raise PanOSAPIError(
+                        "show -> chassis  is unexpected",
+                        raw_response="<response status='error'/>",
+                    )
+                return super().op_response(command_xml)
+
+        async def scenario(cfg):
+            controller = MonitorController(cfg, SingleDataplaneClient())
+            await controller._monitor("refused-run")
+            await controller.wait_for_reports()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            asyncio.run(scenario(make_config(output_dir)))
+            capture = incident_capture_path(output_dir, "refused-run")
+            context = next(
+                record
+                for record in (
+                    json.loads(line)
+                    for line in capture.read_text(encoding="utf-8").splitlines()
+                )
+                if record.get("event") == CONTEXT_EVENT
+            )
+
+            warnings = context["parse_warnings"]
+            self.assertEqual(len(warnings), 2)
+            for warning in warnings:
+                self.assertIn("not supported on this platform", warning)
+                self.assertNotIn("command failed", warning)
+
+    def test_device_reads_that_never_answer_do_not_hold_the_report(self):
+        """A read still running at monitor stop is recorded, not waited for.
+
+        The incident evidence is complete without them. Waiting would hold the
+        report on a chassis whose ARP table takes longer to print than the
+        incident lasted.
+        """
+
+        class SlowContextClient(self.LoggingClient):
+            def op_response(self, command_xml: str) -> PanOSResponse:
+                if command_xml == INCIDENT_START_COMMANDS["pow_performance"]:
+                    time.sleep(0.2)
+                return super().op_response(command_xml)
+
+        async def scenario(cfg):
+            controller = MonitorController(cfg, SlowContextClient())
+            with patch.object(orchestrator, "CONTEXT_READ_TIMEOUT_SECONDS", 0.0):
+                await controller._monitor("slow-context-run")
+            await controller.wait_for_reports()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            asyncio.run(scenario(make_config(output_dir)))
+            capture = incident_capture_path(output_dir, "slow-context-run")
+            context = next(
+                record
+                for record in (
+                    json.loads(line)
+                    for line in capture.read_text(encoding="utf-8").splitlines()
+                )
+                if record.get("event") == CONTEXT_EVENT
+            )
+
+            self.assertEqual(context["pow_performance"], {"parsed": False, "status": "not_collected"})
+            self.assertTrue(
+                any("did not answer" in warning for warning in context["parse_warnings"])
+            )
 
     def test_the_two_raw_counter_reads_bracket_the_incident(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

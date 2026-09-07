@@ -333,6 +333,135 @@ class SupportBundleTests(unittest.TestCase):
             },
         )
 
+    def test_no_identifier_of_the_device_reads_survives_anonymization(self):
+        """The Tier 2 reads travel, and name no address, MAC or customer word.
+
+        Two things could leave with them. `arp_table` is the read that could
+        carry the customer's whole layer-2 map: the entries are dropped as the
+        answer streams, and anything that did slip through must be tokenized
+        before the bundle leaves the site. And an application name is not
+        always PAN-OS's own: a custom App-ID is named by the person who wrote
+        it, so `acme-payroll-erp` identifies the site as surely as an address
+        does and is tokenized in the parsed evidence and in the raw table
+        alike, while a predefined App-ID stays readable.
+        """
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deployment = _Deployment(Path(temporary_directory))
+            incident = (
+                deployment.data
+                / "targets"
+                / "paris-edge"
+                / "incidents"
+                / "20260830T090000Z"
+                / "incident.jsonl"
+            )
+            incident.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-30T09:00:00+00:00",
+                        "event": "context_collected",
+                        "arp_table": {
+                            "parsed": True,
+                            "dataplane": "dp0",
+                            "entries": 2,
+                            "maximum_entries": 3000,
+                            "utilization_percent": 0.1,
+                        },
+                        "session_distribution": {
+                            "parsed": True,
+                            "busiest": "s1dp0",
+                            "busiest_active": 264453,
+                        },
+                        "chassis_status": {
+                            "parsed": True,
+                            "traffic_enabled_slots": [1],
+                            "slots": [
+                                {
+                                    "slot": 1,
+                                    "component": "PA-7000-100G-NPC-A",
+                                    "card_status": "Up",
+                                }
+                            ],
+                        },
+                        "pow_performance": {
+                            "parsed": True,
+                            "peak_pbp_buffer_latency_us": 670,
+                        },
+                        "application_statistics": {
+                            "parsed": True,
+                            "top_by_bytes": [
+                                {"application": "ssl", "bytes": 900},
+                                {"application": "acme-payroll-erp", "bytes": 400},
+                            ],
+                        },
+                        "commands": {
+                            "arp_table": {
+                                "ok": True,
+                                "result": (
+                                    "<result><dp>dp0</dp><total>2</total>"
+                                    "<entries><entry><ip>192.0.2.10</ip>"
+                                    "<mac>00:53:00:11:22:33</mac></entry>"
+                                    "<entry><ip>2001:db8::7</ip>"
+                                    "<mac>00:53:00:44:55:66</mac></entry>"
+                                    "</entries><max>3000</max></result>"
+                                ),
+                            },
+                            "application_statistics": {
+                                "ok": True,
+                                "result": (
+                                    "<result>Vsys: 1\n"
+                                    "ssl             500 239658 247864083 0 124\n"
+                                    "acme-payroll-erp 25 9948 6525908 35 0\n"
+                                    "</result>"
+                                ),
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            _manifest, archive = deployment.bundle(
+                anonymizer=build_anonymizer(deployment.store, [])
+            )
+            with archive:
+                name = next(
+                    item
+                    for item in archive.namelist()
+                    if item.endswith("incident.jsonl")
+                )
+                exported = archive.read(name).decode("utf-8")
+            context = json.loads(exported)
+
+        for identifier in (
+            "192.0.2.10",
+            "2001:db8::7",
+            "00:53:00:11:22:33",
+            "00:53:00:44:55:66",
+            "acme-payroll-erp",
+        ):
+            self.assertNotIn(identifier, exported)
+        # The custom App-ID is tokenized identically in the parsed evidence
+        # and in the raw table, so the two still describe the same traffic.
+        token = context["application_statistics"]["top_by_bytes"][1]["application"]
+        self.assertTrue(token.startswith("app-"))
+        self.assertIn(token, context["commands"]["application_statistics"]["result"])
+        # A predefined App-ID is PAN-OS's own word and stays readable, or the
+        # application evidence would leave with nothing in it.
+        self.assertEqual(
+            context["application_statistics"]["top_by_bytes"][0]["application"], "ssl"
+        )
+        # What decides something is not tokenized away with them: the counts,
+        # the dataplane and slot names, and the buffer wait all survive.
+        self.assertEqual(context["arp_table"]["entries"], 2)
+        self.assertEqual(context["arp_table"]["maximum_entries"], 3000)
+        self.assertEqual(context["session_distribution"]["busiest"], "s1dp0")
+        self.assertEqual(
+            context["chassis_status"]["slots"][0]["component"],
+            "PA-7000-100G-NPC-A",
+        )
+        self.assertEqual(context["pow_performance"]["peak_pbp_buffer_latency_us"], 670)
+
     def test_an_unreadable_configuration_still_produces_a_bundle(self):
         class _Broken:
             def get_settings(self):
