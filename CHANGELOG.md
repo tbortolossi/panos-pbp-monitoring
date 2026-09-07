@@ -3,6 +3,25 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.41.2] - 2026-09-07
+
+### Fixed
+
+- **A firewall that never had a PBP threshold configured no longer reports a
+  failed command.** The collector reads the configured alert and activate
+  thresholds from `…/deviceconfig/setting/session`, and PAN-OS answers
+  `No such node` when that element is absent from the running configuration —
+  which is what a firewall left at its defaults, a VM-Series deployed from an
+  image in particular, actually looks like. The check called that
+  `pbp_settings command failed`, sending the operator to the API role and the
+  credentials for a fault that was not there, the same trap #213 reported for
+  the ingress backlogs. An absent configuration node is now reported for what
+  it is: `pbp_settings is not configured on this firewall, the PAN-OS default
+  PBP thresholds are in force`. The read being refused, timing out or
+  returning an HTTP error still reports as a failed command, because that one
+  is a permission to widen. Monitoring and the diagnosis are unchanged: both
+  reports already fall back on the PAN-OS defaults. Refs #216.
+
 ## [0.41.1] - 2026-09-07
 
 ### Fixed
