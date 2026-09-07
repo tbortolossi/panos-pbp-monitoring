@@ -3,6 +3,36 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.44.0] - 2026-09-07
+
+### Fixed
+
+- **A command that failed in every batch is no longer reported as a firewall
+  that answered nothing was wrong.** A per-batch read that did not complete
+  handed its parser an empty string, and every parser answers a well-formed
+  empty structure to that: an undecided PBP status, an empty ingress backlog, a
+  session table with no counter. Persisted next to the raw failure, those were
+  indistinguishable from a real answer, so a firewall so loaded that `show
+  session packet-buffer-protection` timed out in every batch — the very
+  condition this collector exists for — produced a green step 2 reading "PBP
+  never activated, so it learned no offender". The collector now persists
+  `{"error": "<the failure>"}` in `pbp_status`, `pbp_offenders`, `session_info`
+  and `ingress_backlogs` when the command did not answer, exactly as
+  `interface_counters` already did, in the incident batches and in the API
+  check alike. Step 2 of the diagnosis gains the failed-read outcome step 3
+  received in 0.43.0: amber, stated as a lost read worth repairing, listed
+  among the *not evaluable* findings of the layered report with the number of
+  batches that failed, and never a negative; a mixed run keeps its verdict and
+  names the batches that answered nothing. The step-4 storm-of-new-sessions
+  hypothesis is not evaluable rather than ruled out when every `show session
+  info` read failed, and the denied-burst verdict, which the global counters
+  answer on their own, names the corroboration it could not read. The health
+  view of the report, the read-only firewall check and the diagnosis now
+  classify a stored command record through one shared helper, so a batch is
+  never counted as an error in one place and as a platform limit in another.
+  Captures written before this change stay readable: every reader falls back to
+  the raw command record that travels in the same batch. Refs #226.
+
 ## [0.43.0] - 2026-09-07
 
 ### Added

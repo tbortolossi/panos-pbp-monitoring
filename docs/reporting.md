@@ -250,6 +250,15 @@ logs** section under step 2, and a failed query is stated. When PBP never activa
 logged nothing, the step says no offender was learned; when it activated but
 marked nothing for RED, the work was spread over many small entries.
 
+Only the batches whose PBP read actually ran are counted. When every batch
+failed — a timeout, or a permission the API role does not have — the step is a
+**failed read**, amber, and says so: a firewall loaded enough to leave `show
+session packet-buffer-protection` unanswered is exactly the state this step
+exists to read, so it is never reported as "PBP never activated". The finding
+then joins the *not evaluable* list of the layered report with the number of
+batches that failed, and a mixed run keeps its verdict while naming the
+batches that answered nothing.
+
 **Step 3 — Does the ingress backlog hold a session?** The sessions holding at
 least 2% of the work queue in `show running resource-monitor
 ingress-backlogs`, with the queue's peak ATOMIC and TOTAL usage, each named
@@ -357,7 +366,11 @@ its own verdict:
   addresses without a session, or a zone-protection flood log received during
   the capture.
 - *Storm of new sessions* — 500 new connections per second, or a source that
-  PBP tracks owning 100 or more ranked sessions.
+  PBP tracks owning 100 or more ranked sessions. When every `show session info`
+  read failed, the connection rate is unknown rather than flat: the hypothesis
+  is then *not evaluable* instead of ruled out, and the denied-burst verdict
+  above, which the counters answer on their own, names the corroboration it
+  could not read.
 - *Interface errors* — receive discards, missed frames or transmit errors
   growing on the interfaces the evidence named.
 - *Aggregate load* — every comparable core rising together to 60% or more, or

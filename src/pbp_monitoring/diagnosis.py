@@ -24,7 +24,7 @@ import math
 import re
 import statistics
 from datetime import datetime
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 # PAN-OS packet buffer protection defaults: alert at 50 %, activate at 80 %.
 DEFAULT_ALERT_PERCENT = 50.0
@@ -720,6 +720,131 @@ def command_node_unsupported(record: Any) -> bool:
     return any(marker in error for marker in _UNSUPPORTED_NODE_MARKERS)
 
 
+def command_outcome(record: Any, name: str) -> str:
+    """What one stored command record establishes for the batch that ran it.
+
+    Four outcomes, and only the first one carries evidence:
+
+    * ``succeeded`` - the firewall answered, so the parsed field means what it
+      says.
+    * ``unsupported`` - the PAN-OS CLI parser rejected the command as a node
+      this platform does not have, which no credential, role or upgrade
+      repairs. Only the commands declared platform-dependent qualify: a
+      mandatory command rejected by an old release is a real gap in the
+      evidence and stays a failure.
+    * ``failed`` - every other unanswered read: a timeout, an HTTP status, a
+      denied permission. An operator can act on it.
+    * ``missing`` - the batch never carried the command at all, which is what
+      a capture written before the command existed looks like.
+
+    This is the single classification every reader uses - the diagnosis steps,
+    the report health view and the read-only validation - so a batch is never
+    described one way in the report and another way in the check.
+    """
+    if record is None:
+        return "missing"
+    if command_succeeded(record):
+        return "succeeded"
+    if name in PLATFORM_DEPENDENT_COMMAND_EVIDENCE and command_node_unsupported(record):
+        return "unsupported"
+    return "failed"
+
+
+def command_outcomes(
+    cycles: Sequence[dict[str, Any]],
+    name: str,
+    legacy_evidence: Callable[[dict[str, Any]], bool] | None = None,
+) -> dict[str, int]:
+    """Split the batches by what one per-batch command actually returned.
+
+    `batches` counts the batches that attempted the read, not every cycle, so
+    the three outcomes always add up to it.
+
+    A capture written before the raw command travelled in the batch record
+    carries nothing but the parsed field, and every parser answers a
+    well-formed empty structure to a failed read. Such a batch therefore
+    counts as one that never asked, unless `legacy_evidence` recognizes in the
+    parsed field something only a real answer produces.
+    """
+    counts = {"batches": 0, "succeeded": 0, "unsupported": 0, "failed": 0}
+    for record in cycles:
+        commands = record.get("commands")
+        payload = commands.get(name) if isinstance(commands, dict) else None
+        outcome = command_outcome(payload, name)
+        if outcome == "missing":
+            if legacy_evidence is not None and legacy_evidence(record):
+                counts["batches"] += 1
+                counts["succeeded"] += 1
+            continue
+        counts["batches"] += 1
+        counts[outcome] += 1
+    return counts
+
+
+def collected_field(record: dict[str, Any], field: str) -> dict[str, Any] | None:
+    """The parsed field of a batch, or None when that read never answered.
+
+    Since the write-time gate, a per-batch command that failed persists
+    ``{"error": ...}`` in place of a parsed structure the firewall never
+    returned. A reader must not mistake that marker for a firewall that
+    answered nothing was wrong, so every reader asks this question here.
+    """
+    value = record.get(field)
+    if not isinstance(value, dict):
+        return None
+    if set(value) == {"error"}:
+        return None
+    return value
+
+
+def _legacy_ingress_evidence(record: dict[str, Any]) -> bool:
+    """Did a capture without the raw command still record a real backlog read?"""
+    parsed = record.get("ingress_backlogs")
+    return isinstance(parsed, dict) and bool(
+        parsed.get("dataplanes") or parsed.get("candidates")
+    )
+
+
+def _legacy_pbp_evidence(record: dict[str, Any]) -> bool:
+    """Did a capture without the raw command still record a real PBP read?
+
+    `extract_pbp_status` leaves every state undecided when it is handed the
+    empty string of a failed read, so a status that decided anything - or a
+    single offender row - is the proof the firewall answered.
+    """
+    status = collected_field(record, "pbp_status")
+    if status is not None and any(
+        status.get(key) is not None
+        for key in ("enabled", "active", "congestion_percentage")
+    ):
+        return True
+    offenders = record.get("pbp_offenders")
+    return isinstance(offenders, list) and bool(offenders)
+
+
+def _legacy_session_evidence(record: dict[str, Any]) -> bool:
+    """Did a capture without the raw command still record a real session read?"""
+    info = collected_field(record, "session_info")
+    if info is None:
+        return False
+    if isinstance(info.get("dataplanes"), list) and info["dataplanes"]:
+        return True
+    totals = info.get("totals")
+    return isinstance(totals, dict) and any(
+        isinstance(value, (int, float)) for value in totals.values()
+    )
+
+
+def pbp_read_collection(cycles: Sequence[dict[str, Any]]) -> dict[str, int]:
+    """Split the batches by what the PBP read returned."""
+    return command_outcomes(cycles, "packet_buffer_protection", _legacy_pbp_evidence)
+
+
+def session_info_collection(cycles: Sequence[dict[str, Any]]) -> dict[str, int]:
+    """Split the batches by what the session-table read returned."""
+    return command_outcomes(cycles, "session_info", _legacy_session_evidence)
+
+
 def ingress_backlog_collection(cycles: Sequence[dict[str, Any]]) -> dict[str, int]:
     """Split the batches by what the ingress-backlogs read actually returned.
 
@@ -729,37 +854,8 @@ def ingress_backlog_collection(cycles: Sequence[dict[str, Any]]) -> dict[str, in
     ones counted. The two failure modes stay apart: a rejected node is a
     platform capability gap nothing on the collector side can fix, while a
     timeout or a denied permission is a collection fault an operator acts on.
-
-    `batches` counts the batches that attempted the read, not every cycle, so
-    the three outcomes always add up to it.
     """
-    counts = {"batches": 0, "succeeded": 0, "unsupported": 0, "failed": 0}
-    for record in cycles:
-        commands = record.get("commands")
-        payload = (
-            commands.get("ingress_backlogs") if isinstance(commands, dict) else None
-        )
-        if payload is None:
-            # Captures written before the raw command travelled in the batch
-            # record: the parsed result is all there is to read, and
-            # `extract_ingress_backlogs` returns a dict even for an empty or
-            # refused answer. An empty one proves nothing, so it counts as a
-            # batch that never asked rather than as a clean, empty queue.
-            parsed = record.get("ingress_backlogs")
-            if isinstance(parsed, dict) and (
-                parsed.get("dataplanes") or parsed.get("candidates")
-            ):
-                counts["batches"] += 1
-                counts["succeeded"] += 1
-            continue
-        counts["batches"] += 1
-        if command_succeeded(payload):
-            counts["succeeded"] += 1
-        elif command_node_unsupported(payload):
-            counts["unsupported"] += 1
-        else:
-            counts["failed"] += 1
-    return counts
+    return command_outcomes(cycles, "ingress_backlogs", _legacy_ingress_evidence)
 
 
 _ALERT_THRESHOLD_PATTERN = re.compile(r"alert threshold is\s*(\d+(?:\.\d+)?)\s*%", re.I)
@@ -895,10 +991,11 @@ def _is_buffer_backed_pool(pool: dict[str, Any]) -> bool:
 
 
 def _pbp_statuses(cycles: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The PBP states the firewall actually returned, failed reads excluded."""
     return [
-        record["pbp_status"]
+        status
         for record in cycles
-        if isinstance(record.get("pbp_status"), dict)
+        if (status := collected_field(record, "pbp_status")) is not None
     ]
 
 
@@ -1556,6 +1653,11 @@ def _step_pbp_named(
     threat_logs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     statuses = _pbp_statuses(cycles)
+    collection = pbp_read_collection(cycles)
+    # A firewall too loaded to answer `show session packet-buffer-protection`
+    # is the very condition this collector exists for. Its failed reads parse
+    # to an undecided status, which must never become "PBP never activated".
+    read_failed = collection["succeeded"] == 0 and collection["failed"] > 0
     if threat_logs is None:
         threat_logs = _threat_log_summary(events)
     pbp_seen = any("packet_buffer_protection" in item.get("evidence_sources", []) for item in attribution)
@@ -1570,10 +1672,19 @@ def _step_pbp_named(
     sources = [item for item in marked if item.get("entity_type") != "session"]
     logs = _traffic_log_summary(events)
     facts: list[tuple[str, str, str]] = [
-        ("PBP activated", "yes" if activated else "no", "none"),
+        (
+            "PBP activated",
+            "yes" if activated else "unknown" if read_failed else "no",
+            "none",
+        ),
         ("Entries learned", _fmt(len(learned)), "none"),
         ("Marked for RED", _fmt(len(marked)), "none"),
     ]
+    if collection["failed"]:
+        # Only stated when a read actually failed: a row reading zero on every
+        # healthy capture is a row an operator stops seeing.
+        facts.append(("Batches with the PBP read", _fmt(collection["succeeded"]), "none"))
+        facts.append(("Batches with a failed read", _fmt(collection["failed"]), "warn"))
     # A query the firewall clock could not bound returns the most recent PBP
     # threat logs of the device, of any age. They stay in the report as
     # corroboration, but nothing here may be counted as evidence of *this*
@@ -1650,7 +1761,26 @@ def _step_pbp_named(
             )
             + "."
         )
-    if not activated and not confirming_counts:
+    unavailable_reason = ""
+    if not activated and not confirming_counts and read_failed:
+        state, level = "failed", "warn"
+        unavailable_reason = (
+            f"read failed in {collection['failed']} of "
+            f"{collection['batches']} batches"
+        )
+        verdict = (
+            f"<strong>The PBP read failed in all {collection['failed']} of the "
+            f"{collection['batches']} batches</strong>, so whether the firewall "
+            "activated PBP and whom it designated is unknown. This is not a "
+            "negative result: a firewall loaded enough to leave "
+            "<code>show session packet-buffer-protection</code> unanswered is "
+            "exactly the state this step exists to read. The failure - a "
+            "timeout, or a permission the API role does not have - is worth "
+            "repairing before the next incident; until then the ingress "
+            "backlogs and the wider evidence carry this question."
+            + threat_text
+        )
+    elif not activated and not confirming_counts:
         state, level = "negative", "ok"
         verdict = (
             "<strong>PBP never activated, so it learned no offender.</strong> An "
@@ -1733,6 +1863,14 @@ def _step_pbp_named(
                 "the ranking is the busiest ordinary traffic, not an attack."
             )
         verdict = " ".join(parts)
+    # A batch that answered nothing is worth naming wherever the step landed.
+    # The "read failed" verdict already speaks of nothing else.
+    if state != "failed" and collection["failed"]:
+        verdict += (
+            f" Not every batch answered: the PBP read failed in "
+            f"{collection['failed']} of the {collection['batches']} batches, "
+            "which therefore carry no PBP evidence."
+        )
     return {
         "number": 2,
         "key": "pbp",
@@ -1746,6 +1884,9 @@ def _step_pbp_named(
         "sessions": sessions,
         "sources": sources,
         "anchor": "attribution-title",
+        # One line saying why this step has no answer, for a report that folds
+        # it away beside the other unanswered questions.
+        "unavailable_reason": unavailable_reason,
         # What this step reports is PBP's own ranking. Under the low pressure
         # of step 1 that ranking is the busiest ordinary traffic, and a report
         # must be able to tell it apart from an observation made independently
@@ -1878,11 +2019,15 @@ def _step_ingress_backlogs(
     attribution: Sequence[dict[str, Any]],
     context: dict[str, Any],
 ) -> dict[str, Any]:
-    collected = [record for record in cycles if isinstance(record.get("ingress_backlogs"), dict)]
+    collected = [
+        backlog
+        for record in cycles
+        if (backlog := collected_field(record, "ingress_backlogs")) is not None
+    ]
     atomic_peak: float | None = None
     total_peak: float | None = None
-    for record in collected:
-        for dataplane in record["ingress_backlogs"].get("dataplanes") or []:
+    for backlog in collected:
+        for dataplane in backlog.get("dataplanes") or []:
             if not isinstance(dataplane, dict):
                 continue
             atomic = _first_number(dataplane.get("atomic_percentage"))
@@ -2403,6 +2548,20 @@ def _step_elsewhere(
     hypotheses: list[dict[str, Any]] = []
     batch_count = len(cycles)
     context = context or {}
+    # `show session info` is the only command that says how many sessions
+    # exist while the buffers are full. When every batch failed to read it,
+    # the session table is unknown - not flat - and the hypotheses that read
+    # it say so instead of ruling a storm out.
+    session_reads = session_info_collection(cycles)
+    session_read_failed = (
+        session_reads["succeeded"] == 0 and session_reads["failed"] > 0
+    )
+    session_read_note = (
+        f" The session table read failed in all {session_reads['failed']} of the "
+        f"{session_reads['batches']} batches, so the session count is unknown."
+        if session_read_failed
+        else ""
+    )
 
     # 4a — elephant session: one hot core, or a long-lived transfer near link speed.
     isolated = [verdict for verdict in cpu_verdicts if verdict.get("state") == "isolated"]
@@ -2570,6 +2729,7 @@ def _step_elsewhere(
                     f"Only {_fmt(denied_total)} packets were denied before session setup over "
                     f"{_fmt(counted)} counted batches, peaking at {_fmt(denied_peak_rate)}/s: "
                     "far too few to fill a buffer pool."
+                    + session_read_note
                 ),
                 "named": [],
             }
@@ -2640,6 +2800,32 @@ def _step_elsewhere(
                 ],
             }
         )
+    elif session_read_failed and not session_series:
+        # Every read of the session table failed, so the new-connection rate
+        # is unknown. Ranked sessions alone cannot rule a storm out.
+        hypotheses.append(
+            {
+                "key": "storm",
+                "title": "Storm of new sessions",
+                "state": "unavailable",
+                "text": (
+                    f"The session table read failed in all {session_reads['failed']} "
+                    f"of the {session_reads['batches']} batches, so the rate of new "
+                    "connections could not be read and a storm can be neither "
+                    "confirmed nor excluded."
+                    + (
+                        f" The busiest source owned {busiest[0][1]} ranked sessions."
+                        if busiest
+                        else ""
+                    )
+                ),
+                "named": [],
+                "unavailable_reason": (
+                    f"session table read failed in {session_reads['failed']} of "
+                    f"{session_reads['batches']} batches"
+                ),
+            }
+        )
     else:
         hypotheses.append(
             {
@@ -2661,6 +2847,11 @@ def _step_elsewhere(
                     else "Neither the session table nor the offender ranking was collected."
                 ),
                 "named": [],
+                "unavailable_reason": (
+                    ""
+                    if session_series or attribution
+                    else "neither the session table nor the offender ranking was collected"
+                ),
             }
         )
 
@@ -3589,6 +3780,9 @@ def _conclusion(
                 "observed utilization; the entries it ranked are the ordinary traffic "
                 "mix and do not designate an offender."
                 if named["state"] == "positive"
+                else "The PBP read failed in every batch, so what it learned is "
+                "unknown; nothing is designated."
+                if named["state"] == "failed"
                 else "No offender was learned and none is designated."
             )
         )
@@ -3596,6 +3790,12 @@ def _conclusion(
     if named["state"] == "positive":
         sentences.append(
             "PBP designated: " + "; ".join(named["named"]) + "."
+        )
+    elif named["state"] == "failed":
+        sentences.append(
+            "Whether PBP designated anyone is unknown: its read failed in every "
+            "batch, so this capture holds no PBP evidence and the read is worth "
+            "repairing before the next incident."
         )
     else:
         sentences.append(

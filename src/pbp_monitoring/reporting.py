@@ -32,8 +32,8 @@ from .diagnosis import (
     _numbers,
     build_diagnosis,
     buffer_latency_statuses,
-    command_node_unsupported,
-    PLATFORM_DEPENDENT_COMMAND_EVIDENCE,
+    collected_field,
+    command_outcome,
     hardware_generation,
     ingress_backlog_collection,
     congestion_recurrence,
@@ -962,27 +962,19 @@ def _detail_items(details: Any) -> list[tuple[str, Any]]:
     return [("session_details", details)]
 
 
-def _platform_limit(name: str, payload: Any) -> bool:
-    """Is this a command the platform simply does not have?
-
-    A rejected node is a fact about the platform that no credential, role or
-    network change repairs. Counting it as a partial error sends an operator
-    looking for a collection fault that does not exist, so the health view
-    reports it separately.
-
-    Only the commands declared platform-dependent qualify, exactly as the
-    read-only validation treats them: a mandatory command rejected by an old
-    PAN-OS release is a real gap in the evidence and stays an error here.
-    """
-    return (
-        name in PLATFORM_DEPENDENT_COMMAND_EVIDENCE
-        and command_node_unsupported(payload)
-    )
-
-
 def _record_error_count(record: dict[str, Any]) -> int:
+    """How many reads of this batch actually failed.
+
+    A read the firewall rejected as a node the platform does not have is a
+    fact about the platform that no credential, role or network change
+    repairs; counting it here would send an operator looking for a collection
+    fault that does not exist, so it is reported separately and never as an
+    error. The classification is the one the diagnosis and the read-only
+    validation use, so a batch is never "5 errors" here and "4 failed reads"
+    there.
+    """
     command_errors = sum(
-        _contains_error(payload) and not _platform_limit(name, payload)
+        command_outcome(payload, name) == "failed"
         for name, payload in _command_items(record.get("commands"))
     )
     detail_errors = sum(
@@ -1095,9 +1087,10 @@ def _render_commands(commands: Any) -> str:
 
     fragments: list[str] = []
     for name, payload in items:
-        if _platform_limit(name, payload):
+        outcome = command_outcome(payload, name)
+        if outcome == "unsupported":
             state, state_class = "Not available on this platform", " note"
-        elif _contains_error(payload):
+        elif outcome == "failed":
             state, state_class = "Error", " bad"
         else:
             state, state_class = "Result", ""
@@ -4125,9 +4118,9 @@ def _build_report_parts(
             f'<div class="section-body">{cpu_tracking_html}</div></details>'
         )
     pbp_statuses = [
-        record.get("pbp_status")
+        status
         for _, record in cycles
-        if isinstance(record.get("pbp_status"), dict)
+        if (status := collected_field(record, "pbp_status")) is not None
     ]
     pbp_modes = sorted(
         {

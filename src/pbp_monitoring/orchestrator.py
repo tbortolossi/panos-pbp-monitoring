@@ -27,16 +27,16 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from . import __version__, diagnostics
-# `command_succeeded` and `command_node_unsupported` live with the diagnosis,
-# which reads the same records back out of a capture; they are re-exported here
-# so the collection code and its tests keep addressing them on the module that
-# runs the commands.
+# `command_succeeded`, `command_node_unsupported` and `command_outcome` live
+# with the diagnosis, which reads the same records back out of a capture; they
+# are re-exported here so the collection code and its tests keep addressing
+# them on the module that runs the commands.
 from .diagnosis import (
     DEFAULT_ACTIVATE_PERCENT,
     DEFAULT_ALERT_PERCENT,
@@ -46,6 +46,7 @@ from .diagnosis import (
     PLATFORM_DEPENDENT_COMMAND_EVIDENCE,
     SPECIAL_TAG_NOTED,
     command_node_unsupported,
+    command_outcome,
     command_succeeded,
     merge_special_fields,
 )
@@ -1883,6 +1884,29 @@ def extract_ingress_backlogs(output: str) -> dict[str, list[dict[str, Any]]]:
                 candidate["groups"] = [{"group_id": group_id, "count": count}]
 
     return {"dataplanes": dataplanes, "candidates": candidates}
+
+
+def parsed_or_failed_read(payload: Any, parse: Callable[[str], Any]) -> Any:
+    """Parse a command record, or persist the failure in place of the parse.
+
+    `command_result` returns an empty string for a record that failed, and
+    every parser answers a well-formed empty structure to it: an empty backlog,
+    an undecided PBP status, a session table with no counter. Persisted as
+    such, a read that never happened is indistinguishable from a firewall that
+    answered nothing was wrong - which is how a timed-out PBP read became a
+    green "PBP never activated" in the report.
+
+    The field therefore carries the failure itself, exactly as
+    `interface_counters` already does. A reader treats a dict holding only
+    `error` as evidence that was never collected; captures written before this
+    gate stay readable, because the raw command record travels in the same
+    batch and every reader falls back to it.
+    """
+    if command_succeeded(payload):
+        return parse(command_result(payload))
+    return {
+        "error": payload.get("error") if isinstance(payload, dict) else str(payload or "")
+    }
 
 
 def build_candidate_entities(
@@ -5207,12 +5231,21 @@ class MonitorController:
                 dataplane_pool_result = command_result(
                     outputs.get("dataplane_pool_statistics")
                 )
-                pbp_offenders = extract_pbp_offenders(pbp_result)
-                pbp_status = extract_pbp_status(pbp_result, pbp_offenders)
-                session_info = extract_session_info(
-                    command_result(outputs.get("session_info"))
+                pbp_payload = outputs.get("packet_buffer_protection")
+                pbp_offenders = parsed_or_failed_read(
+                    pbp_payload, extract_pbp_offenders
                 )
-                ingress_backlogs = extract_ingress_backlogs(ingress_result)
+                offender_rows = pbp_offenders if isinstance(pbp_offenders, list) else []
+                pbp_status = parsed_or_failed_read(
+                    pbp_payload,
+                    lambda text: extract_pbp_status(text, offender_rows),
+                )
+                session_info = parsed_or_failed_read(
+                    outputs.get("session_info"), extract_session_info
+                )
+                ingress_backlogs = parsed_or_failed_read(
+                    outputs.get("ingress_backlogs"), extract_ingress_backlogs
+                )
                 dataplane_pools = extract_dataplane_pool_statistics(
                     dataplane_pool_result
                 )
@@ -5221,8 +5254,8 @@ class MonitorController:
                 )
                 fallback_ids = extract_session_ids(pbp_result, ingress_result)
                 candidate_entities = build_candidate_entities(
-                    pbp_offenders,
-                    ingress_backlogs["candidates"],
+                    offender_rows,
+                    ingress_backlogs.get("candidates") or [],
                     fallback_ids,
                     sorted(self.trigger_session_ids),
                     sorted(self.trigger_source_ips),
@@ -6148,18 +6181,26 @@ async def run_api_check(cfg: Config) -> ApiCheckResult:
     pbp_result = command_result(outputs.get("packet_buffer_protection"))
     ingress_result = command_result(outputs.get("ingress_backlogs"))
     dataplane_pool_result = command_result(outputs.get("dataplane_pool_statistics"))
-    pbp_offenders = extract_pbp_offenders(pbp_result)
-    pbp_status = extract_pbp_status(pbp_result, pbp_offenders)
-    session_info = extract_session_info(command_result(outputs.get("session_info")))
-    ingress_backlogs = extract_ingress_backlogs(ingress_result)
+    pbp_payload = outputs.get("packet_buffer_protection")
+    pbp_offenders = parsed_or_failed_read(pbp_payload, extract_pbp_offenders)
+    offender_rows = pbp_offenders if isinstance(pbp_offenders, list) else []
+    pbp_status = parsed_or_failed_read(
+        pbp_payload, lambda text: extract_pbp_status(text, offender_rows)
+    )
+    session_info = parsed_or_failed_read(
+        outputs.get("session_info"), extract_session_info
+    )
+    ingress_backlogs = parsed_or_failed_read(
+        outputs.get("ingress_backlogs"), extract_ingress_backlogs
+    )
     dataplane_pools = extract_dataplane_pool_statistics(dataplane_pool_result)
     global_counters = extract_global_counters(
         command_result(outputs.get("global_counters_delta"))
     )
     fallback_ids = extract_session_ids(pbp_result, ingress_result)
     candidate_entities = build_candidate_entities(
-        pbp_offenders,
-        ingress_backlogs["candidates"],
+        offender_rows,
+        ingress_backlogs.get("candidates") or [],
         fallback_ids,
     )
     ids = [
@@ -6208,13 +6249,15 @@ async def run_api_check(cfg: Config) -> ApiCheckResult:
     if not command_succeeded(global_counter_baseline):
         validation_errors.append("global counter baseline command failed")
     for name, record in outputs.items():
-        if command_succeeded(record):
+        outcome = command_outcome(record, name)
+        if outcome == "succeeded":
             continue
+        # The classification comes from the shared helper; the policy stays
+        # here: an optional read is a warning whatever the reason, and only a
+        # command declared platform-dependent may be downgraded to a note.
         if name in OPTIONAL_COMMAND_EVIDENCE:
             validation_warnings.append(optional_command_warning(name))
-        elif name in PLATFORM_DEPENDENT_COMMAND_EVIDENCE and command_node_unsupported(
-            record
-        ):
+        elif outcome == "unsupported":
             validation_notes.append(unsupported_command_note(name))
         else:
             validation_errors.append(f"{name} command failed")
