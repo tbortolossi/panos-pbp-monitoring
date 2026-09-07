@@ -234,7 +234,11 @@ a short reason when it did not. A validation that collected everything
 monitoring needs but was refused one of the two enrichment reads — the running
 configuration of the PBP thresholds, or the buffer latency of a PAN-OS release
 that does not have that command — reads **Passed with warnings** in amber and
-names the missing evidence; the firewall stays usable. See
+names the missing evidence; the firewall stays usable. Evidence the firewall
+never had, rather than lost — the ingress queues a VM-Series has no dataplane
+for, or PBP thresholds left at the PAN-OS defaults — reads **Passed** in green
+with the fact named in the same detail line, because no role and no upgrade
+would change it. See
 [Troubleshooting](troubleshooting.md#pan-os-api-failure).
 
 Because HTTPS uses port 443 and Syslog uses port 514, one address covers both.

@@ -33,6 +33,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from . import __version__, diagnostics
+from .diagnosis import DEFAULT_ACTIVATE_PERCENT, DEFAULT_ALERT_PERCENT
 from .config_store import (
     SAFE_RUN_COMPONENT,
     ConfigStore,
@@ -193,10 +194,16 @@ OPTIONAL_COMMAND_EVIDENCE = {
 
 
 #: Evidence that exists only on some platforms or PAN-OS releases. A command
-#: listed here stays mandatory: it is downgraded to a warning only when the
+#: listed here stays mandatory: it is downgraded to a note only when the
 #: firewall itself answers that the node does not exist, never when the read
 #: fails for a reason the operator could fix. `ingress-backlogs` reports the
 #: ingress queues of a hardware dataplane, so VM-Series rejects the node.
+#:
+#: An absent node is not reduced evidence: no role, no upgrade and no
+#: configuration can make a VM-Series grow the hardware queues this command
+#: reads. Reporting it amber would leave every VM-Series permanently amber,
+#: which is how an operator learns to stop reading amber, so it is recorded as
+#: a note beside a check that passes.
 PLATFORM_DEPENDENT_COMMAND_EVIDENCE = {
     "ingress_backlogs": "the per-dataplane ingress backlog and on-chip descriptor levels",
 }
@@ -216,7 +223,10 @@ _UNSUPPORTED_NODE_MARKERS = (
 #: every threshold under it is at its PAN-OS default. That is a complete
 #: answer, not a lost read, and must not be reported as a failed command.
 ABSENT_CONFIG_EVIDENCE = {
-    "pbp_settings": "the PAN-OS default PBP thresholds are in force",
+    "pbp_settings": (
+        "the PAN-OS default PBP thresholds are in force "
+        f"(alert {DEFAULT_ALERT_PERCENT:g}%, activate {DEFAULT_ACTIVATE_PERCENT:g}%)"
+    ),
 }
 
 #: The answer PAN-OS gives for a configuration element that does not exist.
@@ -229,16 +239,16 @@ def optional_command_warning(name: str) -> str:
     return f"{name} command failed, {lost} could not be collected"
 
 
-def unsupported_command_warning(name: str) -> str:
+def unsupported_command_note(name: str) -> str:
     """Say which evidence this platform simply does not expose."""
     lost = PLATFORM_DEPENDENT_COMMAND_EVIDENCE.get(name, "part of the evidence")
     return (
         f"{name} is not supported on this platform or PAN-OS release, "
-        f"{lost} could not be collected"
+        f"{lost} do not exist here"
     )
 
 
-def unconfigured_command_warning(name: str) -> str:
+def unconfigured_command_note(name: str) -> str:
     """Say what is in force when the firewall has nothing configured here."""
     in_force = ABSENT_CONFIG_EVIDENCE.get(name, "the PAN-OS defaults apply")
     return f"{name} is not configured on this firewall, {in_force}"
@@ -5943,15 +5953,19 @@ class ApiCheckResult(NamedTuple):
     """Outcome of one read-only API check.
 
     `succeeded` answers the only question the check exists for: can this
-    firewall be monitored? `warnings` carries what was collected less of —
-    an enrichment read the API role refuses, or a command this PAN-OS release
-    does not know — so the operator sees the reduced evidence without the
-    firewall being reported as unreachable.
+    firewall be monitored? `warnings` carries what was collected less of for a
+    reason the operator can act on — an enrichment read the API role refuses —
+    so the reduced evidence is visible without the firewall being reported as
+    unreachable. `notes` carries what this firewall was never going to answer:
+    a node the platform does not have, or a configuration element it does not
+    carry. A note names the evidence the report will not have and leaves the
+    check green, because nothing on the firewall or in the role can change it.
     """
 
     capture: Path
     succeeded: bool
     warnings: list[str]
+    notes: list[str]
 
 
 async def run_api_check(cfg: Config) -> ApiCheckResult:
@@ -6055,14 +6069,17 @@ async def run_api_check(cfg: Config) -> ApiCheckResult:
     )
     validation_errors = list(identity_warnings)
     validation_warnings: list[str] = []
+    validation_notes: list[str] = []
     if not command_succeeded(system_info):
         validation_errors.append("system_info command failed")
     if not command_succeeded(pbp_settings_payload):
-        validation_warnings.append(
-            unconfigured_command_warning("pbp_settings")
-            if config_node_absent(pbp_settings_payload)
-            else optional_command_warning("pbp_settings")
-        )
+        # An absent configuration node is an answer about the firewall, a
+        # refused read is a role the operator can widen: only the second one
+        # costs evidence that could have been collected.
+        if config_node_absent(pbp_settings_payload):
+            validation_notes.append(unconfigured_command_note("pbp_settings"))
+        else:
+            validation_warnings.append(optional_command_warning("pbp_settings"))
     if not command_succeeded(global_counter_baseline):
         validation_errors.append("global counter baseline command failed")
     for name, record in outputs.items():
@@ -6073,7 +6090,7 @@ async def run_api_check(cfg: Config) -> ApiCheckResult:
         elif name in PLATFORM_DEPENDENT_COMMAND_EVIDENCE and command_node_unsupported(
             record
         ):
-            validation_warnings.append(unsupported_command_warning(name))
+            validation_notes.append(unsupported_command_note(name))
         else:
             validation_errors.append(f"{name} command failed")
     if not firewall_clock:
@@ -6103,6 +6120,7 @@ async def run_api_check(cfg: Config) -> ApiCheckResult:
             "resources_below_threshold": is_low,
             "validation_errors": validation_errors,
             "validation_warnings": validation_warnings,
+            "validation_notes": validation_notes,
             "candidate_session_ids": ids,
             "candidate_entities": candidate_entities,
             "pbp_status": pbp_status,
@@ -6153,7 +6171,15 @@ async def run_api_check(cfg: Config) -> ApiCheckResult:
             else "failed, and also collected reduced evidence",
             "; ".join(validation_warnings),
         )
-    return ApiCheckResult(output_file, succeeded, validation_warnings)
+    if validation_notes:
+        LOG.info(
+            "API check for %s collected everything this firewall exposes: %s",
+            cfg.target_name or cfg.panos_url,
+            "; ".join(validation_notes),
+        )
+    return ApiCheckResult(
+        output_file, succeeded, validation_warnings, validation_notes
+    )
 
 
 async def run_configured_api_checks(cfg: Config) -> list[ApiCheckResult]:
@@ -6243,7 +6269,7 @@ async def run_target_keepalive(cfg: Config, store: ConfigStore, target: StoredTa
 async def run_target_validation(cfg: Config, store: ConfigStore, target: StoredTarget) -> bool:
     """Run the full read-only validation batch for one firewall on request."""
     try:
-        capture, ok, warnings = await run_api_check(cfg)
+        capture, ok, warnings, notes = await run_api_check(cfg)
     except Exception as exc:  # a failed validation must not stop the listener
         LOG.exception("Validation failed for %s", target.name)
         store.record_target_check(
@@ -6257,9 +6283,15 @@ async def run_target_validation(cfg: Config, store: ConfigStore, target: StoredT
     # A check that collected everything monitoring needs is not a failure, even
     # when an enrichment read was refused: it is recorded as passed, with the
     # missing evidence named so the dashboard can show it amber rather than red.
-    detail = f"run {capture.parent.name}"
+    # A note is named the same way but keeps the check green: a VM-Series
+    # without ingress queues, or a firewall running the default PBP thresholds,
+    # answered everything it has.
+    parts = [f"run {capture.parent.name}"]
     if ok and warnings:
-        detail = f"{detail} - reduced evidence: {'; '.join(warnings)}"
+        parts.append(f"reduced evidence: {'; '.join(warnings)}")
+    if ok and notes:
+        parts.append("; ".join(notes))
+    detail = " - ".join(parts)
     store.record_target_check(
         target.target_id,
         kind="validation",

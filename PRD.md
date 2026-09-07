@@ -101,7 +101,15 @@ than create a concurrent one.
    restricted to operational requests is refused, and the buffer latency, absent
    from older PAN-OS releases — are reported as warnings: the check passes, the
    outcome reads *passed with warnings* in amber, and the detail names the
-   evidence that will be missing from the reports.
+   evidence that will be missing from the reports. Evidence the firewall was
+   never going to hold is reported as a note instead, and the check stays green:
+   a node the platform does not have, such as the ingress backlogs of a
+   VM-Series, and a configuration element the firewall does not carry, such as
+   PBP thresholds left at the PAN-OS defaults of alert 50 % and activate 80 %.
+   Amber is reserved for what an operator can repair, so a firewall is never
+   left permanently amber for a limit of its own platform. Notes are persisted
+   in the capture as `validation_notes`, beside `validation_errors` and
+   `validation_warnings`.
 4. At startup, the monitor runs `show system info` once without delaying the
    first diagnostic batch, together with one read of the PBP settings of the
    running configuration (`show config running xpath

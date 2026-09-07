@@ -71,8 +71,11 @@ One more read is mandatory, but only where the platform has it:
 |---|---|---|
 | `show running resource-monitor ingress-backlogs` | The ingress queues belong to a hardware dataplane. A VM-Series has none, so PAN-OS rejects the node itself, with `... ingress-backlogs unexpected here` | The per-dataplane ingress backlog and on-chip descriptor levels; the buffer and descriptor levels still come from `show running resource-monitor` |
 
-That last one is downgraded to a warning only when the firewall answers that
-the node does not exist. The same command failing for a reason an operator can
+That last one is downgraded only when the firewall answers that the node does
+not exist, and it is then recorded as a note rather than as a warning: no role,
+no upgrade and no configuration can make a VM-Series grow the hardware queues
+this command reads, so the check passes green and the detail names the evidence
+the report will not have. The same command failing for a reason an operator can
 act on — a timeout, an HTTP status, a permission the API role does not have —
 still fails the check.
 
@@ -85,20 +88,28 @@ alert 50 %, activate 80 % — are the ones in force. The check reports it as
 
 ```
 pbp_settings is not configured on this firewall, the PAN-OS default PBP
-thresholds are in force
+thresholds are in force (alert 50%, activate 80%)
 ```
 
 which is the expected result on a VM-Series deployed from an image and left at
-its defaults. There is nothing to grant and nothing to repair. A refusal of the
-same read still reads `pbp_settings command failed`, and that one is a
-permission to widen.
+its defaults. There is nothing to grant and nothing to repair, so the check
+reads **Passed** in green with that line beside it. A refusal of the same read
+still reads `pbp_settings command failed`, and that one is a permission to
+widen.
 
-The firewall then shows **Passed with warnings** in amber on the configuration
+A refused read shows **Passed with warnings** in amber on the configuration
 page and in the dashboard's API signal, and the check detail names the missing
 evidence. Grant the API administrator the configuration read, or accept the
 reduced evidence: monitoring itself is unaffected. The raw refusal PAN-OS
 returned is kept in the capture, so the permission or release behind it is
 readable from a run archive.
+
+Amber is therefore reserved for what the operator can repair. What the platform
+or the configuration simply does not have — the ingress queues of a VM-Series,
+PBP thresholds left at their defaults — stays green, with the fact named on the
+card and written to the capture as `validation_notes` beside
+`validation_warnings`. A firewall left amber for a limit of its own platform
+would teach the operator to stop reading amber.
 
 ## Reading the collector history beyond `docker logs`
 

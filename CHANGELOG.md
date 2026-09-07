@@ -3,6 +3,39 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.42.0] - 2026-09-07
+
+### Changed
+
+- **A limit of the platform no longer leaves a firewall amber for ever.** The
+  validation reported two facts as reduced evidence that no operator can act
+  on: a VM-Series rejecting `show running resource-monitor ingress-backlogs`,
+  because the ingress queues belong to a hardware dataplane it does not have,
+  and a firewall answering `No such node` for the PBP configuration, because no
+  threshold was ever set on it. Both were amber, permanently, on every check of
+  that firewall — and a target that is always amber is a target whose amber
+  stops being read, which is exactly when a genuinely refused enrichment read
+  gets missed. The check now separates the two kinds of gap. Evidence lost for
+  a reason the operator can repair — a read the API role refuses, a timeout —
+  stays **Passed with warnings** in amber and keeps the `reduced evidence:`
+  wording. Evidence the firewall was never going to hold is recorded as a note:
+  the outcome reads **Passed** in green on the configuration page and in the
+  dashboard's API signal, with the fact named in the same detail line. A
+  refused `pbp_settings` read is still amber; only `No such node` is a note.
+  Refs #221.
+- **An unset PBP threshold now says which thresholds are protecting the
+  firewall.** The note reads `pbp_settings is not configured on this firewall,
+  the PAN-OS default PBP thresholds are in force (alert 50%, activate 80%)`,
+  taking both values from the same constants the reports use, instead of
+  leaving the operator to look up what the defaults are.
+
+### Added
+
+- Each API-check capture carries a `validation_notes` field beside
+  `validation_errors` and `validation_warnings`, so a support bundle shows
+  which evidence was absent by design rather than lost. Existing captures
+  without the field are read unchanged.
+
 ## [0.41.2] - 2026-09-07
 
 ### Fixed
