@@ -179,6 +179,18 @@ is typed by hand. The firewall must be reachable when the entry is saved: an
 unreachable address, an untrusted certificate, or a rejected key is reported and
 nothing is written.
 
+A refusal keeps you on the form with everything you typed, and names the reason
+the firewall gave rather than only the HTTP status, so `403` reads
+`403: Invalid Credential`. Correct the field and save again. Secrets are the one
+exception: an API password or key is never sent back to the browser, so retype
+it. Nothing is written and no firewall appears in the list until the firewall
+itself accepts the credentials.
+
+A successful save then queues the full read-only validation described below, the
+same one the **Test** button runs, so a firewall is proven against every
+collection command without a second click. The result appears in the **Last
+check** column within a few seconds.
+
 ![The firewall form reopened on a saved entry, showing the authentication
 method and the TLS verification warning](images/admin-firewall-form.png)
 

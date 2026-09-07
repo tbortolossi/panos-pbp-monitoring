@@ -255,11 +255,19 @@ than create a concurrent one.
     administrator reached the page on, an editable Syslog port, and an editable
     log forwarding profile name. It is text generation only: the collector never
     writes to PAN-OS.
-13. Saving a firewall in the admin area performs at most two outbound calls: an
-    optional HTTPS key generation from temporary credentials, then one
-    read-only `show system info`. The second call validates the API key and
-    supplies the stored device serial, hostname, model, and PAN-OS version. Neither call changes firewall state, and
-    a failure of either leaves the configuration unchanged.
+13. Saving a firewall in the admin area performs at most three outbound calls:
+    an optional HTTPS key generation from temporary credentials, then a
+    read-only `show system info`, then a read-only `show statistics` that maps
+    the dataplane cores and is allowed to fail. `show system info` validates the
+    API key and supplies the stored device serial, hostname, model, and PAN-OS
+    version. No call changes firewall state, and a failure of key generation or
+    of `show system info` leaves the configuration unchanged.
+14. A refused save re-renders the firewall form with the submitted values and
+    the reason PAN-OS gave, including the message carried in the body of an HTTP
+    error rather than the status code alone, so the operator corrects one field
+    instead of retyping the entry. No API password or key is ever echoed back to
+    the browser. A successful save queues the full read-only validation for that
+    firewall, so its collection commands are proven without a second action.
 
 ## 7. Functional requirements
 
