@@ -1909,6 +1909,46 @@ def parsed_or_failed_read(payload: Any, parse: Callable[[str], Any]) -> Any:
     }
 
 
+class BatchReads(NamedTuple):
+    """The four volatile reads of one batch, each gated on its own command.
+
+    `offender_rows` is the offender list to enrich from: the parsed rows when
+    the read answered, and an empty list when it did not, so the enrichment
+    never has to ask whether the field it holds is a failure marker.
+    """
+
+    pbp_offenders: Any
+    offender_rows: list[dict[str, Any]]
+    pbp_status: Any
+    session_info: Any
+    ingress_backlogs: Any
+
+
+def parse_batch_reads(outputs: dict[str, Any]) -> BatchReads:
+    """Parse the four per-batch fields of one collection, failures included.
+
+    The incident batches and the read-only API check collect the same
+    commands and persist the same fields, so they gate them here once rather
+    than each keeping its own copy of the rule.
+    """
+    pbp_payload = outputs.get("packet_buffer_protection")
+    pbp_offenders = parsed_or_failed_read(pbp_payload, extract_pbp_offenders)
+    offender_rows = pbp_offenders if isinstance(pbp_offenders, list) else []
+    return BatchReads(
+        pbp_offenders=pbp_offenders,
+        offender_rows=offender_rows,
+        pbp_status=parsed_or_failed_read(
+            pbp_payload, lambda text: extract_pbp_status(text, offender_rows)
+        ),
+        session_info=parsed_or_failed_read(
+            outputs.get("session_info"), extract_session_info
+        ),
+        ingress_backlogs=parsed_or_failed_read(
+            outputs.get("ingress_backlogs"), extract_ingress_backlogs
+        ),
+    )
+
+
 def build_candidate_entities(
     pbp_offenders: list[dict[str, Any]],
     ingress_candidates: list[dict[str, Any]],
@@ -5231,21 +5271,7 @@ class MonitorController:
                 dataplane_pool_result = command_result(
                     outputs.get("dataplane_pool_statistics")
                 )
-                pbp_payload = outputs.get("packet_buffer_protection")
-                pbp_offenders = parsed_or_failed_read(
-                    pbp_payload, extract_pbp_offenders
-                )
-                offender_rows = pbp_offenders if isinstance(pbp_offenders, list) else []
-                pbp_status = parsed_or_failed_read(
-                    pbp_payload,
-                    lambda text: extract_pbp_status(text, offender_rows),
-                )
-                session_info = parsed_or_failed_read(
-                    outputs.get("session_info"), extract_session_info
-                )
-                ingress_backlogs = parsed_or_failed_read(
-                    outputs.get("ingress_backlogs"), extract_ingress_backlogs
-                )
+                reads = parse_batch_reads(outputs)
                 dataplane_pools = extract_dataplane_pool_statistics(
                     dataplane_pool_result
                 )
@@ -5254,8 +5280,8 @@ class MonitorController:
                 )
                 fallback_ids = extract_session_ids(pbp_result, ingress_result)
                 candidate_entities = build_candidate_entities(
-                    offender_rows,
-                    ingress_backlogs.get("candidates") or [],
+                    reads.offender_rows,
+                    reads.ingress_backlogs.get("candidates") or [],
                     fallback_ids,
                     sorted(self.trigger_session_ids),
                     sorted(self.trigger_source_ips),
@@ -5353,10 +5379,8 @@ class MonitorController:
                                 ),
                             )
                             outputs[f"interface_counters:{interface_name}"] = payload
-                            interface_counters[interface_name] = (
-                                extract_interface_counters(command_result(payload))
-                                if command_succeeded(payload)
-                                else {"error": payload.get("error")}
+                            interface_counters[interface_name] = parsed_or_failed_read(
+                                payload, extract_interface_counters
                             )
                         if interface_counters:
                             interface_counters_source = "named"
@@ -5409,10 +5433,10 @@ class MonitorController:
                         "resources_below_threshold": is_low,
                         "candidate_session_ids": ids,
                         "candidate_entities": candidate_entities,
-                        "pbp_status": pbp_status,
-                        "pbp_offenders": pbp_offenders,
-                        "session_info": session_info,
-                        "ingress_backlogs": ingress_backlogs,
+                        "pbp_status": reads.pbp_status,
+                        "pbp_offenders": reads.pbp_offenders,
+                        "session_info": reads.session_info,
+                        "ingress_backlogs": reads.ingress_backlogs,
                         "dataplane_pools": dataplane_pools,
                         "global_counters_delta": global_counters,
                         "global_counters_delta_status": (
@@ -6181,26 +6205,15 @@ async def run_api_check(cfg: Config) -> ApiCheckResult:
     pbp_result = command_result(outputs.get("packet_buffer_protection"))
     ingress_result = command_result(outputs.get("ingress_backlogs"))
     dataplane_pool_result = command_result(outputs.get("dataplane_pool_statistics"))
-    pbp_payload = outputs.get("packet_buffer_protection")
-    pbp_offenders = parsed_or_failed_read(pbp_payload, extract_pbp_offenders)
-    offender_rows = pbp_offenders if isinstance(pbp_offenders, list) else []
-    pbp_status = parsed_or_failed_read(
-        pbp_payload, lambda text: extract_pbp_status(text, offender_rows)
-    )
-    session_info = parsed_or_failed_read(
-        outputs.get("session_info"), extract_session_info
-    )
-    ingress_backlogs = parsed_or_failed_read(
-        outputs.get("ingress_backlogs"), extract_ingress_backlogs
-    )
+    reads = parse_batch_reads(outputs)
     dataplane_pools = extract_dataplane_pool_statistics(dataplane_pool_result)
     global_counters = extract_global_counters(
         command_result(outputs.get("global_counters_delta"))
     )
     fallback_ids = extract_session_ids(pbp_result, ingress_result)
     candidate_entities = build_candidate_entities(
-        offender_rows,
-        ingress_backlogs.get("candidates") or [],
+        reads.offender_rows,
+        reads.ingress_backlogs.get("candidates") or [],
         fallback_ids,
     )
     ids = [
@@ -6291,10 +6304,10 @@ async def run_api_check(cfg: Config) -> ApiCheckResult:
             "validation_notes": validation_notes,
             "candidate_session_ids": ids,
             "candidate_entities": candidate_entities,
-            "pbp_status": pbp_status,
-            "pbp_offenders": pbp_offenders,
-            "session_info": session_info,
-            "ingress_backlogs": ingress_backlogs,
+            "pbp_status": reads.pbp_status,
+            "pbp_offenders": reads.pbp_offenders,
+            "session_info": reads.session_info,
+            "ingress_backlogs": reads.ingress_backlogs,
             "dataplane_pools": dataplane_pools,
             "global_counters_delta": global_counters,
             "global_counters_delta_status": (

@@ -17,6 +17,8 @@ from pbp_monitoring.diagnosis import (
     command_outcomes,
     hardware_generation,
     ingress_backlog_collection,
+    read_failed_everywhere,
+    read_failure_reason,
 )
 from pbp_monitoring.reporting import (
     _SIGNAL_COUNTER_FAMILIES,
@@ -271,7 +273,7 @@ class OffenderStepTests(unittest.TestCase):
         self.assertEqual(facts["Batches with a failed read"], "2")
         self.assertIn("read failed in 2 of 2 batches", step["unavailable_reason"])
         self.assertIn(
-            "Whether PBP designated anyone is unknown",
+            "The PBP read failed in every batch, so what it learned is unknown",
             " ".join(diagnosis["conclusion"]),
         )
         # A step that could not be read is still reported, not dropped.
@@ -305,7 +307,9 @@ class OffenderStepTests(unittest.TestCase):
         self.assertEqual(step["state"], "negative")
         self.assertIn("PBP never activated", step["verdict"])
         self.assertIn(
-            "the PBP read failed in 1 of the 2 batches", step["verdict"]
+            "the read failed in 1 of the 2 batches, which therefore carry no "
+            "PBP evidence",
+            step["verdict"],
         )
         self.assertEqual(dict(_facts(step))["PBP activated"], "no")
 
@@ -809,6 +813,28 @@ class CommandOutcomeTests(unittest.TestCase):
         self.assertEqual(
             ingress_backlog_collection(cycles),
             {"batches": 2, "succeeded": 1, "unsupported": 0, "failed": 1},
+        )
+
+    def test_a_read_that_answered_nowhere_is_named_the_same_by_every_reader(self):
+        """One predicate: no batch succeeded and at least one read failed."""
+        every_batch_failed = {"batches": 2, "succeeded": 0, "unsupported": 0, "failed": 2}
+        rejected_and_failed = {"batches": 2, "succeeded": 0, "unsupported": 1, "failed": 1}
+        one_answered = {"batches": 2, "succeeded": 1, "unsupported": 0, "failed": 1}
+        only_rejected = {"batches": 2, "succeeded": 0, "unsupported": 2, "failed": 0}
+
+        self.assertTrue(read_failed_everywhere(every_batch_failed))
+        # A rejected node carries no evidence either, so it does not make the
+        # run look answered; the step that must tell the two apart decides the
+        # platform question first.
+        self.assertTrue(read_failed_everywhere(rejected_and_failed))
+        self.assertFalse(read_failed_everywhere(one_answered))
+        self.assertFalse(read_failed_everywhere(only_rejected))
+        self.assertEqual(
+            read_failure_reason(every_batch_failed), "read failed in 2 of 2 batches"
+        )
+        self.assertEqual(
+            read_failure_reason(every_batch_failed, "session table"),
+            "session table read failed in 2 of 2 batches",
         )
 
     def test_a_failed_read_marker_is_not_read_as_a_collected_field(self):

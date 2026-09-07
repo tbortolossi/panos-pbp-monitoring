@@ -28,14 +28,16 @@ from .diagnosis import (
     _flow_parts,
     _ingress_candidate_entities,
     _level,
+    _pbp_statuses,
     _special_tag_field,
     _numbers,
     build_diagnosis,
     buffer_latency_statuses,
-    collected_field,
     command_outcome,
     hardware_generation,
     ingress_backlog_collection,
+    read_failed_everywhere,
+    session_totals_counted,
     congestion_recurrence,
     ha_summary,
     history_trend,
@@ -1671,7 +1673,7 @@ def _render_ingress_backlogs(
                 "on this platform, so this section holds no evidence either "
                 "way.</p>"
             )
-        if collection["failed"]:
+        if read_failed_everywhere(collection):
             return (
                 '<p class="muted">The ingress backlog read failed in all '
                 f"{collection['failed']} of the {collection['batches']} batches "
@@ -3421,9 +3423,7 @@ def _session_info_totals(record: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(session_info, dict):
         return {}
     totals = session_info.get("totals")
-    if isinstance(totals, dict) and any(
-        isinstance(value, (int, float)) for value in totals.values()
-    ):
+    if session_totals_counted(totals):
         return totals
     dataplanes = session_info.get("dataplanes")
     if isinstance(dataplanes, list) and dataplanes:
@@ -4117,11 +4117,7 @@ def _build_report_parts(
             '<span class="pill">no hot core · open for the detail</span></summary>'
             f'<div class="section-body">{cpu_tracking_html}</div></details>'
         )
-    pbp_statuses = [
-        status
-        for _, record in cycles
-        if (status := collected_field(record, "pbp_status")) is not None
-    ]
+    pbp_statuses = _pbp_statuses([record for _, record in cycles])
     pbp_modes = sorted(
         {
             str(status.get("mode"))
@@ -4554,7 +4550,7 @@ def _build_report_parts(
         # every batch: that pill would read as a negative result the capture
         # cannot support. Decided by what the firewall answered, not the model.
         ingress_pill = "not available on this platform"
-    elif not ingress_collection["succeeded"] and ingress_collection["failed"]:
+    elif read_failed_everywhere(ingress_collection):
         ingress_pill = "read failed in every batch"
     else:
         ingress_pill = "no session at 2%"

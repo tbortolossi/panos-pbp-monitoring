@@ -753,7 +753,7 @@ def command_outcome(record: Any, name: str) -> str:
 def command_outcomes(
     cycles: Sequence[dict[str, Any]],
     name: str,
-    legacy_evidence: Callable[[dict[str, Any]], bool] | None = None,
+    legacy_field: str | None = None,
 ) -> dict[str, int]:
     """Split the batches by what one per-batch command actually returned.
 
@@ -761,10 +761,9 @@ def command_outcomes(
     the three outcomes always add up to it.
 
     A capture written before the raw command travelled in the batch record
-    carries nothing but the parsed field, and every parser answers a
-    well-formed empty structure to a failed read. Such a batch therefore
-    counts as one that never asked, unless `legacy_evidence` recognizes in the
-    parsed field something only a real answer produces.
+    carries nothing but the parsed field. Such a batch counts as one that
+    never asked, unless `legacy_field` names a parsed field holding something
+    only a real answer produces.
     """
     counts = {"batches": 0, "succeeded": 0, "unsupported": 0, "failed": 0}
     for record in cycles:
@@ -772,13 +771,65 @@ def command_outcomes(
         payload = commands.get(name) if isinstance(commands, dict) else None
         outcome = command_outcome(payload, name)
         if outcome == "missing":
-            if legacy_evidence is not None and legacy_evidence(record):
-                counts["batches"] += 1
-                counts["succeeded"] += 1
-            continue
+            if legacy_field is None or not _legacy_evidence(record, legacy_field):
+                continue
+            outcome = "succeeded"
         counts["batches"] += 1
         counts[outcome] += 1
     return counts
+
+
+def read_failed_everywhere(counts: dict[str, int]) -> bool:
+    """Did every batch that attempted this read come back without an answer?
+
+    True when no batch succeeded and at least one read failed for a reason an
+    operator could act on. Batches the firewall rejected as an absent node may
+    sit beside them - they carry no evidence either - so a step that must tell
+    a platform limit apart from a collection fault, as step 3 does, answers
+    the platform question before asking this one.
+    """
+    return counts["succeeded"] == 0 and counts["failed"] > 0
+
+
+def read_failure_reason(counts: dict[str, int], subject: str = "") -> str:
+    """The one line saying why a read carries no evidence, for a folded report.
+
+    `subject` names the read where a report shows several of them side by
+    side and the bare word would not say which one failed.
+    """
+    return (
+        f"{subject + ' ' if subject else ''}read failed in "
+        f"{counts['failed']} of {counts['batches']} batches"
+    )
+
+
+def unanswered_batches_note(
+    counts: dict[str, int],
+    evidence: str,
+    rejections: str | None = None,
+) -> str:
+    """Name every batch that answered nothing, so the counts add up.
+
+    `evidence` is the noun for what those batches do not carry. `rejections`
+    names the outcome of a command the firewall can reject as an absent node,
+    which keeps a platform limit apart from a read that failed for another
+    reason; pass the empty string on a verdict that has already stated its own
+    rejection count, so no batch is counted to the reader twice.
+    """
+    parts: list[str] = []
+    if rejections and counts["unsupported"]:
+        parts.append(f"{rejections} in {counts['unsupported']}")
+    if counts["failed"]:
+        qualifier = " for another reason" if rejections is not None else ""
+        parts.append(f"the read failed{qualifier} in {counts['failed']}")
+    if not parts:
+        return ""
+    return (
+        " Not every batch answered: "
+        + " and ".join(parts)
+        + f" of the {counts['batches']} batches, which therefore carry "
+        f"no {evidence} evidence."
+    )
 
 
 def collected_field(record: dict[str, Any], field: str) -> dict[str, Any] | None:
@@ -797,52 +848,57 @@ def collected_field(record: dict[str, Any], field: str) -> dict[str, Any] | None
     return value
 
 
-def _legacy_ingress_evidence(record: dict[str, Any]) -> bool:
-    """Did a capture without the raw command still record a real backlog read?"""
-    parsed = record.get("ingress_backlogs")
-    return isinstance(parsed, dict) and bool(
-        parsed.get("dataplanes") or parsed.get("candidates")
-    )
+def session_totals_counted(totals: Any) -> bool:
+    """Did a session-table read count anything device-wide?
 
-
-def _legacy_pbp_evidence(record: dict[str, Any]) -> bool:
-    """Did a capture without the raw command still record a real PBP read?
-
-    `extract_pbp_status` leaves every state undecided when it is handed the
-    empty string of a failed read, so a status that decided anything - or a
-    single offender row - is the proof the firewall answered.
+    `extract_session_info` fills every total with None when it parsed no
+    dataplane row, so the presence of a totals dict is not by itself proof the
+    firewall answered. `reporting` asks the same question before charting them.
     """
-    status = collected_field(record, "pbp_status")
-    if status is not None and any(
-        status.get(key) is not None
-        for key in ("enabled", "active", "congestion_percentage")
-    ):
-        return True
-    offenders = record.get("pbp_offenders")
-    return isinstance(offenders, list) and bool(offenders)
-
-
-def _legacy_session_evidence(record: dict[str, Any]) -> bool:
-    """Did a capture without the raw command still record a real session read?"""
-    info = collected_field(record, "session_info")
-    if info is None:
-        return False
-    if isinstance(info.get("dataplanes"), list) and info["dataplanes"]:
-        return True
-    totals = info.get("totals")
     return isinstance(totals, dict) and any(
         isinstance(value, (int, float)) for value in totals.values()
     )
 
 
+#: What a capture written before the raw command travelled in the batch record
+#: must carry in its parsed field for that batch to count as one the firewall
+#: answered. Every parser returns a well-formed empty structure to a failed
+#: read, so an empty one proves nothing and the batch counts as one that never
+#: asked. The failure marker of the write-time gate cannot appear here: a
+#: capture that carries it also carries the raw command record.
+_LEGACY_EVIDENCE: dict[str, Callable[[dict[str, Any]], bool]] = {
+    # A queue level or a ranked entry: either one is an answer.
+    "ingress_backlogs": lambda parsed: bool(
+        parsed.get("dataplanes") or parsed.get("candidates")
+    ),
+    # `extract_pbp_status` leaves every state undecided when it is handed the
+    # empty string of a failed read, so any decided state is the proof. The
+    # states are read for being set, never for being true: PBP listed
+    # inactive is an answer.
+    "pbp_status": lambda parsed: any(
+        parsed.get(key) is not None
+        for key in ("enabled", "active", "congestion_percentage")
+    ),
+    # A dataplane row, or a device-wide total that counted something.
+    "session_info": lambda parsed: bool(parsed.get("dataplanes"))
+    or session_totals_counted(parsed.get("totals")),
+}
+
+
+def _legacy_evidence(record: dict[str, Any], field: str) -> bool:
+    """Did a capture without the raw command still record a real read?"""
+    parsed = record.get(field)
+    return isinstance(parsed, dict) and _LEGACY_EVIDENCE[field](parsed)
+
+
 def pbp_read_collection(cycles: Sequence[dict[str, Any]]) -> dict[str, int]:
     """Split the batches by what the PBP read returned."""
-    return command_outcomes(cycles, "packet_buffer_protection", _legacy_pbp_evidence)
+    return command_outcomes(cycles, "packet_buffer_protection", "pbp_status")
 
 
 def session_info_collection(cycles: Sequence[dict[str, Any]]) -> dict[str, int]:
     """Split the batches by what the session-table read returned."""
-    return command_outcomes(cycles, "session_info", _legacy_session_evidence)
+    return command_outcomes(cycles, "session_info", "session_info")
 
 
 def ingress_backlog_collection(cycles: Sequence[dict[str, Any]]) -> dict[str, int]:
@@ -855,7 +911,7 @@ def ingress_backlog_collection(cycles: Sequence[dict[str, Any]]) -> dict[str, in
     platform capability gap nothing on the collector side can fix, while a
     timeout or a denied permission is a collection fault an operator acts on.
     """
-    return command_outcomes(cycles, "ingress_backlogs", _legacy_ingress_evidence)
+    return command_outcomes(cycles, "ingress_backlogs", "ingress_backlogs")
 
 
 _ALERT_THRESHOLD_PATTERN = re.compile(r"alert threshold is\s*(\d+(?:\.\d+)?)\s*%", re.I)
@@ -1657,7 +1713,7 @@ def _step_pbp_named(
     # A firewall too loaded to answer `show session packet-buffer-protection`
     # is the very condition this collector exists for. Its failed reads parse
     # to an undecided status, which must never become "PBP never activated".
-    read_failed = collection["succeeded"] == 0 and collection["failed"] > 0
+    read_failed = read_failed_everywhere(collection)
     if threat_logs is None:
         threat_logs = _threat_log_summary(events)
     pbp_seen = any("packet_buffer_protection" in item.get("evidence_sources", []) for item in attribution)
@@ -1671,12 +1727,14 @@ def _step_pbp_named(
     sessions = [item for item in marked if item.get("entity_type") == "session"]
     sources = [item for item in marked if item.get("entity_type") != "session"]
     logs = _traffic_log_summary(events)
+    if activated:
+        activated_fact = "yes"
+    elif read_failed:
+        activated_fact = "unknown"
+    else:
+        activated_fact = "no"
     facts: list[tuple[str, str, str]] = [
-        (
-            "PBP activated",
-            "yes" if activated else "unknown" if read_failed else "no",
-            "none",
-        ),
+        ("PBP activated", activated_fact, "none"),
         ("Entries learned", _fmt(len(learned)), "none"),
         ("Marked for RED", _fmt(len(marked)), "none"),
     ]
@@ -1764,10 +1822,7 @@ def _step_pbp_named(
     unavailable_reason = ""
     if not activated and not confirming_counts and read_failed:
         state, level = "failed", "warn"
-        unavailable_reason = (
-            f"read failed in {collection['failed']} of "
-            f"{collection['batches']} batches"
-        )
+        unavailable_reason = read_failure_reason(collection)
         verdict = (
             f"<strong>The PBP read failed in all {collection['failed']} of the "
             f"{collection['batches']} batches</strong>, so whether the firewall "
@@ -1865,12 +1920,8 @@ def _step_pbp_named(
         verdict = " ".join(parts)
     # A batch that answered nothing is worth naming wherever the step landed.
     # The "read failed" verdict already speaks of nothing else.
-    if state != "failed" and collection["failed"]:
-        verdict += (
-            f" Not every batch answered: the PBP read failed in "
-            f"{collection['failed']} of the {collection['batches']} batches, "
-            "which therefore carry no PBP evidence."
-        )
+    if state != "failed":
+        verdict += unanswered_batches_note(collection, "PBP")
     return {
         "number": 2,
         "key": "pbp",
@@ -2082,26 +2133,9 @@ def _step_ingress_backlogs(
     # and a platform said to support the command still has none when every
     # batch came back rejected. The generation only chooses the wording.
     node_absent = succeeded == 0 and unsupported > 0
-    read_failed = succeeded == 0 and unsupported == 0 and failed > 0
-    def _missing_note(include_rejected: bool) -> str:
-        """Name every batch that answered nothing, so the counts add up.
-
-        `include_rejected` is False on the verdict that has already stated its
-        own rejection count, so no batch is counted to the reader twice.
-        """
-        parts: list[str] = []
-        if include_rejected and unsupported:
-            parts.append(f"the firewall rejected it as an absent node in {unsupported}")
-        if failed:
-            parts.append(f"the read failed for another reason in {failed}")
-        if not parts:
-            return ""
-        return (
-            " Not every batch answered: "
-            + " and ".join(parts)
-            + f" of the {collection['batches']} batches, which therefore carry "
-            "no backlog evidence."
-        )
+    # The platform question is answered first, so a run mixing a rejected node
+    # with a timeout is reported as the platform limit it is.
+    read_failed = not node_absent and read_failed_everywhere(collection)
     # Sessions extracted from the backlog output are evidence the command
     # returned, so they answer the step before any failure count is read.
     unavailable_reason = ""
@@ -2123,9 +2157,7 @@ def _step_ingress_backlogs(
         )
     elif not sessions and read_failed:
         state, level = "failed", "warn"
-        unavailable_reason = (
-            f"read failed in {failed} of {collection['batches']} batches"
-        )
+        unavailable_reason = read_failure_reason(collection)
         verdict = (
             f"<strong>The ingress backlog read failed in all {failed} of the "
             f"{collection['batches']} batches.</strong> The firewall did not "
@@ -2242,7 +2274,13 @@ def _step_ingress_backlogs(
     # The "read failed" verdict already speaks of nothing else, and the "not
     # available" verdict has already stated its own rejection count.
     if state != "failed":
-        verdict += _missing_note(include_rejected=not node_unsupported)
+        verdict += unanswered_batches_note(
+            collection,
+            "backlog",
+            # The "not available" verdict has already stated its own rejection
+            # count, so it names the other lost batches and nothing else.
+            "" if node_unsupported else "the firewall rejected it as an absent node",
+        )
     verdict += inflight_monitoring_note(inflight)
     return {
         "number": 3,
@@ -2553,15 +2591,7 @@ def _step_elsewhere(
     # the session table is unknown - not flat - and the hypotheses that read
     # it say so instead of ruling a storm out.
     session_reads = session_info_collection(cycles)
-    session_read_failed = (
-        session_reads["succeeded"] == 0 and session_reads["failed"] > 0
-    )
-    session_read_note = (
-        f" The session table read failed in all {session_reads['failed']} of the "
-        f"{session_reads['batches']} batches, so the session count is unknown."
-        if session_read_failed
-        else ""
-    )
+    session_read_failed = read_failed_everywhere(session_reads)
 
     # 4a — elephant session: one hot core, or a long-lived transfer near link speed.
     isolated = [verdict for verdict in cpu_verdicts if verdict.get("state") == "isolated"]
@@ -2729,7 +2759,14 @@ def _step_elsewhere(
                     f"Only {_fmt(denied_total)} packets were denied before session setup over "
                     f"{_fmt(counted)} counted batches, peaking at {_fmt(denied_peak_rate)}/s: "
                     "far too few to fill a buffer pool."
-                    + session_read_note
+                    + (
+                        f" The session table read failed in all "
+                        f"{session_reads['failed']} of the "
+                        f"{session_reads['batches']} batches, so the session "
+                        "count is unknown."
+                        if session_read_failed
+                        else ""
+                    )
                 ),
                 "named": [],
             }
@@ -2770,10 +2807,14 @@ def _step_elsewhere(
         for source, count in busiest
         if count >= NEW_SESSION_STORM_SESSIONS_PER_SOURCE and source in tracked_sources
     ]
-    if (cps_peak is not None and cps_peak >= NEW_SESSION_STORM_CPS) or storm_sources:
-        text = "<strong>Session setup itself was the load</strong>: "
+    storm_named = cps_peak is not None and cps_peak >= NEW_SESSION_STORM_CPS
+    busiest_count = busiest[0][1] if busiest else None
+    storm_state = "positive"
+    storm_reason = ""
+    storm_named_sources: list[str] = []
+    if storm_named or storm_sources:
         parts = []
-        if cps_peak is not None and cps_peak >= NEW_SESSION_STORM_CPS:
+        if storm_named:
             parts.append(f"the firewall accepted up to {_fmt(cps_peak)} new connections per second")
         if storm_sources:
             parts.append(
@@ -2783,77 +2824,64 @@ def _step_elsewhere(
                     for source, count in storm_sources[:_MAX_NAMED]
                 )
             )
-        text += "; ".join(parts) + (
-            ". Many short sessions from one source are counted by PBP in both "
+        storm_text = (
+            "<strong>Session setup itself was the load</strong>: "
+            + "; ".join(parts)
+            + ". Many short sessions from one source are counted by PBP in both "
             "the slowpath and the fastpath, which is why it tracks the source "
             "address rather than any single session."
         )
-        hypotheses.append(
-            {
-                "key": "storm",
-                "title": "Storm of new sessions",
-                "state": "positive",
-                "text": text,
-                "named": [
-                    f"source IP <code>{_escape(source)}</code> owning {count} ranked sessions"
-                    for source, count in storm_sources[:_MAX_NAMED]
-                ],
-            }
-        )
+        storm_named_sources = [
+            f"source IP <code>{_escape(source)}</code> owning {count} ranked sessions"
+            for source, count in storm_sources[:_MAX_NAMED]
+        ]
     elif session_read_failed and not session_series:
-        # Every read of the session table failed, so the new-connection rate
-        # is unknown. Ranked sessions alone cannot rule a storm out.
-        hypotheses.append(
-            {
-                "key": "storm",
-                "title": "Storm of new sessions",
-                "state": "unavailable",
-                "text": (
-                    f"The session table read failed in all {session_reads['failed']} "
-                    f"of the {session_reads['batches']} batches, so the rate of new "
-                    "connections could not be read and a storm can be neither "
-                    "confirmed nor excluded."
-                    + (
-                        f" The busiest source owned {busiest[0][1]} ranked sessions."
-                        if busiest
-                        else ""
-                    )
-                ),
-                "named": [],
-                "unavailable_reason": (
-                    f"session table read failed in {session_reads['failed']} of "
-                    f"{session_reads['batches']} batches"
-                ),
-            }
+        # Every read of the session table failed, so the rate of new
+        # connections is unknown, not flat: ranked sessions alone cannot rule
+        # a storm out.
+        storm_state = "unavailable"
+        storm_reason = read_failure_reason(session_reads, "session table")
+        storm_text = (
+            f"The session table read failed in all {session_reads['failed']} "
+            f"of the {session_reads['batches']} batches, so the rate of new "
+            "connections could not be read and a storm can be neither "
+            "confirmed nor excluded."
+            + (
+                f" The busiest source owned {busiest_count} ranked sessions."
+                if busiest_count is not None
+                else ""
+            )
+        )
+    elif not session_series and not attribution:
+        storm_state = "unavailable"
+        storm_reason = "neither the session table nor the offender ranking was collected"
+        storm_text = (
+            "Neither the session table nor the offender ranking was collected."
         )
     else:
-        hypotheses.append(
-            {
-                "key": "storm",
-                "title": "Storm of new sessions",
-                "state": "negative" if session_series or attribution else "unavailable",
-                "text": (
-                    (
-                        f"New connections peaked at {_fmt(cps_peak)}/s"
-                        if cps_peak is not None
-                        else "The connection rate was not collected"
-                    )
-                    + (
-                        f" and the busiest source owned {busiest[0][1]} ranked sessions."
-                        if busiest
-                        else "."
-                    )
-                    if session_series or attribution
-                    else "Neither the session table nor the offender ranking was collected."
-                ),
-                "named": [],
-                "unavailable_reason": (
-                    ""
-                    if session_series or attribution
-                    else "neither the session table nor the offender ranking was collected"
-                ),
-            }
+        storm_state = "negative"
+        storm_text = (
+            (
+                f"New connections peaked at {_fmt(cps_peak)}/s"
+                if cps_peak is not None
+                else "The connection rate was not collected"
+            )
+            + (
+                f" and the busiest source owned {busiest_count} ranked sessions."
+                if busiest_count is not None
+                else "."
+            )
         )
+    hypotheses.append(
+        {
+            "key": "storm",
+            "title": "Storm of new sessions",
+            "state": storm_state,
+            "text": storm_text,
+            "named": storm_named_sources,
+            "unavailable_reason": storm_reason,
+        }
+    )
 
     # 4d — errors on the interfaces the evidence names.
     interface_deltas = _interface_error_deltas(cycles)
@@ -3725,6 +3753,16 @@ def _headline(
     }
 
 
+#: What the conclusion says when the PBP read answered in no batch at all.
+#: One wording for both paths it can take: at low pressure and at real
+#: pressure alike, an unread PBP designates nobody and proves nothing.
+PBP_READ_FAILED_SENTENCE = (
+    "The PBP read failed in every batch, so what it learned is unknown: "
+    "nothing is designated, and the read is worth repairing before the next "
+    "incident."
+)
+
+
 def _conclusion(
     context: dict[str, Any],
     pressure: dict[str, Any],
@@ -3773,39 +3811,29 @@ def _conclusion(
         + "."
     )
     if pressure["low_significance"]:
-        sentences.append(
-            "The firewall was not short of resources. "
-            + (
+        if named["state"] == "positive":
+            pbp_sentence = (
                 "PBP activated only because its activate threshold is set below the "
                 "observed utilization; the entries it ranked are the ordinary traffic "
                 "mix and do not designate an offender."
-                if named["state"] == "positive"
-                else "The PBP read failed in every batch, so what it learned is "
-                "unknown; nothing is designated."
-                if named["state"] == "failed"
-                else "No offender was learned and none is designated."
             )
-        )
+        elif named["state"] == "failed":
+            pbp_sentence = PBP_READ_FAILED_SENTENCE
+        else:
+            pbp_sentence = "No offender was learned and none is designated."
+        sentences.append("The firewall was not short of resources. " + pbp_sentence)
         return sentences
     if named["state"] == "positive":
-        sentences.append(
-            "PBP designated: " + "; ".join(named["named"]) + "."
-        )
+        pbp_sentence = "PBP designated: " + "; ".join(named["named"]) + "."
     elif named["state"] == "failed":
-        sentences.append(
-            "Whether PBP designated anyone is unknown: its read failed in every "
-            "batch, so this capture holds no PBP evidence and the read is worth "
-            "repairing before the next incident."
-        )
+        pbp_sentence = PBP_READ_FAILED_SENTENCE
+    elif "never activated" in named["verdict"]:
+        pbp_sentence = "PBP designated nobody: it never activated during the capture."
     else:
-        sentences.append(
-            "PBP designated nobody: "
-            + (
-                "it never activated during the capture."
-                if "never activated" in named["verdict"]
-                else "it activated but marked no entry for RED."
-            )
+        pbp_sentence = (
+            "PBP designated nobody: it activated but marked no entry for RED."
         )
+    sentences.append(pbp_sentence)
     if backlogs["state"] == "positive":
         sentences.append("Ingress backlog: " + "; ".join(backlogs["named"]) + ".")
     elif backlogs["state"] == "negative":
