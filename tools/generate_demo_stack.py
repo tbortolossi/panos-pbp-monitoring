@@ -411,6 +411,17 @@ def demo_incident_records() -> list[dict[str, Any]]:
                 ],
             },
             "ha_state": {"parsed": True, "enabled": False, "passive": None},
+            # Disabled with both nodes read: the demo report then shows the
+            # recommendation branch, which is what a real firewall at its
+            # PAN-OS defaults produces.
+            "inflight_monitoring": {
+                "parsed": True,
+                "status": "read",
+                "enabled": False,
+                "threshold_percent": 80,
+                "duration_seconds": 3,
+                "trigger_pending": False,
+            },
             "global_counters_raw": {
                 "parsed": True,
                 "counter_count": 489,

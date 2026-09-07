@@ -26,9 +26,14 @@ follows [Semantic Versioning](https://semver.org/).
   observational mission requires. A firewall or PAN-OS release without the
   nodes answers `NO_MATCHES`, which leaves the state unknown and is never a
   reason to stop monitoring. Validated read-only on a lab PA-440 running
-  PAN-OS 12.2.2. The command replays from an archive and the state travels in
-  the support bundle like every other startup read, carrying four flags and
-  numbers and nothing that identifies a network. Refs #218.
+  PAN-OS 12.2.2. A PAN-OS release that does not have the feature is reported as
+  such — nothing to enable, and no `pan_ingress_backlogs.log` in the tech
+  support file — and never confused with a read that failed and left the
+  question open. A threshold or duration the firewall did not return is shown
+  as an assumed PAN-OS default rather than as the firewall's own value. The
+  command replays from an archive and the state travels in the support bundle
+  like every other startup read, carrying two flags, two numbers and what the
+  read established, and nothing that identifies a network. Refs #218.
 
 ## [0.42.0] - 2026-09-07
 

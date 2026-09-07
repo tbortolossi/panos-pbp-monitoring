@@ -166,9 +166,13 @@ than create a concurrent one.
      enabling. **The collector only reads this state and never enables it:**
      `set session inflight_monitoring yes` is a configuration change on the
      firewall and stays the operator's gesture. Validated read-only on the lab
-     PA-440 (PAN-OS 12.2.2) on 2026-09-07; a firewall or release without the
-     nodes answers `NO_MATCHES` and every field stays unknown, which is an
-     optional piece of evidence and never a reason to stop monitoring.
+     PA-440 (PAN-OS 12.2.2) on 2026-09-07. The record also keeps what the read
+     established: `read`, `absent` when the firewall answered without the
+     nodes — the release has no such feature, so the tech support file is
+     known to hold no `pan_ingress_backlogs.log` and there is nothing to
+     enable — or `not_collected` when the read itself failed and the question
+     stays open. The read is optional evidence and never a reason to stop
+     monitoring.
 5. At incident startup, the monitor primes the global-counter delta baseline
    separately. At the start of each batch, it starts `show clock`, then collects
    the following commands in parallel every five seconds without waiting for
@@ -356,8 +360,9 @@ sample first), `interface_status` (zone, VLAN tag, link state and speed per
 interface), `zone_protection` (per zone: enabled flood types, profile, PBP
 drops and host blocks), `ha_state` (enabled, local and peer state, mode and
 sync) and `inflight_monitoring` (`enabled`, `threshold_percent`,
-`duration_seconds` and `trigger_pending`, each unknown on a release that does
-not expose the node). Each cycle carries its `buffer_latency` report, its
+`duration_seconds`, `trigger_pending` — each unknown on a release that does
+not expose the node — and `status`, saying whether the state was read, absent
+or not collected). Each cycle carries its `buffer_latency` report, its
 `interface_counters` table and the `interface_counters_source` field naming
 whether it came from the whole-table read or the named fallback. A
 `pbp_threat_logs` event carries the PBP threat logs captured at stop with the
@@ -745,7 +750,12 @@ key must be backed up and restored together.
     on-box auto-collection state: enabled, it names
     `/var/log/pan/pan_ingress_backlogs.log` as the 100 ms-resolution evidence
     to ask TAC for; disabled, it recommends that the operator enable it on the
-    firewall for the next incident, which the collector never does; (4) five wider
+    firewall for the next incident, which the collector never does; absent
+    from the release, it says there is nothing to enable; and unread, it says
+    the question is open. The fact line, the step's verdict and the Ingress
+    section of both reports are formatted from one resolver, and a threshold
+    or duration the firewall did not return is shown as an assumed PAN-OS
+    default rather than as the firewall's own value; (4) five wider
     hypotheses — elephant session, burst of denied sessions, storm of new
     sessions, interface errors, aggregate load — each with its own verdict. At
     low pressure the later steps are read as the ordinary traffic mix and

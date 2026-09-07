@@ -455,14 +455,48 @@ class TsfCorpusEvidenceParsingTests(unittest.TestCase):
             set(parsed),
             {
                 "parsed",
+                "status",
                 "enabled",
                 "duration_seconds",
                 "threshold_percent",
                 "trigger_pending",
             },
         )
-        for value in parsed.values():
+        self.assertEqual(parsed["status"], "read")
+        for name, value in parsed.items():
+            if name == "status":
+                continue
             self.assertIsInstance(value, (bool, int, type(None)))
+
+    def test_a_hexadecimal_state_value_is_read_as_the_number_it_is(self):
+        # `show system state` prints some nodes in hexadecimal. Reading only
+        # the decimal form would leave the value None, and every renderer
+        # would then substitute the PAN-OS default and present it as the
+        # firewall's own setting.
+        parsed = extract_inflight_monitoring(
+            "<result>cfg.session.inflight_monitoring: True\n"
+            "cfg.session.ingress_backlogs_threshold: 0x3c\n"
+            "cfg.session.ingress_backlogs_duration: 0x5\n</result>"
+        )
+
+        self.assertEqual(parsed["threshold_percent"], 60)
+        self.assertEqual(parsed["duration_seconds"], 5)
+
+    def test_a_release_without_the_feature_is_told_from_a_failed_read(self):
+        # NO_MATCHES is an answer: the release has no such setting, so the
+        # tech support file is known to hold no pan_ingress_backlogs.log. An
+        # empty body is a read that did not happen and settles nothing.
+        absent = extract_inflight_monitoring("<result>NO_MATCHES</result>")
+        unrelated = extract_inflight_monitoring(
+            "<result>cfg.session.erspan: False</result>"
+        )
+        not_collected = extract_inflight_monitoring("")
+
+        self.assertEqual(absent["status"], "absent")
+        self.assertEqual(unrelated["status"], "absent")
+        self.assertEqual(not_collected["status"], "not_collected")
+        for parsed in (absent, unrelated, not_collected):
+            self.assertIsNone(parsed["enabled"])
 
     def test_the_whole_interface_counter_table_is_parsed_per_port(self):
         parsed = extract_interface_counter_table(

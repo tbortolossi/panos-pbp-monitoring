@@ -266,8 +266,14 @@ command for the hardware queue of the Cavium chassis.
 
 The step also states the **on-box auto-collection** state, read once at the
 start of the incident, as a fact line reading `disabled`, `enabled (80% for
-3 s)` or `not read`, and the Ingress backlog evidence section repeats it in
-words. Enabled, the firewall ran `show running resource-monitor
+3 s)`, `not available on this PAN-OS release` when the firewall returned none
+of the settings, or `not read` when the read itself failed — the last two are
+different answers and are never merged. The Ingress backlog evidence section
+repeats the same state in words; both are formatted from one resolver, so the
+fact line, the step's verdict and the paragraph cannot disagree. When the
+firewall did not return a threshold or a duration, the PAN-OS default is shown
+and labelled as assumed (`80% for 3 s, PAN-OS defaults: the nodes were not
+returned`) rather than presented as the firewall's own setting. Enabled, the firewall ran `show running resource-monitor
 ingress-backlogs` itself, sampled every 100 ms, into
 `/var/log/pan/pan_ingress_backlogs.log` on the management plane each time the
 in-flight usage stayed above the threshold for the duration: that log travels

@@ -292,14 +292,15 @@ show session ingress_backlogs_threshold
 show session ingress_backlogs_duration
 
 set session inflight_monitoring yes
-set session ingress_backlogs_threshold <percent>
-set session ingress_backlogs_duration <seconds>
+set session ingress_backlogs_threshold <2-100>
+set session ingress_backlogs_duration <0-10>
 ```
 
-The setting survives a reboot. Leave the threshold and the duration at their
-defaults unless a case with TAC calls for something else: a lower threshold or
-a shorter duration makes the firewall write that log more often, on the
-management plane, on a device already under pressure.
+The accepted ranges above are the vendor's. The setting survives a reboot.
+Leave the threshold and the duration at their defaults unless a case with TAC
+calls for something else: a lower threshold or a shorter duration makes the
+firewall write that log more often, on the management plane, on a device
+already under pressure.
 
 The collector then reports, on the next incident, that the on-box collection
 was enabled and that `/var/log/pan/pan_ingress_backlogs.log` in the tech

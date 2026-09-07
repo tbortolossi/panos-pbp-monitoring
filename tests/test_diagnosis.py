@@ -301,7 +301,9 @@ class IngressBacklogStepTests(unittest.TestCase):
             }
         )
 
-        self.assertIn(("On-box auto-collection", "disabled", "warn"), step["facts"])
+        # Informational, not amber: disabled is the PAN-OS default and would
+        # colour nearly every capture.
+        self.assertIn(("On-box auto-collection", "disabled", "none"), step["facts"])
         self.assertIn("on-box auto-collection was disabled", step["verdict"])
         self.assertIn("set session inflight_monitoring yes", step["verdict"])
         # The collector stays observational: the report recommends, the
@@ -314,6 +316,47 @@ class IngressBacklogStepTests(unittest.TestCase):
         self.assertIn(("On-box auto-collection", "not read", "none"), step["facts"])
         self.assertIn("on-box auto-collection state was not read", step["verdict"])
         self.assertNotIn("set session inflight_monitoring yes", step["verdict"])
+
+    def test_a_release_without_the_feature_reads_differently_from_a_lost_read(self):
+        # Nothing to enable, and the tech support file is known to hold no
+        # pan_ingress_backlogs.log: that is an answer, not an unknown.
+        step = self._backlog_step({"parsed": False, "status": "absent"})
+
+        self.assertIn(
+            ("On-box auto-collection", "not available on this PAN-OS release", "none"),
+            step["facts"],
+        )
+        self.assertIn("is not available on this PAN-OS release", step["verdict"])
+        self.assertIn("nothing to enable", step["verdict"])
+        self.assertNotIn("was not read", step["verdict"])
+
+    def test_a_partly_read_on_box_setting_is_never_asserted_as_the_firewalls(self):
+        # Only the duration came back. The threshold shown is the PAN-OS
+        # default, and every rendering must say so rather than presenting 80%
+        # as a value this firewall returned.
+        step = self._backlog_step(
+            {"parsed": True, "status": "read", "enabled": True, "duration_seconds": 5}
+        )
+
+        self.assertIn(
+            (
+                "On-box auto-collection",
+                "enabled (80% for 5 s, PAN-OS defaults: the nodes were not returned)",
+                "none",
+            ),
+            step["facts"],
+        )
+        self.assertIn("PAN-OS defaults: the nodes were not returned", step["verdict"])
+
+    def test_a_non_boolean_enabled_value_is_read_as_unknown_not_as_enabled(self):
+        # A release answering something neither renderer expects must not be
+        # reported as collecting the backlogs when it may not be.
+        step = self._backlog_step(
+            {"parsed": True, "status": "read", "enabled": "maybe"}
+        )
+
+        self.assertIn(("On-box auto-collection", "not read", "none"), step["facts"])
+        self.assertIn("state was not read", step["verdict"])
 
 
 class ElsewhereStepTests(unittest.TestCase):
