@@ -591,6 +591,11 @@ class AdminUITests(unittest.TestCase):
 
                 store = ConfigStore(root / "config" / "config.db")
                 target_id = store.list_targets()[0]["target_id"]
+                # Saving already queues one; the collector clears it when done.
+                self.assertTrue(store.list_targets()[0]["check_requested_at"])
+                store.record_target_check(
+                    target_id, kind="validation", status="ok", clear_request=True
+                )
                 self.assertIsNone(store.list_targets()[0]["check_requested_at"])
 
                 page = opener.open(
@@ -603,6 +608,85 @@ class AdminUITests(unittest.TestCase):
                 self.assertTrue(store.list_targets()[0]["check_requested_at"])
                 self.assertIn("validation requested", page.lower())
                 self.assertIn("Validation queued", page)
+
+    def test_saving_queues_the_full_validation_without_a_second_click(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with signed_in_admin(root) as (opener, base, csrf, _page):
+                with patch(
+                    "pbp_monitoring.adminui.fetch_system_info", return_value=dict(DEVICE_IDENTITY)
+                ), patch(
+                    "pbp_monitoring.adminui.fetch_dp_core_functions",
+                    return_value=[dict(entry) for entry in CORE_FUNCTIONS],
+                ):
+                    page = opener.open(
+                        Request(
+                            base + "/admin/target/save",
+                            data=urlencode(
+                                {
+                                    "csrf": csrf,
+                                    "target_id": "",
+                                    "name": "PA-440",
+                                    "firewall_ip": "192.0.2.10",
+                                    "auth_method": "api_key",
+                                    "api_key": "existing-key",
+                                    "tls_verify": "true",
+                                    "enabled": "true",
+                                }
+                            ).encode(),
+                        )
+                    ).read().decode()
+
+                store = ConfigStore(root / "config" / "config.db")
+                self.assertTrue(store.list_targets()[0]["check_requested_at"])
+                self.assertIn("full read-only validation is queued", page)
+
+    def test_a_refused_firewall_keeps_the_entries_for_correction(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with signed_in_admin(root) as (opener, base, csrf, _page):
+                with patch(
+                    "pbp_monitoring.adminui.generate_api_key",
+                    side_effect=SystemInfoError(
+                        "the firewall returned HTTP error 403: Invalid Credential"
+                    ),
+                ):
+                    with self.assertRaises(HTTPError) as raised:
+                        opener.open(
+                            Request(
+                                base + "/admin/target/save",
+                                data=urlencode(
+                                    {
+                                        "csrf": csrf,
+                                        "target_id": "",
+                                        "name": "PA-VM",
+                                        "firewall_ip": "10.0.0.43",
+                                        "auth_method": "credentials",
+                                        "username": "pbp_monitor_admin",
+                                        "password": "do-not-echo",
+                                        "tls_verify": "false",
+                                        "enabled": "false",
+                                    }
+                                ).encode(),
+                            )
+                        )
+
+                self.assertEqual(raised.exception.code, 400)
+                page = raised.exception.read().decode()
+                self.assertIn("HTTP error 403: Invalid Credential", page)
+                self.assertIn('value="PA-VM"', page)
+                self.assertIn('value="10.0.0.43"', page)
+                self.assertIn('value="pbp_monitor_admin"', page)
+                self.assertIn(
+                    '<input type="radio" id="auth-credentials" name="auth_method"'
+                    ' value="credentials" checked>',
+                    page,
+                )
+                self.assertIn('<option value="false" selected>No</option>', page)
+                self.assertNotIn("do-not-echo", page)
+                self.assertNotIn('http-equiv="refresh"', page)
+                store = ConfigStore(root / "config" / "config.db")
+                self.assertEqual(store.list_targets(), [])
 
     def test_the_syslog_commands_use_the_address_the_admin_page_was_reached_on(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

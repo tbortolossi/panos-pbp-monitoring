@@ -35,6 +35,9 @@ def parse_untrusted_xml(text: str) -> ET.Element:
     return ET.fromstring(text)
 
 
+MAX_ERROR_DETAIL_CHARS = 200
+
+
 class PanOSAdminError(RuntimeError):
     """Base error for the administrative PAN-OS calls made from the UI."""
 
@@ -87,6 +90,47 @@ def make_ssl_context(*, insecure: bool, ca_bundle: str | None) -> ssl.SSLContext
     return ssl.create_default_context(cafile=ca_bundle)
 
 
+def http_error_detail(exc: HTTPError) -> str:
+    """Extract the explanation PAN-OS carries in the body of an HTTP error.
+
+    A rejected keygen or operational call answers with the status code and an
+    XML body naming the reason, so reporting `403` alone hides `Invalid
+    Credential` from the operator. The body is read under the same size ceiling
+    as a successful response, stripped of control characters and truncated: it
+    is firewall-controlled text on its way to an error page.
+    """
+    try:
+        response_text = read_bounded_response(exc)
+    except (OSError, ValueError):
+        return ""
+    try:
+        root = parse_untrusted_xml(response_text)
+    except ET.ParseError:
+        return ""
+    node = root.find("./result/msg")
+    if node is None:
+        node = root.find("./msg")
+    if node is None:
+        return ""
+    detail = " ".join("".join(node.itertext()).split())
+    detail = "".join(character for character in detail if character.isprintable())
+    if len(detail) > MAX_ERROR_DETAIL_CHARS:
+        detail = detail[:MAX_ERROR_DETAIL_CHARS].rstrip() + "..."
+    return detail
+
+
+def _scrubbed(message: str, secret: str) -> str:
+    """Keep a secret the caller submitted out of an error shown to an operator.
+
+    PAN-OS does not echo a password or an API key back in an error body, but
+    the message now carries firewall-controlled text, so the one value this
+    process knows must never survive in it.
+    """
+    if secret and secret in message:
+        return message.replace(secret, "***")
+    return message
+
+
 def _read_api_response(
     request: Request,
     *,
@@ -99,7 +143,11 @@ def _read_api_response(
         with opener(request, timeout=timeout, context=ssl_context) as response:  # type: ignore[operator]
             response_text = read_bounded_response(response)
     except HTTPError as exc:
-        raise error(f"the firewall returned HTTP error {exc.code}") from exc
+        detail = http_error_detail(exc)
+        raise error(
+            f"the firewall returned HTTP error {exc.code}"
+            + (f": {detail}" if detail else "")
+        ) from exc
     except ValueError as exc:
         raise error(str(exc)) from exc
     except URLError as exc:
@@ -130,13 +178,16 @@ def generate_api_key(
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    root = _read_api_response(
-        request,
-        ssl_context=ssl_context,
-        timeout=timeout,
-        opener=opener,
-        error=KeyGenerationError,
-    )
+    try:
+        root = _read_api_response(
+            request,
+            ssl_context=ssl_context,
+            timeout=timeout,
+            opener=opener,
+            error=KeyGenerationError,
+        )
+    except KeyGenerationError as exc:
+        raise KeyGenerationError(_scrubbed(str(exc), password)) from exc
     key = root.findtext("./result/key")
     if root.attrib.get("status") != "success" or not key or not key.strip():
         raise KeyGenerationError(
@@ -166,13 +217,16 @@ def fetch_system_info(
         method="POST",
     )
     request.add_unredirected_header("X-PAN-KEY", api_key)
-    root = _read_api_response(
-        request,
-        ssl_context=ssl_context,
-        timeout=timeout,
-        opener=opener,
-        error=SystemInfoError,
-    )
+    try:
+        root = _read_api_response(
+            request,
+            ssl_context=ssl_context,
+            timeout=timeout,
+            opener=opener,
+            error=SystemInfoError,
+        )
+    except SystemInfoError as exc:
+        raise SystemInfoError(_scrubbed(str(exc), api_key)) from exc
     if root.attrib.get("status") != "success":
         raise SystemInfoError(
             "PAN-OS rejected 'show system info' (check the API key and its permissions)"

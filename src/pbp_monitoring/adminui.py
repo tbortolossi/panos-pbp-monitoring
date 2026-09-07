@@ -392,10 +392,13 @@ collector cannot be claimed by whoever reaches this port first.</p>
         message: str = "",
         edit_id: int | None = None,
         syslog: dict[str, str] | None = None,
+        draft: dict[str, str] | None = None,
+        message_is_error: bool = False,
     ) -> str:
         settings = self.store.get_settings()
         targets = self.store.list_targets()
-        notice = f'<p class="notice">{_e(message)}</p>' if message else ""
+        notice_class = "notice error" if message_is_error else "notice"
+        notice = f'<p class="{notice_class}">{_e(message)}</p>' if message else ""
         rows = []
         for target in targets:
             rows.append(
@@ -413,11 +416,13 @@ collector cannot be claimed by whoever reaches this port first.</p>
         target_rows = "".join(rows) or '<tr><td colspan="7" class="muted">No firewall configured yet.</td></tr>'
         edit_target = next((target for target in targets if target["target_id"] == edit_id), None)
         # A queued validation is cleared by the collector within seconds, so the
-        # page reloads itself until the outcome is known. Editing a firewall
-        # suspends the reload: it must never discard what is being typed.
+        # page reloads itself until the outcome is known. Editing a firewall, or
+        # correcting a refused one, suspends the reload: it must never discard
+        # what is being typed.
         refresh_seconds = (
             PENDING_CHECK_REFRESH_SECONDS
             if edit_target is None
+            and not draft
             and any(target.get("check_requested_at") for target in targets)
             else None
         )
@@ -441,7 +446,7 @@ collector cannot be claimed by whoever reaches this port first.</p>
 <div><label>Confirm new password</label><input type="password" name="confirm_password" autocomplete="new-password" minlength="8" required></div>
 </div><button type="submit">Change password</button></form></section>
 <section class="card"><h2>Firewalls</h2><table><thead><tr><th>Name</th><th>Device</th><th>Firewall IP</th><th>Serial</th><th>State</th><th>Last check</th><th>Actions</th></tr></thead><tbody>{target_rows}</tbody></table></section>
-{self._target_form(csrf, edit_target)}
+{self._target_form(csrf, edit_target, draft)}
 {self._syslog_card(syslog or self._syslog_options(None), targets)}
 <section class="card"><h2>Support bundle</h2>
 <p class="muted">One archive describing this deployment, for remote diagnosis. It carries the collector and dashboard logs, the running versions, every setting, the run inventory and the recent Syslog journals including refused messages. It never carries PAN-OS API keys, the administrator password or the recovery key. Producing it makes no call to any firewall.</p>
@@ -604,18 +609,43 @@ you already apply to your security rules, without replacing its existing destina
     def _firewall_ip(target: dict[str, Any]) -> str:
         return urlsplit(str(target.get("panos_url") or "")).hostname or ""
 
-    def _target_form(self, csrf: str, target: dict[str, Any] | None = None) -> str:
+    def _target_form(
+        self,
+        csrf: str,
+        target: dict[str, Any] | None = None,
+        draft: dict[str, str] | None = None,
+    ) -> str:
+        """Render the add/edit form, refilled from a refused submission if any.
+
+        `draft` carries the raw values of a submission the firewall rejected, so
+        a wrong password costs one field instead of the whole form. No secret is
+        ever part of it: an API password or key is never echoed back to the
+        browser, and the form says so.
+        """
         target = target or {}
+        draft = draft or {}
         editing = bool(target)
-        address = self._firewall_ip(target)
-        tls = str(target.get("tls_verify") or "false")
+        address = draft["firewall_ip"] if "firewall_ip" in draft else self._firewall_ip(target)
+        tls = str(draft.get("tls_verify") or target.get("tls_verify") or "false")
+        auth_method = str(draft.get("auth_method") or ("stored" if editing else "credentials"))
+        enabled_yes = (
+            draft["enabled"] == "true" if "enabled" in draft else bool(target.get("enabled", True))
+        )
+        error_html = (
+            f'<p class="notice error">{_e(draft["error"])}</p>'
+            '<p class="muted">The values below are the ones you submitted. Secrets are never sent '
+            "back to the browser: retype the API password or key before saving again.</p>"
+            if draft.get("error")
+            else ""
+        )
         custom_tls = (
             f'<option value="{_e(tls)}" selected>CA bundle: {_e(tls)}</option>'
             if tls not in {"true", "false"}
             else ""
         )
         stored_choice = (
-            '<input type="radio" id="auth-stored" name="auth_method" value="stored" checked>'
+            '<input type="radio" id="auth-stored" name="auth_method" value="stored"'
+            f'{" checked" if auth_method == "stored" else ""}>'
             '<label for="auth-stored">Keep the stored API key</label>'
             if editing
             else ""
@@ -649,19 +679,20 @@ you already apply to your security rules, without replacing its existing destina
         note_html = f'<p class="muted">{" ".join(notes)}</p>' if notes else ""
         return f"""<section class="card"><h2>{'Edit firewall' if editing else 'Add a firewall'}</h2>
 <p class="muted">The firewall IP is both the API management address and the allowed Syslog source. Saving contacts the firewall
-with <code>show system info</code>: it validates the credentials and reads the device serial, so the firewall must be reachable.</p>
-<form method="post" action="/admin/target/save"><input type="hidden" name="csrf" value="{csrf}">
+with <code>show system info</code>: it validates the credentials and reads the device serial, so the firewall must be reachable.
+Nothing is written unless that call succeeds, and this form keeps what you typed when it does not.</p>
+{error_html}<form method="post" action="/admin/target/save"><input type="hidden" name="csrf" value="{csrf}">
 <input type="hidden" name="target_id" value="{_e(target.get('target_id'))}"><div class="grid">
-<div><label>Name</label><input name="name" value="{_e(target.get('name'))}" placeholder="firewall hostname"><span class="muted">Optional. Left blank, the PAN-OS hostname is used.</span></div>
+<div><label>Name</label><input name="name" value="{_e(draft['name'] if 'name' in draft else target.get('name'))}" placeholder="firewall hostname"><span class="muted">Optional. Left blank, the PAN-OS hostname is used.</span></div>
 <div><label>Firewall IP</label><input name="firewall_ip" value="{_e(address)}" placeholder="192.0.2.10" required></div>
 <div><label>TLS verify</label><select name="tls_verify">{custom_tls}<option value="true" {'selected' if tls == 'true' else ''}>Yes</option><option value="false" {'selected' if tls != 'true' and not custom_tls else ''}>No</option></select><span class="muted">Per-firewall setting. New firewalls default to No.</span></div>
-<div><label>Enabled</label><select name="enabled"><option value="true" {'selected' if target.get('enabled', True) else ''}>Yes</option><option value="false" {'selected' if target and not target.get('enabled') else ''}>No</option></select></div>
+<div><label>Enabled</label><select name="enabled"><option value="true" {'selected' if enabled_yes else ''}>Yes</option><option value="false" {'' if enabled_yes else 'selected'}>No</option></select></div>
 </div>
 <fieldset class="auth"><legend>Authentication method</legend>{stored_choice}
-<input type="radio" id="auth-credentials" name="auth_method" value="credentials" {'' if editing else 'checked'}><label for="auth-credentials">Username and password</label>
-<input type="radio" id="auth-key" name="auth_method" value="api_key"><label for="auth-key">API key</label>
+<input type="radio" id="auth-credentials" name="auth_method" value="credentials"{' checked' if auth_method == 'credentials' else ''}><label for="auth-credentials">Username and password</label>
+<input type="radio" id="auth-key" name="auth_method" value="api_key"{' checked' if auth_method == 'api_key' else ''}><label for="auth-key">API key</label>
 {stored_panel}<div class="panel" id="panel-credentials"><div class="grid">
-<div><label>API username</label><input name="username" autocomplete="off"></div>
+<div><label>API username</label><input name="username" value="{_e(draft.get('username'))}" autocomplete="off"></div>
 <div><label>API password (never stored)</label><input type="password" name="password" autocomplete="new-password"></div>
 </div><p class="muted">The credentials generate an API key by HTTPS POST; only the key is stored.</p>
 <p class="notice error">With <strong>TLS verify: No</strong>, this password travels over an unverified
@@ -731,6 +762,144 @@ generated on the firewall CLI, or enable TLS verification first.</p></div>
         return generate_api_key(
             panos_url, username, password, ssl_context=ssl_context, timeout=timeout
         )
+
+    def _save_target(
+        self,
+        handler: Any,
+        form: dict[str, str],
+        csrf: str,
+        syslog: dict[str, str] | None,
+    ) -> bool:
+        """Validate a firewall on the device, then persist it and queue its check.
+
+        Nothing is written before the firewall answers `show system info`, and a
+        refusal re-renders this form with the submitted values so the operator
+        corrects the credentials in place instead of losing the entry, and
+        without a half-configured firewall appearing in the list.
+        """
+        draft = {
+            "target_id": form.get("target_id", "").strip(),
+            "name": form.get("name", ""),
+            "firewall_ip": form.get("firewall_ip", ""),
+            "tls_verify": form.get("tls_verify", "false"),
+            "enabled": form.get("enabled", "true"),
+            "auth_method": form.get("auth_method", "credentials"),
+            "username": form.get("username", ""),
+        }
+        try:
+            target_id = int(draft["target_id"]) if draft["target_id"] else None
+            existing = None
+            if target_id is not None:
+                existing = next(
+                    (
+                        item
+                        for item in self.store.list_targets(include_secrets=True)
+                        if item.target_id == target_id
+                    ),
+                    None,
+                )
+                if existing is None:
+                    raise ValueError("firewall no longer exists")
+            firewall_ip = self._validated_firewall_ip(form.get("firewall_ip", ""))
+            panos_url = normalize_firewall_url(firewall_ip)
+            tls = self._validated_tls_verify(form.get("tls_verify", "false"), existing)
+            timeout = float(self.store.get_settings()["request_timeout"])
+            context = make_ssl_context(
+                insecure=tls == "false", ca_bundle=None if tls == "true" else tls
+            )
+            api_key = self._resolved_api_key(
+                form,
+                panos_url=panos_url,
+                ssl_context=context,
+                timeout=timeout,
+                existing=existing,
+            )
+            identity = fetch_system_info(
+                panos_url, api_key, ssl_context=context, timeout=timeout
+            )
+            core_functions = fetch_dp_core_functions(
+                panos_url, api_key, ssl_context=context, timeout=timeout
+            )
+            replaced = {firewall_ip}
+            if existing is not None:
+                replaced.add(urlsplit(existing.panos_url).hostname or "")
+            preserved_sources = [
+                source
+                for source in (existing.syslog_sources if existing else ())
+                if source not in replaced
+            ]
+            saved_id = self.store.save_target(
+                target_id=target_id,
+                name=self._resolved_name(form.get("name", ""), identity, existing),
+                panos_url=panos_url, api_key=api_key,
+                target_serial=existing.target_serial if existing else None,
+                serials=[identity["serial"]],
+                syslog_sources=[firewall_ip, *preserved_sources],
+                tls_verify=tls,
+                enabled=form.get("enabled") == "true",
+                device_identity=identity,
+                dp_core_functions=core_functions,
+            )
+            summary = " ".join(
+                part
+                for part in (
+                    identity.get("hostname"),
+                    identity.get("model"),
+                    f"serial {identity['serial']}",
+                    f"PAN-OS {identity['software_version']}"
+                    if identity.get("software_version")
+                    else "",
+                    f"{len(core_functions)} dataplane cores mapped"
+                    if core_functions
+                    else "dataplane core map unavailable",
+                )
+                if part
+            )
+            # The credentials are proven at this point, but only against
+            # `show system info`. Queue the full read-only batch the Test button
+            # runs, so the operator learns from this same screen whether every
+            # diagnostic command the collector needs is actually permitted.
+            try:
+                self.store.request_target_check(saved_id)
+                queued = (
+                    " The full read-only validation is queued: the collector runs it"
+                    " within a few seconds and its result appears in the firewall list below."
+                )
+            except (ValueError, sqlite3.Error):
+                LOG.exception("Unable to queue the validation for firewall %s", saved_id)
+                queued = " Queueing the full validation failed; run Test from the firewall list below."
+            self._send(
+                handler,
+                self._dashboard(
+                    csrf,
+                    f"Firewall saved and API key validated: {summary}. The API password"
+                    " was not stored. Forward its logs with the PAN-OS Syslog commands"
+                    f" below.{queued}",
+                    syslog=syslog,
+                ),
+            )
+        except (
+            KeyError,
+            ValueError,
+            OSError,
+            ssl.SSLError,
+            sqlite3.Error,
+            PanOSAdminError,
+        ) as exc:
+            draft["error"] = str(exc)
+            self._send(
+                handler,
+                self._dashboard(
+                    csrf,
+                    f"Firewall not saved: {exc}",
+                    edit_id=int(draft["target_id"]) if draft["target_id"].isdigit() else None,
+                    syslog=syslog,
+                    draft=draft,
+                    message_is_error=True,
+                ),
+                400,
+            )
+        return True
 
     def handle(self, handler: Any, path: str) -> bool:
         if not path.startswith("/admin"):
@@ -914,83 +1083,7 @@ generated on the firewall CLI, or enable TLS verification first.</p></div>
                 self.store.delete_target(int(form["target_id"]))
                 self._send(handler, self._dashboard(csrf, "Firewall deleted.", syslog=syslog))
             elif path == "/admin/target/save":
-                target_id = int(form["target_id"]) if form.get("target_id", "").strip() else None
-                existing = None
-                if target_id is not None:
-                    existing = next(
-                        (
-                            item
-                            for item in self.store.list_targets(include_secrets=True)
-                            if item.target_id == target_id
-                        ),
-                        None,
-                    )
-                    if existing is None:
-                        raise ValueError("firewall no longer exists")
-                firewall_ip = self._validated_firewall_ip(form.get("firewall_ip", ""))
-                panos_url = normalize_firewall_url(firewall_ip)
-                tls = self._validated_tls_verify(form.get("tls_verify", "false"), existing)
-                timeout = float(self.store.get_settings()["request_timeout"])
-                context = make_ssl_context(
-                    insecure=tls == "false", ca_bundle=None if tls == "true" else tls
-                )
-                api_key = self._resolved_api_key(
-                    form,
-                    panos_url=panos_url,
-                    ssl_context=context,
-                    timeout=timeout,
-                    existing=existing,
-                )
-                identity = fetch_system_info(
-                    panos_url, api_key, ssl_context=context, timeout=timeout
-                )
-                core_functions = fetch_dp_core_functions(
-                    panos_url, api_key, ssl_context=context, timeout=timeout
-                )
-                replaced = {firewall_ip}
-                if existing is not None:
-                    replaced.add(urlsplit(existing.panos_url).hostname or "")
-                preserved_sources = [
-                    source
-                    for source in (existing.syslog_sources if existing else ())
-                    if source not in replaced
-                ]
-                self.store.save_target(
-                    target_id=target_id,
-                    name=self._resolved_name(form.get("name", ""), identity, existing),
-                    panos_url=panos_url, api_key=api_key,
-                    target_serial=existing.target_serial if existing else None,
-                    serials=[identity["serial"]],
-                    syslog_sources=[firewall_ip, *preserved_sources],
-                    tls_verify=tls,
-                    enabled=form.get("enabled") == "true",
-                    device_identity=identity,
-                    dp_core_functions=core_functions,
-                )
-                summary = " ".join(
-                    part
-                    for part in (
-                        identity.get("hostname"),
-                        identity.get("model"),
-                        f"serial {identity['serial']}",
-                        f"PAN-OS {identity['software_version']}"
-                        if identity.get("software_version")
-                        else "",
-                        f"{len(core_functions)} dataplane cores mapped"
-                        if core_functions
-                        else "dataplane core map unavailable",
-                    )
-                    if part
-                )
-                self._send(
-                    handler,
-                    self._dashboard(
-                        csrf,
-                        f"Firewall saved and API key validated: {summary}. The API password"
-                        " was not stored. Forward its logs with the PAN-OS Syslog commands below.",
-                        syslog=syslog,
-                    ),
-                )
+                return self._save_target(handler, form, csrf, syslog)
             else:
                 handler.send_error(404)
             return True

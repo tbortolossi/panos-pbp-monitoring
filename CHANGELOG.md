@@ -3,6 +3,36 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.41.0] - 2026-09-07
+
+### Added
+
+- **A refused firewall no longer costs the whole form.** Saving a firewall in
+  the admin area has always contacted the device before writing anything, so a
+  wrong password meant a dead-end error page and retyping the address, the name
+  and the username. The form is now re-rendered in place with everything that
+  was submitted and the reason in a red banner, and nothing is persisted: no
+  half-configured firewall appears in the list. The API password and the API key
+  are the deliberate exception — they are never sent back to the browser, and
+  the form says to retype the secret.
+- **A save that succeeds queues the full read-only validation.** The batch
+  behind the **Test** button — every collection command and every parser — now
+  runs on its own within a few seconds of a successful save, and its outcome
+  lands in the **Last check** column. `show system info` proves the key is
+  valid; this proves the API role actually permits what the collector needs to
+  collect.
+
+### Changed
+
+- **A PAN-OS HTTP failure reports the reason, not only the status.** PAN-OS
+  answers a rejected call with an XML body naming the cause, which was
+  discarded: `403` alone hid `Invalid Credential`. The message is now read from
+  the error body, bounded, stripped of control characters and truncated, and
+  appended to the status: `the firewall returned HTTP error 403: Invalid
+  Credential`. A submitted password or API key is scrubbed from the message
+  before it is shown, so firewall-controlled text can never carry a secret back
+  to the operator.
+
 ## [0.40.0] - 2026-09-06
 
 ### Added

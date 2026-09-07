@@ -1,8 +1,11 @@
+import io
 import ssl
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 from urllib.parse import parse_qs
 
+from pbp_monitoring import panos_keygen
 from pbp_monitoring.panos_keygen import SystemInfoError, fetch_system_info
 from tools.generate_api_key import (
     KeyGenerationError,
@@ -81,6 +84,78 @@ class GenerateAPIKeyTests(unittest.TestCase):
                 ssl_context=ssl.create_default_context(),
             )
         self.assertNotIn("do-not-print", str(raised.exception))
+
+
+class HTTPErrorDetailTests(unittest.TestCase):
+    """A rejected call reports the reason PAN-OS gives, not only the status."""
+
+    @staticmethod
+    def _failing_opener(body: str, code: int = 403):
+        def opener(request, *, timeout, context):
+            raise HTTPError(
+                request.full_url, code, "Forbidden", {}, io.BytesIO(body.encode("utf-8"))
+            )
+
+        return opener
+
+    def _keygen(self, body: str, password: str = "correct horse"):
+        with self.assertRaises(panos_keygen.KeyGenerationError) as raised:
+            panos_keygen.generate_api_key(
+                "https://192.0.2.10",
+                "api-user",
+                password,
+                ssl_context=ssl.create_default_context(),
+                opener=self._failing_opener(body),
+            )
+        return str(raised.exception)
+
+    def test_a_403_names_the_panos_reason(self):
+        message = self._keygen(
+            "<response status = 'error' code = '403'><result>"
+            "<msg>Invalid Credential</msg></result></response>"
+        )
+
+        self.assertEqual(
+            message, "the firewall returned HTTP error 403: Invalid Credential"
+        )
+
+    def test_an_unparsable_body_falls_back_to_the_status_alone(self):
+        self.assertEqual(
+            self._keygen("<html><body>Forbidden</body></html>"),
+            "the firewall returned HTTP error 403",
+        )
+
+    def test_the_submitted_password_never_returns_in_the_message(self):
+        message = self._keygen(
+            "<response status='error'><result><msg>bad password do-not-print</msg>"
+            "</result></response>",
+            password="do-not-print",
+        )
+
+        self.assertNotIn("do-not-print", message)
+        self.assertIn("***", message)
+
+    def test_a_long_body_is_truncated(self):
+        message = self._keygen(
+            f"<response status='error'><result><msg>{'x' * 900}</msg></result></response>"
+        )
+
+        self.assertLess(len(message), 300)
+        self.assertTrue(message.endswith("..."))
+
+    def test_an_operational_call_reports_the_reason_too(self):
+        with self.assertRaises(SystemInfoError) as raised:
+            fetch_system_info(
+                "https://192.0.2.10",
+                "secret-key",
+                ssl_context=ssl.create_default_context(),
+                opener=self._failing_opener(
+                    "<response status='error'><result><msg>Invalid Credential</msg>"
+                    "</result></response>"
+                ),
+            )
+
+        self.assertIn("Invalid Credential", str(raised.exception))
 
 
 class FetchSystemInfoTests(unittest.TestCase):
