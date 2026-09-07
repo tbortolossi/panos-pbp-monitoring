@@ -33,12 +33,19 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from . import __version__, diagnostics
+# `command_succeeded` and `command_node_unsupported` live with the diagnosis,
+# which reads the same records back out of a capture; they are re-exported here
+# so the collection code and its tests keep addressing them on the module that
+# runs the commands.
 from .diagnosis import (
     DEFAULT_ACTIVATE_PERCENT,
     DEFAULT_ALERT_PERCENT,
     INFLIGHT_MONITORING_ABSENT,
     INFLIGHT_MONITORING_NOT_COLLECTED,
     INFLIGHT_MONITORING_READ,
+    PLATFORM_DEPENDENT_COMMAND_EVIDENCE,
+    command_node_unsupported,
+    command_succeeded,
 )
 from .config_store import (
     SAFE_RUN_COMPONENT,
@@ -220,30 +227,6 @@ OPTIONAL_COMMAND_EVIDENCE = {
 }
 
 
-#: Evidence that exists only on some platforms or PAN-OS releases. A command
-#: listed here stays mandatory: it is downgraded to a note only when the
-#: firewall itself answers that the node does not exist, never when the read
-#: fails for a reason the operator could fix. `ingress-backlogs` reports the
-#: ingress queues of a hardware dataplane, so VM-Series rejects the node.
-#:
-#: An absent node is not reduced evidence: no role, no upgrade and no
-#: configuration can make a VM-Series grow the hardware queues this command
-#: reads. Reporting it amber would leave every VM-Series permanently amber,
-#: which is how an operator learns to stop reading amber, so it is recorded as
-#: a note beside a check that passes.
-PLATFORM_DEPENDENT_COMMAND_EVIDENCE = {
-    "ingress_backlogs": "the per-dataplane ingress backlog and on-chip descriptor levels",
-}
-
-#: Fragments PAN-OS uses to reject a command its parser does not know on this
-#: platform or release, as opposed to one it knows and could not run.
-_UNSUPPORTED_NODE_MARKERS = (
-    "unexpected here",
-    "is unexpected",
-    "no such node",
-    "unknown command",
-)
-
 #: Running-configuration reads, and what an absent node proves about the
 #: firewall. PAN-OS answers `No such node` when the element is not in the
 #: configuration, so the read succeeded and returned nothing to configure:
@@ -296,22 +279,6 @@ def config_node_absent(record: Any) -> bool:
     if not error.startswith("panosapierror:"):
         return False
     return _ABSENT_CONFIG_NODE_MARKER in error
-
-
-def command_node_unsupported(record: Any) -> bool:
-    """Did the firewall reject the command as a node it does not have?
-
-    A rejection by the PAN-OS CLI parser means the command does not exist on
-    this model or release, which no credential, role or network change would
-    repair. Every other failure — a timeout, an HTTP status, a denied
-    permission — stays a collection failure.
-    """
-    if not isinstance(record, dict) or record.get("ok") is True:
-        return False
-    error = str(record.get("error") or "").lower()
-    if not error.startswith("panosapierror:"):
-        return False
-    return any(marker in error for marker in _UNSUPPORTED_NODE_MARKERS)
 
 
 # The PBP threat IDs: RED drop, session discard, source IP block. One bounded
@@ -3817,12 +3784,6 @@ def command_result(record: Any) -> str:
         value = record.get("result", "")
         return value if isinstance(value, str) else str(value)
     return ""
-
-
-def command_succeeded(record: Any) -> bool:
-    if isinstance(record, str):
-        return not record.startswith("ERROR:")
-    return isinstance(record, dict) and record.get("ok") is True
 
 
 def panos_csv_serial(message: str) -> str | None:

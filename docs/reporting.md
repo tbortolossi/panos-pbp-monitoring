@@ -256,13 +256,55 @@ ingress-backlogs`, with the queue's peak ATOMIC and TOTAL usage, each named
 with the batch it peaked in — the two metrics can peak in different batches,
 so each is tied to its own. This view is
 independent of the PBP learning: it is the queue of packets waiting for a
-dataplane core, where the on-chip descriptors are consumed. An `undecided` or
-`unknown` application at a high share is called out as the signature of attack
-traffic, and a session queued in `flow_slowpath` that `show session id` does
-not know (`Bad Key`) is the policy-deny case: the same six-tuple, typically UDP
-syslog, denied and re-evaluated packet by packet on one core. An empty result
-on an x86 platform is stated as not being proof, because PAN-OS documents the
-command for the hardware queue of the Cavium chassis.
+dataplane core. What the percentages measure depends on the platform, and the
+step and the Ingress backlog section both say which:
+
+- on a Cavium chassis (gen3), the on-chip descriptor queue itself;
+- on an x86 platform (PA-400, PA-1400, PA-3400, PA-5400, PA-5450, PA-7500)
+  and on a VM-Series, which runs the same x86 dataplane, the dataplane's
+  in-flight work entries as a percentage of its `max-inflight-num`, 32768 by
+  default — the software equivalent of that queue, so an empty result means no
+  session dominated the in-flight work at the sampled instants.
+
+What the step concludes is decided by what the firewall answered, never by the
+model. Only the batches whose command actually ran are counted, and there are
+three outcomes:
+
+- **The command returned data.** The step reads it, whatever the model is said
+  to support. A VM-Series that answers is reported from its own data, with the
+  in-flight wording above.
+- **Every batch was rejected as a node the firewall does not have.** The step
+  reports **not available on this platform** instead of a negative, states it
+  as a note about the platform rather than a collection fault, and hands the
+  question to the global counter delta of step 4. On a VM-Series it adds why:
+  PAN-OS introduced the command for the x86 platforms in 10.2 and VM-Series
+  was left out of that support. This matches the read-only validation, which
+  records the same rejection as a note beside a check that passes. A rejected
+  node is not counted in the report's *Partial errors*, and the batch details
+  show it as *Not available on this platform* rather than as an error. That
+  downgrade applies only to the reads declared platform-dependent, which today
+  means `ingress-backlogs` alone: a mandatory command rejected by an old
+  PAN-OS release is a real gap in the evidence and stays an error, exactly as
+  the validation treats it.
+- **Every batch failed for another reason** — a timeout, a permission the API
+  role does not have. The step is reported as **failed**, not as a negative
+  and not as a platform limit: the command exists here and the reads did not
+  complete, which is worth repairing before the next incident, and the
+  conclusion says so. Such a failure still counts as a partial error.
+
+When the outcomes are mixed, the verdict names every batch that answered
+nothing — how many were rejected and how many failed, out of the batches that
+attempted the read — so its arithmetic matches the fact rows above it. In the
+layered report, a step left without an answer is folded with the other
+unanswered questions, each carrying its own one-line reason (*not available on
+this platform*, *read failed in N of M batches*, *not collected*) rather than
+one blanket label.
+
+An `undecided` or `unknown` application at a high share is called out as the
+signature of attack traffic, and a session queued in `flow_slowpath` that
+`show session id` does not know (`Bad Key`) is the policy-deny case: the same
+six-tuple, typically UDP syslog, denied and re-evaluated packet by packet on
+one core.
 
 The step also states the **on-box auto-collection** state, read once at the
 start of the incident, as a fact line reading `disabled`, `enabled (80% for

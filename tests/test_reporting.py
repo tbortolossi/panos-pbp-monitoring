@@ -17,6 +17,7 @@ from pbp_monitoring.reporting import (
     generate_html_report,
     main,
 )
+from tests.support import REJECTED_NODE, TIMED_OUT
 
 
 class ReportingTests(unittest.TestCase):
@@ -2070,6 +2071,111 @@ class IncidentStateSectionTests(unittest.TestCase):
         self.assertNotIn(
             "On-box ingress-backlog auto-collection: <strong>enabled</strong>", html
         )
+
+
+class IngressBacklogPlatformTests(unittest.TestCase):
+    """The ingress backlog reads differently per platform, and a rejected
+    node is a capability gap rather than a collection error."""
+
+    def _render(
+        self,
+        model: str,
+        backlog_command: dict | None,
+        extra_commands: dict | None = None,
+    ) -> str:
+        records: list[dict] = [
+            {
+                "timestamp": "2026-08-30T09:59:00+00:00",
+                "run_id": "ingress-run",
+                "event": "monitor_started",
+                "collector_version": "test",
+                "device": {"serial": "fixture", "model": model},
+            }
+        ]
+        for batch in (1, 2):
+            commands: dict = {"resource_monitor": {"ok": True, "result": "<entry/>"}}
+            if backlog_command is not None:
+                commands["ingress_backlogs"] = backlog_command
+            commands.update(extra_commands or {})
+            records.append(
+                {
+                    "timestamp": f"2026-08-30T10:0{batch}:00+00:00",
+                    "run_id": "ingress-run",
+                    "cycle": batch,
+                    "elapsed_seconds": float(batch),
+                    "percentages": {"packet_buffer_congestion": [91]},
+                    "ingress_backlogs": {"dataplanes": [], "candidates": []},
+                    "commands": commands,
+                }
+            )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "ingress.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            return generate_html_report(capture).read_text(encoding="utf-8")
+
+    def test_a_rejected_node_is_not_counted_as_a_partial_error(self):
+        html = self._render("PA-VM", dict(REJECTED_NODE))
+
+        self.assertIn(
+            '<span class="card-label">Partial errors</span><strong>0</strong>', html
+        )
+        self.assertIn("Not available on this platform", html)
+
+    def test_a_timed_out_command_still_counts_as_a_partial_error(self):
+        html = self._render("PA-VM", dict(TIMED_OUT))
+
+        self.assertIn(
+            '<span class="card-label">Partial errors</span><strong>2</strong>', html
+        )
+        self.assertNotIn("Not available on this platform", html)
+
+    def test_a_vm_series_ingress_section_states_the_command_is_unsupported(self):
+        html = self._render("PA-VM", dict(REJECTED_NODE))
+
+        self.assertIn("left VM-Series out of that support", html)
+        self.assertIn("not available on this platform", html)
+        self.assertNotIn("on-chip descriptors are consumed", html)
+        self.assertNotIn("No session held 2% of the work queue", html)
+
+    def test_a_vm_series_that_answers_keeps_its_data_in_the_report(self):
+        html = self._render("PA-VM", {"ok": True, "result": "<entry/>"})
+
+        self.assertIn("in-flight work entries of the dataplane", html)
+        self.assertNotIn("not available on this platform", html)
+        self.assertNotIn("left VM-Series out of that support", html)
+        self.assertIn("No session held 2% of the work queue", html)
+
+    def test_a_read_that_failed_in_every_batch_is_not_a_negative(self):
+        html = self._render("PA-440", dict(TIMED_OUT))
+
+        self.assertIn("read failed in every batch", html)
+        self.assertNotIn("No session held 2% of the work queue", html)
+
+    def test_a_mandatory_command_rejected_as_a_node_stays_an_error(self):
+        """Only a platform-dependent read is downgraded, as the validation does."""
+        html = self._render(
+            "PA-440",
+            {"ok": True, "result": "<entry/>"},
+            extra_commands={"resource_monitor": dict(REJECTED_NODE)},
+        )
+
+        self.assertIn(
+            '<span class="card-label">Partial errors</span><strong>2</strong>', html
+        )
+        self.assertNotIn("Not available on this platform", html)
+
+    def test_the_ingress_intro_names_the_metric_of_the_platform_family(self):
+        x86 = self._render("PA-440", {"ok": True, "result": "<entry/>"})
+        cavium = self._render("PA-5220", {"ok": True, "result": "<entry/>"})
+
+        self.assertIn("in-flight work entries of the dataplane", x86)
+        self.assertIn("max-inflight-num", x86)
+        self.assertNotIn("on-chip descriptor queue of the chassis", x86)
+        self.assertIn("on-chip descriptor queue of the chassis", cavium)
+        self.assertNotIn("in-flight work entries of the dataplane", cavium)
 
 
 if __name__ == "__main__":

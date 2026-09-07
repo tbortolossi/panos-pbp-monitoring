@@ -26,6 +26,15 @@ from pbp_monitoring.reporting_v2 import (
     generate_html_report_v2,
     main,
 )
+from tests.support import REJECTED_NODE, TIMED_OUT
+
+
+def _visible_dismissed(rendered: str) -> str:
+    """The "not evaluable" block of the layered report, expanded."""
+    start = rendered.find("could not be answered from this capture")
+    if start == -1:
+        return rendered
+    return rendered[start : rendered.find("</details>", start)]
 
 
 def _drop_blocks(rendered: str, opening: str, closing: str) -> str:
@@ -836,6 +845,74 @@ class FindingCollectionTests(unittest.TestCase):
 
         self.assertTrue(raised)
         self.assertEqual(raised - set(EVIDENCE_ANCHORS), set())
+
+
+class LayeredIngressPlatformTests(unittest.TestCase):
+    """The layered report declines the ingress metric like the flat one."""
+
+    def _render(self, model: str, backlog_command: dict) -> str:
+        records: list[dict] = [
+            {
+                "timestamp": "2026-08-30T09:59:00+00:00",
+                "run_id": "ingress-v2",
+                "event": "monitor_started",
+                "collector_version": "test",
+                "device": {"serial": "fixture", "model": model},
+            },
+            {
+                "timestamp": "2026-08-30T10:01:00+00:00",
+                "run_id": "ingress-v2",
+                "cycle": 1,
+                "elapsed_seconds": 1.0,
+                "percentages": {"packet_buffer_congestion": [91]},
+                "ingress_backlogs": {"dataplanes": [], "candidates": []},
+                "commands": {"ingress_backlogs": backlog_command},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "incident.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            return generate_html_report_v2(capture).read_text(encoding="utf-8")
+
+    def test_a_vm_series_rejection_is_not_a_negative_in_the_layered_report(self):
+        html = self._render("PA-VM", dict(REJECTED_NODE))
+
+        self.assertIn("left VM-Series out of that support", html)
+        self.assertIn("not available on this platform", html)
+        self.assertNotIn("on-chip descriptors are consumed", html)
+        self.assertNotIn("No session held 2% of the work queue", html)
+
+    def test_an_unanswerable_step_says_why_beside_the_others(self):
+        """A platform limit and a failed read must not blur into one label."""
+        rejected = _visible_dismissed(self._render("PA-VM", dict(REJECTED_NODE)))
+        timed_out = _visible_dismissed(self._render("PA-440", dict(TIMED_OUT)))
+
+        for html in (rejected, timed_out):
+            self.assertIn("could not be answered from this capture", html)
+            self.assertNotIn("returned nothing, or were not collected", html)
+        self.assertIn(
+            '<span class="pill">not available on this platform</span>', rejected
+        )
+        self.assertNotIn("read failed in", rejected)
+        self.assertIn(
+            '<span class="pill">read failed in 1 of 1 batches</span>', timed_out
+        )
+        self.assertNotIn("not available on this platform", timed_out)
+
+    def test_a_vm_series_that_answers_keeps_its_data_in_the_layered_report(self):
+        html = self._render("PA-VM", {"ok": True, "result": "<entry/>"})
+
+        self.assertIn("in-flight work entries of the dataplane", html)
+        self.assertNotIn("not available on this platform", html)
+
+    def test_an_x86_ingress_section_names_the_in_flight_metric(self):
+        html = self._render("PA-440", {"ok": True, "result": "<entry/>"})
+
+        self.assertIn("in-flight work entries of the dataplane", html)
+        self.assertNotIn("on-chip descriptors are consumed", html)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,48 @@ follows [Semantic Versioning](https://semver.org/).
   like every other startup read, carrying two flags, two numbers and what the
   read established, and nothing that identifies a network. Refs #218.
 
+### Fixed
+
+- **Step 3 of the diagnosis no longer reads a VM-Series as a clean ingress
+  backlog.** PAN-OS introduced `show running resource-monitor
+  ingress-backlogs` for the x86 platforms in 10.2 and left VM-Series out of
+  that support, so a PA-VM rejects the node. The batch still stored an empty
+  parsed result, and the report concluded *No session held 2% of the work
+  queue in any of the N batches* — a negative the capture never established —
+  while every batch counted as a partial error in the health view. The step
+  now counts only the batches whose command actually ran and reads the outcome
+  from the raw command record. What the firewall answered decides the state,
+  never the model: data returned is read whatever the platform is said to
+  support, so a VM-Series that answers keeps its own data. Every batch
+  rejected as a node the firewall does not have is reported as **not available
+  on this platform** — a note about the platform, not a collection fault, an
+  error or a negative, with the question handed to the global counter delta of
+  step 4, which is the same reading the validation already gives that
+  rejection since 0.42.0. A rejected node is no longer counted in *Partial
+  errors* and shows in the batch details as *Not available on this platform*.
+  Every batch failing for another reason — a timeout, a denied permission — is
+  reported as a **failed** read rather than a negative, and the conclusion says
+  so instead of claiming the backlogs were not collected; such a failure still
+  counts as a partial error. When the outcomes are mixed the verdict names how
+  many batches were rejected and how many failed, so its arithmetic matches the
+  fact rows. The error downgrade is restricted to the reads declared
+  platform-dependent, so a mandatory command rejected by an old PAN-OS release
+  stays an error, as the validation already treats it. In the layered report an
+  unanswered step is folded with the other unanswered questions, each carrying
+  its own one-line reason instead of one blanket label.
+- **The ingress backlog metric is now described per platform family.** On the
+  physical x86 firewalls (PA-400, PA-1400, PA-3400, PA-5400, PA-5450,
+  PA-7500) the step and the Ingress backlog section claimed PAN-OS documented
+  the command for the hardware queue of the Cavium chassis. There the
+  percentages are the dataplane's in-flight work entries over its
+  `max-inflight-num`, 32768 by default — the software equivalent of the
+  on-chip descriptor queue — so an empty result does mean no session dominated
+  the in-flight work at the sampled instants. A VM-Series runs that same
+  dataplane, so it gets the same wording when it answers. The Cavium wording
+  is unchanged.
+  Both the flat and the layered report decline the section intro the same way.
+  Refs #219.
+
 ## [0.42.0] - 2026-09-07
 
 ### Changed
