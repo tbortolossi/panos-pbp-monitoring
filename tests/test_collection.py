@@ -32,6 +32,7 @@ from pbp_monitoring.orchestrator import (
     firewall_clock_query_time,
     pbp_threat_log_query,
 )
+from pbp_monitoring.diagnosis import merge_special_fields
 
 
 class StubHTTPResponse:
@@ -447,6 +448,125 @@ SESS-ID PROTO SZONE SRC SPORT DST DPORT IGR-IF EGR-IF APP
         self.assertEqual(candidate["protocol"], 89)
         self.assertEqual(candidate["source_ip"], "192.0.2.10")
         self.assertEqual(candidate["application"], "unknown")
+
+    def test_the_special_notes_column_marks_a_backlog_entry_as_an_internal_tag(self):
+        output = """
+-- SLOT: s1, DP: dp0 --
+USAGE - ATOMIC: 4% TOTAL: 4%
+TOP SESSIONS:
+SESS-ID         PCT     GRP-ID          COUNT       Special Notes
+4194327         4%      flow_fastpath   43          Special TAG values, NOT valid session id
+"""
+
+        candidate = extract_ingress_backlogs(output)["candidates"][0]
+
+        self.assertEqual(candidate["session_id"], 4194327)
+        self.assertEqual(candidate["group_id"], "flow_fastpath")
+        self.assertEqual(candidate["count"], 43)
+        self.assertEqual(len(candidate["groups"]), 1)
+        self.assertEqual(candidate["special_reason"], "noted")
+        self.assertEqual(
+            candidate["special_note"],
+            "Special TAG values, NOT valid session id",
+        )
+
+    def test_a_placeholder_in_the_notes_column_leaves_an_ordinary_session(self):
+        output = """
+-- SLOT: s1, DP: dp0 --
+USAGE - ATOMIC: 40% TOTAL: 41%
+TOP SESSIONS:
+SESS-ID PCT GRP-ID COUNT Special Notes
+35299 40% flow_fastpath 512 -
+"""
+
+        candidate = extract_ingress_backlogs(output)["candidates"][0]
+
+        self.assertEqual(candidate["session_id"], 35299)
+        self.assertEqual(candidate["count"], 512)
+        self.assertIsNone(candidate["special_note"])
+        self.assertIsNone(candidate["special_reason"])
+
+    def test_a_note_beginning_with_a_number_never_becomes_a_group(self):
+        output = """
+-- SLOT: s1, DP: dp0 --
+USAGE - ATOMIC: 4% TOTAL: 4%
+TOP SESSIONS:
+SESS-ID PCT GRP-ID COUNT Special Notes
+4194327 4% flow_fastpath 43 Tag 2 host proxy
+"""
+
+        candidate = extract_ingress_backlogs(output)["candidates"][0]
+
+        self.assertEqual(candidate["groups"], [{"group_id": "flow_fastpath", "count": 43}])
+        self.assertEqual(candidate["special_note"], "Tag 2 host proxy")
+        self.assertEqual(candidate["special_reason"], "noted")
+
+    def test_without_the_notes_header_a_trailing_token_is_no_note(self):
+        """Pre-10.1 output has no fifth column, so nothing licenses reading a
+        trailing token as free text; the permissive pair scan is kept."""
+        output = """
+-- SLOT: s1, DP: dp0 --
+USAGE - ATOMIC: 30% TOTAL: 31%
+TOP SESSIONS:
+SESS-ID PCT GRP-ID COUNT
+35299 30% flow_slowpath 3640 7
+"""
+
+        candidate = extract_ingress_backlogs(output)["candidates"][0]
+
+        self.assertEqual(candidate["session_id"], 35299)
+        self.assertEqual(
+            candidate["groups"], [{"group_id": "flow_slowpath", "count": 3640}]
+        )
+        self.assertIsNone(candidate["special_note"])
+        self.assertIsNone(candidate["special_reason"])
+
+    def test_a_pre_10_1_numeric_group_row_keeps_its_group_and_no_note(self):
+        output = """
+-- SLOT: s1, DP: dp0 --
+USAGE - ATOMIC: 30% TOTAL: 31%
+TOP SESSIONS:
+SESS-ID PCT GRP-ID COUNT
+35299 30% 3 512
+"""
+
+        candidate = extract_ingress_backlogs(output)["candidates"][0]
+
+        self.assertEqual(candidate["group_id"], "3")
+        self.assertEqual(candidate["count"], 512)
+        self.assertIsNone(candidate["special_reason"])
+
+    def test_a_noted_candidate_carries_its_reason_and_note_onto_the_entity(self):
+        entities = build_candidate_entities(
+            [],
+            [
+                {
+                    "session_id": 4194327,
+                    "percentage": 4.0,
+                    "group_id": "flow_fastpath",
+                    "count": 43,
+                    "special_reason": "noted",
+                    "special_note": "Special TAG values, NOT valid session id",
+                }
+            ],
+        )
+
+        self.assertEqual(entities[0]["special_reason"], "noted")
+        self.assertEqual(
+            entities[0]["special_note"],
+            "Special TAG values, NOT valid session id",
+        )
+
+    def test_a_batch_that_truncated_the_notes_column_keeps_the_tag(self):
+        """The reason is sticky: one batch seeing the note is enough, so a
+        later truncated row never turns an internal tag back into a session."""
+        aggregate = {"special_reason": None, "special_note": None}
+
+        merge_special_fields(aggregate, {"special_reason": "noted", "special_note": "tag"})
+        merge_special_fields(aggregate, {"special_reason": None, "special_note": None})
+
+        self.assertEqual(aggregate["special_reason"], "noted")
+        self.assertEqual(aggregate["special_note"], "tag")
 
     def test_candidate_ranking_enriches_responsible_id_before_smaller_id(self):
         offenders = extract_pbp_offenders(

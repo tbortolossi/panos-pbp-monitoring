@@ -923,6 +923,94 @@ def _ingress_candidate_entities(
     return candidates
 
 
+#: PAN-OS named the backlog entry an internal tag itself, in the "Special
+#: Notes" column of its TOP SESSIONS table. That column is the only evidence
+#: the collector accepts for a tag.
+SPECIAL_TAG_NOTED = "noted"
+#: `show session id` answered Bad Key: the ID exists in the backlog but no
+#: session is behind it. Established by the lookup, never guessed.
+NO_SESSION_BAD_KEY = "bad_key"
+#: What an internal tag actually is, in one phrase, wherever it is explained.
+INTERNAL_TAG_DESCRIPTION = (
+    "host proxy for WildFire, or log forwarding to the management plane"
+)
+
+
+def _count(number: int, singular: str, plural: str | None = None) -> str:
+    """"3 sessions" or "1 session": one place decides, so no sentence disagrees."""
+    return f"{_fmt(number)} {singular if number == 1 else plural or singular + 's'}"
+
+
+def _special_tag_field(item: dict[str, Any], key: str) -> Any:
+    """Read a special-tag field from wherever this view carries it.
+
+    The same fact rides on the aggregated entity, on the backlog entry it came
+    from and on the session summary, depending on which renderer built the
+    item. One scan keeps every caller reading the same value.
+    """
+    for source in (item, item.get("ingress_detail"), item.get("session_summary")):
+        if isinstance(source, dict) and source.get(key):
+            return source[key]
+    return None
+
+
+def _no_session_behind(item: dict[str, Any]) -> str | None:
+    """Why no session lies behind this backlog SESS-ID, or None if one does.
+
+    Two things can say it, and they are not interchangeable. PAN-OS naming the
+    row in its "Special Notes" column means the entry is the firewall's own
+    traffic and never an offender. `show session id` answering Bad Key means
+    the packets never created a session, which is exactly what traffic denied
+    by policy looks like. Every view resolves this once, here, so a Bad Key row
+    and the diagnosis sentence about it can never disagree.
+    """
+    if _special_tag_field(item, "special_reason") == SPECIAL_TAG_NOTED:
+        return SPECIAL_TAG_NOTED
+    summary = item.get("session_summary")
+    status = summary.get("status") if isinstance(summary, dict) else None
+    return NO_SESSION_BAD_KEY if status == "bad_key" else None
+
+
+def _is_policy_deny_shape(item: dict[str, Any], groups: Iterable[Any] = ()) -> bool:
+    """`flow_slowpath` with no session behind the ID: denied by policy.
+
+    An internal tag never enters this rule: it is the firewall's own traffic,
+    not packets a security policy refused.
+    """
+    return _no_session_behind(item) == NO_SESSION_BAD_KEY and "flow_slowpath" in {
+        str(group).lower() for group in groups
+    }
+
+
+def special_tag_label(item: dict[str, Any]) -> str:
+    """The one wording for a backlog SESS-ID with no session behind it.
+
+    The diagnosis step, the Ingress table and the offender ranking all render
+    this string, so the three never describe the same entry differently.
+    """
+    kind = _no_session_behind(item)
+    if kind == SPECIAL_TAG_NOTED:
+        return "internal tag, not a session"
+    return "missing session / Bad Key" if kind == NO_SESSION_BAD_KEY else ""
+
+
+def merge_special_fields(target: dict[str, Any], source: dict[str, Any]) -> None:
+    """Carry the special-tag fields of one observation onto an aggregate.
+
+    A reason PAN-OS stated is sticky: once any batch has seen the note, the
+    entity stays an internal tag for the whole capture, because a later batch
+    that merely truncated the column must not turn it back into a session.
+    """
+    reason = source.get("special_reason")
+    if reason and (
+        target.get("special_reason") is None or reason == SPECIAL_TAG_NOTED
+    ):
+        target["special_reason"] = str(reason)
+    note = source.get("special_note")
+    if note and not target.get("special_note"):
+        target["special_note"] = str(note)
+
+
 def _flow_parts(item: dict[str, Any]) -> tuple[str, str]:
     """Describe an attributed entity's flow and its application context.
 
@@ -1804,6 +1892,16 @@ def _step_ingress_backlogs(
             if total is not None:
                 total_peak = total if total_peak is None else max(total_peak, total)
     candidates = _ingress_candidate_entities(attribution)
+    # An entry PAN-OS named an internal tag in its own "Special Notes" column
+    # is the firewall's own traffic. It is listed, but it is not a session and
+    # answers none of this step's questions, so it is partitioned off once here
+    # rather than guarded against in every rule below.
+    tags = [
+        item
+        for item in candidates
+        if _no_session_behind(item) == SPECIAL_TAG_NOTED
+    ]
+    sessions = [item for item in candidates if item not in tags]
     inflight = inflight_monitoring_state(context.get("inflight_monitoring"))
     collection = ingress_backlog_collection(cycles)
     succeeded = collection["succeeded"]
@@ -1818,10 +1916,12 @@ def _step_ingress_backlogs(
         facts.append(("Batches without the node", _fmt(unsupported), "none"))
     if failed:
         facts.append(("Batches with a failed read", _fmt(failed), "warn"))
+    if tags:
+        facts.append(("Internal tags listed", _fmt(len(tags)), "none"))
     facts.extend(
         [
             ("Queue peak (ATOMIC / TOTAL)", f"{_pct(atomic_peak)} / {_pct(total_peak)}", "none"),
-            ("Sessions listed", _fmt(len(candidates)), "none"),
+            ("Sessions listed", _fmt(len(sessions)), "none"),
             # Informational, never amber: disabled is the PAN-OS default, so
             # colouring it would put a warning on nearly every capture and
             # dilute what amber means on the rows that carry the step's own
@@ -1860,7 +1960,7 @@ def _step_ingress_backlogs(
     # Sessions extracted from the backlog output are evidence the command
     # returned, so they answer the step before any failure count is read.
     unavailable_reason = ""
-    if not candidates and node_absent:
+    if not sessions and node_absent:
         state, level = "unavailable", "none"
         node_unsupported = True
         unavailable_reason = "not available on this platform"
@@ -1876,7 +1976,7 @@ def _step_ingress_backlogs(
             "global filter delta yes</code>) carries the weight of this "
             "question."
         )
-    elif not candidates and read_failed:
+    elif not sessions and read_failed:
         state, level = "failed", "warn"
         unavailable_reason = (
             f"read failed in {failed} of {collection['batches']} batches"
@@ -1889,18 +1989,18 @@ def _step_ingress_backlogs(
             "This step holds no evidence either way, and the failure is worth "
             "repairing before the next incident."
         )
-    elif not candidates and not succeeded:
+    elif not sessions and not succeeded:
         state, level = "unavailable", "none"
         unavailable_reason = "not collected"
         verdict = (
             "<strong>The ingress backlogs were not collected</strong> in this "
             "capture, so this step cannot be answered."
         )
-    elif candidates:
-        state, level = "positive", "bad"
+    elif sessions or tags:
+        state, level = ("positive", "bad") if sessions else ("negative", "ok")
         unidentified = []
         slowpath_denied = []
-        for item in candidates[:_MAX_NAMED]:
+        for item in sessions[:_MAX_NAMED]:
             text = _entity_html(item)
             share = item.get("ingress_percentage")
             if share is not None:
@@ -1917,31 +2017,59 @@ def _step_ingress_backlogs(
             if application in _UNIDENTIFIED_APPLICATIONS:
                 unidentified.append(str(item.get("identifier")))
             groups = {str(group).lower() for group in item.get("group_ids", [])}
-            status = summary.get("status") if isinstance(summary, dict) else None
-            if "flow_slowpath" in groups and status == "bad_key":
+            if _is_policy_deny_shape(item, groups):
                 slowpath_denied.append(str(item.get("identifier")))
                 text += (
                     " — queued in <code>flow_slowpath</code> and unknown to "
                     "<code>show session id</code> (Bad Key)"
                 )
             named.append(text)
-        verdict = (
-            f"<strong>{len(candidates)} session{'s' if len(candidates) != 1 else ''} "
-            f"held at least {_fmt(INGRESS_BACKLOG_PERCENT)}% of the work queue.</strong> "
-            "This view is independent of the PBP learning: it is the queue of "
-            "packets waiting for a dataplane core, and a session that dominates it "
-            "is the one holding the descriptors."
-        )
+        for item in tags[:_MAX_NAMED]:
+            text = (
+                f"internal tag <code>{_escape(item.get('identifier'))}</code> "
+                f"({INTERNAL_TAG_DESCRIPTION}), {special_tag_label(item)}"
+            )
+            share = item.get("ingress_percentage")
+            if share is not None:
+                text += f" holding {_fmt(share)}% of the queue"
+            note = _special_tag_field(item, "special_note")
+            if note:
+                text += f" — PAN-OS notes: {_escape(note)}"
+            named.append(text)
+        if sessions:
+            verdict = (
+                f"<strong>{_count(len(sessions), 'session')} "
+                f"held at least {_fmt(INGRESS_BACKLOG_PERCENT)}% of the work queue.</strong> "
+                "This view is independent of the PBP learning: it is the queue of "
+                "packets waiting for a dataplane core, and a session that dominates it "
+                "is the one holding the descriptors."
+            )
+            if tags:
+                verdict += (
+                    f" A further {_count(len(tags), 'entry', 'entries')} in the "
+                    "table PAN-OS flagged in its own <code>Special Notes</code> "
+                    f"column as an internal tag ({INTERNAL_TAG_DESCRIPTION}): "
+                    "that is the firewall's own traffic, not a session, and no "
+                    "<code>show session id</code> was spent on it."
+                )
+        else:
+            verdict = (
+                f"<strong>Only internal tags held the work queue.</strong> Every "
+                f"one of the {_count(len(tags), 'entry', 'entries')} the backlog "
+                f"listed is flagged by PAN-OS itself as an internal tag "
+                f"({INTERNAL_TAG_DESCRIPTION}), so this step names no session and "
+                "no offending flow."
+            )
         if unidentified:
             verdict += (
-                f" Session{'s' if len(unidentified) != 1 else ''} "
+                f" {_count(len(unidentified), 'Session')} "
                 f"{_escape(', '.join(unidentified))} carr{'y' if len(unidentified) != 1 else 'ies'} "
                 "an undecided or unknown application at that share, which is the "
                 "signature of attack traffic rather than a legitimate transfer."
             )
         if slowpath_denied:
             verdict += (
-                f" Session{'s' if len(slowpath_denied) != 1 else ''} "
+                f" {_count(len(slowpath_denied), 'Session')} "
                 f"{_escape(', '.join(slowpath_denied))} sit{'' if len(slowpath_denied) != 1 else 's'} "
                 "in <code>flow_slowpath</code> with no session behind the ID: that is "
                 "traffic denied by policy and re-evaluated packet by packet, in "

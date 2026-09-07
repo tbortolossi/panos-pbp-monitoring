@@ -24,9 +24,11 @@ from .diagnosis import (
     INGRESS_BACKLOG_LOG_PATH,
     POOL_HELD_PERCENT,
     SIGNAL_COUNTER_FAMILIES,
+    SPECIAL_TAG_NOTED,
     _flow_parts,
     _ingress_candidate_entities,
     _level,
+    _special_tag_field,
     _numbers,
     build_diagnosis,
     buffer_latency_statuses,
@@ -42,8 +44,10 @@ from .diagnosis import (
     inflight_monitoring_state,
     inflight_monitoring_summary,
     latest_event,
+    merge_special_fields,
     raw_counter_bracket,
     render_diagnosis,
+    special_tag_label,
     start_event,
     zone_protection_summary,
 )
@@ -1154,6 +1158,8 @@ def _aggregate_attribution(
                 "latest_bits_per_second_total": None,
                 "rate_status": None,
                 "ingress_detail": None,
+                "special_reason": None,
+                "special_note": None,
                 "_order": insertion_order,
             }
         return aggregated[key]
@@ -1193,6 +1199,7 @@ def _aggregate_attribution(
             item["drop_state"] = item["drop_state"] or bool(
                 entity.get("drop_state")
             )
+            merge_special_fields(item, entity)
             update_max(item, "pbp_percentage", entity.get("pbp_percentage_total"))
             update_max(item, "pbp_samples", entity.get("pbp_samples"))
             update_max(
@@ -1228,6 +1235,7 @@ def _aggregate_attribution(
                     continue
                 item = ensure("session", str(candidate["session_id"]))
                 item["ingress_detail"] = candidate
+                merge_special_fields(item, candidate)
 
         summaries = record.get("session_summaries")
         if isinstance(summaries, dict):
@@ -1314,6 +1322,22 @@ def _hidden_rows_note(hidden: int, noun: str) -> str:
     )
 
 
+#: What each evidence source and each `show session id` outcome is called, in
+#: the one place every table reads them from.
+_EVIDENCE_SOURCE_LABELS = {
+    "packet_buffer_protection": "Primary PBP",
+    "ingress_backlogs": "Ingress",
+    "syslog_trigger": "Trigger Syslog",
+    "raw_session_id": "Raw ID",
+}
+_SESSION_STATUS_LABELS = {
+    "parsed": "enriched",
+    "bad_key": "missing session / Bad Key",
+    "lookup_failed": "enrichment failed",
+    "unparsed": "unrecognized format",
+}
+
+
 def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
     if not attribution:
         return (
@@ -1321,28 +1345,33 @@ def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
             "This is normal for an out-of-incident API check; during an early alert, "
             "subsequent batches are still required.</p>"
         )
-    source_labels = {
-        "packet_buffer_protection": "Primary PBP",
-        "ingress_backlogs": "Ingress",
-        "syslog_trigger": "Trigger Syslog",
-        "raw_session_id": "Raw ID",
-    }
     rows = []
     for item in attribution[:_MAX_RENDERED_ATTRIBUTION_ROWS]:
-        entity_type = "Session" if item.get("entity_type") == "session" else "Source IP"
+        internal_tag = _special_tag_field(item, "special_reason") == SPECIAL_TAG_NOTED
+        entity_type = (
+            "Internal tag"
+            if internal_tag
+            else "Session"
+            if item.get("entity_type") == "session"
+            else "Source IP"
+        )
         sources = ", ".join(
-            source_labels.get(str(source), str(source))
+            _EVIDENCE_SOURCE_LABELS.get(str(source), str(source))
             for source in item.get("evidence_sources", [])
         ) or "—"
         tuple_text, context = _flow_description(item)
         summary = item.get("session_summary")
         status = summary.get("status") if isinstance(summary, dict) else None
-        status_labels = {
-            "parsed": "enriched",
-            "bad_key": "missing session / Bad Key",
-            "lookup_failed": "enrichment failed",
-            "unparsed": "unrecognized format",
-        }
+        # An internal tag was never looked up, so it has no summary at all.
+        # Reading its status would call it "not enriched", which is what a
+        # missed lookup looks like; the entity's own reason says no lookup was
+        # owed. The wording itself comes from the shared label.
+        status_text = special_tag_label(item) or _SESSION_STATUS_LABELS.get(
+            status, "not enriched"
+        )
+        note = _special_tag_field(item, "special_note")
+        if note:
+            status_text += f"<br><span class=\"muted\">{_escape(note)}</span>"
         evidence_context = ", ".join(
             [*item.get("zones", []), *item.get("group_ids", [])]
         ) or "—"
@@ -1363,7 +1392,7 @@ def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
             f'<td class="number">{_escape(_format_number(item.get("ingress_percentage")))}</td>'
             f'<td class="number">{_escape(peak_mbps)}</td>'
             f'<td class="wrap"><code>{_escape(tuple_text)}</code><br><span class="muted">{_escape(context)}</span></td>'
-            f'<td>{_escape(status_labels.get(status, "not enriched"))}</td>'
+            f"<td>{status_text}</td>"
             f'<td>{_escape(item.get("first_seen") or "—")}<br>{_escape(item.get("last_seen") or "—")}</td>'
             "</tr>"
         )
@@ -1683,9 +1712,19 @@ def _render_ingress_backlogs(
             for value in (detail.get("ingress_interface"), detail.get("egress_interface"))
             if value
         ) or "—"
+        # Resolved once for the row: what PAN-OS says this SESS-ID is, and the
+        # note it printed beside it. The wording is the diagnosis's own, so the
+        # table and the verdict can never describe the entry differently.
+        label = special_tag_label(item)
+        note = _special_tag_field(item, "special_note")
+        identity = f'<code>{_escape(item.get("identifier"))}</code>'
+        if label:
+            identity += f'<br><span class="muted">{_escape(label)}</span>'
+        if note:
+            identity += f'<br><span class="muted">{_escape(note)}</span>'
         rows.append(
             "<tr>"
-            f'<td><code>{_escape(item.get("identifier"))}</code></td>'
+            f"<td>{identity}</td>"
             f'<td class="number">{_escape(_format_number(item.get("ingress_percentage")))}</td>'
             f'<td class="number">{_escape(_format_number(item.get("ingress_count")))}</td>'
             f'<td class="wrap"><code>{_escape(tuple_text)}</code><br><span class="muted">{_escape(context)}</span></td>'
@@ -4495,11 +4534,27 @@ def _build_report_parts(
         attribution_pill = "ranked, none RED"
     else:
         attribution_pill = "no offender learned"
-    ingress_candidate_count = len(_ingress_candidate_entities(attribution))
+    ingress_entities = _ingress_candidate_entities(attribution)
+    # An entry PAN-OS flagged as its own internal tag is listed in the queue
+    # but is not a session, so the pill counts it apart instead of promising a
+    # session the evidence sections do not show.
+    ingress_tag_count = len(
+        [
+            item
+            for item in ingress_entities
+            if _special_tag_field(item, "special_reason") == SPECIAL_TAG_NOTED
+        ]
+    )
+    ingress_candidate_count = len(ingress_entities) - ingress_tag_count
     if ingress_candidate_count:
         ingress_pill = (
             f"{ingress_candidate_count} session"
             f"{'s' if ingress_candidate_count != 1 else ''} in the queue"
+        )
+    elif ingress_tag_count:
+        ingress_pill = (
+            f"{ingress_tag_count} internal tag"
+            f"{'s' if ingress_tag_count != 1 else ''}, no session"
         )
     elif ingress_collection["unsupported"] and not ingress_collection["succeeded"]:
         # Never "no session at 2%" when the firewall rejected the command in
