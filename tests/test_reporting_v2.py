@@ -236,6 +236,71 @@ class LayeredReportTests(unittest.TestCase):
             rendered,
         )
 
+    def test_both_reports_state_the_on_box_ingress_collection_identically(self):
+        # The layered report draws the same evidence sections as the flat one,
+        # so neither can tell TAC something different about whether the tech
+        # support file carries the 100 ms ingress samples.
+        records = self._incident_records()
+        records[0]["inflight_monitoring"] = {
+            "parsed": True,
+            "enabled": False,
+            "duration_seconds": 3,
+            "threshold_percent": 80,
+            "trigger_pending": False,
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            capture, _ = self._capture(directory, records)
+            flat = generate_html_report(
+                capture, directory / "report.html"
+            ).read_text(encoding="utf-8")
+            layered = generate_html_report_v2(
+                capture, directory / REPORT_V2_FILENAME
+            ).read_text(encoding="utf-8")
+
+        for rendered in (flat, layered):
+            self.assertIn(
+                "On-box ingress-backlog auto-collection: <strong>disabled</strong>",
+                rendered,
+            )
+            self.assertIn("set session inflight_monitoring yes", rendered)
+            self.assertIn("On-box auto-collection", rendered)
+
+    def _both_reports(self, inflight: dict) -> tuple[str, str]:
+        records = self._incident_records()
+        records[0]["inflight_monitoring"] = inflight
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            capture, _ = self._capture(directory, records)
+            flat = generate_html_report(
+                capture, directory / "report.html"
+            ).read_text(encoding="utf-8")
+            layered = generate_html_report_v2(
+                capture, directory / REPORT_V2_FILENAME
+            ).read_text(encoding="utf-8")
+        return flat, layered
+
+    def test_a_partly_read_on_box_setting_reads_the_same_in_both_reports(self):
+        # Only the duration was returned. Both reports, and the fact line
+        # inside each, must call the 80% an assumed PAN-OS default rather than
+        # a value this firewall reported.
+        assumed = "80% for 5 s, PAN-OS defaults: the nodes were not returned"
+        for rendered in self._both_reports(
+            {"parsed": True, "status": "read", "enabled": True, "duration_seconds": 5}
+        ):
+            self.assertIn(f"enabled ({assumed})", rendered)
+            # Every printing of the pair carries the caveat: not one place in
+            # either report states the 80% as the firewall's own setting.
+            self.assertEqual(rendered.count("80% for 5 s"), rendered.count(assumed))
+
+    def test_a_non_boolean_on_box_flag_reads_as_unknown_in_both_reports(self):
+        for rendered in self._both_reports(
+            {"parsed": True, "status": "read", "enabled": "on"}
+        ):
+            self.assertIn("On-box ingress-backlog auto-collection: not read", rendered)
+            self.assertIn("On-box auto-collection", rendered)
+            self.assertNotIn("auto-collection was enabled", rendered)
+
     def test_the_destination_must_differ_from_the_capture(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)

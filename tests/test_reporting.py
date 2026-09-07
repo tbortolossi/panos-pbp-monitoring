@@ -1981,6 +1981,96 @@ class IncidentStateSectionTests(unittest.TestCase):
         self.assertIn("are not in this capture", html)
         self.assertNotIn("<th>Since boot</th>", html)
 
+    def test_the_ingress_section_states_the_on_box_collection_when_disabled(self):
+        html = self._render(
+            {
+                "inflight_monitoring": {
+                    "parsed": True,
+                    "enabled": False,
+                    "duration_seconds": 3,
+                    "threshold_percent": 80,
+                    "trigger_pending": False,
+                }
+            }
+        )
+
+        self.assertIn(
+            "On-box ingress-backlog auto-collection: <strong>disabled</strong>", html
+        )
+        self.assertIn("set session inflight_monitoring yes", html)
+        # The collector recommends; it never changes the firewall.
+        self.assertIn("an operator gesture, never", html)
+
+    def test_the_ingress_section_names_the_log_when_the_collection_is_enabled(self):
+        html = self._render(
+            {
+                "inflight_monitoring": {
+                    "parsed": True,
+                    "enabled": True,
+                    "duration_seconds": 5,
+                    "threshold_percent": 60,
+                    "trigger_pending": False,
+                }
+            }
+        )
+
+        self.assertIn(
+            "On-box ingress-backlog auto-collection: <strong>enabled</strong> "
+            "(60% for 5 s)",
+            html,
+        )
+        self.assertIn("/var/log/pan/pan_ingress_backlogs.log", html)
+
+    def test_a_capture_without_the_on_box_state_says_it_was_not_read(self):
+        html = self._render({})
+
+        self.assertIn("On-box ingress-backlog auto-collection: not read", html)
+
+    def test_a_release_without_the_feature_is_not_reported_as_a_lost_read(self):
+        html = self._render(
+            {"inflight_monitoring": {"parsed": False, "status": "absent"}}
+        )
+
+        self.assertIn(
+            "On-box ingress-backlog auto-collection: not available on this "
+            "PAN-OS release",
+            html,
+        )
+        self.assertIn("nothing to enable", html)
+        self.assertNotIn("On-box ingress-backlog auto-collection: not read", html)
+
+    def test_an_unreturned_threshold_is_never_shown_as_the_firewalls_own(self):
+        # Only the duration came back, so the 80% is the PAN-OS default. The
+        # step's fact line, the step's verdict and the Ingress paragraph read
+        # from one resolver, so all three say the value was assumed and none
+        # presents it as the firewall's own.
+        html = self._render(
+            {
+                "inflight_monitoring": {
+                    "parsed": True,
+                    "status": "read",
+                    "enabled": True,
+                    "duration_seconds": 5,
+                }
+            }
+        )
+
+        assumed = "80% for 5 s, PAN-OS defaults: the nodes were not returned"
+        self.assertIn(assumed, html)
+        # Every printing of the pair carries the caveat: nowhere is the 80%
+        # stated as the firewall's own setting.
+        self.assertEqual(html.count("80% for 5 s"), html.count(assumed))
+
+    def test_a_non_boolean_on_box_flag_is_not_rendered_as_enabled(self):
+        html = self._render(
+            {"inflight_monitoring": {"parsed": True, "status": "read", "enabled": 1}}
+        )
+
+        self.assertIn("On-box ingress-backlog auto-collection: not read", html)
+        self.assertNotIn(
+            "On-box ingress-backlog auto-collection: <strong>enabled</strong>", html
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

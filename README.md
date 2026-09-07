@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.42.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.43.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -168,7 +168,7 @@ utilization.
 core, runs when a firewall is saved in the admin UI rather than during an
 incident, so a firewall already under pressure spends no API call on it.
 
-Five further read-only commands run once, while the monitor is starting, and
+Six further read-only commands run once, while the monitor is starting, and
 describe the firewall's state and its recorded history rather than the current
 second. None of it can be recovered later, because a monitor only starts once
 a trigger has already fired:
@@ -179,6 +179,7 @@ show running resource-monitor       # the minute, hour, day and week blocks
 show interface all
 show zone-protection
 show high-availability state
+show system state filter cfg.session.*   # on-box ingress-backlog collection
 ```
 
 The raw counter reads catch what a delta window cannot: it can be a fraction
@@ -188,8 +189,14 @@ unfiltered resource-monitor blocks are what separates a level that only ever
 climbed — a leak — from one that spiked and recovered. `show interface all`
 gives every port its zone and link speed, `show zone-protection` says whether
 the zone PBP dropped in had any flood protection at all, and the HA state says
-whether this unit forwards production traffic in the first place. Each one
-failing costs a piece of the report and nothing else.
+whether this unit forwards production traffic in the first place. The
+`cfg.session.*` state says whether the firewall collects the ingress backlogs
+by itself, every 100 ms, into `/var/log/pan/pan_ingress_backlogs.log` — the
+sub-second evidence a tech support file can carry and no five-second poll can
+reach. The collector only reads that state; enabling it is a configuration
+change and stays the operator's gesture, described in
+[docs/troubleshooting.md](docs/troubleshooting.md). Each one failing costs a
+piece of the report and nothing else.
 
 The last command hunts the elephant session: one transfer large enough and old
 enough to fill a link on its own. It needs its own query because such a session

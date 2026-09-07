@@ -264,6 +264,26 @@ syslog, denied and re-evaluated packet by packet on one core. An empty result
 on an x86 platform is stated as not being proof, because PAN-OS documents the
 command for the hardware queue of the Cavium chassis.
 
+The step also states the **on-box auto-collection** state, read once at the
+start of the incident, as a fact line reading `disabled`, `enabled (80% for
+3 s)`, `not available on this PAN-OS release` when the firewall returned none
+of the settings, or `not read` when the read itself failed — the last two are
+different answers and are never merged. The Ingress backlog evidence section
+repeats the same state in words; both are formatted from one resolver, so the
+fact line, the step's verdict and the paragraph cannot disagree. When the
+firewall did not return a threshold or a duration, the PAN-OS default is shown
+and labelled as assumed (`80% for 3 s, PAN-OS defaults: the nodes were not
+returned`) rather than presented as the firewall's own setting. Enabled, the firewall ran `show running resource-monitor
+ingress-backlogs` itself, sampled every 100 ms, into
+`/var/log/pan/pan_ingress_backlogs.log` on the management plane each time the
+in-flight usage stayed above the threshold for the duration: that log travels
+in the tech support file and is finer than anything a five-second poll can
+see, so the report names it as evidence to ask TAC for. Disabled, that log
+holds nothing for this incident and the report recommends enabling it on the
+firewall for the next one — an operator gesture described in
+[docs/troubleshooting.md](troubleshooting.md), never something this collector
+does.
+
 **Step 4 — If not, where else?** Five always-answered hypotheses, each with
 its own verdict:
 

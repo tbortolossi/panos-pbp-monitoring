@@ -19,6 +19,9 @@ from . import __version__
 from .diagnosis import (
     DEFAULT_ACTIVATE_PERCENT,
     DEFAULT_ALERT_PERCENT,
+    INFLIGHT_MONITORING_ABSENT,
+    INGRESS_BACKLOG_ENABLE_COMMAND,
+    INGRESS_BACKLOG_LOG_PATH,
     POOL_HELD_PERCENT,
     SIGNAL_COUNTER_FAMILIES,
     _flow_parts,
@@ -31,6 +34,9 @@ from .diagnosis import (
     ha_summary,
     history_trend,
     history_windows,
+    inflight_monitoring_settings_text,
+    inflight_monitoring_state,
+    inflight_monitoring_summary,
     latest_event,
     raw_counter_bracket,
     render_diagnosis,
@@ -1494,6 +1500,46 @@ def _render_pbp_threat_logs(events: list[tuple[int, dict[str, Any]]]) -> str:
         "session discards and source blocks, queried read-only once at monitor "
         "stop so the designations are captured even when the threat log is not "
         "forwarded to the collector.",
+    )
+
+
+def _render_inflight_monitoring(events: list[tuple[int, dict[str, Any]]]) -> str:
+    """State whether the firewall collected the ingress backlogs on its own.
+
+    Formats the same `inflight_monitoring_state` dict the diagnosis step reads,
+    so the fact line, the step's verdict and this paragraph cannot disagree
+    about the threshold, the duration or whether either was actually returned.
+    """
+    state = inflight_monitoring_state(
+        inflight_monitoring_summary([record for _, record in events])
+    )
+    log = f"<code>{_escape(INGRESS_BACKLOG_LOG_PATH)}</code>"
+    if state["enabled"] is True:
+        return (
+            "<p>On-box ingress-backlog auto-collection: <strong>enabled</strong> "
+            f"({_escape(inflight_monitoring_settings_text(state))}). The firewall "
+            "wrote <code>show running resource-monitor ingress-backlogs</code> "
+            f"itself into {log} on the management plane, sampled every 100 ms; "
+            "ask TAC to read it from the tech support file.</p>"
+        )
+    if state["enabled"] is False:
+        return (
+            "<p>On-box ingress-backlog auto-collection: <strong>disabled</strong>. "
+            f"{log} in the tech support file holds nothing for this incident. "
+            f"Enabling it on the firewall (<code>{_escape(INGRESS_BACKLOG_ENABLE_COMMAND)}"
+            "</code>) makes the next one carry 100 ms-resolution evidence; that "
+            "is an operator gesture, never one this collector makes.</p>"
+        )
+    if state["status"] == INFLIGHT_MONITORING_ABSENT:
+        return (
+            '<p class="muted">On-box ingress-backlog auto-collection: not '
+            f"available on this PAN-OS release, so {log} is not in the tech "
+            "support file and there is nothing to enable.</p>"
+        )
+    return (
+        '<p class="muted">On-box ingress-backlog auto-collection: not read '
+        "in this capture, so whether the tech support file carries "
+        f"{log} is unknown.</p>"
     )
 
 
@@ -3925,7 +3971,12 @@ def _build_report_parts(
     large_session_summary = _aggregate_large_sessions(cycles)
     cpu_tracking_html = _render_cpu_tracking(cycles, core_functions)
     large_sessions_html = _render_large_sessions(large_session_summary)
-    ingress_html = _render_ingress_backlogs(cycles, attribution)
+    # The on-box collection state is appended whatever the backlogs read:
+    # whether the tech support file carries the 100 ms samples is a separate
+    # question from what this capture managed to collect.
+    ingress_html = _render_ingress_backlogs(
+        cycles, attribution
+    ) + _render_inflight_monitoring(events)
     buffer_latency_html = _render_buffer_latency(cycles)
     pbp_threat_logs_html = _render_pbp_threat_logs(events)
     cpu_needs_attention = any(

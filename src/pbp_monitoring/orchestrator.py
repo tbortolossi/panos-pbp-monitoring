@@ -33,7 +33,13 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from . import __version__, diagnostics
-from .diagnosis import DEFAULT_ACTIVATE_PERCENT, DEFAULT_ALERT_PERCENT
+from .diagnosis import (
+    DEFAULT_ACTIVATE_PERCENT,
+    DEFAULT_ALERT_PERCENT,
+    INFLIGHT_MONITORING_ABSENT,
+    INFLIGHT_MONITORING_NOT_COLLECTED,
+    INFLIGHT_MONITORING_READ,
+)
 from .config_store import (
     SAFE_RUN_COMPONENT,
     ConfigStore,
@@ -132,6 +138,20 @@ PBP_SETTINGS_COMMAND = (
 # - `ha_state` says whether this unit is passive. A buffer at 99 % with no
 #   session means nothing until that is known, and a takeover timestamp
 #   explains a jump from 2 % to 100 % in five seconds.
+# - `inflight_monitoring` reads the on-box ingress-backlog auto-collection
+#   state, and is the one place this mechanism is explained. Since PAN-OS 10.2
+#   `pan_task` samples the in-flight usage every 100 ms and, when it stays
+#   above `ingress_backlogs_threshold` (default 80%) for
+#   `ingress_backlogs_duration` (default 3 s), runs `show running
+#   resource-monitor ingress-backlogs` once itself and appends it to
+#   `/var/log/pan/pan_ingress_backlogs.log` on the management plane, which a
+#   tech support file carries. The feature is disabled by default. That
+#   sampling sees the sub-second bursts no poll interval this collector can
+#   use will catch, so whether it was on decides whether the tech support file
+#   sent to TAC holds anything at all, and whether the report should recommend
+#   turning it on before the next incident. The collector only reads this
+#   state: `set session inflight_monitoring yes` is a configuration change on
+#   the firewall and stays the operator's gesture.
 #
 # Operational XML validated read-only against the lab PA-440 (PAN-OS 12.2.2)
 # on 2026-09-06.
@@ -143,6 +163,12 @@ INCIDENT_START_COMMANDS = {
     "interface_status": "<show><interface>all</interface></show>",
     "zone_protection": "<show><zone-protection/></show>",
     "ha_state": "<show><high-availability><state/></high-availability></show>",
+    # Validated read-only through the XML API on the lab PA-440, PAN-OS
+    # 12.2.2, 2026-09-07.
+    "inflight_monitoring": (
+        "<show><system><state><filter>cfg.session.*</filter></state>"
+        "</system></show>"
+    ),
 }
 
 # Every hardware port's counters in one read. Offender enrichment is
@@ -190,6 +216,7 @@ OPTIONAL_COMMAND_EVIDENCE = {
     "zone_protection": "the per-zone flood protection state and PBP drops",
     "ha_state": "the high-availability role of this unit",
     "interface_counters_all": "the per-interface hardware counters",
+    "inflight_monitoring": "the on-box ingress-backlog auto-collection state",
 }
 
 
@@ -3419,6 +3446,72 @@ def extract_ha_state(output: str) -> dict[str, Any]:
     return state
 
 
+def _inflight_int(value: str) -> int | None:
+    """A `show system state` integer, decimal or hexadecimal.
+
+    The same node prints `80` on one release and `0x50` on another. Reading
+    only the decimal form would leave the value None, which every caller then
+    replaces with the PAN-OS default: a wrong number presented as the
+    firewall's own.
+    """
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return int(text, 0)
+    except ValueError:
+        return _int_value(text)
+
+
+#: The `show system state filter cfg.session.*` nodes this read exists for:
+#: which field each is persisted under, and how its text is read. One table,
+#: so a node cannot be listed here and forgotten in the initial dictionary or
+#: in the choice of parser. A release that does not expose a node simply
+#: leaves its field None.
+_INFLIGHT_MONITORING_NODES: dict[str, tuple[str, Any]] = {
+    "cfg.session.inflight_monitoring": ("enabled", _panos_flag),
+    "cfg.session.ingress_backlogs_duration": ("duration_seconds", _inflight_int),
+    "cfg.session.ingress_backlogs_threshold": ("threshold_percent", _inflight_int),
+    "cfg.session.ingress_backlogs_trigger": ("trigger_pending", _panos_flag),
+}
+
+
+def extract_inflight_monitoring(output: str) -> dict[str, Any]:
+    """Read the on-box ingress-backlog auto-collection state.
+
+    The answer is the plain text of `show system state`, one
+    `cfg.session.<name>: <value>` per line. Nothing kept here identifies the
+    customer's network: two flags, two numbers and what the read established.
+    """
+    state: dict[str, Any] = {
+        field: None for field, _ in _INFLIGHT_MONITORING_NODES.values()
+    }
+    text = panos_result_text(output)
+    for line in text.splitlines():
+        name, separator, value = line.partition(":")
+        if not separator:
+            continue
+        node = _INFLIGHT_MONITORING_NODES.get(name.strip().lower())
+        if node is None:
+            continue
+        field, read = node
+        parsed = read(value)
+        if parsed is not None:
+            state[field] = parsed
+    state["parsed"] = any(value is not None for value in state.values())
+    # An empty body is a read that did not happen — a failed command is stored
+    # with no result. A body that came back without the node is the firewall
+    # answering that this release does not have the feature.
+    state["status"] = (
+        INFLIGHT_MONITORING_READ
+        if state["enabled"] is not None
+        else INFLIGHT_MONITORING_NOT_COLLECTED
+        if not text.strip()
+        else INFLIGHT_MONITORING_ABSENT
+    )
+    return state
+
+
 def extract_interface_counter_table(output: str) -> dict[str, dict[str, Any]]:
     """Every hardware port's counters from one `show counter interface all`.
 
@@ -5067,6 +5160,11 @@ class MonitorController:
                         ),
                         "ha_state": extract_ha_state(
                             command_result(incident_start_payloads.get("ha_state"))
+                        ),
+                        "inflight_monitoring": extract_inflight_monitoring(
+                            command_result(
+                                incident_start_payloads.get("inflight_monitoring")
+                            )
                         ),
                         "commands": {
                             "system_info": system_info,

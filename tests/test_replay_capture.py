@@ -106,6 +106,15 @@ INCIDENT_STATE_RECORD = {
             "error": None,
             "result": "<result><enabled>no</enabled></result>",
         },
+        "inflight_monitoring": {
+            "ok": True,
+            "error": None,
+            "result": (
+                "<result>cfg.session.inflight_monitoring: False\n"
+                "cfg.session.ingress_backlogs_duration: 3\n"
+                "cfg.session.ingress_backlogs_threshold: 80\n</result>"
+            ),
+        },
         "global_counters_raw": {
             "ok": True,
             "error": None,
@@ -226,6 +235,7 @@ class ReplayTests(unittest.TestCase):
             {
                 "zone_protection": "parsed",
                 "ha_state": "parsed",
+                "inflight_monitoring": "parsed",
                 "global_counters_raw": "parsed",
                 "resource_monitor_history": "parsed",
                 "interface_status": "parsed",
@@ -236,6 +246,14 @@ class ReplayTests(unittest.TestCase):
             outcomes["zone_protection"]["parsed"]["zones"][0]["pbp_drop"], 3984
         )
         self.assertIs(outcomes["ha_state"]["parsed"]["enabled"], False)
+        # A customer archive must replay the on-box ingress-backlog state too:
+        # it decides whether the tech support file holds the 100 ms samples.
+        self.assertIs(
+            outcomes["inflight_monitoring"]["parsed"]["enabled"], False
+        )
+        self.assertEqual(
+            outcomes["inflight_monitoring"]["parsed"]["threshold_percent"], 80
+        )
         self.assertEqual(
             outcomes["global_counters_raw"]["parsed"]["counters"][
                 "flow_dos_pbp_block_host"

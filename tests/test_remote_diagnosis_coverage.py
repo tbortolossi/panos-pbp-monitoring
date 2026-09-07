@@ -91,6 +91,28 @@ class ReplayCoverageTests(unittest.TestCase):
             "reproduce their parsing failure. Add each to PARSERS.",
         )
 
+    def test_every_once_per_incident_read_is_declared_optional(self):
+        """A start command missing from the evidence tables fails a check.
+
+        The read-only API check reports a command it cannot classify as an
+        error, so a once-per-incident read forgotten here would turn a
+        firewall that answers everything the monitor needs into an
+        `api_check_partial_failure` — for a firewall with no HA, no zone
+        protection profile, or a PAN-OS release without the node.
+        """
+        classified = set(orchestrator.OPTIONAL_COMMAND_EVIDENCE) | set(
+            orchestrator.PLATFORM_DEPENDENT_COMMAND_EVIDENCE
+        )
+        missing = sorted(set(orchestrator.INCIDENT_START_COMMANDS) - classified)
+        self.assertEqual(
+            missing,
+            [],
+            "Once-per-incident reads absent from OPTIONAL_COMMAND_EVIDENCE and "
+            "PLATFORM_DEPENDENT_COMMAND_EVIDENCE: their failure would be "
+            "reported as a failed API check instead of the piece of evidence "
+            "it costs. Declare each with what it collects.",
+        )
+
     def test_every_event_storing_a_raw_response_can_be_replayed(self):
         missing = sorted(RAW_RESPONSE_EVENT_NAMES - set(RAW_RESPONSE_EVENTS))
         self.assertEqual(

@@ -265,6 +265,47 @@ the eight corpus TSFs contained `show session packet-buffer-protection`,
 `ingress-backlogs`, threat logs, or the identity of blocked hosts. Keep the
 collector's captures with the case.
 
+## Enable the on-box ingress-backlog collection
+
+This is a change on the firewall, decided and made by the operator. The
+collector is observational: it reads the state and reports it, and never
+enables it.
+
+Since PAN-OS 10.2 the firewall can collect the ingress backlogs by itself.
+`pan_task` samples the in-flight usage every **100 ms** and, when it stays
+above `ingress_backlogs_threshold` for `ingress_backlogs_duration`, runs
+`show running resource-monitor ingress-backlogs` once and appends it to
+`/var/log/pan/pan_ingress_backlogs.log` on the management plane, which a tech
+support file carries. The feature is **disabled by default**, and the defaults
+are **80%** and **3 s**.
+
+That resolution is what a five-second poll cannot reach: a burst that fills the
+queue and drains between two collection cycles leaves nothing in the capture
+and a full backlog in that log. The report reads the state at the start of each
+incident and, when it is off, says so in the Ingress backlog section.
+
+Read the state, and turn it on, from the firewall's CLI:
+
+```
+show session inflight_monitoring status
+show session ingress_backlogs_threshold
+show session ingress_backlogs_duration
+
+set session inflight_monitoring yes
+set session ingress_backlogs_threshold <2-100>
+set session ingress_backlogs_duration <0-10>
+```
+
+The accepted ranges above are the vendor's. The setting survives a reboot.
+Leave the threshold and the duration at their defaults unless a case with TAC
+calls for something else: a lower threshold or a shorter duration makes the
+firewall write that log more often, on the management plane, on a device
+already under pressure.
+
+The collector then reports, on the next incident, that the on-box collection
+was enabled and that `/var/log/pan/pan_ingress_backlogs.log` in the tech
+support file holds the 100 ms samples for the incident window.
+
 ## Reporting a problem in a deployment you do not administer
 
 When the collector runs at a site you cannot reach, ask the operator for the

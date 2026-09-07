@@ -41,6 +41,7 @@ from pbp_monitoring.orchestrator import (  # noqa: E402
     extract_global_counters,
     extract_global_counters_raw,
     extract_ha_state,
+    extract_inflight_monitoring,
     extract_ingress_backlogs,
     extract_interface_counter_table,
     extract_interface_counters,
@@ -84,6 +85,7 @@ PARSERS: dict[str, Callable[[str], Any]] = {
     "global_counters_raw": extract_global_counters_raw,
     "zone_protection": extract_zone_protection,
     "ha_state": extract_ha_state,
+    "inflight_monitoring": extract_inflight_monitoring,
     "session_filter_count": extract_session_filter_count,
     "session_filter_list": extract_session_filter_entries,
 }
