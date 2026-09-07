@@ -76,6 +76,23 @@ the node does not exist. The same command failing for a reason an operator can
 act on — a timeout, an HTTP status, a permission the API role does not have —
 still fails the check.
 
+The configuration read has a third outcome, which is not a failure at all.
+PAN-OS answers `No such node` when the element is simply absent from the
+running configuration, and a firewall whose session settings were never touched
+carries no `…/deviceconfig/setting/session` element. Nothing was refused and
+nothing is missing: no PBP threshold is configured, so the PAN-OS defaults —
+alert 50 %, activate 80 % — are the ones in force. The check reports it as
+
+```
+pbp_settings is not configured on this firewall, the PAN-OS default PBP
+thresholds are in force
+```
+
+which is the expected result on a VM-Series deployed from an image and left at
+its defaults. There is nothing to grant and nothing to repair. A refusal of the
+same read still reads `pbp_settings command failed`, and that one is a
+permission to widen.
+
 The firewall then shows **Passed with warnings** in amber on the configuration
 page and in the dashboard's API signal, and the check detail names the missing
 evidence. Grant the API administrator the configuration read, or accept the

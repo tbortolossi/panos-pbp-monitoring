@@ -210,6 +210,18 @@ _UNSUPPORTED_NODE_MARKERS = (
     "unknown command",
 )
 
+#: Running-configuration reads, and what an absent node proves about the
+#: firewall. PAN-OS answers `No such node` when the element is not in the
+#: configuration, so the read succeeded and returned nothing to configure:
+#: every threshold under it is at its PAN-OS default. That is a complete
+#: answer, not a lost read, and must not be reported as a failed command.
+ABSENT_CONFIG_EVIDENCE = {
+    "pbp_settings": "the PAN-OS default PBP thresholds are in force",
+}
+
+#: The answer PAN-OS gives for a configuration element that does not exist.
+_ABSENT_CONFIG_NODE_MARKER = "no such node"
+
 
 def optional_command_warning(name: str) -> str:
     """Say which evidence an operator loses when an enrichment read fails."""
@@ -224,6 +236,29 @@ def unsupported_command_warning(name: str) -> str:
         f"{name} is not supported on this platform or PAN-OS release, "
         f"{lost} could not be collected"
     )
+
+
+def unconfigured_command_warning(name: str) -> str:
+    """Say what is in force when the firewall has nothing configured here."""
+    in_force = ABSENT_CONFIG_EVIDENCE.get(name, "the PAN-OS defaults apply")
+    return f"{name} is not configured on this firewall, {in_force}"
+
+
+def config_node_absent(record: Any) -> bool:
+    """Did the firewall answer that this configuration element is not set?
+
+    `No such node` on a running-configuration read means the element is absent
+    from the configuration, which the role was allowed to read: nothing is
+    configured there and the PAN-OS defaults apply. Every other failure — a
+    timeout, an HTTP status, a permission denied on the configuration — stays
+    a collection failure the operator can act on.
+    """
+    if not isinstance(record, dict) or record.get("ok") is True:
+        return False
+    error = str(record.get("error") or "").lower()
+    if not error.startswith("panosapierror:"):
+        return False
+    return _ABSENT_CONFIG_NODE_MARKER in error
 
 
 def command_node_unsupported(record: Any) -> bool:
@@ -6023,7 +6058,11 @@ async def run_api_check(cfg: Config) -> ApiCheckResult:
     if not command_succeeded(system_info):
         validation_errors.append("system_info command failed")
     if not command_succeeded(pbp_settings_payload):
-        validation_warnings.append(optional_command_warning("pbp_settings"))
+        validation_warnings.append(
+            unconfigured_command_warning("pbp_settings")
+            if config_node_absent(pbp_settings_payload)
+            else optional_command_warning("pbp_settings")
+        )
     if not command_succeeded(global_counter_baseline):
         validation_errors.append("global counter baseline command failed")
     for name, record in outputs.items():

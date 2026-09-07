@@ -2204,6 +2204,42 @@ class FirewallCheckTests(unittest.TestCase):
             self.assertEqual(recorded["last_check_status"], "warning")
             self.assertIn("reduced evidence", recorded["last_check_detail"])
             self.assertIn("pbp_settings", recorded["last_check_detail"])
+            # A read the operator can repair by widening the role must keep
+            # saying so, which is what separates it from an unset threshold.
+            self.assertIn("command failed", recorded["last_check_detail"])
+            self.assertIsNone(recorded["check_requested_at"])
+
+    def test_an_unset_pbp_threshold_is_not_reported_as_a_failed_command(self):
+        """An absent configuration node means the PAN-OS defaults are in force."""
+
+        class UnconfiguredClient(FakeClient):
+            def op_response(self, command: str) -> PanOSResponse:
+                if command == PBP_SETTINGS_COMMAND:
+                    # What PAN-OS answers for an xpath the configuration does
+                    # not carry, observed on a PA-VM never tuned for PBP.
+                    raise PanOSAPIError(
+                        "No such node", raw_response="raw no such node"
+                    )
+                return super().op_response(command)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            router, store = self._router(root, identity="PA-VM|11.2.4")
+            store.request_target_check(store.list_targets()[0]["target_id"])
+
+            with patch(
+                "pbp_monitoring.orchestrator.PanOSClient",
+                return_value=UnconfiguredClient(),
+            ):
+                asyncio.run(run_target_checks_once(router))
+
+            recorded = store.list_targets()[0]
+            self.assertEqual(recorded["last_check_kind"], "validation")
+            self.assertEqual(recorded["last_check_status"], "warning")
+            self.assertIn("pbp_settings", recorded["last_check_detail"])
+            self.assertIn("not configured", recorded["last_check_detail"])
+            self.assertIn("default", recorded["last_check_detail"])
+            self.assertNotIn("command failed", recorded["last_check_detail"])
             self.assertIsNone(recorded["check_requested_at"])
 
     def test_a_platform_without_ingress_backlogs_still_validates(self):
