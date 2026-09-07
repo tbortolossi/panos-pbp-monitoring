@@ -6,6 +6,7 @@ from pbp_monitoring.orchestrator import (
     extract_congestion_log_entries,
     extract_global_counters_raw,
     extract_ha_state,
+    extract_inflight_monitoring,
     extract_interface_counter_table,
     extract_interface_status,
     extract_large_sessions,
@@ -383,6 +384,85 @@ class TsfCorpusEvidenceParsingTests(unittest.TestCase):
         self.assertEqual(parsed["peer_state"], "active")
         self.assertEqual(parsed["running_sync"], "synchronized")
         self.assertNotIn("peer_serial", parsed)
+
+    def test_a_disabled_on_box_ingress_collection_is_read_with_its_settings(self):
+        parsed = extract_inflight_monitoring(
+            "<result>cfg.session.erspan: False\n"
+            "cfg.session.inflight_monitoring: False\n"
+            "cfg.session.ingress_backlogs_duration: 3\n"
+            "cfg.session.ingress_backlogs_threshold: 80\n"
+            "cfg.session.ingress_backlogs_trigger: False\n</result>"
+        )
+
+        self.assertTrue(parsed["parsed"])
+        self.assertIs(parsed["enabled"], False)
+        self.assertEqual(parsed["duration_seconds"], 3)
+        self.assertEqual(parsed["threshold_percent"], 80)
+        self.assertIs(parsed["trigger_pending"], False)
+
+    def test_an_enabled_on_box_ingress_collection_is_read_as_enabled(self):
+        parsed = extract_inflight_monitoring(
+            "cfg.session.inflight_monitoring: True\n"
+            "cfg.session.ingress_backlogs_duration: 5\n"
+            "cfg.session.ingress_backlogs_threshold: 60\n"
+            "cfg.session.ingress_backlogs_trigger: True\n"
+        )
+
+        self.assertIs(parsed["enabled"], True)
+        self.assertEqual(parsed["duration_seconds"], 5)
+        self.assertEqual(parsed["threshold_percent"], 60)
+        self.assertIs(parsed["trigger_pending"], True)
+
+    def test_no_matches_leaves_the_on_box_collection_state_unknown(self):
+        parsed = extract_inflight_monitoring("<result>NO_MATCHES</result>")
+
+        self.assertFalse(parsed["parsed"])
+        self.assertIsNone(parsed["enabled"])
+        self.assertIsNone(parsed["duration_seconds"])
+        self.assertIsNone(parsed["threshold_percent"])
+        self.assertIsNone(parsed["trigger_pending"])
+
+    def test_a_release_without_the_on_box_nodes_is_still_monitored(self):
+        # An empty answer, a failed command stored as an empty string and a
+        # release that exposes only some of the nodes must each parse into a
+        # partial state rather than raise: the incident goes on being
+        # monitored either way.
+        for output in ("", "<result></result>", "not xml at all"):
+            with self.subTest(output=output):
+                parsed = extract_inflight_monitoring(output)
+
+                self.assertFalse(parsed["parsed"])
+                self.assertIsNone(parsed["enabled"])
+        partial = extract_inflight_monitoring(
+            "<result>cfg.session.inflight_monitoring: True</result>"
+        )
+
+        self.assertIs(partial["enabled"], True)
+        self.assertIsNone(partial["threshold_percent"])
+
+    def test_the_on_box_collection_state_carries_nothing_identifying(self):
+        # The whole point of reading `cfg.session.*` is four flags and
+        # numbers; the surrounding nodes of a real firewall must not be kept,
+        # so an anonymized export cannot leak through this field.
+        parsed = extract_inflight_monitoring(
+            "<result>cfg.session.erspan: False\n"
+            "cfg.session.inflight_monitoring: False\n"
+            "cfg.session.hostname: customer-edge-fw\n"
+            "cfg.session.mgmt-ip: 203.0.113.7\n</result>"
+        )
+
+        self.assertEqual(
+            set(parsed),
+            {
+                "parsed",
+                "enabled",
+                "duration_seconds",
+                "threshold_percent",
+                "trigger_pending",
+            },
+        )
+        for value in parsed.values():
+            self.assertIsInstance(value, (bool, int, type(None)))
 
     def test_the_whole_interface_counter_table_is_parsed_per_port(self):
         parsed = extract_interface_counter_table(

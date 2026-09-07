@@ -154,6 +154,21 @@ than create a concurrent one.
      holds and every offender ranking is empty by construction. The peer's
      serial and addresses are not kept: they identify a firewall the collector
      does not monitor.
+   - `show system state filter cfg.session.*`, for the on-box ingress-backlog
+     auto-collection state (`cfg.session.inflight_monitoring` and its
+     `ingress_backlogs_threshold`, `ingress_backlogs_duration` and
+     `ingress_backlogs_trigger` nodes). Since PAN-OS 10.2 the firewall samples
+     the in-flight usage every 100 ms and, when it stays above the threshold
+     for the duration, writes `show running resource-monitor ingress-backlogs`
+     itself into `/var/log/pan/pan_ingress_backlogs.log`, which a tech support
+     file carries; it is disabled by default. Reading the state is what tells
+     TAC whether that file holds anything, and the operator that it is worth
+     enabling. **The collector only reads this state and never enables it:**
+     `set session inflight_monitoring yes` is a configuration change on the
+     firewall and stays the operator's gesture. Validated read-only on the lab
+     PA-440 (PAN-OS 12.2.2) on 2026-09-07; a firewall or release without the
+     nodes answers `NO_MATCHES` and every field stays unknown, which is an
+     optional piece of evidence and never a reason to stop monitoring.
 5. At incident startup, the monitor primes the global-counter delta baseline
    separately. At the start of each batch, it starts `show clock`, then collects
    the following commands in parallel every five seconds without waiting for
@@ -339,8 +354,10 @@ that never moved dropped), `resource_monitor_history` (the minute, hour, day
 and week utilization series and their maxima and averages per dataplane, newest
 sample first), `interface_status` (zone, VLAN tag, link state and speed per
 interface), `zone_protection` (per zone: enabled flood types, profile, PBP
-drops and host blocks) and `ha_state` (enabled, local and peer state, mode and
-sync). Each cycle carries its `buffer_latency` report, its
+drops and host blocks), `ha_state` (enabled, local and peer state, mode and
+sync) and `inflight_monitoring` (`enabled`, `threshold_percent`,
+`duration_seconds` and `trigger_pending`, each unknown on a release that does
+not expose the node). Each cycle carries its `buffer_latency` report, its
 `interface_counters` table and the `interface_counters_source` field naming
 whether it came from the whole-table read or the named fallback. A
 `pbp_threat_logs` event carries the PBP threat logs captured at stop with the
@@ -724,7 +741,11 @@ key must be backed up and restored together.
     id` and source addresses with their recovered traffic log, presented as
     the firewall's designation and not as proof; (3) the sessions holding at
     least 2% of the ingress backlog, calling out unidentified applications and
-    the `flow_slowpath` + `Bad Key` policy-deny signature; (4) five wider
+    the `flow_slowpath` + `Bad Key` policy-deny signature, and stating the
+    on-box auto-collection state: enabled, it names
+    `/var/log/pan/pan_ingress_backlogs.log` as the 100 ms-resolution evidence
+    to ask TAC for; disabled, it recommends that the operator enable it on the
+    firewall for the next incident, which the collector never does; (4) five wider
     hypotheses — elephant session, burst of denied sessions, storm of new
     sessions, interface errors, aggregate load — each with its own verdict. At
     low pressure the later steps are read as the ordinary traffic mix and

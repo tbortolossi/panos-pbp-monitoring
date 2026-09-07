@@ -276,6 +276,63 @@ class SupportBundleTests(unittest.TestCase):
             for line in payload.splitlines():
                 json.loads(line)
 
+    def test_the_on_box_ingress_collection_state_survives_anonymization(self):
+        """The state reaches a remote diagnosis, and identifies nobody.
+
+        `inflight_monitoring` is four flags and numbers, so an anonymized
+        bundle must carry it verbatim: tokenizing it, or dropping it, would
+        cost the one line that says whether the tech support file holds the
+        100 ms ingress samples.
+        """
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deployment = _Deployment(Path(temporary_directory))
+            incident = (
+                deployment.data
+                / "targets"
+                / "paris-edge"
+                / "incidents"
+                / "20260830T090000Z"
+                / "incident.jsonl"
+            )
+            incident.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-30T09:00:00+00:00",
+                        "event": "monitor_started",
+                        "inflight_monitoring": {
+                            "parsed": True,
+                            "enabled": False,
+                            "duration_seconds": 3,
+                            "threshold_percent": 80,
+                            "trigger_pending": False,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            _manifest, archive = deployment.bundle(
+                anonymizer=build_anonymizer(deployment.store, [])
+            )
+            with archive:
+                name = next(
+                    item
+                    for item in archive.namelist()
+                    if item.endswith("incident.jsonl")
+                )
+                started = json.loads(archive.read(name).decode("utf-8"))
+
+        self.assertEqual(
+            started["inflight_monitoring"],
+            {
+                "parsed": True,
+                "enabled": False,
+                "duration_seconds": 3,
+                "threshold_percent": 80,
+                "trigger_pending": False,
+            },
+        )
+
     def test_an_unreadable_configuration_still_produces_a_bundle(self):
         class _Broken:
             def get_settings(self):

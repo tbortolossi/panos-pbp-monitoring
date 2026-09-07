@@ -132,9 +132,20 @@ PBP_SETTINGS_COMMAND = (
 # - `ha_state` says whether this unit is passive. A buffer at 99 % with no
 #   session means nothing until that is known, and a takeover timestamp
 #   explains a jump from 2 % to 100 % in five seconds.
+# - `inflight_monitoring` reads the on-box ingress-backlog auto-collection
+#   state. Since PAN-OS 10.2 `pan_task` samples the in-flight usage every
+#   100 ms and, when it stays above `ingress_backlogs_threshold` for
+#   `ingress_backlogs_duration`, writes `show running resource-monitor
+#   ingress-backlogs` once into `/var/log/pan/pan_ingress_backlogs.log`, which
+#   a tech support file carries. It is disabled by default. Knowing whether it
+#   was on is what tells TAC whether that file holds anything, and what tells
+#   the operator to turn it on for the next incident. The collector only reads
+#   this state; enabling it is a configuration change and stays the operator's
+#   gesture.
 #
 # Operational XML validated read-only against the lab PA-440 (PAN-OS 12.2.2)
-# on 2026-09-06.
+# on 2026-09-06, and `inflight_monitoring` on the same lab PA-440 (PAN-OS
+# 12.2.2) on 2026-09-07.
 INCIDENT_START_COMMANDS = {
     "global_counters_raw": "<show><counter><global/></counter></show>",
     "resource_monitor_history": (
@@ -143,6 +154,10 @@ INCIDENT_START_COMMANDS = {
     "interface_status": "<show><interface>all</interface></show>",
     "zone_protection": "<show><zone-protection/></show>",
     "ha_state": "<show><high-availability><state/></high-availability></show>",
+    "inflight_monitoring": (
+        "<show><system><state><filter>cfg.session.*</filter></state>"
+        "</system></show>"
+    ),
 }
 
 # Every hardware port's counters in one read. Offender enrichment is
@@ -190,6 +205,7 @@ OPTIONAL_COMMAND_EVIDENCE = {
     "zone_protection": "the per-zone flood protection state and PBP drops",
     "ha_state": "the high-availability role of this unit",
     "interface_counters_all": "the per-interface hardware counters",
+    "inflight_monitoring": "the on-box ingress-backlog auto-collection state",
 }
 
 
@@ -3419,6 +3435,59 @@ def extract_ha_state(output: str) -> dict[str, Any]:
     return state
 
 
+#: The `show system state filter cfg.session.*` nodes that describe the on-box
+#: ingress-backlog auto-collection, and the field each one is persisted under.
+#: A release that does not expose a node simply leaves its field None.
+_INFLIGHT_MONITORING_NODES = {
+    "cfg.session.inflight_monitoring": "enabled",
+    "cfg.session.ingress_backlogs_duration": "duration_seconds",
+    "cfg.session.ingress_backlogs_threshold": "threshold_percent",
+    "cfg.session.ingress_backlogs_trigger": "trigger_pending",
+}
+
+_INFLIGHT_MONITORING_FIELDS = ("enabled", "duration_seconds", "threshold_percent", "trigger_pending")
+
+
+def extract_inflight_monitoring(output: str) -> dict[str, Any]:
+    """Whether the firewall collects the ingress backlogs on its own.
+
+    PAN-OS samples the in-flight usage every 100 ms and, when
+    `inflight_monitoring` is on and the usage stays above
+    `ingress_backlogs_threshold` for `ingress_backlogs_duration`, writes
+    `show running resource-monitor ingress-backlogs` once into
+    `/var/log/pan/pan_ingress_backlogs.log`. That resolution is finer than any
+    poll interval the collector can use, so the state decides whether the tech
+    support file carries the sub-second evidence TAC asks for.
+
+    The answer is the plain text of `show system state`, one
+    `cfg.session.<name>: <value>` per line, so it is read line by line. A
+    firewall or release without the nodes answers `NO_MATCHES`, and every
+    field stays None: that is a firewall to keep monitoring, not a failure.
+
+    Nothing here identifies the customer's network: four flags and numbers.
+    """
+    state: dict[str, Any] = dict.fromkeys(_INFLIGHT_MONITORING_FIELDS)
+    state["parsed"] = False
+    for line in panos_result_text(output).splitlines():
+        name, separator, value = line.partition(":")
+        if not separator:
+            continue
+        field = _INFLIGHT_MONITORING_NODES.get(name.strip().lower())
+        if field is None:
+            continue
+        text = value.strip()
+        parsed = (
+            _int_value(text)
+            if field in {"duration_seconds", "threshold_percent"}
+            else _panos_flag(text)
+        )
+        if parsed is None:
+            continue
+        state[field] = parsed
+        state["parsed"] = True
+    return state
+
+
 def extract_interface_counter_table(output: str) -> dict[str, dict[str, Any]]:
     """Every hardware port's counters from one `show counter interface all`.
 
@@ -5067,6 +5136,11 @@ class MonitorController:
                         ),
                         "ha_state": extract_ha_state(
                             command_result(incident_start_payloads.get("ha_state"))
+                        ),
+                        "inflight_monitoring": extract_inflight_monitoring(
+                            command_result(
+                                incident_start_payloads.get("inflight_monitoring")
+                            )
                         ),
                         "commands": {
                             "system_info": system_info,

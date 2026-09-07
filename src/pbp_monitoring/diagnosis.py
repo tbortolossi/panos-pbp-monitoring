@@ -510,6 +510,27 @@ def ha_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return {"collected": bool(state.get("parsed")), **state}
 
 
+def inflight_monitoring_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """The on-box ingress-backlog auto-collection state, read once at start.
+
+    When it is on, the firewall wrote the ingress backlogs itself, at 100 ms
+    resolution, into a management-plane log the tech support file carries, so
+    the report can name that file instead of stopping at the collector's own
+    poll interval. When it is off, the report says so and the operator can
+    turn it on before the next incident.
+    """
+    state = start_event(events).get("inflight_monitoring")
+    if not isinstance(state, dict):
+        return {"collected": False, "enabled": None}
+    return {
+        "collected": bool(state.get("parsed")),
+        "enabled": state.get("enabled"),
+        "duration_seconds": state.get("duration_seconds"),
+        "threshold_percent": state.get("threshold_percent"),
+        "trigger_pending": state.get("trigger_pending"),
+    }
+
+
 def raw_counter_bracket(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """The cumulative counters read at start and at stop, and their growth.
 
@@ -1032,6 +1053,7 @@ def _context(
         # commands existed simply reports them as not collected.
         "ha": ha_summary(events),
         "zone_protection": zone_protection_summary(events),
+        "inflight_monitoring": inflight_monitoring_summary(events),
         "buffer_history": history_trend(events),
         "recurrence": congestion_recurrence(events),
     }
@@ -1494,6 +1516,79 @@ def _step_pbp_named(
     }
 
 
+#: The management-plane log PAN-OS writes when the on-box collection fires.
+INGRESS_BACKLOG_LOG_PATH = "/var/log/pan/pan_ingress_backlogs.log"
+#: PAN-OS defaults, stated when the firewall did not return its own values.
+DEFAULT_INGRESS_BACKLOG_THRESHOLD_PERCENT = 80
+DEFAULT_INGRESS_BACKLOG_DURATION_SECONDS = 3
+
+
+def _inflight_monitoring_fact(summary: dict[str, Any]) -> str:
+    """The on-box auto-collection state as one line of the step's fact table."""
+    enabled = summary.get("enabled")
+    if enabled is None:
+        return "not read"
+    if enabled is False:
+        return "disabled"
+    threshold = _first_number(summary.get("threshold_percent"))
+    duration = _first_number(summary.get("duration_seconds"))
+    if threshold is None and duration is None:
+        return "enabled"
+    return f"enabled ({_pct(threshold)} for {_fmt(duration)} s)"
+
+
+def _inflight_monitoring_note(summary: dict[str, Any]) -> str:
+    """What the on-box collection state means for the evidence and the operator.
+
+    Enabled, the firewall itself wrote the ingress backlogs at 100 ms
+    resolution into a log the tech support file carries: evidence finer than
+    any poll interval, and something to ask TAC for by name. Disabled, that
+    log is empty and the only gesture that changes it is the operator's, on
+    the firewall — the collector never enables it.
+    """
+    enabled = summary.get("enabled")
+    if enabled is None:
+        return (
+            " <strong>The on-box auto-collection state was not read</strong> in "
+            "this capture, so whether "
+            f"<code>{_escape(INGRESS_BACKLOG_LOG_PATH)}</code> holds anything is "
+            "unknown."
+        )
+    if enabled is True:
+        threshold = _first_number(summary.get("threshold_percent"))
+        duration = _first_number(summary.get("duration_seconds"))
+        threshold_text = _pct(
+            threshold
+            if threshold is not None
+            else DEFAULT_INGRESS_BACKLOG_THRESHOLD_PERCENT
+        )
+        duration_text = _fmt(
+            duration
+            if duration is not None
+            else DEFAULT_INGRESS_BACKLOG_DURATION_SECONDS
+        )
+        return (
+            " <strong>The on-box auto-collection was enabled.</strong> Each time "
+            f"the in-flight usage stayed above {threshold_text} for "
+            f"{duration_text} s, the firewall ran <code>show running "
+            "resource-monitor ingress-backlogs</code> itself and appended it to "
+            f"<code>{_escape(INGRESS_BACKLOG_LOG_PATH)}</code> on the management "
+            "plane, which the tech support file carries. That sampling is taken "
+            "every 100 ms, finer than any poll this collector can run, so ask "
+            "TAC to read that file for the sub-second bursts."
+        )
+    return (
+        " <strong>The on-box auto-collection was disabled</strong>, so "
+        f"<code>{_escape(INGRESS_BACKLOG_LOG_PATH)}</code> in the tech support "
+        "file holds nothing for this incident and the sub-second bursts between "
+        "two polls were never recorded. Enabling it on the firewall, with "
+        "<code>set session inflight_monitoring yes</code>, makes the next "
+        "incident carry that evidence; it survives a reboot. That is a "
+        "configuration change on the firewall and the operator's decision: this "
+        "collector is observational and never makes it."
+    )
+
+
 def _step_ingress_backlogs(
     cycles: Sequence[dict[str, Any]],
     attribution: Sequence[dict[str, Any]],
@@ -1513,10 +1608,16 @@ def _step_ingress_backlogs(
             if total is not None:
                 total_peak = total if total_peak is None else max(total_peak, total)
     candidates = _ingress_candidate_entities(attribution)
+    inflight = context.get("inflight_monitoring") or {}
     facts: list[tuple[str, str, str]] = [
         ("Batches with the command", _fmt(len(collected)), "none"),
         ("Queue peak (ATOMIC / TOTAL)", f"{_pct(atomic_peak)} / {_pct(total_peak)}", "none"),
         ("Sessions listed", _fmt(len(candidates)), "none"),
+        (
+            "On-box auto-collection",
+            _inflight_monitoring_fact(inflight),
+            "warn" if inflight.get("enabled") is False else "none",
+        ),
     ]
     named: list[str] = []
     generation = context["generation"]
@@ -1594,6 +1695,7 @@ def _step_ingress_backlogs(
             )
         else:
             verdict += "Whatever filled the buffers was not one session waiting in the queue."
+    verdict += _inflight_monitoring_note(inflight)
     return {
         "number": 3,
         "key": "backlogs",

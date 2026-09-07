@@ -19,6 +19,9 @@ from . import __version__
 from .diagnosis import (
     DEFAULT_ACTIVATE_PERCENT,
     DEFAULT_ALERT_PERCENT,
+    DEFAULT_INGRESS_BACKLOG_DURATION_SECONDS,
+    DEFAULT_INGRESS_BACKLOG_THRESHOLD_PERCENT,
+    INGRESS_BACKLOG_LOG_PATH,
     POOL_HELD_PERCENT,
     SIGNAL_COUNTER_FAMILIES,
     _flow_parts,
@@ -31,6 +34,7 @@ from .diagnosis import (
     ha_summary,
     history_trend,
     history_windows,
+    inflight_monitoring_summary,
     latest_event,
     raw_counter_bracket,
     render_diagnosis,
@@ -1497,9 +1501,50 @@ def _render_pbp_threat_logs(events: list[tuple[int, dict[str, Any]]]) -> str:
     )
 
 
+def _render_inflight_monitoring(events: list[tuple[int, dict[str, Any]]]) -> str:
+    """State whether the firewall collected the ingress backlogs on its own.
+
+    The line is rendered in both reports because the layered v2 renderer draws
+    the same evidence sections, so neither can say something different about
+    the tech support file a TAC case will be opened with.
+    """
+    summary = inflight_monitoring_summary([record for _, record in events])
+    enabled = summary.get("enabled")
+    if enabled is None:
+        return (
+            '<p class="muted">On-box ingress-backlog auto-collection: not read '
+            "in this capture.</p>"
+        )
+    if enabled is False:
+        return (
+            "<p>On-box ingress-backlog auto-collection: <strong>disabled</strong>. "
+            f"<code>{_escape(INGRESS_BACKLOG_LOG_PATH)}</code> in the tech support "
+            "file holds nothing for this incident. Enabling it on the firewall "
+            "(<code>set session inflight_monitoring yes</code>) makes the next one "
+            "carry 100 ms-resolution evidence; that is an operator gesture, never "
+            "one this collector makes.</p>"
+        )
+    threshold = next(iter(_numbers(summary.get("threshold_percent"))), None)
+    duration = next(iter(_numbers(summary.get("duration_seconds"))), None)
+    if threshold is None:
+        threshold = DEFAULT_INGRESS_BACKLOG_THRESHOLD_PERCENT
+    if duration is None:
+        duration = DEFAULT_INGRESS_BACKLOG_DURATION_SECONDS
+    return (
+        "<p>On-box ingress-backlog auto-collection: <strong>enabled</strong> "
+        f"({_escape(_format_number(threshold))}% for "
+        f"{_escape(_format_number(duration))} s). The firewall wrote "
+        "<code>show running resource-monitor ingress-backlogs</code> itself into "
+        f"<code>{_escape(INGRESS_BACKLOG_LOG_PATH)}</code> on the management "
+        "plane, sampled every 100 ms; ask TAC to read it from the tech support "
+        "file.</p>"
+    )
+
+
 def _render_ingress_backlogs(
     cycles: list[tuple[int, dict[str, Any]]],
     attribution: list[dict[str, Any]],
+    events: list[tuple[int, dict[str, Any]]] | None = None,
 ) -> str:
     """List the sessions the ingress work queue named, and the queue itself."""
     collected = [
@@ -1569,15 +1614,21 @@ def _render_ingress_backlogs(
             + "</tbody></table></div>"
         )
     candidates = _ingress_candidate_entities(attribution)
+    # The on-box collection state belongs to every branch: whether the tech
+    # support file carries the 100 ms samples is independent of what this
+    # capture managed to read, and is the one line that says so.
+    inflight_html = _render_inflight_monitoring(events or [])
     if not candidates and not collected:
         return (
             '<p class="muted">The ingress backlogs were not collected in this '
-            "capture.</p>"
+            "capture.</p>" + inflight_html
         )
     if not candidates:
         return (
             f'<p class="muted">No session held 2% of the work queue in any of the '
-            f"{len(collected)} batches that ran the command.</p>" + queue_html
+            f"{len(collected)} batches that ran the command.</p>"
+            + queue_html
+            + inflight_html
         )
     rows = []
     for item in candidates[:_MAX_RENDERED_ATTRIBUTION_ROWS]:
@@ -1606,6 +1657,7 @@ def _render_ingress_backlogs(
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
         + _hidden_rows_note(len(candidates) - _MAX_RENDERED_ATTRIBUTION_ROWS, "sessions")
         + queue_html
+        + inflight_html
     )
 
 
@@ -3925,7 +3977,7 @@ def _build_report_parts(
     large_session_summary = _aggregate_large_sessions(cycles)
     cpu_tracking_html = _render_cpu_tracking(cycles, core_functions)
     large_sessions_html = _render_large_sessions(large_session_summary)
-    ingress_html = _render_ingress_backlogs(cycles, attribution)
+    ingress_html = _render_ingress_backlogs(cycles, attribution, events)
     buffer_latency_html = _render_buffer_latency(cycles)
     pbp_threat_logs_html = _render_pbp_threat_logs(events)
     cpu_needs_attention = any(

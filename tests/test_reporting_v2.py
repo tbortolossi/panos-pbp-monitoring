@@ -236,6 +236,36 @@ class LayeredReportTests(unittest.TestCase):
             rendered,
         )
 
+    def test_both_reports_state_the_on_box_ingress_collection_identically(self):
+        # The layered report draws the same evidence sections as the flat one,
+        # so neither can tell TAC something different about whether the tech
+        # support file carries the 100 ms ingress samples.
+        records = self._incident_records()
+        records[0]["inflight_monitoring"] = {
+            "parsed": True,
+            "enabled": False,
+            "duration_seconds": 3,
+            "threshold_percent": 80,
+            "trigger_pending": False,
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            capture, _ = self._capture(directory, records)
+            flat = generate_html_report(
+                capture, directory / "report.html"
+            ).read_text(encoding="utf-8")
+            layered = generate_html_report_v2(
+                capture, directory / REPORT_V2_FILENAME
+            ).read_text(encoding="utf-8")
+
+        for rendered in (flat, layered):
+            self.assertIn(
+                "On-box ingress-backlog auto-collection: <strong>disabled</strong>",
+                rendered,
+            )
+            self.assertIn("set session inflight_monitoring yes", rendered)
+            self.assertIn("On-box auto-collection", rendered)
+
     def test_the_destination_must_differ_from_the_capture(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)

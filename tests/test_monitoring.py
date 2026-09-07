@@ -180,6 +180,13 @@ HA_STATE_RESULT = (
     "<ha1-encrypt-imported>no</ha1-encrypt-imported>"
     "</local-info></group></result>"
 )
+INFLIGHT_MONITORING_RESULT = (
+    "<result>cfg.session.erspan: False\n"
+    "cfg.session.inflight_monitoring: False\n"
+    "cfg.session.ingress_backlogs_duration: 3\n"
+    "cfg.session.ingress_backlogs_threshold: 80\n"
+    "cfg.session.ingress_backlogs_trigger: False\n</result>"
+)
 INTERFACE_COUNTERS_ALL_RESULT = (
     "<result><hw>"
     "<entry><name>ethernet1/1</name><port>"
@@ -312,6 +319,8 @@ class FakeClient:
             return response(ZONE_PROTECTION_RESULT)
         if command == INCIDENT_START_COMMANDS["ha_state"]:
             return response(HA_STATE_RESULT)
+        if command == INCIDENT_START_COMMANDS["inflight_monitoring"]:
+            return response(INFLIGHT_MONITORING_RESULT)
         if command == INTERFACE_COUNTER_ALL_COMMAND:
             return response(INTERFACE_COUNTERS_ALL_RESULT)
         raise AssertionError(f"Unexpected command: {command}")
@@ -3198,6 +3207,12 @@ class IncidentStateEvidenceTests(unittest.TestCase):
             self.assertEqual(internet["zone"], "INTERNET")
             self.assertIs(internet["flood_protection_enabled"], False)
             self.assertIs(started["ha_state"]["enabled"], False)
+            # The on-box ingress-backlog collection the TSF depends on.
+            inflight = started["inflight_monitoring"]
+            self.assertIs(inflight["enabled"], False)
+            self.assertEqual(inflight["threshold_percent"], 80)
+            self.assertEqual(inflight["duration_seconds"], 3)
+            self.assertIs(inflight["trigger_pending"], False)
 
     def test_the_two_raw_counter_reads_bracket_the_incident(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

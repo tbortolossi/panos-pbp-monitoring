@@ -3,6 +3,33 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.43.0] - 2026-09-07
+
+### Added
+
+- **The report now says whether the firewall was collecting the ingress
+  backlogs on its own.** Since PAN-OS 10.2 a firewall can sample its in-flight
+  usage every 100 ms and, when it stays above a threshold for a duration, write
+  `show running resource-monitor ingress-backlogs` itself into
+  `/var/log/pan/pan_ingress_backlogs.log`, which a tech support file carries.
+  That resolution catches the sub-second bursts a five-second poll cannot, and
+  it is disabled by default, so nobody could tell whether the TSF sent to TAC
+  held anything at all. The collector now reads `show system state filter
+  cfg.session.*` once, at monitor start, beside the other state reads, and
+  persists `inflight_monitoring` — enabled, threshold, duration and pending
+  trigger — in the `monitor_started` record. Step 3 of the diagnosis and the
+  Ingress backlog section of both reports state it: enabled, they name the log
+  file to ask TAC for; disabled, they recommend enabling it on the firewall
+  with `set session inflight_monitoring yes`, which is reboot-persistent and
+  documented in `docs/troubleshooting.md`. **The collector never enables it**:
+  that is a configuration change and stays the operator's decision, as the
+  observational mission requires. A firewall or PAN-OS release without the
+  nodes answers `NO_MATCHES`, which leaves the state unknown and is never a
+  reason to stop monitoring. Validated read-only on a lab PA-440 running
+  PAN-OS 12.2.2. The command replays from an archive and the state travels in
+  the support bundle like every other startup read, carrying four flags and
+  numbers and nothing that identifies a network. Refs #218.
+
 ## [0.42.0] - 2026-09-07
 
 ### Changed

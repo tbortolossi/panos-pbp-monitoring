@@ -1981,6 +1981,51 @@ class IncidentStateSectionTests(unittest.TestCase):
         self.assertIn("are not in this capture", html)
         self.assertNotIn("<th>Since boot</th>", html)
 
+    def test_the_ingress_section_states_the_on_box_collection_when_disabled(self):
+        html = self._render(
+            {
+                "inflight_monitoring": {
+                    "parsed": True,
+                    "enabled": False,
+                    "duration_seconds": 3,
+                    "threshold_percent": 80,
+                    "trigger_pending": False,
+                }
+            }
+        )
+
+        self.assertIn(
+            "On-box ingress-backlog auto-collection: <strong>disabled</strong>", html
+        )
+        self.assertIn("set session inflight_monitoring yes", html)
+        # The collector recommends; it never changes the firewall.
+        self.assertIn("an operator gesture, never", html)
+
+    def test_the_ingress_section_names_the_log_when_the_collection_is_enabled(self):
+        html = self._render(
+            {
+                "inflight_monitoring": {
+                    "parsed": True,
+                    "enabled": True,
+                    "duration_seconds": 5,
+                    "threshold_percent": 60,
+                    "trigger_pending": False,
+                }
+            }
+        )
+
+        self.assertIn(
+            "On-box ingress-backlog auto-collection: <strong>enabled</strong> "
+            "(60% for 5 s)",
+            html,
+        )
+        self.assertIn("/var/log/pan/pan_ingress_backlogs.log", html)
+
+    def test_a_capture_without_the_on_box_state_says_it_was_not_read(self):
+        html = self._render({})
+
+        self.assertIn("On-box ingress-backlog auto-collection: not read", html)
+
 
 if __name__ == "__main__":
     unittest.main()

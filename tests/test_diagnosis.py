@@ -263,6 +263,58 @@ class IngressBacklogStepTests(unittest.TestCase):
 
         self.assertEqual(diagnosis["steps"][2]["state"], "unavailable")
 
+    def _backlog_step(self, inflight: dict | None) -> dict:
+        started = {
+            "run_id": "diagnosis-run",
+            "event": "monitor_started",
+            "device": {"model": "PA-5220", "software_version": "10.2.9"},
+        }
+        if inflight is not None:
+            started["inflight_monitoring"] = inflight
+        return _diagnose([_cycle(1, 60.0)], [started])["steps"][2]
+
+    def test_an_enabled_on_box_collection_names_the_tech_support_log(self):
+        step = self._backlog_step(
+            {
+                "parsed": True,
+                "enabled": True,
+                "duration_seconds": 3,
+                "threshold_percent": 80,
+                "trigger_pending": False,
+            }
+        )
+
+        self.assertIn(("On-box auto-collection", "enabled (80% for 3 s)", "none"), step["facts"])
+        self.assertIn("on-box auto-collection was enabled", step["verdict"])
+        self.assertIn("/var/log/pan/pan_ingress_backlogs.log", step["verdict"])
+        self.assertIn("every 100 ms", step["verdict"])
+        self.assertNotIn("set session inflight_monitoring yes", step["verdict"])
+
+    def test_a_disabled_on_box_collection_recommends_the_operator_enable_it(self):
+        step = self._backlog_step(
+            {
+                "parsed": True,
+                "enabled": False,
+                "duration_seconds": 3,
+                "threshold_percent": 80,
+                "trigger_pending": False,
+            }
+        )
+
+        self.assertIn(("On-box auto-collection", "disabled", "warn"), step["facts"])
+        self.assertIn("on-box auto-collection was disabled", step["verdict"])
+        self.assertIn("set session inflight_monitoring yes", step["verdict"])
+        # The collector stays observational: the report recommends, the
+        # operator decides, and nothing here is done on the firewall.
+        self.assertIn("the operator's decision", step["verdict"])
+
+    def test_an_unread_on_box_collection_state_is_reported_as_unknown(self):
+        step = self._backlog_step(None)
+
+        self.assertIn(("On-box auto-collection", "not read", "none"), step["facts"])
+        self.assertIn("on-box auto-collection state was not read", step["verdict"])
+        self.assertNotIn("set session inflight_monitoring yes", step["verdict"])
+
 
 class ElsewhereStepTests(unittest.TestCase):
     def test_an_isolated_hot_core_supports_the_elephant_hypothesis(self):
