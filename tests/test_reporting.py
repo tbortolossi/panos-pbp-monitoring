@@ -17,6 +17,7 @@ from pbp_monitoring.reporting import (
     generate_html_report,
     main,
 )
+from pbp_monitoring.reporting_v2 import generate_html_report_v2
 from tests.support import REJECTED_NODE, TIMED_OUT
 
 
@@ -1782,6 +1783,104 @@ class RankedEntityDescriptionTests(unittest.TestCase):
             "<code>203.0.113.9 -&gt; 198.51.100.4 / proto 17</code><br>"
             '<span class="muted">app netbackup · rule allow-backup</span>',
             html,
+        )
+
+
+class InternalTagRenderingTests(unittest.TestCase):
+    """An entry PAN-OS flagged in its own "Special Notes" column is shown as
+    an internal tag, never as a session the collector failed to enrich."""
+
+    NOTE = "Special TAG values, NOT valid session id"
+
+    def _render(self, renderer=generate_html_report, *, note: str | None = NOTE) -> str:
+        records = [
+            {
+                "timestamp": "2026-09-01T10:00:00+00:00",
+                "run_id": "tag-run",
+                "event": "monitor_started",
+                "collector_version": "test",
+                "device": {"serial": "fixture", "model": "PA-fixture"},
+            },
+            {
+                "timestamp": "2026-09-01T10:00:05+00:00",
+                "run_id": "tag-run",
+                "elapsed_seconds": 5,
+                "percentages": {"packet_buffer_congestion": [88]},
+                "candidate_session_ids": [4194327],
+                "candidate_entities": [
+                    {
+                        "rank": 1,
+                        "entity_type": "session",
+                        "session_id": 4194327,
+                        "drop_state": False,
+                        "ingress_percentage_max": 61.0,
+                        "evidence_sources": ["ingress_backlogs"],
+                        "group_ids": ["flow_fastpath"],
+                        "special_reason": "noted",
+                        "special_note": note,
+                    }
+                ],
+                "ingress_backlogs": {
+                    "dataplanes": [
+                        {
+                            "slot": "s1",
+                            "dp": "dp0",
+                            "atomic_percentage": 61.0,
+                            "total_percentage": 62.0,
+                        }
+                    ],
+                    "candidates": [
+                        {
+                            "session_id": 4194327,
+                            "percentage": 61.0,
+                            "group_id": "flow_fastpath",
+                            "count": 43,
+                            "special_reason": "noted",
+                            "special_note": note,
+                        }
+                    ],
+                },
+                # No lookup was made, so no summary exists for the tag: the
+                # capture must not carry an answer the firewall never gave.
+                "session_summaries": {},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "tag.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            report = renderer(capture, capture.with_suffix(".html"))
+            return report.read_text(encoding="utf-8")
+
+    def test_a_tag_is_labelled_rather_than_reported_as_a_missed_lookup(self):
+        html = self._render()
+
+        self.assertIn(
+            '<span class="muted">internal tag, not a session</span>', html
+        )
+        self.assertIn(f'<span class="muted">{self.NOTE}</span>', html)
+        self.assertIn("<strong>Internal tag</strong>", html)
+        self.assertNotIn("not enriched", html)
+        self.assertNotIn("missing session / Bad Key", html)
+        self.assertNotIn("&lt;span", html)
+
+    def test_the_layered_report_carries_the_same_label(self):
+        html = self._render(generate_html_report_v2)
+
+        self.assertIn(
+            '<span class="muted">internal tag, not a session</span>', html
+        )
+        self.assertIn("internal tag <code>4194327</code>", html)
+        self.assertIn("Only internal tags held the work queue", html)
+        self.assertIn("1 internal tag, no session", html)
+
+    def test_a_tag_without_a_note_is_still_labelled(self):
+        html = self._render(note=None)
+
+        self.assertIn(
+            '<span class="muted">internal tag, not a session</span>', html
         )
 
 

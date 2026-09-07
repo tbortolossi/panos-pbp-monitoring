@@ -186,6 +186,38 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(outcomes["system_info"]["status"], "parser_raised")
         self.assertIn("unexpected element", outcomes["system_info"]["parser_error"])
 
+    def test_a_replayed_backlog_row_carries_the_internal_tag_reason(self):
+        """The reason is the parser's, so a customer archive replays it with
+        no state from the run that collected it."""
+        record = {
+            "run_id": "20260830T080000Z",
+            "timestamp": "2026-08-30T08:00:00+00:00",
+            "commands": {
+                "ingress_backlogs": {
+                    "ok": True,
+                    "result": (
+                        "<result>-- SLOT: s1, DP: dp0 --\n"
+                        "USAGE - ATOMIC: 4% TOTAL: 4%\n"
+                        "TOP SESSIONS:\n"
+                        "SESS-ID PCT GRP-ID COUNT Special Notes\n"
+                        "4194327 4% flow_fastpath 43 "
+                        "Special TAG values, NOT valid session id</result>"
+                    ),
+                    "error": None,
+                }
+            },
+        }
+
+        outcomes = {item["command"]: item for item in replay_record(record, None)}
+        candidate = outcomes["ingress_backlogs"]["parsed"]["candidates"][0]
+
+        self.assertEqual(outcomes["ingress_backlogs"]["status"], "parsed")
+        self.assertEqual(candidate["special_reason"], "noted")
+        self.assertEqual(
+            candidate["special_note"],
+            "Special TAG values, NOT valid session id",
+        )
+
     def test_a_single_command_can_be_replayed_alone(self):
         outcomes = replay_record(RECORD, {"system_info"})
         self.assertEqual([item["command"] for item in outcomes], ["system_info"])

@@ -34,6 +34,32 @@ follows [Semantic Versioning](https://semver.org/).
   command replays from an archive and the state travels in the support bundle
   like every other startup read, carrying two flags, two numbers and what the
   read established, and nothing that identifies a network. Refs #218.
+- **An internal tag in the ingress backlog is no longer read as an offending
+  session.** Since PAN-OS 10.1 the TOP SESSIONS table of `show running
+  resource-monitor ingress-backlogs` can list the firewall's own traffic — the
+  host proxy that forwards files to WildFire, log forwarding to the management
+  plane — under a SESS-ID that belongs to no session, and says so in a fifth
+  `Special Notes` column. The collector spent a `show session id` call on it,
+  was answered `Bad Key`, and reported "session 4194327 holding 4% of the
+  queue"; beside a `flow_slowpath` group that same `Bad Key` is the policy-deny
+  signature, so a tag could be presented as denied traffic filling the buffers.
+  When, and only when, the header announces that column, the parser now reads
+  the row as one `(GRP-ID, COUNT)` pair followed by free text and keeps it as
+  `special_note` with `special_reason: noted` (a placeholder such as `-` stores
+  nothing, and a note beginning with a number is never mistaken for a group).
+  Such an entry is the only one for which no lookup is made; it is listed apart
+  in its own **Internal tags listed** fact, labelled `internal tag, not a
+  session` in the diagnosis, in the Ingress table and in the offender ranking
+  with the note PAN-OS printed, and excluded from the policy-deny and
+  unidentified-application rules. When every listed entry is one of these,
+  step 3 concludes that no session held the queue. Everything else keeps its
+  `show session id`: the policy-deny rule is still `flow_slowpath` plus a
+  `Bad Key` answer, and no session summary is ever invented, so a replayed
+  archive reproduces exactly what the firewall returned. A SESS-ID is never
+  judged by its value — a PA-7050 reports about 149 million sessions supported
+  while every live session ID is above 2^30, because PA-7000 IDs carry slot and
+  dataplane bits, so a "larger than the sessions supported" rule would flag
+  every real session on such a chassis. Refs #220.
 
 ### Fixed
 

@@ -44,8 +44,10 @@ from .diagnosis import (
     INFLIGHT_MONITORING_NOT_COLLECTED,
     INFLIGHT_MONITORING_READ,
     PLATFORM_DEPENDENT_COMMAND_EVIDENCE,
+    SPECIAL_TAG_NOTED,
     command_node_unsupported,
     command_succeeded,
+    merge_special_fields,
 )
 from .config_store import (
     SAFE_RUN_COMPONENT,
@@ -1561,6 +1563,22 @@ def extract_session_info(output: str) -> dict[str, Any]:
     return {"dataplanes": dataplanes, "totals": _session_info_totals(dataplanes)}
 
 
+#: Values PAN-OS prints in the "Special Notes" column when it has nothing to
+#: say. They must not be stored as a note, or an ordinary session would be
+#: reported as an internal tag.
+_EMPTY_SPECIAL_NOTES = frozenset({"-", "--", "n/a", "na", "none", "null"})
+#: The header of the TOP SESSIONS table, when PAN-OS 10.1 and later announce
+#: the fifth column. Its presence is what licenses reading trailing tokens as
+#: free text instead of as another (GRP-ID, COUNT) pair.
+_SPECIAL_NOTES_HEADER = re.compile(r"SESS-ID\b.*\bSPECIAL\s+NOTES\b", re.I)
+
+
+def _special_note(tokens: list[str]) -> str | None:
+    """The "Special Notes" text of a TOP SESSIONS row, if it says anything."""
+    note = " ".join(tokens).strip()
+    return note if note and note.lower() not in _EMPTY_SPECIAL_NOTES else None
+
+
 def extract_ingress_backlogs(output: str) -> dict[str, list[dict[str, Any]]]:
     """Parse per-DP ingress usage, ranked sessions, and their inline details."""
     text = panos_result_text(output)
@@ -1569,6 +1587,7 @@ def extract_ingress_backlogs(output: str) -> dict[str, list[dict[str, Any]]]:
     current_slot: str | None = None
     current_dp: str | None = None
     section: str | None = None
+    notes_column = False
     context_ranks: dict[tuple[str | None, str | None], int] = {}
 
     def add_dataplane(
@@ -1651,9 +1670,13 @@ def extract_ingress_backlogs(output: str) -> dict[str, list[dict[str, Any]]]:
         normalized = line.strip().upper()
         if normalized.startswith("TOP SESSIONS"):
             section = "top"
+            notes_column = False
             continue
         if normalized.startswith("SESSION DETAILS"):
             section = "details"
+            continue
+        if section == "top" and normalized.startswith("SESS-ID"):
+            notes_column = bool(_SPECIAL_NOTES_HEADER.search(line))
             continue
         tokens = line.split()
         if section == "top" and len(tokens) >= 4:
@@ -1661,11 +1684,24 @@ def extract_ingress_backlogs(output: str) -> dict[str, list[dict[str, Any]]]:
             percentage = _float_value(tokens[1])
             if session_id is None or percentage is None:
                 continue
+            # With the fifth column announced, the row holds exactly one
+            # (GRP-ID, COUNT) pair and the rest of the line is free text: a
+            # note such as `Tag 2 host proxy` would otherwise have its second
+            # word read as another group count. Without that header, nothing
+            # licenses treating a trailing token as text, so the permissive
+            # pair scan of the pre-10.1 form is kept unchanged.
             groups = []
-            for index in range(2, len(tokens) - 1, 2):
-                count = _int_value(tokens[index + 1])
+            special_note = None
+            if notes_column:
+                count = _int_value(tokens[3])
                 if count is not None:
-                    groups.append({"group_id": tokens[index], "count": count})
+                    groups.append({"group_id": tokens[2], "count": count})
+                    special_note = _special_note(tokens[4:])
+            else:
+                for index in range(2, len(tokens) - 1, 2):
+                    count = _int_value(tokens[index + 1])
+                    if count is not None:
+                        groups.append({"group_id": tokens[index], "count": count})
             if not groups:
                 continue
             context = (current_slot, current_dp)
@@ -1681,6 +1717,16 @@ def extract_ingress_backlogs(output: str) -> dict[str, list[dict[str, Any]]]:
                     "group_id": groups[0]["group_id"],
                     "count": groups[0]["count"],
                     "groups": groups,
+                    # PAN-OS naming the row itself is the only evidence that a
+                    # SESS-ID is an internal tag. Deriving it from the ID being
+                    # larger than the sessions `show session info` reports as
+                    # supported was tried and rejected: a PA-7050 running
+                    # 10.2.9 reports ~149 million supported while every live
+                    # session ID is above 2^30, because PA-7000 IDs carry slot
+                    # and dataplane bits. That rule flags every real session on
+                    # such a chassis, so it must not be reintroduced.
+                    "special_note": special_note,
+                    "special_reason": SPECIAL_TAG_NOTED if special_note else None,
                 }
             )
             continue
@@ -1711,6 +1757,8 @@ def extract_ingress_backlogs(output: str) -> dict[str, list[dict[str, Any]]]:
                     "group_id": None,
                     "count": None,
                     "groups": [],
+                    "special_note": None,
+                    "special_reason": None,
                 }
                 candidates.append(candidate)
             candidate.update(
@@ -1780,6 +1828,14 @@ def extract_ingress_backlogs(output: str) -> dict[str, list[dict[str, Any]]]:
                     "dp": dp,
                     "session_id": session_id,
                     "groups": [],
+                    # No API response of this command carrying the "Special
+                    # Notes" column has ever been observed, so its element name
+                    # is unknown and must not be guessed: reading the wrong tag
+                    # would either miss a tag or invent one. In the XML form a
+                    # backlog entry is therefore always read as a session, and
+                    # only `show session id` answering Bad Key says otherwise.
+                    "special_note": None,
+                    "special_reason": None,
                 }
                 candidates.append(candidate)
             structured_fields = {
@@ -1858,6 +1914,8 @@ def build_candidate_entities(
                 "zones": set(),
                 "group_ids": set(),
                 "evidence_sources": set(),
+                "special_reason": None,
+                "special_note": None,
                 "_first_order": order,
             }
         return entities[key]
@@ -1912,6 +1970,7 @@ def build_candidate_entities(
             entity["zones"].add(str(candidate["source_zone"]))
         if candidate.get("group_id"):
             entity["group_ids"].add(str(candidate["group_id"]))
+        merge_special_fields(entity, candidate)
 
     for session_id in fallback_session_ids or []:
         entity = ensure("session", str(session_id))
@@ -5179,6 +5238,12 @@ class MonitorController:
                     for entity in candidate_entities
                     if entity.get("entity_type") == "session"
                     and isinstance(entity.get("session_id"), int)
+                    # PAN-OS named this entry an internal tag in its own
+                    # "Special Notes" column: it is the firewall's own traffic,
+                    # `show session id` would answer Bad Key, and the call would
+                    # be spent for nothing. Nothing else is ever skipped - an ID
+                    # is looked up until the firewall itself says otherwise.
+                    and entity.get("special_reason") != SPECIAL_TAG_NOTED
                 ]
                 now = time.monotonic()
                 lookup_ids = select_session_lookups(
@@ -6102,6 +6167,7 @@ async def run_api_check(cfg: Config) -> ApiCheckResult:
         for entity in candidate_entities
         if entity.get("entity_type") == "session"
         and isinstance(entity.get("session_id"), int)
+        and entity.get("special_reason") != SPECIAL_TAG_NOTED
     ]
     lookup_ids = ids[: cfg.max_session_lookups]
     details = await controller._session_details(lookup_ids)

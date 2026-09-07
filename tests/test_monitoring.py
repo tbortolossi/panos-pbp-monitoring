@@ -1008,6 +1008,88 @@ class MonitorTests(unittest.TestCase):
                 ["<show><session><id>999</id></session></show>"],
             )
 
+    def test_a_noted_internal_tag_is_never_queried_as_a_session(self):
+        """PAN-OS naming the row is the only reason a lookup is skipped.
+
+        Every other SESS-ID keeps its `show session id`, including one that
+        will answer Bad Key: that answer is the policy-deny evidence, and the
+        collector must not spare a call that produces it.
+        """
+
+        class TaggedBacklogClient(FakeClient):
+            def op_response(self, command: str) -> PanOSResponse:
+                if command == OP_COMMANDS["ingress_backlogs"]:
+                    return response(
+                        "<result>-- SLOT: s1, DP: dp0 --\n"
+                        "USAGE - ATOMIC: 88% TOTAL: 89%\n"
+                        "TOP SESSIONS:\n"
+                        "SESS-ID PCT GRP-ID COUNT Special Notes\n"
+                        "4194327 4% flow_fastpath 43 "
+                        "Special TAG values, NOT valid session id\n"
+                        "2022536315 88% flow_slowpath 3640 -\n"
+                        "SESSION DETAILS\n"
+                        "SESS-ID PROTO SZONE SRC SPORT DST DPORT IGR-IF EGR-IF APP\n"
+                        "2022536315 17 untrust 203.0.113.7 514 198.51.100.14 514 "
+                        "ethernet1/1 ethernet1/2 undecided</result>"
+                    )
+                if command.startswith("<show><session><id>"):
+                    with self.lock:
+                        self.commands.append(command)
+                    return response("<result>Bad Key: c2s: 'c2s'</result>")
+                return super().op_response(command)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            client = TaggedBacklogClient()
+            controller = MonitorController(make_config(output_dir), client)
+            controller.last_trigger_monotonic = 0
+
+            asyncio.run(controller._monitor("tagged-run"))
+
+            session_commands = {
+                command
+                for command in client.commands
+                if command.startswith("<show><session><id>")
+            }
+            self.assertEqual(
+                session_commands,
+                {"<show><session><id>2022536315</id></session></show>"},
+            )
+            cycle = next(
+                record
+                for record in (
+                    json.loads(line)
+                    for line in incident_capture_path(output_dir, "tagged-run")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                )
+                if "cycle" in record
+            )
+            candidates = {
+                candidate["session_id"]: candidate
+                for candidate in cycle["ingress_backlogs"]["candidates"]
+            }
+            self.assertEqual(candidates[4194327]["special_reason"], "noted")
+            self.assertEqual(
+                candidates[4194327]["special_note"],
+                "Special TAG values, NOT valid session id",
+            )
+            self.assertIsNone(candidates[2022536315]["special_reason"])
+            self.assertEqual(candidates[2022536315]["source_ip"], "203.0.113.7")
+            # No answer is invented for the tag: the session summaries stay
+            # what `show session id` actually returned, so a replay of this
+            # capture reproduces them exactly.
+            self.assertNotIn("4194327", cycle["session_summaries"])
+            self.assertEqual(
+                cycle["session_summaries"]["2022536315"]["status"], "bad_key"
+            )
+            entity = next(
+                item
+                for item in cycle["candidate_entities"]
+                if item.get("session_id") == 4194327
+            )
+            self.assertEqual(entity["special_reason"], "noted")
+
     def test_system_info_once_and_clock_before_each_recovered_batch(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             output_dir = Path(temporary_directory)

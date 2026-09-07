@@ -210,7 +210,10 @@ batches.
 
 Candidate sessions are enriched with `show session id <session-id>`, and
 consecutive cumulative byte counters are sampled to derive c2s, s2c, and total
-bit rates without scanning the session table. The hardware ports get a
+bit rates without scanning the session table. The one exception is a backlog
+entry PAN-OS itself flags as an internal tag in the `Special Notes` column of
+`show running resource-monitor ingress-backlogs`: that SESS-ID is the
+firewall's own traffic, not a session, so no lookup is spent on it. The hardware ports get a
 `show counter interface all` snapshot on the first batch then every third
 batch, so which port's broadcast or multicast counter is moving says where the
 flood enters when session evidence is thin — which is exactly the case in a

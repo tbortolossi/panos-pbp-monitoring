@@ -243,7 +243,81 @@ class OffenderStepTests(unittest.TestCase):
         self.assertIn("PBP designated nobody: it never activated", diagnosis["conclusion"][2])
 
 
+def _tag_attribution(**extra: object) -> dict:
+    """A backlog entry PAN-OS named an internal tag in its Special Notes."""
+    item = {
+        "entity_type": "session", "identifier": "4194327", "drop_state": False,
+        "ingress_percentage": 88, "ingress_count": 43,
+        "evidence_sources": ["ingress_backlogs"], "zones": [],
+        "group_ids": ["flow_slowpath"],
+        "special_reason": "noted",
+        "special_note": "Special TAG values, NOT valid session id",
+        # A tag is never looked up, so it has no session summary at all.
+        "ingress_detail": {"application": "undecided"},
+    }
+    item.update(extra)
+    return item
+
+
 class IngressBacklogStepTests(unittest.TestCase):
+    def test_an_internal_tag_is_named_as_one_and_answers_no_question(self):
+        cycles = [
+            _cycle(
+                1, 14.0,
+                ingress_backlogs={"dataplanes": [{"slot": "s1", "dp": "dp0", "atomic_percentage": 88, "total_percentage": 89}], "candidates": []},
+            )
+        ]
+
+        backlogs = _diagnose(cycles, attribution=[_tag_attribution()])["steps"][2]
+
+        self.assertIn("internal tag <code>4194327</code>", backlogs["named"][0])
+        self.assertIn("host proxy for WildFire", backlogs["named"][0])
+        self.assertIn("not a session", backlogs["named"][0])
+        self.assertIn("holding 88% of the queue", backlogs["named"][0])
+        self.assertIn(
+            "Special TAG values, NOT valid session id", backlogs["named"][0]
+        )
+        # Neither signature may fire: a tag is the firewall's own traffic, and
+        # `flow_slowpath` alone is not the policy-deny shape without Bad Key.
+        self.assertNotIn("traffic denied by policy", backlogs["verdict"])
+        self.assertNotIn("undecided or unknown application", backlogs["verdict"])
+        self.assertIn("Only internal tags held the work queue", backlogs["verdict"])
+        self.assertEqual(backlogs["state"], "negative")
+        self.assertIn(("Internal tags listed", "1", "none"), backlogs["facts"])
+        self.assertIn(("Sessions listed", "0", "none"), backlogs["facts"])
+
+    def test_a_tag_beside_a_denied_session_leaves_the_deny_rule_standing(self):
+        attribution = [
+            _tag_attribution(ingress_percentage=90, group_ids=["flow_fastpath"]),
+            {
+                "entity_type": "session", "identifier": "2022536315", "drop_state": False,
+                "ingress_percentage": 88, "evidence_sources": ["ingress_backlogs"],
+                "zones": [], "group_ids": ["flow_slowpath"],
+                "session_summary": {"status": "bad_key"},
+                "ingress_detail": {"source_ip": "203.0.113.7", "destination_ip": "198.51.100.14",
+                                   "source_port": 514, "destination_port": 514, "protocol": 17,
+                                   "application": "undecided"},
+            },
+        ]
+        cycles = [
+            _cycle(
+                1, 14.0,
+                ingress_backlogs={"dataplanes": [{"slot": "s1", "dp": "dp0", "atomic_percentage": 90, "total_percentage": 91}], "candidates": []},
+            )
+        ]
+
+        backlogs = _diagnose(cycles, attribution=attribution)["steps"][2]
+
+        self.assertEqual(backlogs["state"], "positive")
+        self.assertIn("1 session held at least", backlogs["verdict"])
+        self.assertIn("traffic denied by policy", backlogs["verdict"])
+        self.assertIn("undecided or unknown application", backlogs["verdict"])
+        self.assertNotIn("4194327", backlogs["verdict"].split("Special Notes")[0])
+        self.assertIn("A further 1 entry", backlogs["verdict"])
+        self.assertIn("203.0.113.7:514 -&gt; 198.51.100.14:514", backlogs["named"][0])
+        self.assertIn("Bad Key", backlogs["named"][0])
+        self.assertIn("internal tag <code>4194327</code>", backlogs["named"][1])
+
     def test_a_slowpath_session_without_a_key_is_the_policy_deny_signature(self):
         attribution = [
             {

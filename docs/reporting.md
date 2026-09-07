@@ -306,6 +306,25 @@ signature of attack traffic, and a session queued in `flow_slowpath` that
 six-tuple, typically UDP syslog, denied and re-evaluated packet by packet on
 one core.
 
+Not every line of that table is a session. PAN-OS also queues its own traffic
+there — the host proxy that forwards files to WildFire, and log forwarding to
+the management plane — and since PAN-OS 10.1 it says so itself, in a fifth
+`Special Notes` column. Such an entry is listed apart, counted in its own
+**Internal tags listed** fact, and labelled **internal tag, not a session** in
+the step, in the Ingress table and in the offender ranking, with the note the
+firewall printed. It is the firewall's own traffic, so it is excluded from the
+policy-deny signature and from the unidentified-application one, and when every
+listed entry is one of these the step concludes that no session held the queue.
+It is also the one entry for which no `show session id` is sent: the firewall
+would answer `Bad Key` and the call would be spent for nothing.
+
+Nothing else is ever assumed to be a tag. A SESS-ID is never judged by its
+value: a PA-7050 reports about 149 million sessions supported while every live
+session ID is above 2^30, because PA-7000 IDs carry slot and dataplane bits, so
+"larger than the sessions supported" would flag every real session on such a
+chassis. Only the firewall's own `Special Notes` column, or `show session id`
+answering `Bad Key`, says that no session lies behind an ID.
+
 The step also states the **on-box auto-collection** state, read once at the
 start of the incident, as a fact line reading `disabled`, `enabled (80% for
 3 s)`, `not available on this PAN-OS release` when the firewall returned none

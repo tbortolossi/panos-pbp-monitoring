@@ -193,7 +193,14 @@ than create a concurrent one.
    time until discard. Both output forms are accepted: the pipe-delimited CLI
    table and the structured XML `<entry>` form returned by the API on current
    PAN-OS releases, whose fields map one for one onto the same columns. `ingress-backlogs` separately preserves slot/DP,
-   ATOMIC/TOTAL, groups, counts, and flow details. `show session info` is parsed
+   ATOMIC/TOTAL, groups, counts, and flow details. Since PAN-OS 10.1 its TOP
+   SESSIONS table can carry a fifth `Special Notes` column naming a SESS-ID as
+   an internal tag — the host proxy for WildFire, or log forwarding to the
+   management plane — and not a session. When and only when the header
+   announces that column, the row is read as one `(GRP-ID, COUNT)` pair
+   followed by free text, kept as `special_note` with
+   `special_reason: noted`; a placeholder note stores nothing. Such an entry is
+   the only one for which `show session id` is not called. `show session info` is parsed
    per dataplane and summed device-wide into `session_info`: sessions supported
    and allocated, the protocol mix, the sessions created since bootup, the new
    connection rate, the packet rate, and the throughput. Its utilization is
@@ -746,7 +753,13 @@ key must be backed up and restored together.
     id` and source addresses with their recovered traffic log, presented as
     the firewall's designation and not as proof; (3) the sessions holding at
     least 2% of the ingress backlog, calling out unidentified applications and
-    the `flow_slowpath` + `Bad Key` policy-deny signature, counting only the
+    the `flow_slowpath` + `Bad Key` policy-deny signature, listing apart the
+    entries PAN-OS named internal tags in its own `Special Notes` column and
+    excluding them from both signatures — no session ID is ever inferred to be
+    a tag from its value, because a PA-7050 running 10.2.9 reports about 149
+    million sessions supported while every live session ID is above 2^30, so a
+    "larger than the sessions supported" rule would flag every real session on
+    a PA-7000, whose IDs carry slot and dataplane bits — counting only the
     batches whose command actually ran and declining the metric per platform
     family — the on-chip descriptor queue on a Cavium chassis, the dataplane's
     in-flight work entries over `max-inflight-num` (32768 by default) on an
