@@ -219,7 +219,46 @@ than create a concurrent one.
 
    The last three are declared platform-dependent: a firewall that refuses one
    as a node it does not have costs no evidence that existed there, and the
-   report states it as a platform note rather than as a failed read.
+   report states it as a platform note rather than as a failed read. A read
+   that failed for any other reason, or that never answered, is stated as
+   what it is; the three are never confused.
+
+   These five describe the firewall rather than the incident, and on a chassis
+   they can take ten seconds each. **They are therefore never on the monitor's
+   critical path**: they start once the first batch has been collected, run in
+   the background, and are journalled in their own `context_collected` record
+   when they answer. The batch loop never waits for them, so the five-second
+   cadence that catches the first seconds of an incident is untouched. At
+   monitor stop the collector gives them a bounded moment and then records
+   what did not answer as not collected. Both records are read the same way by
+   the diagnosis, so a capture that carries a read in either place is
+   diagnosed identically.
+
+   Every once-per-incident read is bounded to three in flight. Monitor start
+   would otherwise open eleven state reads and a whole batch at once, and on a
+   management plane already under pressure the first
+   `show session packet-buffer-protection` snapshot - the one measurement
+   nothing can recover - would queue behind them.
+
+   What each read persists is what a reader consumes, and no more; the raw
+   answer travels beside it for everything else. `arp_table` carries the
+   occupancy per dataplane and the fullest of them (`entries`,
+   `maximum_entries`, `timeout_seconds`, `utilization_percent`, `dataplane`);
+   `application_statistics` the ten applications with the most bytes, the
+   table totals and the application count PAN-OS reported;
+   `session_distribution` the per-dataplane active and dispatched counts, the
+   busiest dataplane, the median of its peers and their ratio;
+   `chassis_status` the slot table and the traffic-enabled slot list;
+   `pow_performance` four named timing rows per dataplane, the packet-buffer
+   latency histogram and the peak wait. Each carries `parsed`.
+
+   `show arp all` is read under two bounds of its own. The answer is streamed
+   and each `<entry>` is dropped as it arrives, so the transfer may reach
+   64 MB - a 128000-entry table on a chassis is around 24 MB, well past the
+   8 MB ceiling every other command is read with - while what is retained
+   stays under that ceiling and holds no address at all. Reading it whole
+   would refuse the answer from roughly a third of the table onwards, which is
+   to say exactly when the ARP evidence matters.
 5. At incident startup, the monitor primes the global-counter delta baseline
    separately. At the start of each batch, it starts `show clock`, then collects
    the following commands in parallel every five seconds without waiting for
@@ -514,9 +553,15 @@ the collector is not running, and to a host-only archive when the image is
 absent.
 
 Every support export, bundle and run archive alike, is also offered in an
-anonymized form. Addresses, MAC addresses, serial numbers and firewall names are
-replaced by tokens in the contents, the archive paths and the manifest, which
-records which form it describes. Tokens derive from a salt generated once per
+anonymized form. Addresses, MAC addresses, serial numbers, firewall names and
+application names that are not PAN-OS's own are replaced by tokens in the
+contents, the archive paths and the manifest, which records which form it
+describes. The application rule fails closed: a name is kept readable only when
+it belongs to a compact list of predefined App-IDs, because a custom
+application is named by the person who created it and `acme-payroll-erp`
+identifies a site as surely as its management address. It is applied to the
+parsed evidence and to the raw table alike, with one token for one name, so
+the two still describe the same traffic. Tokens derive from a salt generated once per
 installation and held in the configuration volume, so a value keeps one token
 within an export and across successive exports, and the recipient cannot invert
 it. Loopback and unspecified addresses, and a name equal to the platform model,
@@ -937,7 +982,8 @@ key must be backed up and restored together.
   deferred here was never the usefulness of these reads but the gating rule:
   a second lab platform (PA-VM, PAN-OS 11.2.3-h3) beside the PA-440 (12.2.2)
   established that PAN-OS refuses a command it does not have by name, which the
-  `command_node_unsupported` mechanism added in v0.41.1 already turns into a
+  `command_node_unsupported` mechanism, whose platform-note treatment
+  arrived in v0.42.0, already turns into a
   platform note. The gate is therefore keyed on the firewall's own answer and
   not on the model. The two chassis-only reads were validated for content
   against the anonymized PA-5250 and PA-7080 tech support files of the TAC

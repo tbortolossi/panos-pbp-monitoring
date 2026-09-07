@@ -277,29 +277,39 @@ class LayeredReportTests(unittest.TestCase):
 
     def test_both_reports_carry_the_device_section_identically(self):
         # The layered report reuses the flat report's evidence fragments, so a
-        # chassis card that was down, or an ARP table at its limit, cannot be
-        # visible in one report and missing from the other.
+        # chassis card not carrying traffic, or an ARP table at its limit,
+        # cannot be visible in one report and missing from the other.
         records = self._incident_records()
-        records[0]["arp_table"] = {
-            "parsed": True,
-            "entries": 2940,
-            "maximum_entries": 3000,
-            "utilization_percent": 98.0,
-        }
-        records[0]["chassis_status"] = {
-            "parsed": True,
-            "populated_slots": 1,
-            "slots_up": 0,
-            "slots_not_up": [2],
-            "slots": [
-                {
-                    "slot": 2,
-                    "component": "PA-7000-DPC-A",
-                    "card_status": "Down",
-                    "config_status": "Success",
-                }
-            ],
-        }
+        records.append(
+            {
+                "run_id": records[0]["run_id"],
+                "event": "context_collected",
+                "arp_table": {
+                    "parsed": True,
+                    "entries": 2940,
+                    "maximum_entries": 3000,
+                    "utilization_percent": 98.0,
+                    "dataplanes": [],
+                },
+                "chassis_status": {
+                    "parsed": True,
+                    "traffic_enabled_slots": [1],
+                    "slots": [
+                        {
+                            "slot": 1,
+                            "component": "PA-7000-100G-NPC-A",
+                            "card_status": "Up",
+                        },
+                        {
+                            "slot": 2,
+                            "component": "PA-7000-DPC-A",
+                            "card_status": "Powered Off",
+                        },
+                    ],
+                },
+                "commands": {},
+            }
+        )
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             capture, _ = self._capture(directory, records)
@@ -316,7 +326,7 @@ class LayeredReportTests(unittest.TestCase):
             self.assertIn("PA-7000-DPC-A", rendered)
             # The two findings the section proves are linked to it by name.
             self.assertIn("ARP table near its limit", rendered)
-            self.assertIn("Line card not up", rendered)
+            self.assertIn("Line card not carrying traffic", rendered)
 
     def _both_reports(self, inflight: dict) -> tuple[str, str]:
         records = self._incident_records()

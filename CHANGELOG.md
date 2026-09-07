@@ -7,42 +7,57 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **Five device reads that were deferred for want of a way to gate them.** At
-  monitor start the collector now also reads the header of `show arp all`,
+- **Five device reads that were deferred for want of a way to gate them.**
+  Once per incident the collector now also reads the header of `show arp all`,
   `show running application statistics`, `show session distribution
-  statistics`, `show chassis status` and `debug dataplane pow performance all`,
-  and persists a bounded parsed object for each in the `monitor_started`
-  record. Operationally: the ARP header separates an ARP flood from an ARP
-  table filling towards its own limit, which is the same incident class seen
-  from two sides and the second one is invisible to every counter; the
-  application statistics say what the deployment carries, so a named offender
-  can be judged against the site's daily business; the session distribution
-  says whether the dispatcher was giving one dataplane more sessions than its
-  peers, which separates a hashing imbalance from one heavy flow group; the
-  chassis status names a line card that dropped out and concentrated its
-  traffic on the cards that remain; and the dataplane timing table carries
-  `pbp_buf_latency`, the packet-buffer latency measurement a PAN-OS release
-  older than 12.0 exposes nowhere else, with its bucket histogram. A new
-  **Device and traffic context** section of both reports carries the four
-  tables; step 1 states the longest buffer wait, step 4 states the ARP
-  occupancy, the session distribution and the busiest application, and two new
-  findings are named where the evidence supports them — *ARP table near its
-  limit* and *line card not up*. **The ARP entries are dropped before the
-  answer is persisted**: the collector needs the counts, not the customer's
-  address-to-MAC map, and a full table on a large platform would otherwise
-  write megabytes of addresses into every capture; the stored answer keeps the
-  header and a marker saying the rest was removed, and replays to the same
-  parsed object. The three reads a platform can lack — the distribution, the
-  chassis and the timing table — are declared platform-dependent, so a firewall
-  that refuses one as a node it does not have produces a note rather than a
-  failed read. Every command replays from an archive and travels in the support
-  bundle like the other startup reads. Validated read-only on the lab PA-440
-  (PAN-OS 12.2.2) and the lab PA-VM (PAN-OS 11.2.3-h3) on 2026-09-07; the two
-  chassis-only reads were validated for content against the anonymized PA-5250
-  and PA-7080 tech support files of the TAC corpus, neither lab firewall being
-  a chassis. `debug dataplane show ssl-decrypt ssl-stats` and `debug dataplane
-  show dos block-table` stay deferred, with the reason recorded in PRD §12.
-  Refs #210.
+  statistics`, `show chassis status` and `debug dataplane pow performance
+  all`, and persists a bounded parsed object for each. Operationally: the ARP
+  header separates an ARP flood from an ARP table filling towards its own
+  limit, which is the same incident class seen from two sides and the second
+  one is invisible to every counter; the application statistics say what the
+  deployment carries, so a named offender can be judged against the site's
+  daily business; the session distribution says whether the dispatcher was
+  giving one dataplane more sessions than its peers, which separates a hashing
+  imbalance from one heavy flow group; the chassis status names a traffic card
+  the chassis is no longer dispatching to; and the dataplane timing table
+  carries `pbp_buf_latency`, the packet-buffer latency measurement a PAN-OS
+  release older than 12.0 exposes nowhere else, with its bucket histogram.
+  **They never sit on the monitor's critical path**: they start once the first
+  batch is collected, run in the background under a bound of three concurrent
+  reads, and are journalled in a new `context_collected` record when they
+  answer, so the five-second cadence that catches the first seconds of an
+  incident is untouched; at monitor stop what has not answered is recorded as
+  not collected rather than waited for. A new **Device and traffic context**
+  section of both reports carries the tables; step 1 states the longest buffer
+  wait, step 4 states the ARP occupancy, the session distribution and the
+  busiest application, and two findings are named where the evidence supports
+  them — *ARP table near its limit* and *line card not carrying traffic*, the
+  latter from the chassis's own traffic-enabled slot list rather than from a
+  card status, so a booting card or a disabled spare is not reported as an
+  incident. A read that carries nothing says which of four things happened —
+  the platform does not have the command, the read failed and why, it did not
+  answer in time, or the capture predates it — instead of showing them all as
+  a platform limit. **The ARP entries never enter a capture and never have to
+  fit in memory**: the answer is streamed and each entry is dropped as it
+  arrives, so a 128000-entry table on a chassis — around 24 MB, three times
+  what the collector reads of any other command — is transferred but not
+  retained, where reading it whole would have refused the answer from roughly
+  a third of the table onwards, exactly when the ARP evidence matters. The
+  stored answer keeps the header and a marker saying the rest was removed, and
+  replays to the same parsed object. The three reads a platform can lack are
+  declared platform-dependent, so a firewall that refuses one as a node it
+  does not have produces a note rather than a failed read, and the monitor and
+  the read-only API check now word that classification identically. Every
+  command is registered in `tools/replay_capture.py`, the new record travels
+  in the support bundle and the text export like any other, and an anonymized
+  export now also tokenizes application names that are not predefined App-IDs,
+  because a custom application is named by the customer. Validated read-only
+  on the lab PA-440 (PAN-OS 12.2.2) and the lab PA-VM (PAN-OS 11.2.3-h3) on
+  2026-09-07; the two chassis-only reads were validated for content against
+  the anonymized PA-5250 and PA-7080 tech support files of the TAC corpus,
+  neither lab firewall being a chassis. `debug dataplane show ssl-decrypt
+  ssl-stats` and `debug dataplane show dos block-table` stay deferred, with
+  the reason recorded in PRD §12. Refs #210.
 
 ### Fixed
 

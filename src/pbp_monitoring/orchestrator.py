@@ -14,6 +14,7 @@ from collections import deque
 import ipaddress
 import json
 import logging
+import heapq
 import math
 import os
 import re
@@ -28,7 +29,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Iterator, NamedTuple
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
@@ -57,7 +58,11 @@ from .config_store import (
     StoredTarget,
     dp_core_identity,
 )
-from .panos_keygen import parse_untrusted_xml, read_bounded_response
+from .panos_keygen import (
+    MAX_API_RESPONSE_BYTES,
+    parse_untrusted_xml,
+    read_bounded_response,
+)
 from .text_export import write_record_text_export
 
 
@@ -195,42 +200,18 @@ PBP_SETTINGS_COMMAND = (
 #
 # Operational XML validated read-only against the lab PA-440 (PAN-OS 12.2.2)
 # on 2026-09-06.
-INCIDENT_START_COMMANDS = {
-    "global_counters_raw": "<show><counter><global/></counter></show>",
-    "resource_monitor_history": (
-        "<show><running><resource-monitor/></running></show>"
-    ),
-    "interface_status": "<show><interface>all</interface></show>",
-    "zone_protection": "<show><zone-protection/></show>",
-    "ha_state": "<show><high-availability><state/></high-availability></show>",
-    # Validated read-only through the XML API on the lab PA-440, PAN-OS
-    # 12.2.2, 2026-09-07.
-    "inflight_monitoring": (
-        "<show><system><state><filter>cfg.session.*</filter></state>"
-        "</system></show>"
-    ),
-    # Validated read-only through the XML API on the lab PA-440 (PAN-OS
-    # 12.2.2) and on the lab PA-VM (PAN-OS 11.2.3-h3) on 2026-09-07. Both
-    # answered `arp_table` and `application_statistics`. `session_distribution`
-    # is accepted on 11.2.3-h3 and rejected as an unknown node on 12.2.2, and
-    # `chassis_status` is rejected on both because neither is a chassis, so
-    # both are declared platform-dependent below and their content shape comes
-    # from the anonymized PA-5250 and PA-7080 tech support files in the TAC
-    # corpus. `pow_performance` was accepted on both lab platforms, and its
-    # table shape is the one those same tech support files carry.
-    "arp_table": "<show><arp><entry name='all'/></arp></show>",
-    "application_statistics": (
-        "<show><running><application><statistics/></application></running></show>"
-    ),
-    "session_distribution": (
-        "<show><session><distribution><statistics/></distribution></session></show>"
-    ),
-    "chassis_status": "<show><chassis><status/></chassis></show>",
-    "pow_performance": (
-        "<debug><dataplane><pow><performance><all/></performance></pow>"
-        "</dataplane></debug>"
-    ),
-}
+# Operational XML validated read-only against the lab PA-440 (PAN-OS 12.2.2)
+# on 2026-09-06, and the five device reads against that firewall and the lab
+# PA-VM (PAN-OS 11.2.3-h3) on 2026-09-07. Both answered `arp_table` and
+# `application_statistics`; `session_distribution` is accepted on 11.2.3-h3
+# and refused as an unknown node on 12.2.2; `chassis_status` is refused by
+# both, neither being a chassis, and the content shape of those two comes
+# from the anonymized PA-5250 and PA-7080 tech support files of the TAC
+# corpus.
+#
+# The table itself is `START_READS`, declared beside the parsers it names so
+# a read cannot be collected without one, and `INCIDENT_START_COMMANDS` is
+# the view of it every caller that only needs the XML uses.
 
 # Every hardware port's counters in one read. Offender enrichment is
 # session-driven, so a session-less flood (a gratuitous-ARP storm) leaves it
@@ -266,23 +247,13 @@ CONGESTION_LOG_ENTRY_LIMIT = 1000
 #: answers every monitoring command into a failed check. The once-per-incident
 #: reads are optional for the same reason: a firewall with no HA, no zone
 #: protection profile or a restricted role must still be monitored.
+#: The once-per-incident reads declare their own entry here, from
+#: `START_READS`, so a read cannot exist without saying what its failure
+#: costs. The three below are the per-batch and per-run reads.
 OPTIONAL_COMMAND_EVIDENCE = {
     "pbp_settings": "the configured PBP alert and activate thresholds",
     "buffer_latency": "the packet buffer latency measurements",
-    "global_counters_raw": "the cumulative value of every global counter",
-    "resource_monitor_history": (
-        "the hour, day and week resource-utilization history"
-    ),
-    "interface_status": "the interface zone, VLAN tag and link speed map",
-    "zone_protection": "the per-zone flood protection state and PBP drops",
-    "ha_state": "the high-availability role of this unit",
     "interface_counters_all": "the per-interface hardware counters",
-    "inflight_monitoring": "the on-box ingress-backlog auto-collection state",
-    "arp_table": "the ARP table occupancy against the platform limit",
-    "application_statistics": "the applications this firewall carries",
-    "session_distribution": "the per-dataplane session distribution",
-    "chassis_status": "the chassis slot and line-card state",
-    "pow_performance": "the per-dataplane processing latency table",
 }
 
 
@@ -932,7 +903,11 @@ class PanOSClient:
             RejectRedirectHandler(),
         )
 
-    def _api_request(self, params: dict[str, str]) -> tuple[ET.Element, str]:
+    def _api_request(
+        self,
+        params: dict[str, str],
+        reader: Callable[[object], str] = read_bounded_response,
+    ) -> tuple[ET.Element, str]:
         if self.cfg.target_serial:
             params = {**params, "target": self.cfg.target_serial}
         request = Request(
@@ -949,7 +924,7 @@ class PanOSClient:
                 request,
                 timeout=self.cfg.request_timeout,
             ) as response:
-                response_text = read_bounded_response(response)
+                response_text = reader(response)
         except HTTPError as exc:
             try:
                 response_text = read_bounded_response(exc)
@@ -977,7 +952,14 @@ class PanOSClient:
         return root, response_text
 
     def op_response(self, command_xml: str) -> PanOSResponse:
-        root, response_text = self._api_request({"type": "op", "cmd": command_xml})
+        # One command is answered with the customer's whole ARP table, which
+        # neither fits the ordinary ceiling nor may be held in memory. It is
+        # read through a reader that drops the entries as they arrive; every
+        # other command is read whole, as before.
+        root, response_text = self._api_request(
+            {"type": "op", "cmd": command_xml},
+            STREAMED_COMMAND_READERS.get(command_xml, read_bounded_response),
+        )
         result = root.find("result")
         result_xml = (
             ET.tostring(result, encoding="unicode") if result is not None else response_text
@@ -1237,6 +1219,37 @@ def extract_pbp_offenders(output: str) -> list[dict[str, Any]]:
         }
         offenders.append(record)
     return offenders
+
+
+#: A dataplane name as PAN-OS spells it: `dp0` on a single-slot platform,
+#: `s1dp0` per slot on a chassis. Six parsers used to carry their own copy of
+#: this pattern, and one of them had already drifted into requiring the slot
+#: prefix - which reads nothing at all on a PA-5260, whose dataplanes are
+#: `dp0` to `dp3`.
+_DP_NAME = re.compile(r"(?:s\d+)?dp\d+", re.I)
+#: The `DP <name>:` line that opens a per-dataplane section of a text answer.
+_DP_SECTION_HEADER = re.compile(rf"^\s*DP\s+({_DP_NAME.pattern})\s*:\s*$", re.I)
+
+
+def _kv_lines(text: str) -> Iterator[tuple[str, str]]:
+    """Yield the `label: value` lines of an operational answer, label lowered.
+
+    Half the text commands PAN-OS answers with are a list of labelled values,
+    and every parser that read one had its own copy of the same three rules:
+    skip the blanks, skip the `-----` and `=====` separators, split on the
+    first colon. One copy could drift from another - a label matched with its
+    spacing intact, a separator read as a label - so they share this one.
+    A line with no colon is not a labelled value and is simply not yielded;
+    a parser that also reads table rows iterates the text itself for them.
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or set(stripped) <= {"-", "="}:
+            continue
+        label, separator, value = stripped.partition(":")
+        if not separator:
+            continue
+        yield label.strip().lower(), value.strip()
 
 
 def _panos_flag(value: str | None) -> bool | None:
@@ -1592,17 +1605,12 @@ def extract_session_info(output: str) -> dict[str, Any]:
 
     current_dp: str | None = None
     values = {}
-    for line in panos_result_text(output).splitlines():
-        target = re.match(r"\s*target-dp\s*:\s*(\S+)", line, re.I)
-        if target:
+    for name, remainder in _kv_lines(panos_result_text(output)):
+        if name == "target-dp":
             add(current_dp, values)
-            current_dp = target.group(1)
+            current_dp = remainder.split()[0] if remainder.split() else None
             values = {}
             continue
-        label, separator, remainder = line.partition(":")
-        if not separator:
-            continue
-        name = label.strip().lower()
         key = next(
             (
                 field
@@ -2731,7 +2739,7 @@ def extract_resource_cpu_cores(resource_monitor: str) -> list[dict[str, Any]]:
         dataplanes = [
             element
             for element in root.iter()
-            if re.fullmatch(r"(?:s\d+)?dp\d+", _local_tag(element), re.I)
+            if _DP_NAME.fullmatch(_local_tag(element))
         ]
         if not dataplanes:
             dataplanes = [root]
@@ -2901,7 +2909,7 @@ def _extract_latest_resource_percentages(resource_monitor: str) -> dict[str, Any
         dataplane_elements = [
             element
             for element in root.iter()
-            if re.fullmatch(r"(?:s\d+)?dp\d+", _local_tag(element), re.I)
+            if _DP_NAME.fullmatch(_local_tag(element))
         ]
         if not dataplane_elements:
             dataplane_elements = [root]
@@ -2972,7 +2980,7 @@ def _extract_latest_resource_percentages(resource_monitor: str) -> dict[str, Any
     # Chassis CLI text repeats every window under one ``DP sXdpY:`` header per
     # dataplane; the header is tracked so the per-dataplane view survives the
     # text fallback too.
-    dataplane_pattern = re.compile(r"^\s*DP\s+((?:s\d+)?dp\d+)\s*:\s*$", re.I)
+    dataplane_pattern = _DP_SECTION_HEADER
     current_dataplane = "dp0"
     text_dataplanes: dict[str, dict[str, float]] = {}
     for index, line in enumerate(lines):
@@ -3022,7 +3030,7 @@ def extract_dataplane_pool_statistics(output: str) -> dict[str, Any]:
     # ``DP s1dp0:`` headers repeat the whole table per dataplane on multi-DP
     # platforms; a wedged DP next to a healthy one is itself evidence, so the
     # plane must survive into each pool row.
-    dataplane_pattern = re.compile(r"^\s*DP\s+((?:s\d+)?dp\d+)\s*:\s*$", re.I)
+    dataplane_pattern = _DP_SECTION_HEADER
     # One line shape per platform generation: the single-chip form ends after
     # ``free/total`` plus at most an address, the ASIC (PA-3200/5200/7000)
     # hardware form appends ``address intr``, and the ASIC software form is
@@ -3372,7 +3380,7 @@ def extract_resource_monitor_history(output: str) -> dict[str, Any]:
     dataplane_elements = [
         element
         for element in root.iter()
-        if re.fullmatch(r"(?:s\d+)?dp\d+", _local_tag(element), re.I)
+        if _DP_NAME.fullmatch(_local_tag(element))
     ]
     if not dataplane_elements:
         dataplane_elements = [root]
@@ -3633,11 +3641,8 @@ def extract_inflight_monitoring(output: str) -> dict[str, Any]:
         field: None for field, _ in _INFLIGHT_MONITORING_NODES.values()
     }
     text = panos_result_text(output)
-    for line in text.splitlines():
-        name, separator, value = line.partition(":")
-        if not separator:
-            continue
-        node = _INFLIGHT_MONITORING_NODES.get(name.strip().lower())
+    for name, value in _kv_lines(text):
+        node = _INFLIGHT_MONITORING_NODES.get(name)
         if node is None:
             continue
         field, read = node
@@ -3661,35 +3666,118 @@ def extract_inflight_monitoring(output: str) -> dict[str, Any]:
 #: Bounds for the once-per-incident device reads. None of these outputs is
 #: read for its individual rows, and each of them can be arbitrarily long on a
 #: large platform: a chassis dataplane table, an application table with one
-#: line per App-ID, a dataplane timing table with one line per function.
+#: line per App-ID, a dataplane timing table with one line per function. What
+#: is persisted is what a reader consumes and nothing else; the raw answer
+#: travels beside it for everything else.
 TOP_APPLICATION_LIMIT = 10
 SESSION_DISTRIBUTION_LIMIT = 64
 CHASSIS_SLOT_LIMIT = 32
-CHASSIS_SUMMARY_SLOT_LIMIT = 32
 POW_DATAPLANE_LIMIT = 32
-POW_SLOWEST_LIMIT = 5
+POW_HISTOGRAM_LIMIT = 24
 ARP_DATAPLANE_LIMIT = 32
 
-#: The ARP table itself, and the marker left in its place. `show arp all`
-#: answers with the header this collector reads and then one entry per
-#: address the firewall has resolved: up to 128000 of them on a chassis,
-#: which is megabytes of the customer's address-to-MAC map written into every
-#: capture, twice, for evidence nobody reads. The entries are removed before
-#: the answer is persisted, and the marker says so rather than leaving a
-#: reader to conclude that the firewall returned an empty table.
-_ARP_ENTRIES_ELEMENT = re.compile(r"<entries\b.*?</entries>", re.DOTALL)
+#: `show arp all` answers with a header this collector reads and then one
+#: element per address the firewall has resolved - up to 128000 of them on a
+#: chassis, around 190 bytes each, which is 24 MB of the customer's
+#: address-to-MAC map. Two things follow.
+#:
+#: The answer cannot be read whole: `MAX_API_RESPONSE_BYTES` would refuse it
+#: from roughly a third of the table onwards, so the evidence would disappear
+#: exactly when the table is full, which is the case it exists for. It is
+#: therefore streamed, and each `<entry>` is dropped as it arrives; only the
+#: header elements and an emptied `<entries>` are kept, well under the normal
+#: ceiling, and the transfer itself is capped separately.
+#:
+#: And nothing keeps that map. The entries never reach a capture: not the
+#: parsed record, not the raw response, not memory beyond the chunk they
+#: arrived in. `ARP_ENTRIES_OMITTED_MARKER` is left where the first one was,
+#: so a TAC reader sees a table the collector removed rather than a firewall
+#: that answered nothing.
+ARP_TRANSFER_LIMIT_BYTES = 64 * 1024 * 1024
+ARP_READ_CHUNK_BYTES = 256 * 1024
 ARP_ENTRIES_OMITTED_MARKER = (
     "<!-- ARP entries removed by the collector: only the header is kept -->"
 )
+_ARP_ENTRY_OPEN = "<entry>"
+_ARP_ENTRY_CLOSE = "</entry>"
+#: The whole element, for the guard applied to an answer that did not come
+#: through the streaming reader (a replayed capture, a Panorama proxy). It
+#: deliberately does not match a self-closing `<entries/>`: on an answer
+#: carrying one block per dataplane, `<entries/>.*?</entries>` would swallow
+#: the next block's header and the replayed parse would contradict the live
+#: one.
+_ARP_ENTRIES_ELEMENT = re.compile(r"<entries>.*?</entries>", re.DOTALL)
+
+
+def read_arp_response(response: object) -> str:
+    """Read `show arp all` in chunks, dropping the entries as they arrive.
+
+    The retained text stays under the ceiling every other command is read
+    with; only the transfer is allowed to be larger, because the firewall
+    sends the table whether or not anything here wants it.
+    """
+    kept: list[str] = []
+    kept_bytes = 0
+    transferred = 0
+    pending = ""
+    dropping = False
+    dropped_any = False
+
+    def keep(text: str) -> None:
+        nonlocal kept_bytes
+        if not text:
+            return
+        kept_bytes += len(text)
+        if kept_bytes > MAX_API_RESPONSE_BYTES:
+            raise ValueError("the firewall response exceeds the size limit")
+        kept.append(text)
+
+    while True:
+        chunk = response.read(ARP_READ_CHUNK_BYTES)  # type: ignore[attr-defined]
+        if not chunk:
+            break
+        transferred += len(chunk)
+        if transferred > ARP_TRANSFER_LIMIT_BYTES:
+            raise ValueError("the ARP table exceeds the transfer limit")
+        pending += chunk.decode("utf-8", errors="replace")
+        while pending:
+            if dropping:
+                end = pending.find(_ARP_ENTRY_CLOSE)
+                if end < 0:
+                    # Keep only enough to recognise a closing tag split
+                    # across two chunks.
+                    pending = pending[-(len(_ARP_ENTRY_CLOSE) - 1) :]
+                    break
+                pending = pending[end + len(_ARP_ENTRY_CLOSE) :]
+                dropping = False
+                continue
+            start = pending.find(_ARP_ENTRY_OPEN)
+            if start < 0:
+                boundary = len(pending) - (len(_ARP_ENTRY_OPEN) - 1)
+                if boundary > 0:
+                    keep(pending[:boundary])
+                    pending = pending[boundary:]
+                break
+            keep(pending[:start])
+            if not dropped_any:
+                keep(ARP_ENTRIES_OMITTED_MARKER)
+                dropped_any = True
+            pending = pending[start + len(_ARP_ENTRY_OPEN) :]
+            dropping = True
+    if not dropping:
+        keep(pending)
+    return "".join(kept)
 
 
 def trim_arp_entries(payload: dict[str, Any]) -> dict[str, Any]:
-    """Drop the ARP table from a stored `show arp all` answer, keep the header.
+    """Guard the invariant on an answer the streaming reader did not produce.
 
-    Applied to the persisted record only. The parser reads nothing but the
-    header elements, so a replayed capture parses to exactly what the live
-    read parsed, and the raw response still shows what PAN-OS answered
-    everywhere the collector did not deliberately remove.
+    The live read never carries the table this far - it was dropped as it
+    streamed - so this scans a text that holds no entry and changes nothing.
+    It matters for every other path into the same record: a fake client, a
+    replayed capture, a firewall reached through something that buffered the
+    answer for us. Applied in the collection coroutine, so no caller can
+    forget it.
     """
     if not isinstance(payload, dict):
         return payload
@@ -3698,7 +3786,7 @@ def trim_arp_entries(payload: dict[str, Any]) -> dict[str, Any]:
         value = trimmed.get(key)
         if isinstance(value, str) and value:
             trimmed[key] = _ARP_ENTRIES_ELEMENT.sub(
-                ARP_ENTRIES_OMITTED_MARKER, value
+                f"<entries>{ARP_ENTRIES_OMITTED_MARKER}</entries>", value
             )
     return trimmed
 
@@ -3706,15 +3794,16 @@ def trim_arp_entries(payload: dict[str, Any]) -> dict[str, Any]:
 def extract_arp_table_header(output: str) -> dict[str, Any]:
     """Read how full the ARP table is, never what is in it.
 
-    PAN-OS answers `show arp all` with `<dp>`, `<timeout>`, `<total>` and
-    `<max>` beside the `<entries>` element the collector removes before
-    persisting. A platform that answers with one such block per dataplane is
-    summed rather than guessed at: the occupancy of the whole firewall is the
-    question, and a shape this parser does not recognise leaves `parsed`
-    false, which reads as evidence not collected rather than as a full table.
+    PAN-OS answers with `<dp>`, `<timeout>`, `<total>` and `<max>` beside the
+    `<entries>` element the collector empties as it streams. A platform that
+    answers with one such block per dataplane is read per block and reported
+    from the fullest one: the blocks are replicas of one table, so adding
+    their totals would multiply the occupancy by the number of dataplanes and
+    invent an exhaustion that is not there.
     """
     header: dict[str, Any] = {
         "dataplanes": [],
+        "dataplane": None,
         "entries": None,
         "maximum_entries": None,
         "timeout_seconds": None,
@@ -3725,40 +3814,54 @@ def extract_arp_table_header(output: str) -> dict[str, Any]:
         root = parse_untrusted_xml(output)
     except ET.ParseError:
         return header
-    names: list[str] = []
-    totals: list[int] = []
-    maxima: list[int] = []
-    timeouts: list[int] = []
-    for node in root.iter():
-        text = (node.text or "").strip()
-        if not text:
+    # One block per dataplane, or one block for the whole answer. A block is
+    # an element holding a `<total>`; an ancestor of another block is the
+    # envelope, not a block of its own.
+    blocks = [element for element in root.iter() if element.find("total") is not None]
+    inner = [
+        element
+        for element in blocks
+        if not any(child in blocks for child in element.iter() if child is not element)
+    ]
+    rows: list[dict[str, Any]] = []
+    for block in inner[:ARP_DATAPLANE_LIMIT]:
+        entries = _int_value((block.findtext("total") or "").strip())
+        if entries is None:
             continue
-        if node.tag == "dp":
-            if text not in names and len(names) < ARP_DATAPLANE_LIMIT:
-                names.append(text)
-        elif node.tag == "total":
-            value = _int_value(text)
-            if value is not None:
-                totals.append(value)
-        elif node.tag == "max":
-            value = _int_value(text)
-            if value is not None:
-                maxima.append(value)
-        elif node.tag == "timeout":
-            value = _int_value(text)
-            if value is not None:
-                timeouts.append(value)
-    header["dataplanes"] = names
-    if totals:
-        header["entries"] = sum(totals)
-    if maxima:
-        header["maximum_entries"] = sum(maxima)
-    if timeouts:
-        header["timeout_seconds"] = max(timeouts)
-    entries, maximum = header["entries"], header["maximum_entries"]
-    if entries is not None and maximum:
-        header["utilization_percent"] = round(entries * 100.0 / maximum, 1)
-    header["parsed"] = entries is not None
+        maximum = _int_value((block.findtext("max") or "").strip())
+        rows.append(
+            {
+                "dataplane": (block.findtext("dp") or "").strip() or None,
+                "entries": entries,
+                "maximum_entries": maximum,
+                "timeout_seconds": _int_value((block.findtext("timeout") or "").strip()),
+                "utilization_percent": (
+                    round(entries * 100.0 / maximum, 1) if maximum else None
+                ),
+            }
+        )
+    if not rows:
+        return header
+    fullest = max(
+        rows,
+        key=lambda row: (
+            row["utilization_percent"]
+            if row["utilization_percent"] is not None
+            else -1.0,
+            row["entries"],
+        ),
+    )
+    header.update(
+        {
+            "dataplanes": rows,
+            "dataplane": fullest["dataplane"],
+            "entries": fullest["entries"],
+            "maximum_entries": fullest["maximum_entries"],
+            "timeout_seconds": fullest["timeout_seconds"],
+            "utilization_percent": fullest["utilization_percent"],
+            "parsed": True,
+        }
+    )
     return header
 
 
@@ -3790,39 +3893,32 @@ def extract_application_statistics(output: str) -> dict[str, Any]:
     """What this firewall carries, by application.
 
     The counters are cumulative since boot, not for the incident: they
-    describe the deployment, and the report says so. Only the ranked heads of
-    the table are kept, so a firewall with two thousand App-IDs persists the
-    same handful of rows as one with twelve.
+    describe the deployment, and the report says so. Only the head of the
+    table by bytes is kept, so a firewall with two thousand App-IDs persists
+    the same handful of rows as one with twelve; the rest stays in the raw
+    answer beside it.
     """
     summary: dict[str, Any] = {
-        "vsys_count": 0,
-        "application_count": 0,
         "reported_application_count": None,
         "totals": {},
         "top_by_bytes": [],
-        "top_by_sessions": [],
         "parsed": False,
     }
     text = panos_result_text(output)
     applications: dict[str, dict[str, int]] = {}
     totals: dict[str, int] = {column: 0 for column in _APPLICATION_COLUMNS}
     totals_seen = False
+    reported = 0
+    for label, value in _kv_lines(text):
+        if label.startswith("number of apps"):
+            count = _int_value(value)
+            if count is not None:
+                reported += count
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped or set(stripped) <= {"-"}:
+        if not stripped or ":" in stripped or set(stripped) <= {"-", "="}:
             continue
-        lowered = stripped.lower()
-        if lowered.startswith("vsys:"):
-            summary["vsys_count"] += 1
-            continue
-        if lowered.startswith("number of apps"):
-            reported = _int_value(stripped.partition(":")[2])
-            if reported is not None:
-                summary["reported_application_count"] = (
-                    summary["reported_application_count"] or 0
-                ) + reported
-            continue
-        if lowered.startswith("app ("):
+        if stripped.lower().startswith("app ("):
             continue
         row = _application_row(stripped)
         if row is None:
@@ -3840,32 +3936,25 @@ def extract_application_statistics(output: str) -> dict[str, Any]:
             entry[column] += value
     if not applications:
         return summary
-
-    def ranked(column: str) -> list[dict[str, Any]]:
-        ordered = sorted(
-            applications.items(), key=lambda item: -item[1][column]
-        )[:TOP_APPLICATION_LIMIT]
-        return [
-            {"application": name, **counters}
-            for name, counters in ordered
-            if counters[column] > 0
-        ]
-
-    summary["application_count"] = len(applications)
-    summary["totals"] = totals if totals_seen else {
-        column: sum(entry[column] for entry in applications.values())
-        for column in _APPLICATION_COLUMNS
-    }
-    summary["top_by_bytes"] = ranked("bytes")
-    summary["top_by_sessions"] = ranked("sessions")
+    summary["reported_application_count"] = reported or len(applications)
+    summary["totals"] = (
+        totals
+        if totals_seen
+        else {
+            column: sum(entry[column] for entry in applications.values())
+            for column in _APPLICATION_COLUMNS
+        }
+    )
+    summary["top_by_bytes"] = [
+        {"application": name, **counters}
+        for name, counters in heapq.nlargest(
+            TOP_APPLICATION_LIMIT,
+            (item for item in applications.items() if item[1]["bytes"] > 0),
+            key=lambda item: item[1]["bytes"],
+        )
+    ]
     summary["parsed"] = True
     return summary
-
-
-#: A dataplane name in the distribution and timing tables: `dp0` on a single
-#: dataplane, `s1dp0` per slot on a chassis. Requiring the shape keeps a line
-#: of prose from being read as a table row.
-_DATAPLANE_NAME = re.compile(r"^[a-z][a-z0-9]*dp[0-9]+$", re.IGNORECASE)
 
 
 def extract_session_distribution(output: str) -> dict[str, Any]:
@@ -3879,7 +3968,6 @@ def extract_session_distribution(output: str) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "dataplanes": [],
         "dataplane_count": 0,
-        "active_total": None,
         "busiest": None,
         "busiest_active": None,
         "median_active": None,
@@ -3890,7 +3978,7 @@ def extract_session_distribution(output: str) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) < 3 or not _DATAPLANE_NAME.match(parts[0]):
+        if len(parts) < 3 or not _DP_NAME.fullmatch(parts[0]):
             continue
         active = _int_value(parts[1])
         dispatched = _int_value(parts[2])
@@ -3910,10 +3998,9 @@ def extract_session_distribution(output: str) -> dict[str, Any]:
             break
     if not rows:
         return summary
+    ordered = sorted(rows, key=lambda row: -row["active"])
     summary["dataplanes"] = rows
     summary["dataplane_count"] = len(rows)
-    summary["active_total"] = sum(row["active"] for row in rows)
-    ordered = sorted(rows, key=lambda row: -row["active"])
     summary["busiest"] = ordered[0]["dataplane"]
     summary["busiest_active"] = ordered[0]["active"]
     peers = [row["active"] for row in ordered[1:]]
@@ -3921,6 +4008,9 @@ def extract_session_distribution(output: str) -> dict[str, Any]:
         # The median describes the OTHER dataplanes, exactly as the
         # single-dataplane saturation signature does: folding the busiest one
         # into its own baseline hides the imbalance it is meant to measure.
+        # A median of zero leaves the ratio undefined, and the readers say
+        # what that is - peers holding no session at all - rather than
+        # printing a number that does not exist.
         median = statistics.median(peers)
         summary["median_active"] = median
         if median > 0:
@@ -3929,85 +4019,96 @@ def extract_session_distribution(output: str) -> dict[str, Any]:
     return summary
 
 
-#: The summary lines `show chassis status` prints under the slot table, and
-#: the field each is kept under.
-_CHASSIS_SUMMARY_LINES = {
-    "inserted slots": "inserted_slots",
-    "powered slots": "powered_slots",
-    "config ready slots": "config_ready_slots",
-    "config done slots": "config_done_slots",
-    "traffic enabled slots": "traffic_enabled_slots",
-}
-#: The one slot-table value that says the card is carrying traffic.
-CHASSIS_CARD_UP = "up"
+#: The summary lines `show chassis status` prints under the slot table. Only
+#: the traffic-enabled list is kept: it is the firewall's own verdict on which
+#: cards are carrying traffic, and the others repeat what the slot table says.
+_CHASSIS_TRAFFIC_LINE = "traffic enabled slots"
+#: The slot table's columns, by the header PAN-OS prints above them. The
+#: layout is fixed-width, but a component name wider than its column pushes
+#: the rest to the right, so a row is read by the position each token starts
+#: at rather than by slicing: `Powered Off` is one status, and an overflowing
+#: `PA-7000-100G-NPC-A` is still one component.
+_CHASSIS_COLUMNS = ("slot", "component", "card status", "config status", "disabled")
+
+
+def _chassis_column_starts(line: str) -> dict[str, int] | None:
+    """Where each column of the slot table begins, from its header line."""
+    lowered = line.lower()
+    if not lowered.lstrip().startswith("slot") or "component" not in lowered:
+        return None
+    starts: dict[str, int] = {}
+    for column in _CHASSIS_COLUMNS:
+        index = lowered.find(column)
+        if index >= 0:
+            starts[column] = index
+    return starts if "component" in starts and "card status" in starts else None
+
+
+def _chassis_row(line: str, starts: dict[str, int]) -> dict[str, Any] | None:
+    """One slot row, each token assigned to the column it starts in."""
+    tokens = [(match.start(), match.group(0)) for match in re.finditer(r"\S+", line)]
+    if not tokens:
+        return None
+    slot = _int_value(tokens[0][1])
+    if slot is None:
+        return None
+    component: list[str] = []
+    card: list[str] = []
+    config: list[str] = []
+    card_start = starts["card status"]
+    config_start = starts.get("config status", card_start + 1)
+    disabled_start = starts.get("disabled", config_start + 1)
+    for position, token in tokens[1:]:
+        if position < card_start:
+            component.append(token)
+        elif position < config_start:
+            card.append(token)
+        elif position < disabled_start:
+            config.append(token)
+    name = " ".join(component)
+    if not name or name.lower() == "empty":
+        return {"slot": slot, "component": None, "card_status": None, "config_status": None}
+    return {
+        "slot": slot,
+        "component": name,
+        "card_status": " ".join(card) or None,
+        "config_status": " ".join(config) or None,
+    }
 
 
 def extract_chassis_status(output: str) -> dict[str, Any]:
-    """Which chassis slots hold a card, and which of those cards are up.
+    """Which chassis slots hold a card, and which of those carry traffic.
 
     Read from the `Slot / Component / Card Status / Config Status` table and
-    the slot lists printed under it. Nothing here identifies a network: slot
-    numbers and Palo Alto card model names.
+    from the traffic-enabled slot list printed under it. Nothing here
+    identifies a network: slot numbers and Palo Alto card model names.
     """
     summary: dict[str, Any] = {
         "slots": [],
-        "populated_slots": 0,
-        "slots_up": 0,
-        "slots_not_up": [],
+        "traffic_enabled_slots": [],
         "parsed": False,
     }
-    for field in _CHASSIS_SUMMARY_LINES.values():
-        summary[field] = []
     text = panos_result_text(output)
+    for label, value in _kv_lines(text):
+        if label == _CHASSIS_TRAFFIC_LINE:
+            summary["traffic_enabled_slots"] = [
+                number
+                for number in (_int_value(part) for part in value.split())
+                if number is not None
+            ][:CHASSIS_SLOT_LIMIT]
+    starts: dict[str, int] | None = None
     for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or set(stripped) <= {"-"}:
+        if ":" in line:
             continue
-        label, separator, value = stripped.partition(":")
-        if separator:
-            field = _CHASSIS_SUMMARY_LINES.get(label.strip().lower())
-            if field is not None:
-                summary[field] = [
-                    number
-                    for number in (_int_value(part) for part in value.split())
-                    if number is not None
-                ][:CHASSIS_SUMMARY_SLOT_LIMIT]
-                continue
-        parts = stripped.split()
-        slot = _int_value(parts[0])
-        if slot is None or len(summary["slots"]) >= CHASSIS_SLOT_LIMIT:
+        header = _chassis_column_starts(line)
+        if header is not None:
+            starts = header
             continue
-        component = parts[1] if len(parts) > 1 else ""
-        if not component or component.lower() == "empty":
-            summary["slots"].append(
-                {
-                    "slot": slot,
-                    "component": None,
-                    "card_status": None,
-                    "config_status": None,
-                }
-            )
+        if starts is None or len(summary["slots"]) >= CHASSIS_SLOT_LIMIT:
             continue
-        summary["slots"].append(
-            {
-                "slot": slot,
-                "component": component,
-                "card_status": parts[2] if len(parts) > 2 else None,
-                "config_status": parts[3] if len(parts) > 3 else None,
-            }
-        )
-    populated = [slot for slot in summary["slots"] if slot["component"]]
-    summary["populated_slots"] = len(populated)
-    summary["slots_up"] = sum(
-        1
-        for slot in populated
-        if str(slot["card_status"] or "").lower() == CHASSIS_CARD_UP
-    )
-    summary["slots_not_up"] = [
-        slot["slot"]
-        for slot in populated
-        if str(slot["card_status"] or "").lower() != CHASSIS_CARD_UP
-    ]
+        row = _chassis_row(line, starts)
+        if row is not None:
+            summary["slots"].append(row)
     summary["parsed"] = bool(summary["slots"])
     return summary
 
@@ -4024,11 +4125,9 @@ POW_NAMED_FUNCTIONS = (
 )
 #: The distribution of the same measurement, printed further down the answer
 #: as one `<function> (func)` section per function: how many packets fell in
-#: each latency bucket, rather than one average that a single slow packet
-#: skews. Only the `pbp_buf_latency` one is kept.
+#: each latency bucket, rather than one average a single slow packet skews.
+#: Only the `pbp_buf_latency` one is kept.
 POW_HISTOGRAM_FUNCTION = "pbp_buf_latency"
-POW_HISTOGRAM_LIMIT = 24
-_POW_DATAPLANE_HEADER = re.compile(r"^DP\s+(\S+?):$")
 _POW_HISTOGRAM_HEADER = re.compile(r"^(\S+)\s+\(func\)$")
 #: A processing-function name, so the numeric first column of a histogram
 #: bucket is never read as one.
@@ -4041,8 +4140,8 @@ def extract_pow_performance(output: str) -> dict[str, Any]:
     One section per dataplane, each a `name max-us avg-us count total-us`
     table, then one bucket histogram per function. The whole answer is tens of
     kilobytes of function names and microseconds; what is persisted is the
-    named rows above, the slowest few per dataplane and the packet-buffer
-    latency histogram, all bounded.
+    named rows above and the packet-buffer latency histogram, both bounded,
+    and the raw answer carries the rest.
     """
     summary: dict[str, Any] = {
         "dataplanes": [],
@@ -4052,18 +4151,16 @@ def extract_pow_performance(output: str) -> dict[str, Any]:
     }
     text = panos_result_text(output)
     dataplanes: list[dict[str, Any]] = []
-    rows_by_dataplane: list[list[dict[str, Any]]] = []
     in_histogram = False
 
     def open_dataplane(name: str | None) -> None:
         dataplanes.append(
             {"dataplane": name, "functions": {}, "latency_histogram": []}
         )
-        rows_by_dataplane.append([])
 
     for line in text.splitlines():
         stripped = line.strip()
-        header = _POW_DATAPLANE_HEADER.match(stripped)
+        header = _DP_SECTION_HEADER.match(stripped)
         if header:
             if len(dataplanes) >= POW_DATAPLANE_LIMIT:
                 break
@@ -4081,44 +4178,30 @@ def extract_pow_performance(output: str) -> dict[str, Any]:
             # `col avg-ticks avg-us count total-us`, one row per bucket.
             avg_us = _float_value(parts[2])
             count = _int_value(parts[3])
-            total_us = _int_value(parts[4])
-            if _int_value(parts[0]) is None or None in (avg_us, count, total_us):
+            if _int_value(parts[0]) is None or None in (avg_us, count):
                 continue
             if not dataplanes:
                 open_dataplane(None)
             buckets = dataplanes[-1]["latency_histogram"]
             if len(buckets) < POW_HISTOGRAM_LIMIT:
-                buckets.append(
-                    {"avg_us": avg_us, "count": count, "total_us": total_us}
-                )
+                buckets.append({"avg_us": avg_us, "count": count})
             continue
-        if not _POW_FUNCTION_NAME.match(parts[0]):
+        if parts[0] not in POW_NAMED_FUNCTIONS or not _POW_FUNCTION_NAME.match(parts[0]):
             continue
         max_us = _int_value(parts[1])
         avg_us = _float_value(parts[2])
         count = _int_value(parts[3])
-        total_us = _int_value(parts[4])
-        if None in (max_us, avg_us, count, total_us):
+        if None in (max_us, avg_us, count):
             continue
         if not dataplanes:
             # A single-dataplane platform need not print a `DP <name>:`
             # header. The rows still belong to a dataplane, unnamed.
             open_dataplane(None)
-        row = {
-            "function": parts[0],
+        dataplanes[-1]["functions"][parts[0]] = {
             "max_us": max_us,
             "avg_us": avg_us,
             "count": count,
-            "total_us": total_us,
         }
-        if parts[0] in POW_NAMED_FUNCTIONS:
-            dataplanes[-1]["functions"][parts[0]] = row
-        if count > 0:
-            rows_by_dataplane[-1].append(row)
-    for dataplane, rows in zip(dataplanes, rows_by_dataplane):
-        dataplane["slowest"] = sorted(rows, key=lambda row: -row["avg_us"])[
-            :POW_SLOWEST_LIMIT
-        ]
     summary["dataplanes"] = dataplanes
     latencies = [
         (dataplane["functions"]["pbp_buf_latency"]["max_us"], dataplane["dataplane"])
@@ -4234,6 +4317,187 @@ CONGESTION_LOG_PATTERN = re.compile(
     r"(?:\s*\(alert threshold is\s*(?P<threshold>\d+(?:\.\d+)?)\s*%\))?",
     re.IGNORECASE,
 )
+
+
+class StartRead(NamedTuple):
+    """One once-per-incident read, and everything that must be true of it.
+
+    A read that is collected but not parsed, not declared, not replayable or
+    not rendered is evidence nobody can use, and each of those used to be a
+    separate list to keep in step. They are one row here: the command to send,
+    the parser that owns its answer, what its failure costs an operator,
+    whether a platform can legitimately not have it, whether it waits for the
+    first batch, and the sanitizer applied to the stored answer.
+
+    `deferred` is what keeps the monitor's cadence. The reads that describe
+    the device rather than the incident can take ten seconds on a chassis; run
+    on the critical path they would delay the first five-second snapshots,
+    which are the ones nothing can recover. They start after the first batch,
+    run in the background, and their result is journalled on its own when it
+    arrives.
+    """
+
+    command: str
+    parse: Callable[[str], Any]
+    evidence: str
+    platform_dependent: bool = False
+    deferred: bool = False
+    sanitize: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+
+
+START_READS: dict[str, StartRead] = {
+    "global_counters_raw": StartRead(
+        command="<show><counter><global/></counter></show>",
+        parse=extract_global_counters_raw,
+        evidence="the cumulative value of every global counter",
+    ),
+    "resource_monitor_history": StartRead(
+        command="<show><running><resource-monitor/></running></show>",
+        parse=extract_resource_monitor_history,
+        evidence="the hour, day and week resource-utilization history",
+    ),
+    "interface_status": StartRead(
+        command="<show><interface>all</interface></show>",
+        parse=extract_interface_status,
+        evidence="the interface zone, VLAN tag and link speed map",
+    ),
+    "zone_protection": StartRead(
+        command="<show><zone-protection/></show>",
+        parse=extract_zone_protection,
+        evidence="the per-zone flood protection state and PBP drops",
+    ),
+    "ha_state": StartRead(
+        command="<show><high-availability><state/></high-availability></show>",
+        parse=extract_ha_state,
+        evidence="the high-availability role of this unit",
+    ),
+    "inflight_monitoring": StartRead(
+        command=(
+            "<show><system><state><filter>cfg.session.*</filter></state>"
+            "</system></show>"
+        ),
+        parse=extract_inflight_monitoring,
+        evidence="the on-box ingress-backlog auto-collection state",
+    ),
+    "arp_table": StartRead(
+        command="<show><arp><entry name='all'/></arp></show>",
+        parse=extract_arp_table_header,
+        evidence="the ARP table occupancy against the platform limit",
+        deferred=True,
+        sanitize=trim_arp_entries,
+    ),
+    "application_statistics": StartRead(
+        command=(
+            "<show><running><application><statistics/></application></running></show>"
+        ),
+        parse=extract_application_statistics,
+        evidence="the applications this firewall carries",
+        deferred=True,
+    ),
+    "session_distribution": StartRead(
+        command=(
+            "<show><session><distribution><statistics/></distribution></session></show>"
+        ),
+        parse=extract_session_distribution,
+        evidence="the per-dataplane session distribution",
+        platform_dependent=True,
+        deferred=True,
+    ),
+    "chassis_status": StartRead(
+        command="<show><chassis><status/></chassis></show>",
+        parse=extract_chassis_status,
+        evidence="the chassis slot and line-card state",
+        platform_dependent=True,
+        deferred=True,
+    ),
+    "pow_performance": StartRead(
+        command=(
+            "<debug><dataplane><pow><performance><all/></performance></pow>"
+            "</dataplane></debug>"
+        ),
+        parse=extract_pow_performance,
+        evidence="the per-dataplane processing latency table",
+        platform_dependent=True,
+        deferred=True,
+    ),
+}
+
+#: The command of every once-per-incident read, for the callers that need
+#: nothing else. A view of the table above, never a second list.
+INCIDENT_START_COMMANDS = {name: read.command for name, read in START_READS.items()}
+#: The commands whose answer is streamed and filtered as it arrives instead of
+#: read whole. One entry, for the reason `read_arp_response` records.
+STREAMED_COMMAND_READERS: dict[str, Callable[[object], str]] = {
+    START_READS["arp_table"].command: read_arp_response,
+}
+#: How many once-per-incident reads may be in flight at a time. Monitor start
+#: otherwise opens every startup read and the whole first batch at once, and
+#: on a management plane already under pressure the first
+#: `show session packet-buffer-protection` snapshot - the one measurement
+#: nothing can recover - queues behind an ARP table and a dataplane timing
+#: table.
+START_READ_CONCURRENCY = 3
+#: How long monitor stop waits for the background device reads before giving
+#: up on them. They describe the firewall, not the incident: worth waiting a
+#: little for, never worth holding the report.
+CONTEXT_READ_TIMEOUT_SECONDS = 30.0
+#: The journal event carrying the deferred reads, written when they answer.
+CONTEXT_EVENT = "context_collected"
+#: What a deferred read that never answered in time is recorded as. A reader
+#: tells it apart from a read the firewall refused and from one that failed.
+CONTEXT_NOT_COLLECTED = "not_collected"
+
+#: The reads that wait for the first batch and then run in the background.
+DEFERRED_START_READS = tuple(
+    name for name, read in START_READS.items() if read.deferred
+)
+#: The reads that run while the monitor is starting, before the first batch.
+IMMEDIATE_START_READS = tuple(
+    name for name, read in START_READS.items() if not read.deferred
+)
+
+# Each read declares what its failure costs, and whether a platform can
+# legitimately not have it, in the two tables every reader consults. The
+# platform-dependent one lives with the diagnosis, beside the per-batch read
+# that shares the same treatment.
+OPTIONAL_COMMAND_EVIDENCE.update(
+    {name: read.evidence for name, read in START_READS.items()}
+)
+PLATFORM_DEPENDENT_COMMAND_EVIDENCE.update(
+    {
+        name: read.evidence
+        for name, read in START_READS.items()
+        if read.platform_dependent
+    }
+)
+
+
+def start_read_fields(payloads: dict[str, Any]) -> dict[str, Any]:
+    """Parse each once-per-incident answer with the parser its table names.
+
+    The record and the table can therefore not drift: a read added to
+    `START_READS` is parsed into the journal by the same line that collects
+    it, and one removed leaves no orphan field behind.
+    """
+    return {
+        name: START_READS[name].parse(command_result(payload))
+        for name, payload in payloads.items()
+        if name in START_READS
+    }
+
+
+def command_failure_message(name: str, payload: Any) -> str:
+    """Say what one unanswered read costs, in the words its outcome deserves.
+
+    A platform that does not have a command loses nothing an operator could
+    recover, and saying "command failed" there sends them hunting for a fault
+    that is not on their network. Every caller - the monitor's startup
+    warnings and the read-only API check - classifies with `command_outcome`
+    and words it here, so the two can never disagree about the same record.
+    """
+    if command_outcome(payload, name) == "unsupported":
+        return unsupported_command_note(name)
+    return optional_command_warning(name)
 
 
 def extract_congestion_log_entries(output: str) -> list[dict[str, Any]]:
@@ -4825,6 +5089,9 @@ class MonitorController:
         self.trigger_source_ips: set[str] = set()
         self.trigger_interfaces: set[str] = set()
         self.report_tasks: set[asyncio.Task[None]] = set()
+        # The once-per-incident reads share this, so they never crowd out the
+        # per-batch snapshots on a busy management plane.
+        self.start_read_limit = asyncio.Semaphore(START_READ_CONCURRENCY)
         self.run_starts: deque[float] = deque()
         self.webhook_tasks: set[asyncio.Task[None]] = set()
 
@@ -5074,6 +5341,23 @@ class MonitorController:
             "raw_response": self._redact_secret(response.raw_response),
             "error": None,
         }
+
+    async def _collect_start_command(
+        self, name: str
+    ) -> tuple[str, dict[str, Any]]:
+        """Run one once-per-incident read, bounded, and sanitize its answer.
+
+        The sanitizer belongs here and not at the call site: it is the last
+        point where a raw answer exists before it is persisted, so no caller
+        can forget it and no path can store what the table says must not be
+        stored.
+        """
+        read = START_READS[name]
+        async with self.start_read_limit:
+            name, payload = await self._collect_command(name, read.command)
+        if read.sanitize is not None:
+            payload = read.sanitize(payload)
+        return name, payload
 
     async def _op_commands(
         self,
@@ -5487,6 +5771,87 @@ class MonitorController:
             outcome["error"] = self._redact_secret(f"{type(exc).__name__}: {exc}")
         append_jsonl(output_file, outcome)
 
+    async def _collect_context_reads(
+        self, output_file: Path, run_id: str, started_at: str
+    ) -> None:
+        """Read what describes the firewall, off the monitor's critical path.
+
+        These answers are large and slow - an ARP table, an application table,
+        a dataplane timing table - and none of them changes during an
+        incident. Awaiting them would delay the first batch record and the
+        cadence of the batches that follow, which is the one thing a monitor
+        cannot make up afterwards. They therefore run here, bounded by the
+        same semaphore as the startup reads, and land in their own journal
+        record whenever they finish.
+        """
+        payloads = dict(
+            await asyncio.gather(
+                *(self._collect_start_command(name) for name in DEFERRED_START_READS)
+            )
+        )
+        append_jsonl(
+            output_file,
+            {
+                "timestamp": utc_now(),
+                "collector_version": __version__,
+                "run_id": run_id,
+                "event": CONTEXT_EVENT,
+                "target_name": self.cfg.target_name,
+                "monitor_started_at": started_at,
+                "parse_warnings": [
+                    command_failure_message(name, payload)
+                    for name, payload in payloads.items()
+                    if not command_succeeded(payload)
+                ],
+                **start_read_fields(payloads),
+                "commands": payloads,
+            },
+        )
+
+    async def _await_context_reads(
+        self,
+        task: asyncio.Task[None] | None,
+        output_file: Path,
+        run_id: str,
+    ) -> None:
+        """Give the device reads a bounded moment, then stop waiting for them.
+
+        The incident evidence is complete without them, so they never hold the
+        report. What they did not answer is journalled as not collected, which
+        a reader tells apart from a read that failed on the firewall.
+        """
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait_for(task, CONTEXT_READ_TIMEOUT_SECONDS)
+            return
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            LOG.exception("Device context reads failed for %s", run_id)
+            return
+        append_jsonl(
+            output_file,
+            {
+                "timestamp": utc_now(),
+                "collector_version": __version__,
+                "run_id": run_id,
+                "event": CONTEXT_EVENT,
+                "target_name": self.cfg.target_name,
+                "parse_warnings": [
+                    f"{name} did not answer within "
+                    f"{CONTEXT_READ_TIMEOUT_SECONDS:g}s, "
+                    f"{START_READS[name].evidence} was not collected"
+                    for name in DEFERRED_START_READS
+                ],
+                **{
+                    name: {"parsed": False, "status": CONTEXT_NOT_COLLECTED}
+                    for name in DEFERRED_START_READS
+                },
+                "commands": {},
+            },
+        )
+
     async def _collect_stop_evidence(
         self,
         output_file: Path,
@@ -5683,11 +6048,15 @@ class MonitorController:
         # State and history, read once while the incident is starting. None of
         # it can be recovered later: the hour/day/week utilization is already
         # rolling, and a counter that increments a dozen times an hour never
-        # shows up in a per-batch delta.
+        # shows up in a per-batch delta. The reads that describe the device
+        # rather than the incident wait for the first batch and then run in
+        # the background, so nothing that can take ten seconds on a chassis
+        # sits on the five-second cadence.
         incident_start_tasks = {
-            name: asyncio.create_task(self._collect_command(name, command))
-            for name, command in INCIDENT_START_COMMANDS.items()
+            name: asyncio.create_task(self._collect_start_command(name))
+            for name in IMMEDIATE_START_READS
         }
+        context_task: asyncio.Task[None] | None = None
         first_firewall_clock: str | None = None
         startup_pbp_settings: dict[str, Any] = {}
         startup_global_counters_raw: dict[str, Any] = {}
@@ -5713,17 +6082,14 @@ class MonitorController:
                     incident_start_payloads = dict(
                         await asyncio.gather(*incident_start_tasks.values())
                     )
-                    # The ARP table is parsed for its header and then dropped
-                    # from what is persisted: the counts are the evidence, the
-                    # customer's address-to-MAC map is not, and on a large
-                    # platform it would be megabytes of it per incident.
-                    arp_table = extract_arp_table_header(
-                        command_result(incident_start_payloads.get("arp_table"))
+                    # Done, and holding whatever they read: the answers live
+                    # in the record from here on, not in the task objects.
+                    incident_start_tasks.clear()
+                    # The device reads start only now, with the first batch
+                    # already collected, and are never awaited by this loop.
+                    context_task = asyncio.create_task(
+                        self._collect_context_reads(output_file, run_id, started_at)
                     )
-                    if "arp_table" in incident_start_payloads:
-                        incident_start_payloads["arp_table"] = trim_arp_entries(
-                            incident_start_payloads["arp_table"]
-                        )
                     device = extract_system_info(command_result(system_info))
                     identity_warnings = device_identity_warnings(device)
                     (
@@ -5738,28 +6104,20 @@ class MonitorController:
                         )
                     # One of these failing costs a piece of the report and
                     # nothing else: the batch loop below has not started yet
-                    # and must not be prevented from starting.
-                    # A command the firewall refuses as a node it does not
-                    # have costs no evidence that existed: a single-dataplane
-                    # firewall has no session distribution and no chassis. It
-                    # is recorded as what it is, so an operator does not go
-                    # looking for a collection fault on their platform.
-                    for name, payload in incident_start_payloads.items():
-                        if command_succeeded(payload):
-                            continue
-                        if name in PLATFORM_DEPENDENT_COMMAND_EVIDENCE and (
-                            command_node_unsupported(payload)
-                        ):
-                            startup_warnings.append(unsupported_command_note(name))
-                        else:
-                            startup_warnings.append(optional_command_warning(name))
+                    # and must not be prevented from starting. What each one
+                    # costs is worded in one place, shared with the read-only
+                    # API check.
+                    startup_warnings.extend(
+                        command_failure_message(name, payload)
+                        for name, payload in incident_start_payloads.items()
+                        if not command_succeeded(payload)
+                    )
                     startup_pbp_settings = extract_pbp_settings(
                         command_result(pbp_settings_payload)
                     )
-                    startup_global_counters_raw = extract_global_counters_raw(
-                        command_result(
-                            incident_start_payloads.get("global_counters_raw")
-                        )
+                    start_reads = start_read_fields(incident_start_payloads)
+                    startup_global_counters_raw = start_reads.get(
+                        "global_counters_raw", {}
                     )
                     startup_record = {
                         "timestamp": started_at,
@@ -5773,55 +6131,7 @@ class MonitorController:
                         "dp_core_functions": core_functions,
                         "dp_core_functions_source": core_functions_source,
                         "pbp_settings": startup_pbp_settings,
-                        "global_counters_raw": startup_global_counters_raw,
-                        "resource_monitor_history": (
-                            extract_resource_monitor_history(
-                                command_result(
-                                    incident_start_payloads.get(
-                                        "resource_monitor_history"
-                                    )
-                                )
-                            )
-                        ),
-                        "interface_status": extract_interface_status(
-                            command_result(
-                                incident_start_payloads.get("interface_status")
-                            )
-                        ),
-                        "zone_protection": extract_zone_protection(
-                            command_result(
-                                incident_start_payloads.get("zone_protection")
-                            )
-                        ),
-                        "ha_state": extract_ha_state(
-                            command_result(incident_start_payloads.get("ha_state"))
-                        ),
-                        "inflight_monitoring": extract_inflight_monitoring(
-                            command_result(
-                                incident_start_payloads.get("inflight_monitoring")
-                            )
-                        ),
-                        "arp_table": arp_table,
-                        "application_statistics": extract_application_statistics(
-                            command_result(
-                                incident_start_payloads.get("application_statistics")
-                            )
-                        ),
-                        "session_distribution": extract_session_distribution(
-                            command_result(
-                                incident_start_payloads.get("session_distribution")
-                            )
-                        ),
-                        "chassis_status": extract_chassis_status(
-                            command_result(
-                                incident_start_payloads.get("chassis_status")
-                            )
-                        ),
-                        "pow_performance": extract_pow_performance(
-                            command_result(
-                                incident_start_payloads.get("pow_performance")
-                            )
-                        ),
+                        **start_reads,
                         "commands": {
                             "system_info": system_info,
                             "pbp_settings": pbp_settings_payload,
@@ -6083,6 +6393,12 @@ class MonitorController:
                 if not startup_task.done():
                     startup_task.cancel()
                     await asyncio.gather(startup_task, return_exceptions=True)
+            if stop_reason == "cancelled":
+                if context_task is not None and not context_task.done():
+                    context_task.cancel()
+                    await asyncio.gather(context_task, return_exceptions=True)
+            else:
+                await self._await_context_reads(context_task, output_file, run_id)
             if stop_reason != "cancelled":
                 await self._collect_stop_evidence(
                     output_file,
@@ -6837,13 +7153,16 @@ async def run_api_check(cfg: Config) -> ApiCheckResult:
         outcome = command_outcome(record, name)
         if outcome == "succeeded":
             continue
-        # The classification comes from the shared helper; the policy stays
-        # here: an optional read is a warning whatever the reason, and only a
-        # command declared platform-dependent may be downgraded to a note.
-        if name in OPTIONAL_COMMAND_EVIDENCE:
-            validation_warnings.append(optional_command_warning(name))
-        elif outcome == "unsupported":
-            validation_notes.append(unsupported_command_note(name))
+        # The classification and the wording both come from the shared
+        # helpers, and the precedence is the monitor's: a command the platform
+        # does not have is a note wherever it is reported, an optional read
+        # that failed for a reason an operator can act on is a warning, and
+        # anything else is an error. Only the last line is this check's own
+        # policy - the monitor has no errors to raise at that point.
+        if outcome == "unsupported":
+            validation_notes.append(command_failure_message(name, record))
+        elif name in OPTIONAL_COMMAND_EVIDENCE:
+            validation_warnings.append(command_failure_message(name, record))
         else:
             validation_errors.append(f"{name} command failed")
     if not firewall_clock:

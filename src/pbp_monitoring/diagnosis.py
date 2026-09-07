@@ -74,6 +74,10 @@ CHASSIS_IMBALANCE_MEDIAN_PERCENT = 20.0
 # for addresses that are not in it yet, and the table itself is what has to be
 # looked at rather than the packet rate.
 ARP_TABLE_FULL_PERCENT = 90.0
+#: And the occupancy worth naming before it gets there: a table climbing
+#: towards its limit is the shape of the incident, and saying "far from the
+#: limit" at 85% would be false comfort.
+ARP_TABLE_CLOSE_PERCENT = 75.0
 # One dataplane holding this many times the median peer's active sessions is
 # the dispatcher sending it more work, not the same work costing more.
 SESSION_DISTRIBUTION_IMBALANCE_RATIO = 2.0
@@ -511,31 +515,37 @@ def zone_protection_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 def ha_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """The high-availability role of the monitored unit, read once at start."""
-    state = start_event(events).get("ha_state")
-    if not isinstance(state, dict):
-        return {"collected": False}
-    return {"collected": bool(state.get("parsed")), **state}
+    return _start_state(events, "ha_state")
 
 
 def inflight_monitoring_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """The on-box ingress-backlog auto-collection state, read once at start."""
-    state = start_event(events).get("inflight_monitoring")
-    if not isinstance(state, dict):
-        return {"collected": False}
-    return {"collected": bool(state.get("parsed")), **state}
+    return _start_state(events, "inflight_monitoring")
+
+
+#: The journal event carrying the reads that ran in the background, after the
+#: first batch. Declared here because the diagnosis reads it; the orchestrator
+#: writes it under the same name.
+CONTEXT_EVENT = "context_collected"
 
 
 def _start_state(events: Sequence[dict[str, Any]], field: str) -> dict[str, Any]:
     """One once-per-incident parsed read, with whether it was collected.
 
-    Every one of these is written by the monitor-start record and read back
-    the same way, so a capture taken before the read existed reports it as not
-    collected instead of raising.
+    Two records can carry one: the monitor-start record for the reads that run
+    before the first batch, and the context record for the ones that run in
+    the background after it. The start record wins where both hold the field,
+    so a capture written before the split - when every read landed in the
+    start record - reads exactly as it did.
+
+    A capture from a version that never collected the field reports it as not
+    collected rather than raising.
     """
-    state = start_event(events).get(field)
-    if not isinstance(state, dict):
-        return {"collected": False}
-    return {"collected": bool(state.get("parsed")), **state}
+    for source in (start_event(events), latest_event(events, CONTEXT_EVENT) or {}):
+        state = source.get(field)
+        if isinstance(state, dict):
+            return {"collected": bool(state.get("parsed")), **state}
+    return {"collected": False}
 
 
 def arp_table_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -2134,10 +2144,91 @@ def inflight_monitoring_note(state: dict[str, Any]) -> str:
     )
 
 
-#: The once-per-incident device reads, formatted for a step's fact table.
-#: Each returns the `(label, value, level)` triple a step appends, or None
-#: when the read was not collected. Written once here so the step, the flat
-#: report and the layered report can never state the same read differently.
+#: The once-per-incident device reads, formatted for the readers that present
+#: them. Each fact returns the `(label, value, level)` triple a step appends,
+#: or None when the read was not collected. `render_diagnosis` escapes a fact
+#: value, so these are plain text: markup put here would print as tags.
+#: Written once, so a step, a section and a pill can never state the same read
+#: differently.
+
+
+def start_read_payload(events: Sequence[dict[str, Any]], name: str) -> Any:
+    """The stored command record of one once-per-incident read, if it ran.
+
+    Looked up where `_start_state` looks for the parsed field, so a read and
+    its raw answer are always found in the same record.
+    """
+    for source in (start_event(events), latest_event(events, CONTEXT_EVENT) or {}):
+        commands = source.get("commands")
+        if isinstance(commands, dict) and name in commands:
+            return commands[name]
+    return None
+
+
+def device_read_absence(name: str, payload: Any, summary: dict[str, Any] | None) -> str:
+    """Why one device read carries nothing, decided from what it answered.
+
+    A read that is not collected has four quite different meanings, and a
+    section that renders them all as "this platform does not have it" tells an
+    operator their chassis is not a chassis when the truth is that the read
+    timed out. The stored record decides, through the same classification the
+    health view and the API check use.
+    """
+    summary = summary or {}
+    if summary.get("collected"):
+        return ""
+    if str(summary.get("status") or "") == "not_collected":
+        return (
+            "did not answer before the monitor stopped, so this evidence is "
+            "missing from this capture"
+        )
+    outcome = command_outcome(payload, name)
+    if outcome == "unsupported":
+        return (
+            "is not available on this platform or PAN-OS release, which "
+            "answered that the command does not exist there: a note about the "
+            "platform, not a collection fault, and it proves nothing either way"
+        )
+    if outcome == "failed":
+        reason = str((payload or {}).get("error") or "").strip() if isinstance(payload, dict) else ""
+        return (
+            "failed on this firewall"
+            + (f" ({reason})" if reason else "")
+            + ", so this evidence is missing and the question stays open"
+        )
+    if outcome == "succeeded":
+        return "answered, but nothing in the answer could be read"
+    return "was not collected in this capture"
+
+
+def arp_occupancy_text(summary: dict[str, Any] | None) -> str:
+    """`38 of 3000 entries (1.3%)`, or as much of it as the firewall gave.
+
+    One rule for the whole report: the step's fact, the storm hypothesis, the
+    finding and the section's verdict all print this, so the occupancy cannot
+    read one way in the walk and another in the evidence.
+    """
+    summary = summary or {}
+    entries = _first_number(summary.get("entries"))
+    if entries is None:
+        return ""
+    maximum = _first_number(summary.get("maximum_entries"))
+    percent = _first_number(summary.get("utilization_percent"))
+    text = (
+        f"{_fmt(entries)} of {_fmt(maximum)} entries"
+        if maximum
+        else f"{_fmt(entries)} entries, against a platform limit the firewall "
+        "did not return"
+    )
+    if percent is not None:
+        text += f" ({_pct(percent)})"
+    return text
+
+
+def arp_table_full(summary: dict[str, Any] | None) -> bool:
+    """Is the ARP table at or above the occupancy that is its own incident?"""
+    percent = _first_number((summary or {}).get("utilization_percent"))
+    return percent is not None and percent >= ARP_TABLE_FULL_PERCENT
 
 
 def arp_table_fact(summary: dict[str, Any] | None) -> tuple[str, str, str] | None:
@@ -2145,24 +2236,13 @@ def arp_table_fact(summary: dict[str, Any] | None) -> tuple[str, str, str] | Non
     summary = summary or {}
     if not summary.get("collected"):
         return None
-    entries = _first_number(summary.get("entries"))
-    maximum = _first_number(summary.get("maximum_entries"))
-    percent = _first_number(summary.get("utilization_percent"))
-    if entries is None:
+    text = arp_occupancy_text(summary)
+    if not text:
         return None
-    text = (
-        f"{_fmt(entries)} of {_fmt(maximum)} entries"
-        if maximum
-        else f"{_fmt(entries)} entries"
-    )
-    if percent is not None:
-        text += f" ({_pct(percent)})"
-    level = (
-        "warn"
-        if percent is not None and percent >= ARP_TABLE_FULL_PERCENT
-        else "none"
-    )
-    return ("ARP table", text, level)
+    dataplane = summary.get("dataplane")
+    if dataplane and len(summary.get("dataplanes") or []) > 1:
+        text += f", fullest on {dataplane}"
+    return ("ARP table", text, "warn" if arp_table_full(summary) else "none")
 
 
 def top_application(summary: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -2176,6 +2256,18 @@ def top_application(summary: dict[str, Any] | None) -> dict[str, Any] | None:
     return ranked[0] if isinstance(ranked[0], dict) else None
 
 
+def application_share_percent(summary: dict[str, Any] | None) -> float | None:
+    """What share of this firewall's bytes the busiest application carries."""
+    top = top_application(summary)
+    if top is None:
+        return None
+    total_bytes = _first_number(((summary or {}).get("totals") or {}).get("bytes"))
+    top_bytes = _first_number(top.get("bytes"))
+    if not total_bytes or top_bytes is None:
+        return None
+    return round(top_bytes * 100.0 / total_bytes, 1)
+
+
 def application_fact(summary: dict[str, Any] | None) -> tuple[str, str, str] | None:
     """The busiest application by bytes, always as a share since boot.
 
@@ -2186,14 +2278,41 @@ def application_fact(summary: dict[str, Any] | None) -> tuple[str, str, str] | N
     top = top_application(summary)
     if top is None:
         return None
-    totals = (summary or {}).get("totals") or {}
-    total_bytes = _first_number(totals.get("bytes"))
-    top_bytes = _first_number(top.get("bytes"))
-    text = f"<code>{_escape(top.get('application'))}</code>"
-    if total_bytes and top_bytes is not None:
-        text += f" carries {_pct(round(top_bytes * 100.0 / total_bytes, 1))}"
+    share = application_share_percent(summary)
+    text = str(top.get("application"))
+    if share is not None:
+        text += f" carries {_pct(share)}"
     text += " of the bytes this firewall has forwarded since boot"
     return ("Top application", text, "none")
+
+
+def session_distribution_imbalance(summary: dict[str, Any] | None) -> str:
+    """How lopsided the dispatcher's split was, in one phrase or none.
+
+    A median of zero is not a missing measurement: it is the extreme case, one
+    dataplane holding every session while its peers hold none, and the ratio
+    that would express it does not exist. It is named rather than rounded away
+    into "spread evenly".
+    """
+    summary = summary or {}
+    ratio = _first_number(summary.get("imbalance_ratio"))
+    median = _first_number(summary.get("median_active"))
+    busiest = _first_number(summary.get("busiest_active"))
+    if ratio is not None:
+        return f"{_fmt(ratio)}x the median of its peers"
+    if median == 0 and busiest:
+        return "its peers held no session at all"
+    return ""
+
+
+def session_distribution_uneven(summary: dict[str, Any] | None) -> bool:
+    """Was one dataplane given materially more sessions than its peers?"""
+    summary = summary or {}
+    ratio = _first_number(summary.get("imbalance_ratio"))
+    if ratio is not None:
+        return ratio >= SESSION_DISTRIBUTION_IMBALANCE_RATIO
+    median = _first_number(summary.get("median_active"))
+    return median == 0 and bool(_first_number(summary.get("busiest_active")))
 
 
 def session_distribution_fact(
@@ -2206,21 +2325,17 @@ def session_distribution_fact(
     count = _first_number(summary.get("dataplane_count"))
     busiest = summary.get("busiest")
     active = _first_number(summary.get("busiest_active"))
-    ratio = _first_number(summary.get("imbalance_ratio"))
     if not count or busiest is None or active is None:
         return None
-    text = (
-        f"{_fmt(count)} dataplanes, busiest <code>{_escape(busiest)}</code> "
-        f"with {_fmt(active)} active sessions"
+    text = f"{_fmt(count)} dataplanes, busiest {busiest} with {_fmt(active)} active sessions"
+    imbalance = session_distribution_imbalance(summary)
+    if imbalance:
+        text += f", {imbalance}"
+    return (
+        "Session distribution",
+        text,
+        "bad" if session_distribution_uneven(summary) else "none",
     )
-    if ratio is not None:
-        text += f", {_fmt(ratio)}x the median of its peers"
-    level = (
-        "warn"
-        if ratio is not None and ratio >= SESSION_DISTRIBUTION_IMBALANCE_RATIO
-        else "none"
-    )
-    return ("Session distribution", text, level)
 
 
 def pow_latency_fact(summary: dict[str, Any] | None) -> tuple[str, str, str] | None:
@@ -2240,8 +2355,45 @@ def pow_latency_fact(summary: dict[str, Any] | None) -> tuple[str, str, str] | N
     dataplane = summary.get("peak_pbp_buffer_latency_dataplane")
     text = f"{_fmt(peak)} µs longest buffer wait"
     if dataplane:
-        text += f" on <code>{_escape(dataplane)}</code>"
+        text += f" on {dataplane}"
     return ("Buffer wait (dataplane counters)", text, "none")
+
+
+#: The chassis cards whose job is to carry traffic. A chassis also holds a
+#: management and a log card, which are populated, healthy and absent from the
+#: traffic-enabled list by design: reading their absence as a fault would
+#: raise a finding on every healthy chassis in the field.
+_TRAFFIC_CARD_MARKERS = ("npc", "dpc")
+
+
+def _carries_traffic(component: Any) -> bool:
+    """Is this card one PAN-OS is expected to dispatch sessions to?"""
+    name = str(component or "").lower()
+    return any(marker in name for marker in _TRAFFIC_CARD_MARKERS)
+
+
+def chassis_slots_idle(summary: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The traffic cards the firewall itself does not list as carrying traffic.
+
+    The verdict is the firewall's own `Traffic enabled slots` line, not a card
+    status this collector interprets: a card can read `Booting`, `Starting` or
+    be a deliberately disabled spare and none of those is an incident. A card
+    that should be dispatching sessions and is not, is.
+    """
+    summary = summary or {}
+    if not summary.get("collected"):
+        return []
+    enabled = summary.get("traffic_enabled_slots")
+    slots = summary.get("slots")
+    if not isinstance(enabled, list) or not enabled or not isinstance(slots, list):
+        return []
+    return [
+        slot
+        for slot in slots
+        if isinstance(slot, dict)
+        and _carries_traffic(slot.get("component"))
+        and slot.get("slot") not in enabled
+    ]
 
 
 def _distribution_note(summary: dict[str, Any] | None, dataplane: str) -> str:
@@ -2280,31 +2432,13 @@ def _distribution_note(summary: dict[str, Any] | None, dataplane: str) -> str:
         note += f", against a median of {_fmt(median)} on its peers"
         note += (
             ": the imbalance is in what it was given."
-            if median > 0
-            and active / median >= SESSION_DISTRIBUTION_IMBALANCE_RATIO
+            if session_distribution_uneven(summary)
             else ": the session counts are even, so the imbalance is in what "
             "those sessions cost rather than in how many there are."
         )
     else:
         note += "."
     return note
-
-
-def chassis_slots_down(summary: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """The populated chassis slots whose card was not up, bounded."""
-    summary = summary or {}
-    if not summary.get("collected"):
-        return []
-    slots = summary.get("slots")
-    if not isinstance(slots, list):
-        return []
-    return [
-        slot
-        for slot in slots
-        if isinstance(slot, dict)
-        and slot.get("component")
-        and str(slot.get("card_status") or "").lower() != "up"
-    ][:_MAX_NAMED]
 
 
 def _step_ingress_backlogs(
@@ -3274,21 +3408,10 @@ def _step_elsewhere(
     # see fills the buffers with packets; a table climbing towards its own
     # limit starts failing to resolve addresses that are not in it yet.
     arp_table = context.get("arp_table") or {}
-    arp_entries = _first_number(arp_table.get("entries"))
-    arp_maximum = _first_number(arp_table.get("maximum_entries"))
-    arp_occupancy = _first_number(arp_table.get("utilization_percent"))
-    arp_table_note = ""
-    if arp_table.get("collected") and arp_entries is not None:
-        arp_table_note = (
-            f" The ARP table itself held {_fmt(arp_entries)} entries"
-            + (
-                f" of the {_fmt(arp_maximum)} this platform supports"
-                if arp_maximum
-                else ""
-            )
-            + (f" ({_pct(arp_occupancy)})" if arp_occupancy is not None else "")
-            + "."
-        )
+    arp_occupancy = arp_occupancy_text(arp_table) if arp_table.get("collected") else ""
+    arp_table_note = (
+        f" The ARP table itself held {_escape(arp_occupancy)}." if arp_occupancy else ""
+    )
     if arp_rate >= ARP_STORM_RATE_PER_SECOND:
         gratuitous_share = (
             _signal_total(arp, *arp_counters["gratuitous"]) / arp_total
@@ -3324,20 +3447,15 @@ def _step_elsewhere(
     # ARP table exhaustion: the other shape of the same class. The table fills
     # towards the platform limit and resolution starts failing for every
     # address not already in it, which is not a packet rate any counter shows.
-    if (
-        arp_table.get("collected")
-        and arp_occupancy is not None
-        and arp_occupancy >= ARP_TABLE_FULL_PERCENT
-    ):
+    if arp_table.get("collected") and arp_table_full(arp_table):
         hypotheses.append(
             {
                 "key": "arp_table_full",
                 "title": "ARP table near its limit",
                 "state": "positive",
                 "text": (
-                    f"<strong>The ARP table held {_fmt(arp_entries)} of the "
-                    f"{_fmt(arp_maximum)} entries this platform supports "
-                    f"({_pct(arp_occupancy)})</strong>. A table at its limit "
+                    f"<strong>The ARP table held {_escape(arp_occupancy)}"
+                    "</strong>. A table at its limit "
                     "stops resolving addresses that are not already in it, so "
                     "the dataplane holds packets waiting for a resolution that "
                     "never completes - buffers consumed by traffic that never "
@@ -3667,27 +3785,32 @@ def _step_elsewhere(
     # A line card that is not up concentrates the same traffic on the cards
     # that are left. That is a capacity explanation the buffer levels alone
     # never give, and it is read from the chassis, not inferred from them.
-    slots_down = chassis_slots_down(context.get("chassis_status"))
-    if slots_down:
+    idle_cards = chassis_slots_idle(context.get("chassis_status"))
+    if idle_cards:
         named_slots = ", ".join(
             f"slot {_escape(slot.get('slot'))} "
             f"(<code>{_escape(slot.get('component'))}</code>, "
             f"{_escape(slot.get('card_status') or 'no status')})"
-            for slot in slots_down
+            for slot in idle_cards[:_MAX_NAMED]
         )
         hypotheses.append(
             {
                 "key": "chassis_slot",
-                "title": "Line card not up",
+                "title": "Line card not carrying traffic",
                 "state": "positive",
                 "text": (
-                    f"<strong>{_count(len(slots_down), 'populated chassis slot was', 'populated chassis slots were')} "
-                    f"not up during the incident</strong>: {named_slots}. The "
-                    "traffic those cards were carrying is redistributed over "
-                    "the cards that remain, so the buffers of the surviving "
-                    "dataplanes carry a load the chassis was not sized for. "
-                    "Restoring the card is the remedy; the buffer levels are "
-                    "the symptom."
+                    "<strong>"
+                    + _count(
+                        len(idle_cards),
+                        "traffic card was",
+                        "traffic cards were",
+                    )
+                    + " missing from the chassis's own traffic-enabled slot "
+                    f"list</strong>: {named_slots}. The traffic those cards "
+                    "were carrying is redistributed over the cards that "
+                    "remain, so the buffers of the surviving dataplanes carry "
+                    "a load the chassis was not sized for. Restoring the card "
+                    "is the remedy; the buffer levels are the symptom."
                 ),
                 "named": [],
             }

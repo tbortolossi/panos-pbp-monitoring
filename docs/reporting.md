@@ -398,9 +398,10 @@ collapse* (sessions draining under a pinned buffer — the terminal stage),
 `flow_dos_drop_ip_blocked` says it cost, and the warning when the source may
 be shared infrastructure), *ARP table near its limit* (the table at 90% or more
 of what the platform supports, where resolution starts failing for every
-address not already in it), *line card not up* (a populated chassis slot whose
-card was down, concentrating its traffic on the cards that remain), and *recent
-boot or upgrade* (the known-issue hypothesis). An elephant session whose application is backup or storage
+address not already in it), *line card not carrying traffic* (a chassis traffic
+card the firewall itself does not list as traffic-enabled, concentrating its
+load on the cards that remain), and *recent boot or upgrade* (the known-issue
+hypothesis). An elephant session whose application is backup or storage
 traffic carries its own guardrail: align PBP, QoS or the schedule with the
 backup window rather than blocking your own media server.
 
@@ -510,8 +511,9 @@ or `rx-multicast` is moving is the only localization left.
 ## Device and traffic context
 
 Five reads taken once per incident that describe the firewall rather than the
-second the trigger landed on. None of them attributes an incident on its own;
-each frames a finding above.
+second the trigger landed on. They run in the background, after the first
+batch, so nothing here ever delayed a packet-buffer snapshot. None of them
+attributes an incident on its own; each frames a finding above.
 
 **ARP table** gives the occupancy of the table: how many entries it held
 against how many the platform supports, and the default entry timeout. That is
@@ -528,9 +530,14 @@ dispatcher was giving the saturated dataplane more sessions than its peers — a
 hashing or policy question — or whether the counts were even and the imbalance
 is in what those sessions cost.
 
-**Chassis** lists the slots, the card in each and whether it is up. A line card
-that dropped out concentrates its traffic on the cards that remain, which is a
-capacity explanation the buffer levels alone never give.
+**Chassis** lists the slots, the card in each and whether the chassis is
+dispatching traffic to it. The verdict is the firewall's own *Traffic enabled
+slots* line, not a card status read here: a card can be booting, or be a
+deliberately disabled spare, and neither is an incident. A traffic card the
+chassis is not dispatching to is one, because what it was forwarding is
+concentrated on the cards that remain — a capacity explanation the buffer
+levels alone never give. The management and log cards of a chassis never carry
+traffic and are never a finding.
 
 **Dataplane processing latency** is the firewall's own timing table, reduced to
 the rows a buffer incident needs: the longest and average time a packet waited
@@ -544,9 +551,13 @@ threat counts. These counters are cumulative since the firewall booted, never
 for the incident, and the section says so: they are the context for deciding
 whether a named offender is an anomaly or the site's daily business.
 
-A platform without one of these reads — a single-dataplane firewall has no
-distribution and no chassis — says so as a platform note. Nothing was lost:
-the firewall answered that the command does not exist there.
+A read that carries nothing says which of four things happened, because they
+are not the same news. The firewall answered that the command does not exist
+there — a single-dataplane firewall has no distribution and no chassis — and
+nothing was lost. The read failed, with the reason, and that evidence is
+missing. It did not answer before the monitor stopped. Or the capture predates
+the read. A section that showed all four as "not a chassis" would tell an
+operator their chassis is not one when the truth is that a read timed out.
 
 ## Denied and dropped traffic
 

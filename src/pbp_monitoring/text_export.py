@@ -10,6 +10,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from .diagnosis import CONTEXT_EVENT
+
 
 def _text(value: Any) -> str:
     if isinstance(value, str):
@@ -161,6 +163,11 @@ def write_record_text_export(
     """Write the text file corresponding to one startup or cycle record."""
     if record.get("event") == "monitor_started":
         filename = "startup.txt"
+    elif record.get("event") == CONTEXT_EVENT:
+        # The device reads answer after the first batch and land in their own
+        # record; without this they would be the one part of a capture the
+        # text export does not carry.
+        filename = "context.txt"
     elif record.get("cycle") is not None:
         try:
             cycle = int(record["cycle"])

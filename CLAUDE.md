@@ -52,7 +52,14 @@ accordingly:
    to disabled verification for compatibility with appliance certificates, and
    the UI and logs must make that reduced assurance visible.
 5. Preserve direct-firewall and Panorama `target` operation modes.
-6. Preserve raw command outputs in JSONL for TAC evidence.
+6. Preserve raw command outputs in JSONL for TAC evidence. One recorded
+   exception: the entries of `show arp all` are dropped as the answer streams
+   and replaced by a marker, keeping the header the collector reads. The
+   entries are the customer's whole address-to-MAC map, up to 128000 of them,
+   and nothing in the diagnosis reads a single one. Any further exception
+   needs the same three things: the evidence is not read, the data identifies
+   the customer or is unbounded, and the stored answer says the collector
+   removed it.
 7. Treat parser failures as partial collection failures; one failed command
    must not discard successful results from the same cycle.
 8. Deduplicate concurrent triggers. A new trigger during an active incident

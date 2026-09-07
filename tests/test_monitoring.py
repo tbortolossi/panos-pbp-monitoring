@@ -9,12 +9,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from pbp_monitoring import __version__
+from pbp_monitoring import __version__, orchestrator
 from pbp_monitoring.config_store import ConfigStore
 from pbp_monitoring.orchestrator import (
     PBP_SETTINGS_COMMAND,
     CLOCK_COMMAND,
     CONGESTION_LOG_QUERY,
+    CONTEXT_EVENT,
+    DEFERRED_START_READS,
+    IMMEDIATE_START_READS,
     DP_CORE_FUNCTIONS_COMMAND,
     INCIDENT_START_COMMANDS,
     INTERFACE_COUNTER_ALL_COMMAND,
@@ -3443,8 +3446,8 @@ class IncidentStateEvidenceTests(unittest.TestCase):
                 record for record in records if record.get("event") == "monitor_started"
             )
 
-            for name, command in INCIDENT_START_COMMANDS.items():
-                self.assertIn(command, client.commands, name)
+            for name in IMMEDIATE_START_READS:
+                self.assertIn(INCIDENT_START_COMMANDS[name], client.commands, name)
                 self.assertIn(name, started["commands"])
             self.assertEqual(started["parse_warnings"], [])
             # The counter no delta window could ever have caught.
@@ -3476,33 +3479,58 @@ class IncidentStateEvidenceTests(unittest.TestCase):
             self.assertEqual(inflight["duration_seconds"], 3)
             self.assertIs(inflight["trigger_pending"], False)
 
-    def test_the_tier_two_device_reads_land_in_the_startup_record(self):
+    def test_the_tier_two_device_reads_land_in_the_context_record(self):
+        """They describe the firewall, so they answer on their own record."""
         with tempfile.TemporaryDirectory() as temporary_directory:
             _, records = self._run(Path(temporary_directory))
-            started = next(
-                record for record in records if record.get("event") == "monitor_started"
+            context = next(
+                record for record in records if record.get("event") == CONTEXT_EVENT
             )
 
-            self.assertEqual(started["arp_table"]["entries"], 2)
-            self.assertEqual(started["arp_table"]["maximum_entries"], 3000)
+            self.assertEqual(context["arp_table"]["entries"], 2)
+            self.assertEqual(context["arp_table"]["maximum_entries"], 3000)
             self.assertEqual(
-                started["application_statistics"]["top_by_bytes"][0]["application"],
+                context["application_statistics"]["top_by_bytes"][0]["application"],
                 "ssl",
             )
-            self.assertEqual(started["session_distribution"]["busiest"], "s1dp0")
-            self.assertEqual(started["chassis_status"]["populated_slots"], 2)
+            self.assertEqual(context["session_distribution"]["busiest"], "s1dp0")
+            self.assertEqual(context["chassis_status"]["traffic_enabled_slots"], [1, 2])
             self.assertEqual(
-                started["pow_performance"]["peak_pbp_buffer_latency_us"], 670
+                context["pow_performance"]["peak_pbp_buffer_latency_us"], 670
             )
+            self.assertEqual(context["parse_warnings"], [])
+
+    def test_the_first_batch_is_issued_before_the_device_reads(self):
+        """The five-second cadence is never delayed by a device read.
+
+        An ARP table or a dataplane timing table can take ten seconds on a
+        chassis. Collected on the critical path they would push the first
+        snapshots past the seconds that matter, and those cannot be taken
+        again.
+        """
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            client, _ = self._run(Path(temporary_directory))
+
+            first_batch = max(
+                client.commands.index(command)
+                for command in OP_COMMANDS.values()
+                if command in client.commands
+            )
+            for name in DEFERRED_START_READS:
+                self.assertGreater(
+                    client.commands.index(INCIDENT_START_COMMANDS[name]),
+                    first_batch,
+                    name,
+                )
 
     def test_the_stored_arp_answer_carries_the_header_and_no_address(self):
         """The capture keeps how full the table was, never who is in it."""
         with tempfile.TemporaryDirectory() as temporary_directory:
             _, records = self._run(Path(temporary_directory))
-            started = next(
-                record for record in records if record.get("event") == "monitor_started"
+            context = next(
+                record for record in records if record.get("event") == CONTEXT_EVENT
             )
-            stored = json.dumps(started["commands"]["arp_table"])
+            stored = json.dumps(context["commands"]["arp_table"])
 
             self.assertIn("<total>2</total>", stored)
             self.assertIn("removed by the collector", stored)
@@ -3533,20 +3561,58 @@ class IncidentStateEvidenceTests(unittest.TestCase):
             output_dir = Path(temporary_directory)
             asyncio.run(scenario(make_config(output_dir)))
             capture = incident_capture_path(output_dir, "refused-run")
-            started = next(
+            context = next(
                 record
                 for record in (
                     json.loads(line)
                     for line in capture.read_text(encoding="utf-8").splitlines()
                 )
-                if record.get("event") == "monitor_started"
+                if record.get("event") == CONTEXT_EVENT
             )
 
-            warnings = started["parse_warnings"]
+            warnings = context["parse_warnings"]
             self.assertEqual(len(warnings), 2)
             for warning in warnings:
                 self.assertIn("not supported on this platform", warning)
                 self.assertNotIn("command failed", warning)
+
+    def test_device_reads_that_never_answer_do_not_hold_the_report(self):
+        """A read still running at monitor stop is recorded, not waited for.
+
+        The incident evidence is complete without them. Waiting would hold the
+        report on a chassis whose ARP table takes longer to print than the
+        incident lasted.
+        """
+
+        class SlowContextClient(self.LoggingClient):
+            def op_response(self, command_xml: str) -> PanOSResponse:
+                if command_xml == INCIDENT_START_COMMANDS["pow_performance"]:
+                    time.sleep(0.2)
+                return super().op_response(command_xml)
+
+        async def scenario(cfg):
+            controller = MonitorController(cfg, SlowContextClient())
+            with patch.object(orchestrator, "CONTEXT_READ_TIMEOUT_SECONDS", 0.0):
+                await controller._monitor("slow-context-run")
+            await controller.wait_for_reports()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            asyncio.run(scenario(make_config(output_dir)))
+            capture = incident_capture_path(output_dir, "slow-context-run")
+            context = next(
+                record
+                for record in (
+                    json.loads(line)
+                    for line in capture.read_text(encoding="utf-8").splitlines()
+                )
+                if record.get("event") == CONTEXT_EVENT
+            )
+
+            self.assertEqual(context["pow_performance"], {"parsed": False, "status": "not_collected"})
+            self.assertTrue(
+                any("did not answer" in warning for warning in context["parse_warnings"])
+            )
 
     def test_the_two_raw_counter_reads_bracket_the_incident(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

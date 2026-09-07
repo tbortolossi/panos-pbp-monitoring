@@ -2173,18 +2173,37 @@ class IncidentStateSectionTests(unittest.TestCase):
 
 
 class DeviceContextSectionTests(unittest.TestCase):
-    """The device section carries the Tier 2 reads, or says they were not read."""
+    """The device section carries the Tier 2 reads, or says why it cannot."""
 
     # The same capture builder as the other once-per-incident reads, without
-    # inheriting that class's tests and running them a second time.
-    _render = IncidentStateSectionTests._render
+    # inheriting that class's tests and running them a second time. The device
+    # reads answer on their own record, so they are passed as an event.
+    _render_records = IncidentStateSectionTests._render
+
+    def _render(self, context: dict, commands: dict | None = None) -> str:
+        record = {
+            "run_id": "state-run",
+            "event": "context_collected",
+            **context,
+            "commands": commands or {},
+        }
+        return self._render_records({}, [record])
 
     def test_the_arp_header_is_shown_without_a_single_address(self):
         html = self._render(
             {
                 "arp_table": {
                     "parsed": True,
-                    "dataplanes": ["dp0"],
+                    "dataplane": "dp0",
+                    "dataplanes": [
+                        {
+                            "dataplane": "dp0",
+                            "entries": 38,
+                            "maximum_entries": 3000,
+                            "utilization_percent": 1.3,
+                            "timeout_seconds": 1800,
+                        }
+                    ],
                     "entries": 38,
                     "maximum_entries": 3000,
                     "timeout_seconds": 1800,
@@ -2195,9 +2214,9 @@ class DeviceContextSectionTests(unittest.TestCase):
 
         self.assertIn("Device and traffic context", html)
         self.assertIn("ARP table", html)
-        self.assertIn("Entries the platform supports", html)
+        self.assertIn("38 of 3000 entries (1.3%)", html)
         self.assertIn("far from the platform limit", html)
-        self.assertIn("stay on the firewall", html)
+        self.assertIn("dropped as the answer streams", html)
 
     def test_a_nearly_full_arp_table_reads_as_a_finding_in_the_section(self):
         html = self._render(
@@ -2207,6 +2226,7 @@ class DeviceContextSectionTests(unittest.TestCase):
                     "entries": 2940,
                     "maximum_entries": 3000,
                     "utilization_percent": 98.0,
+                    "dataplanes": [],
                 }
             }
         )
@@ -2214,13 +2234,43 @@ class DeviceContextSectionTests(unittest.TestCase):
         self.assertIn("verdict-bad", html)
         self.assertIn("stops resolving addresses it does not", html)
 
+    def test_a_table_without_a_platform_limit_leaves_the_question_open(self):
+        html = self._render(
+            {
+                "arp_table": {
+                    "parsed": True,
+                    "entries": 2940,
+                    "maximum_entries": None,
+                    "utilization_percent": None,
+                    "dataplanes": [],
+                }
+            }
+        )
+
+        self.assertIn("did not return the number of entries", html)
+        self.assertNotIn("far from the platform limit", html)
+
+    def test_a_table_close_to_its_limit_is_not_called_far_from_it(self):
+        html = self._render(
+            {
+                "arp_table": {
+                    "parsed": True,
+                    "entries": 2550,
+                    "maximum_entries": 3000,
+                    "utilization_percent": 85.0,
+                    "dataplanes": [],
+                }
+            }
+        )
+
+        self.assertIn("close to the platform limit", html)
+        self.assertNotIn("far from the platform limit", html)
+
     def test_the_applications_are_labelled_as_cumulative_since_boot(self):
         html = self._render(
             {
                 "application_statistics": {
                     "parsed": True,
-                    "vsys_count": 1,
-                    "application_count": 2,
                     "reported_application_count": 2,
                     "totals": {"bytes": 1000, "sessions": 10},
                     "top_by_bytes": [
@@ -2266,9 +2316,6 @@ class DeviceContextSectionTests(unittest.TestCase):
                 },
                 "chassis_status": {
                     "parsed": True,
-                    "populated_slots": 2,
-                    "slots_up": 1,
-                    "slots_not_up": [2],
                     "traffic_enabled_slots": [1],
                     "slots": [
                         {
@@ -2280,7 +2327,7 @@ class DeviceContextSectionTests(unittest.TestCase):
                         {
                             "slot": 2,
                             "component": "PA-7000-DPC-A",
-                            "card_status": "Down",
+                            "card_status": "Powered Off",
                             "config_status": "Success",
                         },
                     ],
@@ -2291,8 +2338,7 @@ class DeviceContextSectionTests(unittest.TestCase):
         self.assertIn("<code>s1dp0</code>", html)
         self.assertIn("21.25x the median of its peers", html)
         self.assertIn("PA-7000-DPC-A", html)
-        self.assertIn("slot 2 held a card that was not up", html)
-        self.assertIn("Slots carrying traffic: 1", html)
+        self.assertIn("slot 2 holds a traffic card", html)
 
     def test_the_dataplane_latency_table_states_the_longest_buffer_wait(self):
         html = self._render(
@@ -2306,17 +2352,12 @@ class DeviceContextSectionTests(unittest.TestCase):
                             "dataplane": "s1dp0",
                             "functions": {
                                 "pbp_buf_latency": {
-                                    "function": "pbp_buf_latency",
                                     "max_us": 670,
                                     "avg_us": 2.4,
                                     "count": 161525,
-                                    "total_us": 393629,
                                 }
                             },
-                            "latency_histogram": [
-                                {"avg_us": 2.0, "count": 113315, "total_us": 244850}
-                            ],
-                            "slowest": [],
+                            "latency_histogram": [{"avg_us": 2.0, "count": 113315}],
                         }
                     ],
                 }
@@ -2325,17 +2366,39 @@ class DeviceContextSectionTests(unittest.TestCase):
 
         self.assertIn("Dataplane processing latency", html)
         self.assertIn("<code>pbp_buf_latency</code>", html)
-        self.assertIn("longest a packet waited on a buffer was 670", html)
+        self.assertIn("670 µs longest buffer wait", html)
         self.assertIn("Buffer wait distribution", html)
 
-    def test_a_platform_without_these_reads_says_so_rather_than_showing_nothing(self):
+    def test_a_platform_that_does_not_have_a_read_is_told_from_one_that_failed(self):
+        """A refused node is a platform fact; a timeout is a missing read."""
+        html = self._render(
+            {},
+            {
+                "chassis_status": {
+                    "ok": False,
+                    "error": "TimeoutError: the read timed out",
+                    "result": "",
+                },
+                "session_distribution": {
+                    "ok": False,
+                    "error": (
+                        "PanOSAPIError: show -> session -> distribution  is "
+                        "unexpected"
+                    ),
+                    "result": "",
+                },
+            },
+        )
+
+        self.assertIn("Chassis failed on this firewall", html)
+        self.assertIn("the read timed out", html)
+        self.assertNotIn("Chassis is not available on this platform", html)
+        self.assertIn("Session distribution is not available on this platform", html)
+
+    def test_a_read_this_version_never_ran_says_so(self):
         html = self._render({})
 
-        self.assertIn("ARP table header was not collected", html)
-        self.assertIn("this firewall has a single dataplane", html)
-        self.assertIn("not a chassis", html)
-        self.assertIn("processing-latency table was not", html)
-        self.assertIn("application statistics were not collected", html)
+        self.assertIn("was not collected in this capture", html)
 
 
 class IngressBacklogPlatformTests(unittest.TestCase):
