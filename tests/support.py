@@ -41,3 +41,25 @@ def stop_fast_password_hashing() -> None:
 # flag, which it checks every `poll_interval` seconds. The 0.5 s default made
 # every test that starts an HTTP or HTTPS server wait half a second on teardown.
 SERVER_POLL_INTERVAL = 0.01
+
+
+#: The record PAN-OS leaves when its CLI parser rejects a command as a node
+#: the platform does not have, and the record a read that did not complete
+#: leaves. The two are the whole difference between a platform limit and a
+#: collection fault, so every test that exercises that distinction builds them
+#: from here rather than retyping an error string that could drift.
+REJECTED_NODE = {
+    "ok": False,
+    "result": "",
+    "raw_response": "raw unexpected node",
+    "error": (
+        "PanOSAPIError: show -> running -> resource-monitor -> "
+        "ingress-backlogs unexpected here show -> running  is unexpected"
+    ),
+}
+TIMED_OUT = {
+    "ok": False,
+    "result": "",
+    "raw_response": "",
+    "error": "TimeoutError: the read timed out",
+}

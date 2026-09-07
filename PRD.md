@@ -746,7 +746,16 @@ key must be backed up and restored together.
     id` and source addresses with their recovered traffic log, presented as
     the firewall's designation and not as proof; (3) the sessions holding at
     least 2% of the ingress backlog, calling out unidentified applications and
-    the `flow_slowpath` + `Bad Key` policy-deny signature, and stating the
+    the `flow_slowpath` + `Bad Key` policy-deny signature, counting only the
+    batches whose command actually ran and declining the metric per platform
+    family — the on-chip descriptor queue on a Cavium chassis, the dataplane's
+    in-flight work entries over `max-inflight-num` (32768 by default) on an
+    x86 platform and on a VM-Series, which runs the same dataplane — with the
+    state decided by what the firewall answered and never by the model: data
+    returned is read, every batch rejected as a node the firewall does not
+    have is stated as a note about the platform rather than a negative or an
+    error (PAN-OS left VM-Series out of the x86 support), and every batch
+    failing for another reason is reported as a failed read; and stating the
     on-box auto-collection state: enabled, it names
     `/var/log/pan/pan_ingress_backlogs.log` as the 100 ms-resolution evidence
     to ask TAC for; disabled, it recommends that the operator enable it on the

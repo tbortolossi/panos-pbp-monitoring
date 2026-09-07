@@ -18,6 +18,7 @@ from pbp_monitoring.reporting import (
     _SIGNAL_COUNTER_FAMILIES,
     generate_html_report,
 )
+from tests.support import REJECTED_NODE, TIMED_OUT
 
 
 def _cycle(number: int, buffer_pct: float, **extra: object) -> dict:
@@ -42,6 +43,10 @@ def _render(records: list[dict]) -> str:
         return generate_html_report(capture).read_text(encoding="utf-8")
 
 
+def _facts(step: dict) -> list[tuple[str, str]]:
+    return [(label, value) for label, value, _ in step["facts"]]
+
+
 def _diagnose(cycles: list[dict], events: list[dict] | None = None, **kwargs: object) -> dict:
     defaults = {
         "attribution": [],
@@ -56,6 +61,24 @@ def _diagnose(cycles: list[dict], events: list[dict] | None = None, **kwargs: ob
 
 
 class PlatformTests(unittest.TestCase):
+    def test_a_vm_series_measures_the_same_in_flight_queue_as_an_x86(self):
+        """A VM-Series runs the x86 dataplane, so the metric means the same."""
+        virtual = hardware_generation("PA-VM")
+        x86 = hardware_generation("PA-440")
+        cavium = hardware_generation("PA-5220")
+
+        self.assertEqual(
+            virtual["ingress_backlog_metric"], x86["ingress_backlog_metric"]
+        )
+        self.assertTrue(virtual["ingress_backlog_in_flight"])
+        self.assertTrue(x86["ingress_backlog_in_flight"])
+        self.assertFalse(cavium["ingress_backlog_in_flight"])
+        # Only a VM-Series explains the rejection by the x86 exclusion; the
+        # other families print the generic reason.
+        self.assertIn("left VM-Series", virtual["ingress_backlog_absent_reason"])
+        self.assertNotIn("VM-Series", x86["ingress_backlog_absent_reason"])
+        self.assertNotIn("VM-Series", cavium["ingress_backlog_absent_reason"])
+
     def test_cavium_and_x86_families_are_told_apart_from_the_model(self):
         self.assertEqual(hardware_generation("PA-5220")["family"], "cavium")
         self.assertEqual(hardware_generation("PA-3260")["family"], "cavium")
@@ -251,17 +274,235 @@ class IngressBacklogStepTests(unittest.TestCase):
         self.assertIn("undecided or unknown application", backlogs["verdict"])
         self.assertEqual(diagnosis["headline"]["label"], "Offender in the ingress backlog")
 
-    def test_an_empty_backlog_on_x86_is_not_read_as_proof(self):
+    def test_an_empty_backlog_on_x86_names_the_in_flight_work_metric(self):
         cycles = [_cycle(1, 60.0, ingress_backlogs={"dataplanes": [{"slot": "1", "dp": "0", "atomic_percentage": 0.0, "total_percentage": 0.0}], "candidates": []})]
         diagnosis = _diagnose(cycles, device={"model": "PA-440"})
+        verdict = diagnosis["steps"][2]["verdict"]
 
         self.assertEqual(diagnosis["steps"][2]["state"], "negative")
-        self.assertIn("an empty result is not proof", diagnosis["steps"][2]["verdict"])
+        self.assertIn("in-flight work entries", verdict)
+        self.assertIn("max-inflight-num", verdict)
+        self.assertNotIn("hardware queue of the Cavium chassis", verdict)
+
+    def test_an_empty_backlog_on_a_cavium_chassis_keeps_its_wording(self):
+        cycles = [_cycle(1, 60.0, ingress_backlogs={"dataplanes": [{"slot": "1", "dp": "0", "atomic_percentage": 0.0, "total_percentage": 0.0}], "candidates": []})]
+        diagnosis = _diagnose(cycles, device={"model": "PA-5220"})
+        verdict = diagnosis["steps"][2]["verdict"]
+
+        self.assertEqual(diagnosis["steps"][2]["state"], "negative")
+        self.assertIn(
+            "Whatever filled the buffers was not one session waiting in the queue",
+            verdict,
+        )
+        self.assertNotIn("in-flight work entries", verdict)
+
+    def test_a_vm_series_rejection_is_unavailable_and_not_a_negative(self):
+        cycles = [
+            _cycle(
+                number,
+                60.0,
+                commands={"ingress_backlogs": dict(REJECTED_NODE)},
+                ingress_backlogs={"dataplanes": [], "candidates": []},
+            )
+            for number in (1, 2)
+        ]
+        diagnosis = _diagnose(cycles, device={"model": "PA-VM"})
+        step = diagnosis["steps"][2]
+
+        self.assertEqual(step["state"], "unavailable")
+        self.assertTrue(step["node_unsupported"])
+        self.assertIn("not available on this platform", step["verdict"])
+        self.assertIn("VM-Series out of that support", step["verdict"])
+        self.assertIn("note about the platform, not a collection fault", step["verdict"])
+        self.assertIn("show counter global filter delta yes", step["verdict"])
+        self.assertNotIn("No session held", step["verdict"])
+        self.assertEqual(dict(_facts(step))["Batches with the command"], "0")
+        self.assertEqual(dict(_facts(step))["Batches without the node"], "2")
+        self.assertIn(
+            "not available on this platform",
+            " ".join(diagnosis["conclusion"]),
+        )
+
+    def test_every_batch_rejecting_the_node_is_unavailable_on_any_platform(self):
+        cycles = [
+            _cycle(
+                1,
+                60.0,
+                commands={"ingress_backlogs": dict(REJECTED_NODE)},
+                ingress_backlogs={"dataplanes": [], "candidates": []},
+            )
+        ]
+        diagnosis = _diagnose(cycles, device={"model": "PA-440"})
+        step = diagnosis["steps"][2]
+
+        self.assertEqual(step["state"], "unavailable")
+        self.assertIn("rejected the command", step["verdict"])
+        self.assertNotIn("No session held", step["verdict"])
+
+    def test_a_vm_series_that_answers_is_read_from_its_data(self):
+        """A returned answer is evidence, whatever the model is said to support."""
+        cycles = [
+            _cycle(
+                1,
+                60.0,
+                commands={"ingress_backlogs": {"ok": True, "result": "<entry/>"}},
+                ingress_backlogs={"dataplanes": [{"slot": "1", "dp": "0", "atomic_percentage": 12.0, "total_percentage": 14.0}], "candidates": []},
+            )
+        ]
+        diagnosis = _diagnose(cycles, device={"model": "PA-VM"})
+        step = diagnosis["steps"][2]
+
+        self.assertEqual(step["state"], "negative")
+        self.assertFalse(step["node_unsupported"])
+        self.assertIn("in-flight work entries", step["verdict"])
+        self.assertIn("queue peak ATOMIC 12%, TOTAL 14%", step["verdict"])
+        self.assertNotIn("not available on this platform", step["verdict"])
+        self.assertNotIn("left VM-Series out", step["verdict"])
+        self.assertEqual(dict(_facts(step))["Batches with the command"], "1")
+
+    def test_a_supported_platform_that_rejects_the_node_is_still_unavailable(self):
+        """The firewall's answer decides, not the family the model belongs to."""
+        cycles = [
+            _cycle(
+                1,
+                60.0,
+                commands={"ingress_backlogs": dict(REJECTED_NODE)},
+                ingress_backlogs={"dataplanes": [], "candidates": []},
+            )
+        ]
+        diagnosis = _diagnose(cycles, device={"model": "PA-5220"})
+        step = diagnosis["steps"][2]
+
+        self.assertEqual(step["state"], "unavailable")
+        self.assertTrue(step["node_unsupported"])
+        self.assertIn("answered that it has no", step["verdict"])
+        self.assertNotIn("left VM-Series out", step["verdict"])
+
+    def test_every_batch_failing_for_another_reason_is_a_failed_step(self):
+        cycles = [
+            _cycle(
+                number,
+                60.0,
+                commands={"ingress_backlogs": dict(TIMED_OUT)},
+                ingress_backlogs={"dataplanes": [], "candidates": []},
+            )
+            for number in (1, 2)
+        ]
+        diagnosis = _diagnose(cycles, device={"model": "PA-440"})
+        step = diagnosis["steps"][2]
+
+        self.assertEqual(step["state"], "failed")
+        self.assertFalse(step["node_unsupported"])
+        self.assertIn("failed in all 2 of the 2 batches", step["verdict"])
+        self.assertNotIn("No session held", step["verdict"])
+        # A step that could not be read is still reported, not dropped.
+        findings = collect_findings(diagnosis)
+        self.assertIn(
+            "Session holding the ingress backlog",
+            [item["title"] for item in findings["unavailable"]],
+        )
+
+    def test_a_timed_out_backlog_read_is_counted_as_a_failed_batch(self):
+        cycles = [
+            _cycle(
+                1,
+                60.0,
+                commands={"ingress_backlogs": dict(TIMED_OUT)},
+                ingress_backlogs={"dataplanes": [], "candidates": []},
+            ),
+            _cycle(
+                2,
+                60.0,
+                commands={"ingress_backlogs": {"ok": True, "result": "<entry/>"}},
+                ingress_backlogs={"dataplanes": [{"slot": "1", "dp": "0", "atomic_percentage": 0.0, "total_percentage": 0.0}], "candidates": []},
+            ),
+        ]
+        diagnosis = _diagnose(cycles, device={"model": "PA-5220"})
+        step = diagnosis["steps"][2]
+
+        self.assertEqual(step["state"], "negative")
+        self.assertFalse(step["node_unsupported"])
+        self.assertIn("in any of the 1 batches that ran the command", step["verdict"])
+        self.assertIn("failed for another reason in 1 of the 2 batches", step["verdict"])
+        self.assertEqual(dict(_facts(step))["Batches with a failed read"], "1")
+
+    def test_the_conclusion_says_the_read_failed_rather_than_was_not_collected(self):
+        cycles = [
+            _cycle(
+                1,
+                60.0,
+                commands={"ingress_backlogs": dict(TIMED_OUT)},
+                ingress_backlogs={"dataplanes": [], "candidates": []},
+            )
+        ]
+        conclusion = " ".join(_diagnose(cycles, device={"model": "PA-440"})["conclusion"])
+
+        self.assertIn("ingress backlog read failed in every batch", conclusion)
+        self.assertIn("worth repairing", conclusion)
+        self.assertNotIn("The ingress backlog was not collected", conclusion)
+
+    def test_a_legacy_capture_without_the_raw_command_is_not_a_negative(self):
+        """`extract_ingress_backlogs` returns a dict even for an empty answer."""
+        cycles = [
+            _cycle(number, 60.0, ingress_backlogs={"dataplanes": [], "candidates": []})
+            for number in (1, 2)
+        ]
+        step = _diagnose(cycles, device={"model": "PA-440"})["steps"][2]
+
+        self.assertEqual(step["state"], "unavailable")
+        self.assertNotIn("No session held", step["verdict"])
+        self.assertEqual(dict(_facts(step))["Batches with the command"], "0")
+
+    def test_a_legacy_capture_that_carries_dataplanes_still_counts(self):
+        cycles = [
+            _cycle(1, 60.0, ingress_backlogs={"dataplanes": [{"slot": "1", "dp": "0", "atomic_percentage": 0.0, "total_percentage": 0.0}], "candidates": []})
+        ]
+        step = _diagnose(cycles, device={"model": "PA-440"})["steps"][2]
+
+        self.assertEqual(step["state"], "negative")
+        self.assertEqual(dict(_facts(step))["Batches with the command"], "1")
+
+    def test_a_mixed_run_names_every_batch_that_answered_nothing(self):
+        """The counts in the verdict must add up to the batches that asked."""
+        cycles = [
+            _cycle(1, 60.0, commands={"ingress_backlogs": {"ok": True, "result": "<entry/>"}},
+                   ingress_backlogs={"dataplanes": [{"slot": "1", "dp": "0", "atomic_percentage": 1.0, "total_percentage": 2.0}], "candidates": []}),
+            _cycle(2, 60.0, commands={"ingress_backlogs": dict(REJECTED_NODE)},
+                   ingress_backlogs={"dataplanes": [], "candidates": []}),
+            _cycle(3, 60.0, commands={"ingress_backlogs": dict(TIMED_OUT)},
+                   ingress_backlogs={"dataplanes": [], "candidates": []}),
+        ]
+        step = _diagnose(cycles, device={"model": "PA-440"})["steps"][2]
+        facts = dict(_facts(step))
+
+        self.assertEqual(step["state"], "negative")
+        self.assertIn("in any of the 1 batches that ran the command", step["verdict"])
+        self.assertIn("rejected it as an absent node in 1", step["verdict"])
+        self.assertIn("the read failed for another reason in 1", step["verdict"])
+        self.assertIn("of the 3 batches", step["verdict"])
+        self.assertEqual(facts["Batches with the command"], "1")
+        self.assertEqual(facts["Batches without the node"], "1")
+        self.assertEqual(facts["Batches with a failed read"], "1")
+
+    def test_a_rejected_node_verdict_does_not_count_its_batches_twice(self):
+        cycles = [
+            _cycle(1, 60.0, commands={"ingress_backlogs": dict(REJECTED_NODE)},
+                   ingress_backlogs={"dataplanes": [], "candidates": []}),
+            _cycle(2, 60.0, commands={"ingress_backlogs": dict(TIMED_OUT)},
+                   ingress_backlogs={"dataplanes": [], "candidates": []}),
+        ]
+        step = _diagnose(cycles, device={"model": "PA-VM"})["steps"][2]
+
+        self.assertEqual(step["state"], "unavailable")
+        self.assertIn("rejected in 1 of the 2 batches", step["verdict"])
+        self.assertIn("the read failed for another reason in 1", step["verdict"])
+        self.assertNotIn("rejected it as an absent node", step["verdict"])
 
     def test_a_capture_without_the_command_says_so(self):
         diagnosis = _diagnose([_cycle(1, 60.0)])
 
         self.assertEqual(diagnosis["steps"][2]["state"], "unavailable")
+        self.assertFalse(diagnosis["steps"][2]["node_unsupported"])
 
     def _backlog_step(self, inflight: dict | None) -> dict:
         started = {

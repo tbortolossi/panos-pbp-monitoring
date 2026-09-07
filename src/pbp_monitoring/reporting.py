@@ -30,6 +30,10 @@ from .diagnosis import (
     _numbers,
     build_diagnosis,
     buffer_latency_statuses,
+    command_node_unsupported,
+    PLATFORM_DEPENDENT_COMMAND_EVIDENCE,
+    hardware_generation,
+    ingress_backlog_collection,
     congestion_recurrence,
     ha_summary,
     history_trend,
@@ -954,10 +958,28 @@ def _detail_items(details: Any) -> list[tuple[str, Any]]:
     return [("session_details", details)]
 
 
+def _platform_limit(name: str, payload: Any) -> bool:
+    """Is this a command the platform simply does not have?
+
+    A rejected node is a fact about the platform that no credential, role or
+    network change repairs. Counting it as a partial error sends an operator
+    looking for a collection fault that does not exist, so the health view
+    reports it separately.
+
+    Only the commands declared platform-dependent qualify, exactly as the
+    read-only validation treats them: a mandatory command rejected by an old
+    PAN-OS release is a real gap in the evidence and stays an error here.
+    """
+    return (
+        name in PLATFORM_DEPENDENT_COMMAND_EVIDENCE
+        and command_node_unsupported(payload)
+    )
+
+
 def _record_error_count(record: dict[str, Any]) -> int:
     command_errors = sum(
-        _contains_error(payload)
-        for _, payload in _command_items(record.get("commands"))
+        _contains_error(payload) and not _platform_limit(name, payload)
+        for name, payload in _command_items(record.get("commands"))
     )
     detail_errors = sum(
         _contains_error(payload)
@@ -1069,8 +1091,12 @@ def _render_commands(commands: Any) -> str:
 
     fragments: list[str] = []
     for name, payload in items:
-        state = "Error" if _contains_error(payload) else "Result"
-        state_class = " bad" if _contains_error(payload) else ""
+        if _platform_limit(name, payload):
+            state, state_class = "Not available on this platform", " note"
+        elif _contains_error(payload):
+            state, state_class = "Error", " bad"
+        else:
+            state, state_class = "Result", ""
         fragments.append(
             '<details class="raw-block">'
             f'<summary><code>{_escape(name)}</code>'
@@ -1546,11 +1572,9 @@ def _render_inflight_monitoring(events: list[tuple[int, dict[str, Any]]]) -> str
 def _render_ingress_backlogs(
     cycles: list[tuple[int, dict[str, Any]]],
     attribution: list[dict[str, Any]],
+    collection: dict[str, int],
 ) -> str:
     """List the sessions the ingress work queue named, and the queue itself."""
-    collected = [
-        record for _, record in cycles if isinstance(record.get("ingress_backlogs"), dict)
-    ]
     queue_rows: list[str] = []
     for batch_number, (_, record) in enumerate(cycles, 1):
         ingress = record.get("ingress_backlogs")
@@ -1615,15 +1639,40 @@ def _render_ingress_backlogs(
             + "</tbody></table></div>"
         )
     candidates = _ingress_candidate_entities(attribution)
-    if not candidates and not collected:
+    if not candidates and not collection["succeeded"]:
+        if collection["unsupported"]:
+            return (
+                '<p class="muted">The firewall rejected <code>show running '
+                "resource-monitor ingress-backlogs</code> as a node it does not "
+                f"have in {collection['unsupported']} of the "
+                f"{collection['batches']} batches: the command is not available "
+                "on this platform, so this section holds no evidence either "
+                "way.</p>"
+            )
+        if collection["failed"]:
+            return (
+                '<p class="muted">The ingress backlog read failed in all '
+                f"{collection['failed']} of the {collection['batches']} batches "
+                "— a timeout or a permission the API role does not have, not a "
+                "node the firewall rejected — so this section holds no evidence "
+                "either way.</p>"
+            )
         return (
             '<p class="muted">The ingress backlogs were not collected in this '
             "capture.</p>"
         )
     if not candidates:
+        note = (
+            f' The command failed in {collection["failed"]} further '
+            f'batch{"es" if collection["failed"] != 1 else ""}, which carry no '
+            "backlog evidence."
+            if collection["failed"]
+            else ""
+        )
         return (
             f'<p class="muted">No session held 2% of the work queue in any of the '
-            f"{len(collected)} batches that ran the command.</p>" + queue_html
+            f"{collection['succeeded']} batches that ran the command.{note}</p>"
+            + queue_html
         )
     rows = []
     for item in candidates[:_MAX_RENDERED_ATTRIBUTION_ROWS]:
@@ -2229,6 +2278,7 @@ REPORT_STYLE = """    :root { color-scheme: light; --ink:#172033; --muted:#64748
     details.raw-block>summary { display:flex; align-items:center; gap:9px; padding:9px 12px; cursor:pointer; }
     .pill { margin-left:auto; padding:2px 8px; border-radius:999px; background:#dff6f2; color:#115e59; font-size:11px; font-weight:700; }
     .pill.bad { background:#fee4e2; color:var(--danger); }
+    .pill.note { background:#e2e8f0; color:#334155; }
     .signal-high { color:var(--danger); font-weight:800; }
     .chart { display:block; max-width:100%; height:auto; margin:6px 0 4px; padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:#fff; }
     .chart text.axis { fill:#475569; font:11px ui-sans-serif,system-ui,sans-serif; }
@@ -3732,6 +3782,52 @@ def _render_nav(items: Sequence[tuple[str, str]]) -> str:
     ) + "</nav>"
 
 
+def _report_generation(parts: dict[str, Any]) -> dict[str, Any]:
+    """The platform description the diagnosis already derived for this capture.
+
+    Deriving it a second time from the model string could drift from what the
+    steps say. A capture with no batch has no diagnosis, and only then is the
+    model read directly.
+    """
+    diagnosis = parts.get("diagnosis")
+    if isinstance(diagnosis, dict):
+        generation = diagnosis.get("context", {}).get("generation")
+        if isinstance(generation, dict):
+            return generation
+    return hardware_generation(parts["device_model"])
+
+
+def _ingress_intro(generation: dict[str, Any], collection: dict[str, int]) -> str:
+    """Say what the ingress backlog percentages are, or that there are none.
+
+    The same command means a different thing per generation - the on-chip
+    descriptor queue on the Cavium chassis, the dataplane's in-flight work
+    entries on the x86 platforms and on a VM-Series, which runs the same
+    dataplane. Whether there is anything to read is decided by what the
+    firewall answered, not by the model: the "not available" wording appears
+    only when every batch was rejected as a node the firewall does not have.
+    """
+    opening = (
+        "Which sessions held at least 2% of the work queue in front of the "
+        "dataplane cores (<code>show running resource-monitor "
+        "ingress-backlogs</code>). "
+    )
+    if not collection["succeeded"] and collection["unsupported"]:
+        return (
+            opening
+            + generation["ingress_backlog_absent_reason"]
+            + " The section is not available on this platform: a note about "
+            "the platform, not a collection fault, and it proves nothing "
+            "either way."
+        )
+    return (
+        opening
+        + "Independent of the PBP learning: the percentages are "
+        + generation["ingress_backlog_metric"]
+        + "."
+    )
+
+
 def _evidence_sections(parts: dict[str, Any]) -> str:
     """The sections that carry the detail behind the diagnosis.
 
@@ -3815,10 +3911,9 @@ def _evidence_sections(parts: dict[str, Any]) -> str:
                 "ingress-title",
                 "Ingress backlog",
                 ingress_html,
-                intro="Which sessions held at least 2% of the work queue in front "
-                "of the dataplane cores (<code>show running resource-monitor "
-                "ingress-backlogs</code>). Independent of the PBP learning: the "
-                "queue is where the on-chip descriptors are consumed.",
+                intro=_ingress_intro(
+                    _report_generation(parts), parts["ingress_collection"]
+                ),
                 pill=ingress_pill,
                 open=False,
             ),
@@ -3974,8 +4069,9 @@ def _build_report_parts(
     # The on-box collection state is appended whatever the backlogs read:
     # whether the tech support file carries the 100 ms samples is a separate
     # question from what this capture managed to collect.
+    ingress_collection = ingress_backlog_collection([record for _, record in cycles])
     ingress_html = _render_ingress_backlogs(
-        cycles, attribution
+        cycles, attribution, ingress_collection
     ) + _render_inflight_monitoring(events)
     buffer_latency_html = _render_buffer_latency(cycles)
     pbp_threat_logs_html = _render_pbp_threat_logs(events)
@@ -4400,11 +4496,20 @@ def _build_report_parts(
     else:
         attribution_pill = "no offender learned"
     ingress_candidate_count = len(_ingress_candidate_entities(attribution))
-    ingress_pill = (
-        f"{ingress_candidate_count} session{'s' if ingress_candidate_count != 1 else ''} in the queue"
-        if ingress_candidate_count
-        else "no session at 2%"
-    )
+    if ingress_candidate_count:
+        ingress_pill = (
+            f"{ingress_candidate_count} session"
+            f"{'s' if ingress_candidate_count != 1 else ''} in the queue"
+        )
+    elif ingress_collection["unsupported"] and not ingress_collection["succeeded"]:
+        # Never "no session at 2%" when the firewall rejected the command in
+        # every batch: that pill would read as a negative result the capture
+        # cannot support. Decided by what the firewall answered, not the model.
+        ingress_pill = "not available on this platform"
+    elif not ingress_collection["succeeded"] and ingress_collection["failed"]:
+        ingress_pill = "read failed in every batch"
+    else:
+        ingress_pill = "no session at 2%"
     isolated_cores = [v for v in cpu_verdict_data if v.get("state") == "isolated"]
     if not cpu_verdict_data:
         cpu_pill = "not sampled"
@@ -4498,6 +4603,7 @@ def _build_report_parts(
         "generated_at": generated_at,
         "history_html": history_html,
         "history_pill": history_pill,
+        "ingress_collection": ingress_collection,
         "ingress_html": ingress_html,
         "ingress_pill": ingress_pill,
         "large_pill": large_pill,

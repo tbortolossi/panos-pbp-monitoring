@@ -585,18 +585,181 @@ def uptime_days(value: Any) -> float | None:
     return round(days + (hours * 3600 + minutes * 60 + seconds) / 86400.0, 3)
 
 
+#: What `show running resource-monitor ingress-backlogs` reports, per platform
+#: family, and whether the node is expected to exist there.
+#:
+#: On the Cavium chassis the queue the command reports is the on-chip
+#: descriptor queue itself. PAN-OS 10.2 brought the command to the x86
+#: platforms, where the same percentages are the dataplane's in-flight work
+#: entries over `max-inflight-num` (32768 by default) - the software
+#: equivalent of that queue, not on-chip descriptors. A VM-Series runs that
+#: same x86 dataplane and the metric means the same thing there; it was left
+#: out of the x86 support (PAN-222805, still rejected on 11.2.3-h3), so the
+#: PAN-OS CLI parser is expected to refuse the node and no credential, role or
+#: network change repairs that.
+#:
+#: Nothing here is a verdict. What a firewall actually answered decides
+#: whether the step has evidence: a VM-Series that returns data is read from
+#: its data, and a platform whose family is listed as an in-flight one still
+#: has nothing to read when it rejected the node. These entries only choose
+#: the wording, per family: the metric the percentages measure, whether that
+#: metric is the software in-flight queue, and the sentence to print when the
+#: firewall answered that the node does not exist.
+_IN_FLIGHT_WORK_METRIC = (
+    "the in-flight work entries of the dataplane, as a percentage of its "
+    "<code>max-inflight-num</code> (32768 by default)"
+)
+_GENERIC_NODE_ABSENT_REASON = (
+    "This firewall answered that it has no <code>show running "
+    "resource-monitor ingress-backlogs</code> node, so its own CLI parser "
+    "rejected the command."
+)
+_VM_SERIES_NODE_ABSENT_REASON = (
+    "PAN-OS introduced <code>show running resource-monitor "
+    "ingress-backlogs</code> for the x86 platforms in 10.2 and left VM-Series "
+    "out of that support, so this firewall rejected the node."
+)
+#: family -> (metric prose, metric is the in-flight work queue, absent reason)
+_INGRESS_BACKLOG_METRICS = {
+    "cavium": (
+        "the on-chip descriptor queue of the chassis",
+        False,
+        _GENERIC_NODE_ABSENT_REASON,
+    ),
+    "x86": (_IN_FLIGHT_WORK_METRIC, True, _GENERIC_NODE_ABSENT_REASON),
+    "virtual": (_IN_FLIGHT_WORK_METRIC, True, _VM_SERIES_NODE_ABSENT_REASON),
+    "unknown": (
+        "the work queue in front of the dataplane cores",
+        False,
+        _GENERIC_NODE_ABSENT_REASON,
+    ),
+}
+
+
+def _generation(label: str, family: str, on_chip_descriptors: bool | None) -> dict[str, Any]:
+    metric, in_flight, absent_reason = _INGRESS_BACKLOG_METRICS[family]
+    return {
+        "label": label,
+        "family": family,
+        "on_chip_descriptors": on_chip_descriptors,
+        "ingress_backlog_metric": metric,
+        "ingress_backlog_in_flight": in_flight,
+        "ingress_backlog_absent_reason": absent_reason,
+    }
+
+
 def hardware_generation(model: Any) -> dict[str, Any]:
     """Name the platform family a model belongs to and what it can report."""
     text = str(model or "").strip().upper()
     if not text or text == "—":
-        return {"label": "unknown platform", "family": "unknown", "on_chip_descriptors": None}
+        return _generation("unknown platform", "unknown", None)
     if text.startswith(_VIRTUAL_PREFIXES):
-        return {"label": "virtual platform", "family": "virtual", "on_chip_descriptors": False}
+        return _generation("virtual platform", "virtual", False)
     if text.startswith(_X86_PREFIXES):
-        return {"label": "x86 platform (gen4)", "family": "x86", "on_chip_descriptors": False}
+        return _generation("x86 platform (gen4)", "x86", False)
     if text.startswith(_CAVIUM_PREFIXES):
-        return {"label": "Cavium platform (gen3)", "family": "cavium", "on_chip_descriptors": True}
-    return {"label": "unknown platform", "family": "unknown", "on_chip_descriptors": None}
+        return _generation("Cavium platform (gen3)", "cavium", True)
+    return _generation("unknown platform", "unknown", None)
+
+
+def command_succeeded(record: Any) -> bool:
+    """Did this stored command record come back with a usable answer?
+
+    Accepts the legacy string form a very old capture carries as well as the
+    structured record. `orchestrator` re-exports it.
+    """
+    if isinstance(record, str):
+        return not record.startswith("ERROR:")
+    return isinstance(record, dict) and record.get("ok") is True
+
+
+#: Evidence that exists only on some platforms or PAN-OS releases. A command
+#: listed here stays mandatory: it is downgraded to a note only when the
+#: firewall itself answers that the node does not exist, never when the read
+#: fails for a reason the operator could fix. PAN-OS introduced
+#: `ingress-backlogs` for the x86 platforms in 10.2 and left VM-Series out of
+#: that support (PAN-222805, still rejected on 11.2.3-h3), so the CLI parser
+#: refuses the node there.
+#:
+#: An absent node is not reduced evidence: no role, no upgrade and no
+#: configuration makes a VM-Series answer this command. Reporting it amber
+#: would leave every VM-Series permanently amber, which is how an operator
+#: learns to stop reading amber, so it is recorded as a note beside a check
+#: that passes.
+PLATFORM_DEPENDENT_COMMAND_EVIDENCE = {
+    "ingress_backlogs": "the per-dataplane ingress backlog work-queue levels",
+}
+
+#: Fragments PAN-OS uses to reject a command its parser does not know on this
+#: platform or release, as opposed to one it knows and could not run.
+_UNSUPPORTED_NODE_MARKERS = (
+    "unexpected here",
+    "is unexpected",
+    "no such node",
+    "unknown command",
+)
+
+
+def command_node_unsupported(record: Any) -> bool:
+    """Did the firewall reject the command as a node it does not have?
+
+    A rejection by the PAN-OS CLI parser means the command does not exist on
+    this model or release, which no credential, role or network change would
+    repair. Every other failure - a timeout, an HTTP status, a denied
+    permission - stays a collection failure.
+
+    This reads nothing but the stored record, so the validation that runs the
+    command and the diagnosis that reads it back out of a capture classify a
+    rejection identically. `orchestrator` re-exports it.
+    """
+    if not isinstance(record, dict) or record.get("ok") is True:
+        return False
+    error = str(record.get("error") or "").lower()
+    if not error.startswith("panosapierror:"):
+        return False
+    return any(marker in error for marker in _UNSUPPORTED_NODE_MARKERS)
+
+
+def ingress_backlog_collection(cycles: Sequence[dict[str, Any]]) -> dict[str, int]:
+    """Split the batches by what the ingress-backlogs read actually returned.
+
+    A batch whose command the firewall rejected as a node it does not have
+    carries no backlog evidence, and neither does one that timed out. Only the
+    batches that ran the command can answer the question, so they are the only
+    ones counted. The two failure modes stay apart: a rejected node is a
+    platform capability gap nothing on the collector side can fix, while a
+    timeout or a denied permission is a collection fault an operator acts on.
+
+    `batches` counts the batches that attempted the read, not every cycle, so
+    the three outcomes always add up to it.
+    """
+    counts = {"batches": 0, "succeeded": 0, "unsupported": 0, "failed": 0}
+    for record in cycles:
+        commands = record.get("commands")
+        payload = (
+            commands.get("ingress_backlogs") if isinstance(commands, dict) else None
+        )
+        if payload is None:
+            # Captures written before the raw command travelled in the batch
+            # record: the parsed result is all there is to read, and
+            # `extract_ingress_backlogs` returns a dict even for an empty or
+            # refused answer. An empty one proves nothing, so it counts as a
+            # batch that never asked rather than as a clean, empty queue.
+            parsed = record.get("ingress_backlogs")
+            if isinstance(parsed, dict) and (
+                parsed.get("dataplanes") or parsed.get("candidates")
+            ):
+                counts["batches"] += 1
+                counts["succeeded"] += 1
+            continue
+        counts["batches"] += 1
+        if command_succeeded(payload):
+            counts["succeeded"] += 1
+        elif command_node_unsupported(payload):
+            counts["unsupported"] += 1
+        else:
+            counts["failed"] += 1
+    return counts
 
 
 _ALERT_THRESHOLD_PATTERN = re.compile(r"alert threshold is\s*(\d+(?:\.\d+)?)\s*%", re.I)
@@ -1642,19 +1805,93 @@ def _step_ingress_backlogs(
                 total_peak = total if total_peak is None else max(total_peak, total)
     candidates = _ingress_candidate_entities(attribution)
     inflight = inflight_monitoring_state(context.get("inflight_monitoring"))
+    collection = ingress_backlog_collection(cycles)
+    succeeded = collection["succeeded"]
+    unsupported = collection["unsupported"]
+    failed = collection["failed"]
     facts: list[tuple[str, str, str]] = [
-        ("Batches with the command", _fmt(len(collected)), "none"),
-        ("Queue peak (ATOMIC / TOTAL)", f"{_pct(atomic_peak)} / {_pct(total_peak)}", "none"),
-        ("Sessions listed", _fmt(len(candidates)), "none"),
-        # Informational, never amber: disabled is the PAN-OS default, so
-        # colouring it would put a warning on nearly every capture and dilute
-        # what amber means on the rows that carry the step's own verdict.
-        ("On-box auto-collection", inflight_monitoring_fact(inflight), "none"),
+        ("Batches with the command", _fmt(succeeded), "none"),
     ]
+    if unsupported:
+        # A node the platform does not have is a fact about the firewall, not
+        # something an operator can repair, so it is stated and not flagged.
+        facts.append(("Batches without the node", _fmt(unsupported), "none"))
+    if failed:
+        facts.append(("Batches with a failed read", _fmt(failed), "warn"))
+    facts.extend(
+        [
+            ("Queue peak (ATOMIC / TOTAL)", f"{_pct(atomic_peak)} / {_pct(total_peak)}", "none"),
+            ("Sessions listed", _fmt(len(candidates)), "none"),
+            # Informational, never amber: disabled is the PAN-OS default, so
+            # colouring it would put a warning on nearly every capture and
+            # dilute what amber means on the rows that carry the step's own
+            # verdict.
+            ("On-box auto-collection", inflight_monitoring_fact(inflight), "none"),
+        ]
+    )
     named: list[str] = []
+    node_unsupported = False
     generation = context["generation"]
-    if not collected and not candidates:
+    # What the firewall answered decides the state, never the model. A batch
+    # that returned data is evidence whatever the platform is said to support,
+    # and a platform said to support the command still has none when every
+    # batch came back rejected. The generation only chooses the wording.
+    node_absent = succeeded == 0 and unsupported > 0
+    read_failed = succeeded == 0 and unsupported == 0 and failed > 0
+    def _missing_note(include_rejected: bool) -> str:
+        """Name every batch that answered nothing, so the counts add up.
+
+        `include_rejected` is False on the verdict that has already stated its
+        own rejection count, so no batch is counted to the reader twice.
+        """
+        parts: list[str] = []
+        if include_rejected and unsupported:
+            parts.append(f"the firewall rejected it as an absent node in {unsupported}")
+        if failed:
+            parts.append(f"the read failed for another reason in {failed}")
+        if not parts:
+            return ""
+        return (
+            " Not every batch answered: "
+            + " and ".join(parts)
+            + f" of the {collection['batches']} batches, which therefore carry "
+            "no backlog evidence."
+        )
+    # Sessions extracted from the backlog output are evidence the command
+    # returned, so they answer the step before any failure count is read.
+    unavailable_reason = ""
+    if not candidates and node_absent:
         state, level = "unavailable", "none"
+        node_unsupported = True
+        unavailable_reason = "not available on this platform"
+        verdict = (
+            "<strong>The ingress backlog is not available on this "
+            "platform.</strong> "
+            + generation["ingress_backlog_absent_reason"]
+            + f" It was rejected in {unsupported} of the "
+            f"{collection['batches']} batches. That is a note about the "
+            "platform, not a collection fault, an error or a negative result: "
+            "it says nothing about whether a session dominated the work queue. "
+            "Here the global counter delta of step 4 (<code>show counter "
+            "global filter delta yes</code>) carries the weight of this "
+            "question."
+        )
+    elif not candidates and read_failed:
+        state, level = "failed", "warn"
+        unavailable_reason = (
+            f"read failed in {failed} of {collection['batches']} batches"
+        )
+        verdict = (
+            f"<strong>The ingress backlog read failed in all {failed} of the "
+            f"{collection['batches']} batches.</strong> The firewall did not "
+            "reject the node, so the command exists here; the reads did not "
+            "complete - a timeout or a permission the API role does not have. "
+            "This step holds no evidence either way, and the failure is worth "
+            "repairing before the next incident."
+        )
+    elif not candidates and not succeeded:
+        state, level = "unavailable", "none"
+        unavailable_reason = "not collected"
         verdict = (
             "<strong>The ingress backlogs were not collected</strong> in this "
             "capture, so this step cannot be answered."
@@ -1716,17 +1953,23 @@ def _step_ingress_backlogs(
         state, level = "negative", "ok"
         verdict = (
             f"<strong>No session held {_fmt(INGRESS_BACKLOG_PERCENT)}% of the work "
-            f"queue</strong> in any of the {len(collected)} batches (queue peak "
-            f"ATOMIC {_pct(atomic_peak)}, TOTAL {_pct(total_peak)}). "
+            f"queue</strong> in any of the {succeeded} batches that ran the command "
+            f"(queue peak ATOMIC {_pct(atomic_peak)}, TOTAL {_pct(total_peak)}). "
         )
-        if generation["family"] == "x86":
+        if generation["ingress_backlog_in_flight"]:
             verdict += (
-                "PAN-OS documents this command for the hardware queue of the "
-                f"Cavium chassis; on this {generation['label']} an empty result is not "
-                "proof that no session dominated, so the next step carries the weight."
+                f"On this {generation['label']} these percentages are "
+                f"{generation['ingress_backlog_metric']}, the software equivalent "
+                "of the on-chip descriptor queue, so an empty result means no "
+                "session dominated the in-flight work at the sampled instants."
             )
         else:
             verdict += "Whatever filled the buffers was not one session waiting in the queue."
+    # A batch that answered nothing is worth naming wherever the step landed.
+    # The "read failed" verdict already speaks of nothing else, and the "not
+    # available" verdict has already stated its own rejection count.
+    if state != "failed":
+        verdict += _missing_note(include_rejected=not node_unsupported)
     verdict += inflight_monitoring_note(inflight)
     return {
         "number": 3,
@@ -1742,6 +1985,13 @@ def _step_ingress_backlogs(
         # The work queue is read independently of the PBP learning, so this
         # step never reports what PBP ranked.
         "ranking_derived": False,
+        # Whether the absence of an answer is the platform lacking the node,
+        # so the conclusion never calls a capability gap a lost collection.
+        "node_unsupported": node_unsupported,
+        # One line saying why this step has no answer, for a report that folds
+        # it away beside other unanswered questions and must not blur them
+        # into "not collected".
+        "unavailable_reason": unavailable_reason,
     }
 
 
@@ -3234,6 +3484,17 @@ def _conclusion(
         sentences.append(
             f"No session held {_fmt(INGRESS_BACKLOG_PERCENT)}% of the ingress work queue."
         )
+    elif backlogs.get("node_unsupported"):
+        sentences.append(
+            "The ingress backlog command is not available on this platform, so "
+            "the global counter delta carries that question."
+        )
+    elif backlogs["state"] == "failed":
+        sentences.append(
+            "The ingress backlog read failed in every batch — the firewall has "
+            "the command but did not answer it — so that question is open and "
+            "the read is worth repairing before the next incident."
+        )
     else:
         sentences.append("The ingress backlog was not collected.")
     positives = [
@@ -3312,6 +3573,10 @@ def collect_findings(diagnosis: dict[str, Any]) -> dict[str, list[dict[str, Any]
         "positive": findings["confirmed"],
         "negative": findings["ruled_out"],
         "unavailable": findings["unavailable"],
+        # A step the collector could not read is still a step that could not
+        # be judged: it belongs with the unavailable findings rather than
+        # disappearing from the layered report.
+        "failed": findings["unavailable"],
     }
     low_significance = any(
         bool(step.get("low_significance")) for step in diagnosis["steps"]
@@ -3328,6 +3593,7 @@ def collect_findings(diagnosis: dict[str, Any]) -> dict[str, list[dict[str, Any]
                     "origin": "step",
                     "ranking_derived": bool(step.get("ranking_derived")),
                     "low_significance": low_significance,
+                    "reason": str(step.get("unavailable_reason") or ""),
                 }
             )
         for hypothesis in step.get("hypotheses") or []:
@@ -3345,6 +3611,7 @@ def collect_findings(diagnosis: dict[str, Any]) -> dict[str, list[dict[str, Any]
                     # table or the uptime. None of them is PBP's ranking.
                     "ranking_derived": bool(hypothesis.get("ranking_derived")),
                     "low_significance": low_significance,
+                    "reason": str(hypothesis.get("unavailable_reason") or ""),
                 }
             )
     return findings

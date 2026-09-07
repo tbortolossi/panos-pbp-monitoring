@@ -221,7 +221,16 @@ def _render_dismissed(
     items = "".join(
         f'<li class="hypothesis hypothesis-{_escape(state)}">'
         f'<span class="hypothesis-mark" aria-hidden="true"></span>'
-        f'<strong>{_escape(finding["title"])}</strong> — {finding["text"]}'
+        f'<strong>{_escape(finding["title"])}</strong>'
+        # Why this one could not be answered, in the words of the step that
+        # tried: a platform that does not have the command and a read that
+        # failed are different questions for the operator.
+        + (
+            f' <span class="pill">{_escape(finding["reason"])}</span>'
+            if finding.get("reason")
+            else ""
+        )
+        + f' — {finding["text"]}'
         + (
             '<ol class="step-named">'
             + "".join(f"<li>{named}</li>" for named in finding["named"])
@@ -402,8 +411,8 @@ def _render_cause_layer(diagnosis: dict[str, Any]) -> tuple[str, str, str]:
         "unavailable",
         f"{len(findings['unavailable'])} cause"
         f"{'s' if len(findings['unavailable']) != 1 else ''} not evaluable",
-        "The commands these need returned nothing, or were not collected. "
-        "Neither confirmed nor excluded.",
+        "Each of these could not be answered from this capture, and the entry "
+        "says why. Neither confirmed nor excluded.",
     )
     walk = (
         '<details class="dismissed"><summary>The full four-step investigation</summary>'

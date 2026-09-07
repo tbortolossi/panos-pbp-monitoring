@@ -69,13 +69,13 @@ One more read is mandatory, but only where the platform has it:
 
 | Read | Why it may be absent | What is lost |
 |---|---|---|
-| `show running resource-monitor ingress-backlogs` | The ingress queues belong to a hardware dataplane. A VM-Series has none, so PAN-OS rejects the node itself, with `... ingress-backlogs unexpected here` | The per-dataplane ingress backlog and on-chip descriptor levels; the buffer and descriptor levels still come from `show running resource-monitor` |
+| `show running resource-monitor ingress-backlogs` | PAN-OS introduced this command for the x86 platforms in 10.2 and VM-Series was left out of that support, so on a VM-Series the CLI parser rejects the node itself, with `... ingress-backlogs unexpected here` | The per-dataplane ingress backlog work-queue levels; the buffer and descriptor levels still come from `show running resource-monitor` |
 
 That last one is downgraded only when the firewall answers that the node does
-not exist, and it is then recorded as a note rather than as a warning: no role,
-no upgrade and no configuration can make a VM-Series grow the hardware queues
-this command reads, so the check passes green and the detail names the evidence
-the report will not have. The same command failing for a reason an operator can
+not exist, and it is then recorded as a note rather than as a warning: no role
+and no configuration change makes a VM-Series answer a command PAN-OS never
+brought to that platform, so the check passes green and the detail names the
+evidence the report will not have. The same command failing for a reason an operator can
 act on — a timeout, an HTTP status, a permission the API role does not have —
 still fails the check.
 
