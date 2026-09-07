@@ -371,7 +371,14 @@ sync) and `inflight_monitoring` (`enabled`, `threshold_percent`,
 not expose the node — and `status`, saying whether the state was read, absent
 or not collected). Each cycle carries its `buffer_latency` report, its
 `interface_counters` table and the `interface_counters_source` field naming
-whether it came from the whole-table read or the named fallback. A
+whether it came from the whole-table read or the named fallback. A per-batch
+command that did not answer is never persisted as a parsed result: `pbp_status`,
+`pbp_offenders`, `session_info` and `ingress_backlogs` then hold
+`{"error": "<the failure>"}` instead of the empty structure their parser
+returns for an empty answer, so a read that never happened cannot be read back
+as a firewall reporting that nothing was wrong. The raw command record travels
+in the same batch, so a capture written before this gate stays readable and
+every reader falls back to it. A
 `pbp_threat_logs` event carries the PBP threat logs captured at stop with the
 query and its window; a `global_counters_raw` event carries the second raw
 counter read and the `growth_since_start` of every counter; a
@@ -751,7 +758,12 @@ key must be backed up and restored together.
     descriptor pool is stated rather than shown as not collected; (2) the
     entries PBP marked for RED, sessions with their flow from `show session
     id` and source addresses with their recovered traffic log, presented as
-    the firewall's designation and not as proof; (3) the sessions holding at
+    the firewall's designation and not as proof, and counting only the batches
+    whose PBP read actually ran: when every batch failed the step is reported
+    as a failed read and never as "PBP never activated", since a firewall too
+    loaded to answer `show session packet-buffer-protection` is exactly the
+    condition the step exists to read, and a mixed run names the batches that
+    answered nothing; (3) the sessions holding at
     least 2% of the ingress backlog, calling out unidentified applications and
     the `flow_slowpath` + `Bad Key` policy-deny signature, listing apart the
     entries PAN-OS named internal tags in its own `Special Notes` column and
@@ -779,7 +791,12 @@ key must be backed up and restored together.
     or duration the firewall did not return is shown as an assumed PAN-OS
     default rather than as the firewall's own value; (4) five wider
     hypotheses — elephant session, burst of denied sessions, storm of new
-    sessions, interface errors, aggregate load — each with its own verdict. At
+    sessions, interface errors, aggregate load — each with its own verdict.
+    The ones reading the session table state it as unknown rather than flat
+    when every `show session info` read failed: the storm hypothesis is then
+    not evaluable instead of negative, and the denied-burst verdict, which the
+    global counters answer on their own, names the corroboration it could not
+    read. At
     low pressure the later steps are read as the ordinary traffic mix and
     nothing is blamed; when the pressure is real and no step names a cause, the
     conclusion points at the software-defect scenario and a Tech Support File.

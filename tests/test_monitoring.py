@@ -2592,6 +2592,110 @@ class FirewallCheckTests(unittest.TestCase):
             self.assertTrue(captured_urls)
             self.assertEqual(set(captured_urls), {"https://192.0.2.20"})
 
+class FailedReadPersistenceTests(unittest.TestCase):
+    """A per-batch command that failed must not be persisted as an empty answer.
+
+    `command_result` hands the parsers an empty string for a failed record,
+    and each of them answers a well-formed empty structure to it. Persisted as
+    such, a read that never happened looks exactly like a firewall reporting
+    that nothing was wrong.
+    """
+
+    GATED_FIELDS = ("pbp_status", "pbp_offenders", "session_info", "ingress_backlogs")
+
+    class SilentClient(FakeClient):
+        """A firewall too loaded to answer the three volatile reads."""
+
+        FAILING = (
+            OP_COMMANDS["packet_buffer_protection"],
+            OP_COMMANDS["session_info"],
+            OP_COMMANDS["ingress_backlogs"],
+        )
+
+        def op_response(self, command: str) -> PanOSResponse:
+            if command in self.FAILING:
+                with self.lock:
+                    self.commands.append(command)
+                raise PanOSAPIError("read timed out", raw_response="")
+            return super().op_response(command)
+
+    def _assert_marked_as_failed(self, record: dict) -> None:
+        for field in self.GATED_FIELDS:
+            with self.subTest(field=field):
+                self.assertEqual(list(record[field]), ["error"])
+                self.assertIn("read timed out", record[field]["error"])
+
+    def test_a_failed_batch_read_is_persisted_as_an_error_not_as_an_empty_parse(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, self.SilentClient())
+            await controller._monitor("fixture-run")
+            await controller.wait_for_reports()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            asyncio.run(scenario(make_config(output_dir)))
+
+            records = [
+                json.loads(line)
+                for line in incident_capture_path(output_dir, "fixture-run")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            cycle = next(record for record in records if "cycle" in record)
+            self._assert_marked_as_failed(cycle)
+            # The evidence itself is preserved: the raw record is still there.
+            self.assertFalse(cycle["commands"]["packet_buffer_protection"]["ok"])
+            # The enrichment must survive a read that answered nothing.
+            self.assertEqual(cycle["candidate_entities"], [])
+            self.assertEqual(cycle["candidate_session_ids"], [])
+
+    def test_the_api_check_marks_the_same_fields_the_same_way(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cfg = make_config(Path(temporary_directory))
+
+            with patch(
+                "pbp_monitoring.orchestrator.PanOSClient",
+                return_value=self.SilentClient(),
+            ):
+                output_file, succeeded, _, _ = asyncio.run(run_api_check(cfg))
+
+            cycle = next(
+                record
+                for line in output_file.read_text(encoding="utf-8").splitlines()
+                if "cycle" in (record := json.loads(line))
+            )
+            self._assert_marked_as_failed(cycle)
+            self.assertFalse(succeeded)
+            self.assertIn(
+                "packet_buffer_protection command failed", cycle["validation_errors"]
+            )
+
+    def test_a_successful_batch_still_persists_the_parsed_result(self):
+        async def scenario(cfg):
+            controller = MonitorController(cfg, FakeClient())
+            await controller._monitor("fixture-run")
+            await controller.wait_for_reports()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            asyncio.run(scenario(make_config(output_dir)))
+
+            cycle = next(
+                record
+                for line in incident_capture_path(output_dir, "fixture-run")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if "cycle" in (record := json.loads(line))
+            )
+
+            self.assertEqual(cycle["session_info"]["totals"]["allocated"], 421)
+            self.assertIs(cycle["pbp_status"]["enabled"], True)
+            self.assertEqual(cycle["pbp_offenders"], [])
+            self.assertEqual(
+                cycle["ingress_backlogs"]["dataplanes"][0]["atomic_percentage"], 11.0
+            )
+
+
 class PbpEvidenceTests(unittest.TestCase):
     """The configured thresholds, the buffer latency and the PBP threat logs
     reach the capture, read-only, without delaying the batches."""

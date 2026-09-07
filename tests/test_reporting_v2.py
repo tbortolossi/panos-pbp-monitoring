@@ -847,6 +847,56 @@ class FindingCollectionTests(unittest.TestCase):
         self.assertEqual(raised - set(EVIDENCE_ANCHORS), set())
 
 
+class LayeredPbpReadTests(unittest.TestCase):
+    """A PBP read that never answered is not evaluable, never a green negative."""
+
+    def _render(self, pbp_command: dict, pbp_status: dict) -> str:
+        records: list[dict] = [
+            {
+                "timestamp": "2026-08-30T09:59:00+00:00",
+                "run_id": "pbp-v2",
+                "event": "monitor_started",
+                "collector_version": "test",
+                "device": {"serial": "fixture", "model": "PA-440"},
+            },
+            {
+                "timestamp": "2026-08-30T10:01:00+00:00",
+                "run_id": "pbp-v2",
+                "cycle": 1,
+                "elapsed_seconds": 1.0,
+                "percentages": {"packet_buffer_congestion": [91]},
+                "pbp_status": pbp_status,
+                "commands": {"packet_buffer_protection": pbp_command},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "incident.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            return generate_html_report_v2(capture).read_text(encoding="utf-8")
+
+    def test_a_timed_out_pbp_read_is_not_evaluable_and_says_why(self):
+        html = self._render(dict(TIMED_OUT), {"error": "TimeoutError: the read timed out"})
+        dismissed = _visible_dismissed(html)
+
+        self.assertIn("could not be answered from this capture", dismissed)
+        self.assertIn(
+            '<span class="pill">read failed in 1 of 1 batches</span>', dismissed
+        )
+        self.assertNotIn("PBP never activated, so it learned no offender", html)
+
+    def test_a_pbp_read_that_answered_keeps_its_negative(self):
+        html = self._render(
+            {"ok": True, "result": "<result>not activated</result>"},
+            {"enabled": True, "active": False, "mode": "packet_buffer"},
+        )
+
+        self.assertIn("PBP never activated, so it learned no offender", html)
+        self.assertNotIn("The PBP read failed in all", html)
+
+
 class LayeredIngressPlatformTests(unittest.TestCase):
     """The layered report declines the ingress metric like the flat one."""
 

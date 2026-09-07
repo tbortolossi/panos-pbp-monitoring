@@ -28,14 +28,16 @@ from .diagnosis import (
     _flow_parts,
     _ingress_candidate_entities,
     _level,
+    _pbp_statuses,
     _special_tag_field,
     _numbers,
     build_diagnosis,
     buffer_latency_statuses,
-    command_node_unsupported,
-    PLATFORM_DEPENDENT_COMMAND_EVIDENCE,
+    command_outcome,
     hardware_generation,
     ingress_backlog_collection,
+    read_failed_everywhere,
+    session_totals_counted,
     congestion_recurrence,
     ha_summary,
     history_trend,
@@ -962,27 +964,19 @@ def _detail_items(details: Any) -> list[tuple[str, Any]]:
     return [("session_details", details)]
 
 
-def _platform_limit(name: str, payload: Any) -> bool:
-    """Is this a command the platform simply does not have?
-
-    A rejected node is a fact about the platform that no credential, role or
-    network change repairs. Counting it as a partial error sends an operator
-    looking for a collection fault that does not exist, so the health view
-    reports it separately.
-
-    Only the commands declared platform-dependent qualify, exactly as the
-    read-only validation treats them: a mandatory command rejected by an old
-    PAN-OS release is a real gap in the evidence and stays an error here.
-    """
-    return (
-        name in PLATFORM_DEPENDENT_COMMAND_EVIDENCE
-        and command_node_unsupported(payload)
-    )
-
-
 def _record_error_count(record: dict[str, Any]) -> int:
+    """How many reads of this batch actually failed.
+
+    A read the firewall rejected as a node the platform does not have is a
+    fact about the platform that no credential, role or network change
+    repairs; counting it here would send an operator looking for a collection
+    fault that does not exist, so it is reported separately and never as an
+    error. The classification is the one the diagnosis and the read-only
+    validation use, so a batch is never "5 errors" here and "4 failed reads"
+    there.
+    """
     command_errors = sum(
-        _contains_error(payload) and not _platform_limit(name, payload)
+        command_outcome(payload, name) == "failed"
         for name, payload in _command_items(record.get("commands"))
     )
     detail_errors = sum(
@@ -1095,9 +1089,10 @@ def _render_commands(commands: Any) -> str:
 
     fragments: list[str] = []
     for name, payload in items:
-        if _platform_limit(name, payload):
+        outcome = command_outcome(payload, name)
+        if outcome == "unsupported":
             state, state_class = "Not available on this platform", " note"
-        elif _contains_error(payload):
+        elif outcome == "failed":
             state, state_class = "Error", " bad"
         else:
             state, state_class = "Result", ""
@@ -1678,7 +1673,7 @@ def _render_ingress_backlogs(
                 "on this platform, so this section holds no evidence either "
                 "way.</p>"
             )
-        if collection["failed"]:
+        if read_failed_everywhere(collection):
             return (
                 '<p class="muted">The ingress backlog read failed in all '
                 f"{collection['failed']} of the {collection['batches']} batches "
@@ -3428,9 +3423,7 @@ def _session_info_totals(record: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(session_info, dict):
         return {}
     totals = session_info.get("totals")
-    if isinstance(totals, dict) and any(
-        isinstance(value, (int, float)) for value in totals.values()
-    ):
+    if session_totals_counted(totals):
         return totals
     dataplanes = session_info.get("dataplanes")
     if isinstance(dataplanes, list) and dataplanes:
@@ -4124,11 +4117,7 @@ def _build_report_parts(
             '<span class="pill">no hot core · open for the detail</span></summary>'
             f'<div class="section-body">{cpu_tracking_html}</div></details>'
         )
-    pbp_statuses = [
-        record.get("pbp_status")
-        for _, record in cycles
-        if isinstance(record.get("pbp_status"), dict)
-    ]
+    pbp_statuses = _pbp_statuses([record for _, record in cycles])
     pbp_modes = sorted(
         {
             str(status.get("mode"))
@@ -4561,7 +4550,7 @@ def _build_report_parts(
         # every batch: that pill would read as a negative result the capture
         # cannot support. Decided by what the firewall answered, not the model.
         ingress_pill = "not available on this platform"
-    elif not ingress_collection["succeeded"] and ingress_collection["failed"]:
+    elif read_failed_everywhere(ingress_collection):
         ingress_pill = "read failed in every batch"
     else:
         ingress_pill = "no session at 2%"

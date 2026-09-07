@@ -12,7 +12,13 @@ from pbp_monitoring.diagnosis import (
     SIGNAL_COUNTER_FAMILIES,
     build_diagnosis,
     collect_findings,
+    collected_field,
+    command_outcome,
+    command_outcomes,
     hardware_generation,
+    ingress_backlog_collection,
+    read_failed_everywhere,
+    read_failure_reason,
 )
 from pbp_monitoring.reporting import (
     _SIGNAL_COUNTER_FAMILIES,
@@ -241,6 +247,89 @@ class OffenderStepTests(unittest.TestCase):
         self.assertEqual(diagnosis["steps"][1]["state"], "negative")
         self.assertIn("PBP never activated", diagnosis["steps"][1]["verdict"])
         self.assertIn("PBP designated nobody: it never activated", diagnosis["conclusion"][2])
+
+    def test_a_pbp_read_that_timed_out_everywhere_is_failed_not_a_negative(self):
+        """A firewall too loaded to answer must never read as "PBP never activated"."""
+        cycles = [
+            _cycle(
+                number,
+                84.0,
+                commands={"packet_buffer_protection": dict(TIMED_OUT)},
+                pbp_status={"error": "TimeoutError: the read timed out"},
+                pbp_offenders={"error": "TimeoutError: the read timed out"},
+            )
+            for number in (1, 2)
+        ]
+        diagnosis = _diagnose(cycles)
+        step = diagnosis["steps"][1]
+        facts = dict(_facts(step))
+
+        self.assertEqual(step["state"], "failed")
+        self.assertEqual(step["level"], "warn")
+        self.assertIn("PBP read failed in all 2 of the 2 batches", step["verdict"])
+        self.assertNotIn("PBP never activated", step["verdict"])
+        self.assertEqual(facts["PBP activated"], "unknown")
+        self.assertEqual(facts["Batches with the PBP read"], "0")
+        self.assertEqual(facts["Batches with a failed read"], "2")
+        self.assertIn("read failed in 2 of 2 batches", step["unavailable_reason"])
+        self.assertIn(
+            "The PBP read failed in every batch, so what it learned is unknown",
+            " ".join(diagnosis["conclusion"]),
+        )
+        # A step that could not be read is still reported, not dropped.
+        findings = collect_findings(diagnosis)
+        self.assertIn(
+            "Offender named by PBP",
+            [item["title"] for item in findings["unavailable"]],
+        )
+        self.assertNotIn(
+            "Offender named by PBP",
+            [item["title"] for item in findings["ruled_out"]],
+        )
+
+    def test_a_mixed_pbp_run_keeps_its_verdict_and_names_the_lost_batches(self):
+        cycles = [
+            _cycle(
+                1,
+                84.0,
+                commands={"packet_buffer_protection": {"ok": True, "result": "<result/>"}},
+                pbp_status={"enabled": True, "active": False, "mode": "packet_buffer"},
+            ),
+            _cycle(
+                2,
+                84.0,
+                commands={"packet_buffer_protection": dict(TIMED_OUT)},
+                pbp_status={"error": "TimeoutError: the read timed out"},
+            ),
+        ]
+        step = _diagnose(cycles)["steps"][1]
+
+        self.assertEqual(step["state"], "negative")
+        self.assertIn("PBP never activated", step["verdict"])
+        self.assertIn(
+            "the read failed in 1 of the 2 batches, which therefore carry no "
+            "PBP evidence",
+            step["verdict"],
+        )
+        self.assertEqual(dict(_facts(step))["PBP activated"], "no")
+
+    def test_a_legacy_capture_without_the_raw_pbp_command_reads_as_before(self):
+        """A capture written before the gate carries the parsed status alone."""
+        cycles = [
+            _cycle(1, 62.0, pbp_status={"enabled": True, "active": False, "mode": "packet_buffer"})
+        ]
+        step = _diagnose(cycles)["steps"][1]
+
+        self.assertEqual(step["state"], "negative")
+        self.assertIn("PBP never activated", step["verdict"])
+        self.assertNotIn("failed", step["verdict"])
+
+    def test_a_capture_holding_no_pbp_evidence_at_all_stays_a_negative(self):
+        """No command and no parsed status is not a failed read: nothing asked."""
+        step = _diagnose([_cycle(1, 62.0)])["steps"][1]
+
+        self.assertEqual(step["state"], "negative")
+        self.assertIn("PBP never activated", step["verdict"])
 
 
 def _tag_attribution(**extra: object) -> dict:
@@ -674,6 +763,89 @@ class IngressBacklogStepTests(unittest.TestCase):
         self.assertIn("state was not read", step["verdict"])
 
 
+class CommandOutcomeTests(unittest.TestCase):
+    """One classification of a stored command record, shared by every reader."""
+
+    def test_the_four_outcomes_are_told_apart_from_the_stored_record(self):
+        self.assertEqual(
+            command_outcome({"ok": True, "result": "<result/>"}, "ingress_backlogs"),
+            "succeeded",
+        )
+        self.assertEqual(
+            command_outcome(dict(REJECTED_NODE), "ingress_backlogs"), "unsupported"
+        )
+        self.assertEqual(
+            command_outcome(dict(TIMED_OUT), "ingress_backlogs"), "failed"
+        )
+        self.assertEqual(command_outcome(None, "ingress_backlogs"), "missing")
+
+    def test_only_a_platform_dependent_command_may_be_called_unsupported(self):
+        """A mandatory command an old release rejects is a real gap, not a note."""
+        self.assertEqual(
+            command_outcome(dict(REJECTED_NODE), "packet_buffer_protection"), "failed"
+        )
+
+    def test_a_legacy_string_record_keeps_its_meaning(self):
+        self.assertEqual(command_outcome("<result/>", "session_info"), "succeeded")
+        self.assertEqual(command_outcome("ERROR: timed out", "session_info"), "failed")
+
+    def test_the_counts_add_up_to_the_batches_that_asked(self):
+        cycles = [
+            _cycle(1, 60.0, commands={"ingress_backlogs": {"ok": True, "result": "<r/>"}}),
+            _cycle(2, 60.0, commands={"ingress_backlogs": dict(REJECTED_NODE)}),
+            _cycle(3, 60.0, commands={"ingress_backlogs": dict(TIMED_OUT)}),
+            _cycle(4, 60.0),
+        ]
+        counts = command_outcomes(cycles, "ingress_backlogs")
+
+        self.assertEqual(counts, {"batches": 3, "succeeded": 1, "unsupported": 1, "failed": 1})
+        self.assertEqual(
+            counts["batches"],
+            counts["succeeded"] + counts["unsupported"] + counts["failed"],
+        )
+
+    def test_the_step_three_counter_is_the_same_helper(self):
+        cycles = [
+            _cycle(1, 60.0, commands={"ingress_backlogs": dict(TIMED_OUT)}),
+            _cycle(2, 60.0, ingress_backlogs={"dataplanes": [{"slot": "1", "dp": "0"}], "candidates": []}),
+        ]
+
+        self.assertEqual(
+            ingress_backlog_collection(cycles),
+            {"batches": 2, "succeeded": 1, "unsupported": 0, "failed": 1},
+        )
+
+    def test_a_read_that_answered_nowhere_is_named_the_same_by_every_reader(self):
+        """One predicate: no batch succeeded and at least one read failed."""
+        every_batch_failed = {"batches": 2, "succeeded": 0, "unsupported": 0, "failed": 2}
+        rejected_and_failed = {"batches": 2, "succeeded": 0, "unsupported": 1, "failed": 1}
+        one_answered = {"batches": 2, "succeeded": 1, "unsupported": 0, "failed": 1}
+        only_rejected = {"batches": 2, "succeeded": 0, "unsupported": 2, "failed": 0}
+
+        self.assertTrue(read_failed_everywhere(every_batch_failed))
+        # A rejected node carries no evidence either, so it does not make the
+        # run look answered; the step that must tell the two apart decides the
+        # platform question first.
+        self.assertTrue(read_failed_everywhere(rejected_and_failed))
+        self.assertFalse(read_failed_everywhere(one_answered))
+        self.assertFalse(read_failed_everywhere(only_rejected))
+        self.assertEqual(
+            read_failure_reason(every_batch_failed), "read failed in 2 of 2 batches"
+        )
+        self.assertEqual(
+            read_failure_reason(every_batch_failed, "session table"),
+            "session table read failed in 2 of 2 batches",
+        )
+
+    def test_a_failed_read_marker_is_not_read_as_a_collected_field(self):
+        self.assertIsNone(collected_field({"pbp_status": {"error": "TimeoutError: x"}}, "pbp_status"))
+        self.assertIsNone(collected_field({}, "pbp_status"))
+        self.assertEqual(
+            collected_field({"pbp_status": {"active": False}}, "pbp_status"),
+            {"active": False},
+        )
+
+
 class ElsewhereStepTests(unittest.TestCase):
     def test_an_isolated_hot_core_supports_the_elephant_hypothesis(self):
         diagnosis = _diagnose(
@@ -738,6 +910,85 @@ class ElsewhereStepTests(unittest.TestCase):
         self.assertIn("would be a supported finding", diagnosis["steps"][3]["verdict"])
         self.assertEqual(diagnosis["headline"]["label"], "Low pressure")
         self.assertNotIn("Elephant session:", " ".join(diagnosis["conclusion"]))
+
+    def test_a_session_table_that_never_answered_cannot_rule_out_a_storm(self):
+        cycles = [
+            _cycle(
+                number,
+                84.0,
+                commands={"session_info": dict(TIMED_OUT)},
+                session_info={"error": "TimeoutError: the read timed out"},
+            )
+            for number in (1, 2)
+        ]
+        diagnosis = _diagnose(cycles, attribution=[])
+        storm = next(
+            item
+            for item in diagnosis["steps"][3]["hypotheses"]
+            if item["key"] == "storm"
+        )
+
+        self.assertEqual(storm["state"], "unavailable")
+        self.assertIn(
+            "session table read failed in all 2 of the 2 batches", storm["text"]
+        )
+        self.assertIn(
+            "neither confirmed nor excluded", storm["text"]
+        )
+        self.assertIn(
+            "session table read failed in 2 of 2 batches",
+            storm["unavailable_reason"],
+        )
+        self.assertIn(
+            "Storm of new sessions",
+            [item["title"] for item in collect_findings(diagnosis)["unavailable"]],
+        )
+
+    def test_a_failed_session_read_is_named_beside_the_denied_verdict(self):
+        diagnosis = _diagnose(
+            [
+                _cycle(
+                    1,
+                    84.0,
+                    commands={"session_info": dict(TIMED_OUT)},
+                    session_info={"error": "TimeoutError: the read timed out"},
+                )
+            ],
+            drop_summary={"items": [{"family_key": "policy", "peak_rate": 2}],
+                          "family_totals": {"policy": 71}, "denied_total": 71,
+                          "counted_batches": 50},
+        )
+        denied = next(
+            item
+            for item in diagnosis["steps"][3]["hypotheses"]
+            if item["key"] == "denied"
+        )
+
+        # The counters answer this hypothesis on their own, so it keeps its
+        # verdict; the corroboration it could not read is named, not implied.
+        self.assertEqual(denied["state"], "negative")
+        self.assertIn("session table read failed in all 1 of the 1 batches", denied["text"])
+
+    def test_a_session_table_read_that_answered_still_rules_the_storm_out(self):
+        diagnosis = _diagnose(
+            [
+                _cycle(
+                    1,
+                    84.0,
+                    commands={"session_info": {"ok": True, "result": "<result/>"}},
+                    session_info={"totals": {"allocated": 400, "cps": 4}},
+                )
+            ],
+            session_series=[{"batch": 1, "allocated": 400, "cps": 4, "pps": 100}],
+        )
+        storm = next(
+            item
+            for item in diagnosis["steps"][3]["hypotheses"]
+            if item["key"] == "storm"
+        )
+
+        self.assertEqual(storm["state"], "negative")
+        self.assertIn("New connections peaked at 4/s", storm["text"])
 
     def test_real_pressure_with_no_cause_points_at_a_tech_support_file(self):
         diagnosis = _diagnose([_cycle(1, 91.0), _cycle(2, 90.0)])
