@@ -74,6 +74,22 @@ def make_config(output_dir: Path, **overrides):
     return Config(**values)
 
 
+#: A VM-Series per-second resource monitor, in the structured form PAN-OS
+#: 11.2 returns: it reports the buffer and descriptor levels, and carries no
+#: on-chip descriptor row because it has no hardware dataplane.
+VM_SERIES_RESOURCE_MONITOR_RESULT = (
+    "<result><resource-monitor><data-processors><dp0><second>"
+    "<cpu-load><entry><coreid>1</coreid><value>3,2,1</value></entry></cpu-load>"
+    "<resource-utilization>"
+    "<entry><name>session</name><value>0,0,0</value></entry>"
+    "<entry><name>packet buffer</name><value>3,3,2</value></entry>"
+    "<entry><name>packet descriptor</name><value>0,0,0</value></entry>"
+    "<entry><name>sw tags descriptor</name><value>4,4,3</value></entry>"
+    "</resource-utilization></second></dp0></data-processors>"
+    "</resource-monitor></result>"
+)
+
+
 LARGE_SESSION_RESULT = (
     "<result>"
     "<entry><source>198.51.100.20</source><dst>203.0.113.30</dst>"
@@ -2189,6 +2205,77 @@ class FirewallCheckTests(unittest.TestCase):
             self.assertIn("reduced evidence", recorded["last_check_detail"])
             self.assertIn("pbp_settings", recorded["last_check_detail"])
             self.assertIsNone(recorded["check_requested_at"])
+
+    def test_a_platform_without_ingress_backlogs_still_validates(self):
+        """VM-Series has no ingress queues; its rejection is not a fault."""
+
+        class VmSeriesClient(FakeClient):
+            def op_response(self, command: str) -> PanOSResponse:
+                if command == OP_COMMANDS["ingress_backlogs"]:
+                    raise PanOSAPIError(
+                        "show -> running -> resource-monitor -> ingress-backlogs "
+                        "unexpected here show -> running -> resource-monitor  is "
+                        "unexpected show -> running  is unexpected show  is unexpected",
+                        raw_response="raw unexpected node",
+                    )
+                if "<resource-monitor><second><last>" in command:
+                    # A VM-Series still reports both levels here, which is why
+                    # losing the ingress queues costs evidence and not monitoring.
+                    return PanOSResponse(
+                        result_xml=VM_SERIES_RESOURCE_MONITOR_RESULT,
+                        raw_response=VM_SERIES_RESOURCE_MONITOR_RESULT,
+                    )
+                return super().op_response(command)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            router, store = self._router(root, identity="PA-VM|11.2.4")
+            store.request_target_check(store.list_targets()[0]["target_id"])
+
+            with patch(
+                "pbp_monitoring.orchestrator.PanOSClient",
+                return_value=VmSeriesClient(),
+            ):
+                asyncio.run(run_target_checks_once(router))
+
+            recorded = store.list_targets()[0]
+            self.assertEqual(recorded["last_check_kind"], "validation")
+            self.assertEqual(recorded["last_check_status"], "warning")
+            self.assertIn("reduced evidence", recorded["last_check_detail"])
+            self.assertIn("ingress_backlogs", recorded["last_check_detail"])
+            self.assertIn("not supported", recorded["last_check_detail"])
+            self.assertIsNone(recorded["check_requested_at"])
+
+    def test_an_unreadable_ingress_backlog_still_fails_the_validation(self):
+        """A command the firewall knows and could not run stays a failure."""
+
+        class DeniedIngressClient(FakeClient):
+            def op_response(self, command: str) -> PanOSResponse:
+                if command == OP_COMMANDS["ingress_backlogs"]:
+                    raise PanOSAPIError(
+                        "Permission denied", raw_response="raw permission denied"
+                    )
+                if "<resource-monitor><second><last>" in command:
+                    return PanOSResponse(
+                        result_xml=VM_SERIES_RESOURCE_MONITOR_RESULT,
+                        raw_response=VM_SERIES_RESOURCE_MONITOR_RESULT,
+                    )
+                return super().op_response(command)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            router, store = self._router(root, identity="PA-VM|11.2.4")
+            store.request_target_check(store.list_targets()[0]["target_id"])
+
+            with patch(
+                "pbp_monitoring.orchestrator.PanOSClient",
+                return_value=DeniedIngressClient(),
+            ):
+                asyncio.run(run_target_checks_once(router))
+
+            recorded = store.list_targets()[0]
+            self.assertEqual(recorded["last_check_status"], "failed")
+            self.assertNotIn("reduced evidence", recorded["last_check_detail"])
 
     def test_a_firewall_saved_after_startup_is_checked_without_syslog_traffic(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
