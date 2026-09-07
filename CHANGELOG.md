@@ -33,6 +33,24 @@ follows [Semantic Versioning](https://semver.org/).
   before it is shown, so firewall-controlled text can never carry a secret back
   to the operator.
 
+### Fixed
+
+- **A VM-Series firewall can now pass its read-only API validation.** The check
+  treated `show running resource-monitor ingress-backlogs` as mandatory, but
+  the ingress queues it reports belong to a hardware dataplane: a PA-VM has
+  none and PAN-OS rejects the node itself. Every VM-Series therefore ended its
+  validation as **Failed** with correct credentials and full API reachability,
+  sending the operator to look at the API user and password for a fault that
+  was not there. A command the firewall rejects as a node it does not have is
+  now recorded as reduced evidence — amber, with the missing evidence named —
+  the way a refused configuration read already was. The buffer and descriptor
+  levels monitoring needs still come from `show running resource-monitor`, so
+  nothing is lost for the monitor itself. The same command failing for a
+  reason an operator can act on, such as a timeout or a denied permission,
+  still fails the check. Refs #213.
+- A check that failed while also collecting reduced evidence logged
+  `passed with reduced evidence` on the line above its own failure line.
+
 ## [0.40.0] - 2026-09-06
 
 ### Added

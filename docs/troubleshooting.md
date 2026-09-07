@@ -65,6 +65,17 @@ failure of the check:
 | `show config running xpath …/deviceconfig/setting/session` | The collector's only running-configuration read. An API administrator restricted to operational requests is refused it | The configured PBP alert and activate thresholds; the report falls back on the Syslog text and the PAN-OS defaults |
 | `show session packet-buffer-protection buffer-latency` | Absent from PAN-OS releases older than the one it was validated on | The packet buffer latency measurements, and with them the latency case of the diagnosis |
 
+One more read is mandatory, but only where the platform has it:
+
+| Read | Why it may be absent | What is lost |
+|---|---|---|
+| `show running resource-monitor ingress-backlogs` | The ingress queues belong to a hardware dataplane. A VM-Series has none, so PAN-OS rejects the node itself, with `... ingress-backlogs unexpected here` | The per-dataplane ingress backlog and on-chip descriptor levels; the buffer and descriptor levels still come from `show running resource-monitor` |
+
+That last one is downgraded to a warning only when the firewall answers that
+the node does not exist. The same command failing for a reason an operator can
+act on — a timeout, an HTTP status, a permission the API role does not have —
+still fails the check.
+
 The firewall then shows **Passed with warnings** in amber on the configuration
 page and in the dashboard's API signal, and the check detail names the missing
 evidence. Grant the API administrator the configuration read, or accept the

@@ -192,10 +192,54 @@ OPTIONAL_COMMAND_EVIDENCE = {
 }
 
 
+#: Evidence that exists only on some platforms or PAN-OS releases. A command
+#: listed here stays mandatory: it is downgraded to a warning only when the
+#: firewall itself answers that the node does not exist, never when the read
+#: fails for a reason the operator could fix. `ingress-backlogs` reports the
+#: ingress queues of a hardware dataplane, so VM-Series rejects the node.
+PLATFORM_DEPENDENT_COMMAND_EVIDENCE = {
+    "ingress_backlogs": "the per-dataplane ingress backlog and on-chip descriptor levels",
+}
+
+#: Fragments PAN-OS uses to reject a command its parser does not know on this
+#: platform or release, as opposed to one it knows and could not run.
+_UNSUPPORTED_NODE_MARKERS = (
+    "unexpected here",
+    "is unexpected",
+    "no such node",
+    "unknown command",
+)
+
+
 def optional_command_warning(name: str) -> str:
     """Say which evidence an operator loses when an enrichment read fails."""
     lost = OPTIONAL_COMMAND_EVIDENCE.get(name, "part of the evidence")
     return f"{name} command failed, {lost} could not be collected"
+
+
+def unsupported_command_warning(name: str) -> str:
+    """Say which evidence this platform simply does not expose."""
+    lost = PLATFORM_DEPENDENT_COMMAND_EVIDENCE.get(name, "part of the evidence")
+    return (
+        f"{name} is not supported on this platform or PAN-OS release, "
+        f"{lost} could not be collected"
+    )
+
+
+def command_node_unsupported(record: Any) -> bool:
+    """Did the firewall reject the command as a node it does not have?
+
+    A rejection by the PAN-OS CLI parser means the command does not exist on
+    this model or release, which no credential, role or network change would
+    repair. Every other failure — a timeout, an HTTP status, a denied
+    permission — stays a collection failure.
+    """
+    if not isinstance(record, dict) or record.get("ok") is True:
+        return False
+    error = str(record.get("error") or "").lower()
+    if not error.startswith("panosapierror:"):
+        return False
+    return any(marker in error for marker in _UNSUPPORTED_NODE_MARKERS)
 
 
 # The PBP threat IDs: RED drop, session discard, source IP block. One bounded
@@ -5987,6 +6031,10 @@ async def run_api_check(cfg: Config) -> ApiCheckResult:
             continue
         if name in OPTIONAL_COMMAND_EVIDENCE:
             validation_warnings.append(optional_command_warning(name))
+        elif name in PLATFORM_DEPENDENT_COMMAND_EVIDENCE and command_node_unsupported(
+            record
+        ):
+            validation_warnings.append(unsupported_command_warning(name))
         else:
             validation_errors.append(f"{name} command failed")
     if not firewall_clock:
@@ -6056,9 +6104,14 @@ async def run_api_check(cfg: Config) -> ApiCheckResult:
     controller._schedule_report(output_file)
     await controller.wait_for_reports()
     if validation_warnings:
+        # A failed check logging "passed" next to its own failure line is how an
+        # operator ends up hunting the wrong cause, so say which one this is.
         LOG.warning(
-            "API check for %s passed with reduced evidence: %s",
+            "API check for %s %s: %s",
             cfg.target_name or cfg.panos_url,
+            "passed with reduced evidence"
+            if succeeded
+            else "failed, and also collected reduced evidence",
             "; ".join(validation_warnings),
         )
     return ApiCheckResult(output_file, succeeded, validation_warnings)
