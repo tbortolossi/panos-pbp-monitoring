@@ -886,7 +886,7 @@ class MonitorTests(unittest.TestCase):
 
         async def fake_check(target_cfg):
             return ApiCheckResult(
-                target_cfg.output_dir / "api-check.jsonl", True, []
+                target_cfg.output_dir / "api-check.jsonl", True, [], []
             )
 
         with patch(
@@ -1236,7 +1236,9 @@ class MonitorTests(unittest.TestCase):
             cfg = make_config(output_dir)
 
             with patch("pbp_monitoring.orchestrator.PanOSClient", return_value=client):
-                output_file, succeeded, warnings = asyncio.run(run_api_check(cfg))
+                output_file, succeeded, warnings, notes = asyncio.run(
+                    run_api_check(cfg)
+                )
 
             records = [
                 json.loads(line)
@@ -1245,7 +1247,9 @@ class MonitorTests(unittest.TestCase):
             cycle = next(record for record in records if "cycle" in record)
             self.assertTrue(succeeded)
             self.assertEqual(warnings, [])
+            self.assertEqual(notes, [])
             self.assertEqual(cycle["validation_warnings"], [])
+            self.assertEqual(cycle["validation_notes"], [])
             self.assertTrue(records[0]["identity_complete"])
             self.assertEqual(records[0]["collector_version"], __version__)
             self.assertTrue(cycle["recovery_sample_eligible"])
@@ -1295,7 +1299,9 @@ class MonitorTests(unittest.TestCase):
                 "pbp_monitoring.orchestrator.PanOSClient",
                 return_value=OperationalOnlyClient(),
             ):
-                output_file, succeeded, warnings = asyncio.run(run_api_check(cfg))
+                output_file, succeeded, warnings, notes = asyncio.run(
+                    run_api_check(cfg)
+                )
 
             records = [
                 json.loads(line)
@@ -1307,6 +1313,7 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(cycle["validation_errors"], [])
             self.assertEqual(records[-1]["reason"], "api_check_complete")
             self.assertEqual(sorted(warnings), sorted(cycle["validation_warnings"]))
+            self.assertEqual(notes, [])
             self.assertEqual(len(warnings), 2)
             self.assertTrue(
                 any("pbp_settings" in warning for warning in warnings), warnings
@@ -1335,7 +1342,9 @@ class MonitorTests(unittest.TestCase):
                 "pbp_monitoring.orchestrator.PanOSClient",
                 return_value=NoSessionInfoClient(),
             ):
-                _output_file, succeeded, warnings = asyncio.run(run_api_check(cfg))
+                _output_file, succeeded, warnings, _notes = asyncio.run(
+                    run_api_check(cfg)
+                )
 
             self.assertFalse(succeeded)
             self.assertEqual(warnings, [])
@@ -1361,7 +1370,9 @@ class MonitorTests(unittest.TestCase):
                 "pbp_monitoring.orchestrator.PanOSClient",
                 return_value=OpaqueClient(),
             ):
-                output_file, succeeded, _warnings = asyncio.run(run_api_check(cfg))
+                output_file, succeeded, _warnings, _notes = asyncio.run(
+                    run_api_check(cfg)
+                )
 
             records = [
                 json.loads(line)
@@ -1393,7 +1404,9 @@ class MonitorTests(unittest.TestCase):
                 "pbp_monitoring.orchestrator.PanOSClient",
                 return_value=CandidateClient(),
             ):
-                output_file, succeeded, _warnings = asyncio.run(run_api_check(cfg))
+                output_file, succeeded, _warnings, _notes = asyncio.run(
+                    run_api_check(cfg)
+                )
 
             records = [
                 json.loads(line)
@@ -2235,15 +2248,24 @@ class FirewallCheckTests(unittest.TestCase):
 
             recorded = store.list_targets()[0]
             self.assertEqual(recorded["last_check_kind"], "validation")
-            self.assertEqual(recorded["last_check_status"], "warning")
+            # Nothing to repair on the firewall or in the role, so the check
+            # stays green and the note says which thresholds are protecting it.
+            self.assertEqual(recorded["last_check_status"], "ok")
             self.assertIn("pbp_settings", recorded["last_check_detail"])
             self.assertIn("not configured", recorded["last_check_detail"])
-            self.assertIn("default", recorded["last_check_detail"])
+            self.assertIn("alert 50%, activate 80%", recorded["last_check_detail"])
             self.assertNotIn("command failed", recorded["last_check_detail"])
+            self.assertNotIn("reduced evidence", recorded["last_check_detail"])
             self.assertIsNone(recorded["check_requested_at"])
 
     def test_a_platform_without_ingress_backlogs_still_validates(self):
-        """VM-Series has no ingress queues; its rejection is not a fault."""
+        """VM-Series has no ingress queues; its rejection is not a fault.
+
+        No role and no upgrade can make a VM-Series answer this command, so the
+        check passes green with the missing evidence named as a note. A target
+        left amber for a limit of its own platform trains the operator to stop
+        reading amber.
+        """
 
         class VmSeriesClient(FakeClient):
             def op_response(self, command: str) -> PanOSResponse:
@@ -2276,11 +2298,110 @@ class FirewallCheckTests(unittest.TestCase):
 
             recorded = store.list_targets()[0]
             self.assertEqual(recorded["last_check_kind"], "validation")
-            self.assertEqual(recorded["last_check_status"], "warning")
-            self.assertIn("reduced evidence", recorded["last_check_detail"])
+            self.assertEqual(recorded["last_check_status"], "ok")
+            self.assertNotIn("reduced evidence", recorded["last_check_detail"])
             self.assertIn("ingress_backlogs", recorded["last_check_detail"])
             self.assertIn("not supported", recorded["last_check_detail"])
             self.assertIsNone(recorded["check_requested_at"])
+
+    def test_a_vm_series_on_default_thresholds_passes_without_a_warning(self):
+        """The lab PA-VM hits both structural absences at once.
+
+        No hardware dataplane and no PBP profile: every read that could be made
+        was made. The check must read green, name both facts, and keep them out
+        of the reduced-evidence list a restricted role produces.
+        """
+
+        class DefaultVmSeriesClient(FakeClient):
+            def op_response(self, command: str) -> PanOSResponse:
+                if command == PBP_SETTINGS_COMMAND:
+                    raise PanOSAPIError(
+                        "No such node", raw_response="raw no such node"
+                    )
+                if command == OP_COMMANDS["ingress_backlogs"]:
+                    raise PanOSAPIError(
+                        "show -> running -> resource-monitor -> ingress-backlogs "
+                        "unexpected here",
+                        raw_response="raw unexpected node",
+                    )
+                if "<resource-monitor><second><last>" in command:
+                    return PanOSResponse(
+                        result_xml=VM_SERIES_RESOURCE_MONITOR_RESULT,
+                        raw_response=VM_SERIES_RESOURCE_MONITOR_RESULT,
+                    )
+                return super().op_response(command)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            router, store = self._router(root, identity="PA-VM|11.2.4")
+            store.request_target_check(store.list_targets()[0]["target_id"])
+
+            with patch(
+                "pbp_monitoring.orchestrator.PanOSClient",
+                return_value=DefaultVmSeriesClient(),
+            ):
+                asyncio.run(run_target_checks_once(router))
+
+            recorded = store.list_targets()[0]
+            self.assertEqual(recorded["last_check_status"], "ok")
+            detail = recorded["last_check_detail"]
+            self.assertNotIn("reduced evidence", detail)
+            self.assertIn("ingress_backlogs", detail)
+            self.assertIn("pbp_settings", detail)
+            self.assertIn("alert 50%, activate 80%", detail)
+
+            capture = next(
+                (root / "data" / "targets" / "fw-a" / "api-checks").rglob("*.jsonl")
+            )
+            records = [
+                json.loads(line)
+                for line in capture.read_text(encoding="utf-8").splitlines()
+            ]
+            cycle = next(record for record in records if "cycle" in record)
+            # The capture is what TAC reads: both facts belong to it, and
+            # neither belongs to the list of evidence that went missing.
+            self.assertEqual(cycle["validation_warnings"], [])
+            self.assertEqual(len(cycle["validation_notes"]), 2)
+            self.assertEqual(cycle["validation_errors"], [])
+
+    def test_a_refused_read_stays_amber_beside_a_platform_note(self):
+        """A repairable refusal must not be hidden by a structural absence."""
+
+        class RestrictedVmSeriesClient(FakeClient):
+            def op_response(self, command: str) -> PanOSResponse:
+                if command == OP_COMMANDS["buffer_latency"]:
+                    raise PanOSAPIError(
+                        "Permission denied", raw_response="raw permission denied"
+                    )
+                if command == OP_COMMANDS["ingress_backlogs"]:
+                    raise PanOSAPIError(
+                        "show -> running -> resource-monitor -> ingress-backlogs "
+                        "unexpected here",
+                        raw_response="raw unexpected node",
+                    )
+                if "<resource-monitor><second><last>" in command:
+                    return PanOSResponse(
+                        result_xml=VM_SERIES_RESOURCE_MONITOR_RESULT,
+                        raw_response=VM_SERIES_RESOURCE_MONITOR_RESULT,
+                    )
+                return super().op_response(command)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            router, store = self._router(root, identity="PA-VM|11.2.4")
+            store.request_target_check(store.list_targets()[0]["target_id"])
+
+            with patch(
+                "pbp_monitoring.orchestrator.PanOSClient",
+                return_value=RestrictedVmSeriesClient(),
+            ):
+                asyncio.run(run_target_checks_once(router))
+
+            recorded = store.list_targets()[0]
+            self.assertEqual(recorded["last_check_status"], "warning")
+            detail = recorded["last_check_detail"]
+            self.assertIn("reduced evidence: buffer_latency", detail)
+            self.assertIn("ingress_backlogs", detail)
 
     def test_an_unreadable_ingress_backlog_still_fails_the_validation(self):
         """A command the firewall knows and could not run stays a failure."""
