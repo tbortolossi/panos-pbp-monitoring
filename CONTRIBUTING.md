@@ -55,8 +55,8 @@ against a lab firewall using a dedicated least-privilege API administrator.
 
 ## Contributions and licensing
 
-The project is proprietary. Submit changes only if you are authorized to do so.
-By submitting a contribution, you confirm that it may be incorporated and
-distributed under the project's proprietary terms. Contact the maintainer
-through the established private project channel if a separate contribution
-agreement is required.
+The project is licensed under the Apache License, Version 2.0. By submitting a
+contribution you agree that it is your own work, or that you are entitled to
+submit it, and that it may be incorporated and distributed under that licence
+(Apache-2.0 section 5). Keep the `NOTICE` attribution intact and state any
+significant change you make to an existing file.
