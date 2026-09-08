@@ -687,6 +687,57 @@ session tracker stage l7proc: app identified
         self.assertEqual(candidate["source_port"], 5000)
         self.assertEqual(candidate["application"], "sctp")
 
+    def test_panos_11_2_session_fields_yield_interfaces_and_throughput(self):
+        def snapshot(c2s_octets, s2c_octets):
+            return f"""
+<result><c2s>
+  <source>192.0.2.10</source><source-zone>TRUST</source-zone>
+  <dst>198.51.100.20</dst><proto>17</proto>
+  <sport>38253</sport><dport>5203</dport>
+  <state>ACTIVE</state><type>FLOW</type>
+</c2s><s2c>
+  <source>198.51.100.20</source><source-zone>UNTRUST</source-zone>
+  <dst>192.0.2.10</dst><proto>17</proto>
+  <sport>5203</sport><dport>38253</dport>
+  <state>ACTIVE</state><type>FLOW</type>
+</s2c><start-time>Mon Sep  7 21:52:04 2026</start-time>
+<application>unknown-udp</application><rule>allow-udp</rule>
+<c2s-packets>7658</c2s-packets><c2s-octets>{c2s_octets}</c2s-octets>
+<s2c-packets>1</s2c-packets><s2c-octets>{s2c_octets}</s2c-octets>
+<l7-proc>completed</l7-proc>
+<igr-if>ethernet1/2</igr-if><egr-if>ethernet1/3</egr-if>
+</result>
+""".strip()
+
+        baseline = extract_session_summary(snapshot(811702, 60), 1217)
+        later = extract_session_summary(snapshot(1811702, 120), 1217)
+
+        self.assertEqual(baseline["total_bytes_c2s"], 811702)
+        self.assertEqual(baseline["total_bytes_s2c"], 60)
+        self.assertEqual(baseline["ingress_interface"], "ethernet1/2")
+        self.assertEqual(baseline["egress_interface"], "ethernet1/3")
+        self.assertEqual(baseline["layer7_processing"], "completed")
+
+        previous_samples = {}
+        derive_session_rates({"1217": baseline}, previous_samples, 10.0)
+        rates = derive_session_rates({"1217": later}, previous_samples, 20.0)
+
+        self.assertEqual(rates["1217"]["status"], "calculated")
+        self.assertEqual(rates["1217"]["delta_bytes_total"], 1000060)
+        self.assertEqual(rates["1217"]["bits_per_second_total"], 800048.0)
+
+    def test_session_without_byte_counters_reports_them_missing(self):
+        summary = extract_session_summary(
+            "<result><c2s><source>192.0.2.10</source></c2s>"
+            "<application>unknown-udp</application></result>",
+            1218,
+        )
+
+        rates = derive_session_rates({"1218": summary}, {}, 10.0)
+
+        self.assertNotIn("total_bytes_c2s", summary)
+        self.assertEqual(rates["1218"]["status"], "missing_byte_counters")
+
     def test_bad_key_and_labelled_trigger_metadata_are_explicit(self):
         summary = extract_session_summary(
             "Session 2022536315\nBad Key: c2s: 'c2s'\nBad Key: s2c: 's2c'"

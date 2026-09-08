@@ -3,6 +3,32 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.44.1] - 2026-09-08
+
+### Fixed
+
+- **A PAN-OS 11.2 session snapshot no longer loses its counters and its
+  interfaces.** `show session id` names its fields differently across
+  releases, and 11.2 abbreviates the interfaces to `igr-if` and `egr-if`,
+  shortens the layer-7 state to `l7-proc` and counts the traffic in
+  `c2s-octets` and `s2c-octets`. The parser only looked for the older names,
+  so five fields were dropped from every summary while the answer itself
+  parsed cleanly and nothing was logged. Two consequences, both seen on a real
+  incident whose buffer peaked at 99.8% with PBP dropping: no per-session
+  throughput existed anywhere in the capture, because `derive_session_rates`
+  needs the byte counters and returned `missing_byte_counters` for every
+  candidate in every batch, so the report ranked the offender by its share of
+  the packet buffer alone and never said what it was pushing; and the session
+  evidence named no ingress port, leaving `evidence_interfaces` empty, so on a
+  release refusing `show counter interface all` the incident would carry no
+  interface counters at all. Both readings were already in the raw XML
+  preserved in the capture. The parser now accepts the 11.2 names alongside
+  the existing ones, so an older release keeps parsing exactly as before, and
+  a release printing neither form still reports `missing_byte_counters`
+  instead of a fabricated zero. Collection is unchanged: no command was added
+  or removed, the persisted fields already existed, and captures written
+  before this fix stay readable. Refs #229.
+
 ## [0.44.0] - 2026-09-07
 
 ### Added
