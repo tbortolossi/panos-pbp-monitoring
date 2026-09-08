@@ -456,6 +456,7 @@ pbp-report-v2
 pbp-export-text
 pbp-web
 pbp-config
+pbp-support
 ```
 
 ### Regenerating the documentation screenshots
