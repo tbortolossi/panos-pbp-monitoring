@@ -2314,6 +2314,11 @@ def extract_session_summary(
     }
     metadata = {name: value for name, value in metadata.items() if value is not None}
     if root is not None:
+        # PAN-OS names these fields differently across releases, and a name it
+        # does not print is simply absent from the answer. 11.2 abbreviates the
+        # interfaces and counts the traffic in octets, so a summary parsed with
+        # the older names alone carries no throughput and names no ingress
+        # port, without anything failing.
         structured_metadata = {
             "start_time": _first_descendant_text(root, "start-time", "start_time"),
             "timeout": _first_descendant_text(root, "timeout"),
@@ -2325,23 +2330,30 @@ def extract_session_summary(
                 root,
                 "ingress-interface",
                 "ingress_interface",
+                "igr-if",
             ),
             "egress_interface": _first_descendant_text(
                 root,
                 "egress-interface",
                 "egress_interface",
+                "egr-if",
             ),
             "layer7_processing": _first_descendant_text(
                 root,
                 "layer7-processing",
                 "layer7_processing",
+                "l7-proc",
             ),
             "offload": _first_descendant_text(root, "offload"),
             "total_bytes_c2s": _int_value(
-                _first_descendant_text(root, "total-bytes-c2s", "bytes-c2s")
+                _first_descendant_text(
+                    root, "total-bytes-c2s", "bytes-c2s", "c2s-octets"
+                )
             ),
             "total_bytes_s2c": _int_value(
-                _first_descendant_text(root, "total-bytes-s2c", "bytes-s2c")
+                _first_descendant_text(
+                    root, "total-bytes-s2c", "bytes-s2c", "s2c-octets"
+                )
             ),
             "layer7_packets_c2s": _int_value(
                 _first_descendant_text(root, "layer7-packets-c2s", "packets-c2s")
