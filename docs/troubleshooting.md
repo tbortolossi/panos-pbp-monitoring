@@ -142,7 +142,7 @@ incident report has a **Largest sessions** section for them. To look at a
 firewall right now, outside any incident, the same query runs at the CLI:
 
 ```text
-> show session all filter min-kb 1048576 min-age 600
+> show session all filter min-kb 10240
 > show session id <id>
 ```
 
@@ -160,8 +160,8 @@ twice through the XML API, five to ten seconds apart, index by session ID, and
 compare the byte counters:
 
 ```text
-/api/?type=op&cmd=<show><session><all><filter><min-kb>1048576</min-kb>
-<min-age>600</min-age></filter></all></session></show>
+/api/?type=op&cmd=<show><session><all><filter><min-kb>10240</min-kb>
+</filter></all></session></show>
 ```
 
 That is exactly what the collector does between two batches, and it is the only

@@ -300,10 +300,15 @@ than create a concurrent one.
    total bit rates while detecting reset counters and reused session IDs. A
    source IP alone remains valid attribution evidence but does not cause a
    session command.
-7bis. Every batch also lists the largest, longest-lived sessions. The
-   `min-kb` and `min-age` filters are what keep the query affordable: they are
-   applied by the firewall, so the management plane returns a short list
-   instead of the session table. Each returned session already carries its
+7bis. Every batch also lists the largest sessions. The `min-kb` and
+   `min-age` filters are applied by the firewall, so it returns a short list
+   instead of the session table. They are not a CPU control: a packet-buffer
+   incident saturates the dataplane while this query runs on the management
+   plane, which stays available. What they bound is the size of the answer,
+   which `MAX_API_RESPONSE_BYTES` caps at 8 MiB. They default to ten mebibytes
+   of cumulative traffic and no age filter, which is what a session pushing a
+   flood reaches inside one incident, because these thresholds decide what the
+   growth ranking of requirement 7ter can ever see. Each returned session already carries its
    index, start time, cumulative byte counter, state, application, zones, and
    ingress and egress interfaces, so no per-session follow-up call is made. The
    collector keeps the largest ones, measures each session's age against the
@@ -311,6 +316,21 @@ than create a concurrent one.
    throughput from the delta of the cumulative counter between two batches. A
    session index PAN-OS recycled is detected by its start time and never
    inherits the volume of its predecessor.
+7ter. The report ranks the sessions by what they gained during the incident,
+   derived at report time from the batches already persisted rather than
+   collected as new state, so no command is added and a capture holding the
+   evidence can be ranked after the fact. Growth is the difference between the
+   first and the last cumulative byte counter observed for one session inside
+   the incident, never its lifetime volume, over the union of the sessions the
+   filtered table listed and the candidates looked up individually, so a
+   session ranks whether or not PBP designated it. Each row states whether
+   PAN-OS ever designated the session: a heavy grower it never named is the
+   finding this ranking exists for, since an offloaded flow writes no traffic
+   log while it is open. A session seen in a single batch, and one whose
+   counter went backwards, are reported as such and never ranked as a zero; a
+   recycled index inherits nothing. The ranking is bounded in the sessions it
+   follows and the rows it renders, and it states the threshold in force and
+   the batches whose read failed, so it is never read as an exhaustive list.
 8. The complete cycle, raw XML API responses, and partial errors are written to
    a JSONL file. The hardware port counters are collected on the first batch
    then every third batch, with one `show counter interface all` read: a flood

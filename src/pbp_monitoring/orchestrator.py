@@ -412,12 +412,21 @@ LARGE_SESSION_COMMAND_TEMPLATE = (
     "</filter></all></session></show>"
 )
 LARGE_SESSION_MIN_AGE_ELEMENT = "<min-age>{seconds}</min-age>"
-# One gibibyte of cumulative traffic and ten minutes of age. Both filters are
-# there to cut the candidate list down: on the lab firewall they take the
-# match from 44 sessions to 1. An age filter also hides a session younger than
-# the threshold, so an operator hunting a fast short transfer lowers it.
-LARGE_SESSION_MIN_KB_DEFAULT = 1048576
-LARGE_SESSION_MIN_AGE_DEFAULT = 600
+# Ten mebibytes of cumulative traffic and no age filter. The threshold decides
+# what the growth ranking can ever see, so it is set to what a session pushing
+# a flood reaches inside one incident, not to what a long transfer accumulates
+# over days: an observed incident had its heaviest session gain 36 MB in 38
+# seconds, which a gibibyte threshold hid completely. An age filter is worse
+# still here, because a session born with the incident is exactly the one being
+# hunted, so there is none by default.
+#
+# The bound on this read is not the firewall's CPU. A packet-buffer incident
+# saturates the dataplane while this query runs on the management plane, which
+# stays available. It is `MAX_API_RESPONSE_BYTES`: a deployment whose table
+# holds enough sessions above the threshold to exceed it sees the read fail,
+# which the batch records as a failure, and the operator raises the threshold.
+LARGE_SESSION_MIN_KB_DEFAULT = 10240
+LARGE_SESSION_MIN_AGE_DEFAULT = 0
 LARGE_SESSION_MIN_KB_FLOOR = 1000
 LARGE_SESSION_LIMIT = 10
 LARGE_SESSION_FIELDS = (

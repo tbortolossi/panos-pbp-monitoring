@@ -981,6 +981,222 @@ def ingress_backlog_collection(cycles: Sequence[dict[str, Any]]) -> dict[str, in
     return command_outcomes(cycles, "ingress_backlogs", "ingress_backlogs")
 
 
+#: How many grown sessions the ranking renders.
+SESSION_GROWTH_LIMIT = 10
+#: How many sessions the ranking follows at once. A busy firewall lists far
+#: more than a report should carry, and only the head of the ranking is ever
+#: read, so the tracker is bounded and says when it stopped taking new ones.
+SESSION_GROWTH_TRACK_LIMIT = 5000
+#: The identity fields a ranked row carries over from whichever read named the
+#: session, so a row reads like the offender rows above it.
+_SESSION_GROWTH_FIELDS = (
+    "source_ip",
+    "destination_ip",
+    "source_port",
+    "destination_port",
+    "protocol",
+    "application",
+    "from_zone",
+    "to_zone",
+    "ingress_interface",
+    "egress_interface",
+    "state",
+)
+
+
+def _growth_bytes(value: Any) -> int | None:
+    """One cumulative byte counter, or None when the read did not carry it."""
+    number = _first_number(value)
+    if number is None or number < 0:
+        return None
+    return int(number)
+
+
+def _pbp_flagged_ids(cycles: Sequence[dict[str, Any]]) -> set[int]:
+    """Every session PAN-OS itself ranked as a packet-buffer offender."""
+    flagged: set[int] = set()
+    for record in cycles:
+        for offender in record.get("pbp_offenders") or []:
+            if not isinstance(offender, dict):
+                continue
+            session_id = _first_number(offender.get("session_id"))
+            if session_id is not None:
+                flagged.add(int(session_id))
+        for session_id in record.get("candidate_session_ids") or []:
+            number = _first_number(session_id)
+            if number is not None:
+                flagged.add(int(number))
+    return flagged
+
+
+def _growth_observations(
+    record: dict[str, Any],
+) -> Iterable[tuple[int, str | None, int, str, dict[str, Any]]]:
+    """Every cumulative byte counter one batch observed, whatever named it.
+
+    Two reads name a session in a batch, and a session ranks whether or not
+    PBP flagged it: the filtered session table, which is the only read that can
+    show a session nothing designated, and the per-candidate lookup, which
+    follows the designated ones below whatever threshold the table applies.
+    """
+    table = collected_field(record, "large_sessions")
+    for session in (table or {}).get("sessions") or []:
+        if not isinstance(session, dict):
+            continue
+        session_id = _first_number(session.get("session_id"))
+        total = _growth_bytes(session.get("total_bytes"))
+        if session_id is None or total is None:
+            continue
+        yield int(session_id), session.get("start_time"), total, "session_table", session
+
+    summaries = record.get("session_summaries")
+    for summary in (summaries or {}).values() if isinstance(summaries, dict) else ():
+        if not isinstance(summary, dict) or not summary.get("available"):
+            continue
+        session_id = _first_number(summary.get("session_id"))
+        c2s = _growth_bytes(summary.get("total_bytes_c2s"))
+        s2c = _growth_bytes(summary.get("total_bytes_s2c"))
+        if session_id is None or c2s is None or s2c is None:
+            continue
+        flow = summary.get("c2s") if isinstance(summary.get("c2s"), dict) else {}
+        identity = {
+            "source_ip": flow.get("source_ip"),
+            "destination_ip": flow.get("destination_ip"),
+            "source_port": flow.get("source_port"),
+            "destination_port": flow.get("destination_port"),
+            "protocol": flow.get("protocol"),
+            "application": summary.get("application"),
+            "from_zone": flow.get("source_zone"),
+            "to_zone": flow.get("destination_zone"),
+            "ingress_interface": summary.get("ingress_interface"),
+            "egress_interface": summary.get("egress_interface"),
+            "state": flow.get("state"),
+        }
+        yield int(session_id), summary.get("start_time"), c2s + s2c, "candidate", identity
+
+
+def session_growth_ranking(
+    cycles: Sequence[dict[str, Any]],
+    limit: int = SESSION_GROWTH_LIMIT,
+) -> dict[str, Any]:
+    """Rank the sessions by what they gained between their first and last batch.
+
+    The offender ranking answers which sessions PAN-OS designated. This answers
+    which ones actually grew while the buffers were full, and the two are not
+    the same question: an offloaded high-volume flow writes no traffic log
+    while it is open and is never designated, so the only way to name it is to
+    watch its counter move.
+
+    Growth is the difference between the first and the last cumulative byte
+    counter observed for a session inside the incident, never its lifetime
+    volume: a session opened days earlier that moved nothing while the buffers
+    filled gains nothing here, however large it is. A session index PAN-OS
+    recycled is a different session, told apart by its start time, and inherits
+    nothing from the one that held the index before it. A counter that went
+    backwards is reported as such rather than ranked, and a session seen in
+    only one batch has no growth to report: neither is a zero.
+    """
+    tracked: dict[str, dict[str, Any]] = {}
+    tracking_truncated = False
+    min_kb: Any = None
+    min_age_seconds: Any = None
+    truncated = False
+
+    for record in cycles:
+        table = collected_field(record, "large_sessions")
+        if table is not None:
+            if table.get("min_kb") is not None:
+                min_kb = table["min_kb"]
+            if table.get("min_age_seconds") is not None:
+                min_age_seconds = table["min_age_seconds"]
+            if table.get("truncated"):
+                truncated = True
+        elapsed = _first_number(record.get("elapsed_seconds"))
+        for session_id, start_time, total, source, identity in _growth_observations(
+            record
+        ):
+            key = f"{session_id}@{start_time}"
+            item = tracked.get(key)
+            if item is None:
+                if len(tracked) >= SESSION_GROWTH_TRACK_LIMIT:
+                    tracking_truncated = True
+                    continue
+                item = {
+                    "session_id": session_id,
+                    "start_time": start_time,
+                    "first_bytes": total,
+                    "last_bytes": total,
+                    "first_elapsed": elapsed,
+                    "last_elapsed": elapsed,
+                    "observations": 0,
+                    "sources": [],
+                }
+                tracked[key] = item
+            item["last_bytes"] = total
+            if elapsed is not None:
+                if item["first_elapsed"] is None:
+                    item["first_elapsed"] = elapsed
+                item["last_elapsed"] = elapsed
+            item["observations"] += 1
+            if source not in item["sources"]:
+                item["sources"].append(source)
+            for field in _SESSION_GROWTH_FIELDS:
+                if identity.get(field) is not None:
+                    item[field] = identity[field]
+
+    flagged = _pbp_flagged_ids(cycles)
+    ranked: list[dict[str, Any]] = []
+    single_observation = 0
+    counter_reset = 0
+    for item in tracked.values():
+        item["pbp_flagged"] = item["session_id"] in flagged
+        first = item["first_bytes"]
+        last = item["last_bytes"]
+        if item["observations"] < 2:
+            item["growth_status"] = "single_observation"
+            single_observation += 1
+            continue
+        if last < first:
+            item["growth_status"] = "counter_reset"
+            counter_reset += 1
+            continue
+        window: float | None = None
+        if item["first_elapsed"] is not None and item["last_elapsed"] is not None:
+            window = round(item["last_elapsed"] - item["first_elapsed"], 3)
+        item["growth_status"] = "measured"
+        item["growth_bytes"] = last - first
+        item["observed_seconds"] = window
+        item["average_bits_per_second"] = (
+            round(8.0 * item["growth_bytes"] / window, 3)
+            if window is not None and window > 0
+            else None
+        )
+        ranked.append(item)
+
+    grown = [item for item in ranked if item["growth_bytes"] > 0]
+    grown.sort(key=lambda item: item["growth_bytes"], reverse=True)
+    if not tracked:
+        status = "unobserved"
+    elif not grown:
+        status = "no_growth"
+    else:
+        status = "ranked"
+    return {
+        "status": status,
+        "limit": limit,
+        "min_kb": min_kb,
+        "min_age_seconds": min_age_seconds,
+        "truncated": truncated,
+        "tracking_truncated": tracking_truncated,
+        "read": command_outcomes(cycles, "large_sessions"),
+        "followed": len(tracked),
+        "measured": len(ranked),
+        "single_observation": single_observation,
+        "counter_reset": counter_reset,
+        "sessions": grown[:limit],
+    }
+
+
 _ALERT_THRESHOLD_PATTERN = re.compile(r"alert threshold is\s*(\d+(?:\.\d+)?)\s*%", re.I)
 
 
