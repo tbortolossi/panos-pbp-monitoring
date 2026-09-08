@@ -39,8 +39,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "request_timeout": "15",
     "max_session_lookups": "10",
     "session_retry_seconds": "5",
-    "large_session_min_kb": "1048576",
-    "large_session_min_age_seconds": "600",
+    "large_session_min_kb": "10240",
+    "large_session_min_age_seconds": "0",
     "generate_html_report": "true",
     "generate_text_export": "true",
     "syslog_fresh_seconds": "300",
@@ -220,9 +220,23 @@ class ConfigStore:
             connection.execute(
                 "INSERT OR IGNORE INTO meta(key,value) VALUES('revision','1')"
             )
+            # The session-table thresholds decide what the growth ranking can
+            # ever see, and the old defaults hid every session an incident
+            # actually grows. Lower them where they are still untouched, and
+            # only there: an operator who chose a threshold keeps it.
             connection.execute(
-                """INSERT INTO meta(key,value) VALUES('schema_version','6')
-                   ON CONFLICT(key) DO UPDATE SET value='6'"""
+                """UPDATE settings SET value='10240', updated_at=?
+                   WHERE key='large_session_min_kb' AND value='1048576'""",
+                (now,),
+            )
+            connection.execute(
+                """UPDATE settings SET value='0', updated_at=?
+                   WHERE key='large_session_min_age_seconds' AND value='600'""",
+                (now,),
+            )
+            connection.execute(
+                """INSERT INTO meta(key,value) VALUES('schema_version','7')
+                   ON CONFLICT(key) DO UPDATE SET value='7'"""
             )
         self._chmod_private(self.path)
 

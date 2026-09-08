@@ -23,20 +23,30 @@ published:
 | Request timeout | `15` | PAN-OS API timeout per request |
 | Maximum session lookups | `10` | Bounded session enrichments per cycle |
 | Session retry seconds | `5` | Minimum resampling interval per candidate |
-| Large session min KB | `1048576` | Cumulative volume above which a session is tracked; `0` disables the query |
-| Large session min age seconds | `600` | Minimum session age for the same query; `0` removes the age filter |
+| Large session min KB | `10240` | Cumulative volume above which a session is tracked; `0` disables the query |
+| Large session min age seconds | `0` | Minimum session age for the same query; `0` removes the age filter |
 | Generate HTML report | `true` | Build the standalone incident reports, layered and flat |
 | Generate text export | `true` | Write startup and batch TXT files |
 | Syslog fresh seconds | `300` | Green/red dashboard freshness window |
 | Target check hours | `24` | Interval of the read-only firewall check; `0` disables it |
 | Webhook URL | *(empty)* | Incident notifications; empty disables them |
 
-The two large-session thresholds are the cost control of the largest-session
-query: `show session all filter` walks the session table on the management
-plane, and the filters are what keep the returned list short on a firewall
-carrying hundreds of thousands of sessions. Lower them and the query matches
-more, costs more, and fills the report with ordinary sessions; raise them and
-only the real elephants remain. The volume threshold accepts `0`, which stops
+The two large-session thresholds decide what the session evidence can ever
+see. `show session all filter` walks the session table on the management
+plane, which stays available during an incident: a packet-buffer incident
+saturates the dataplane, not the plane this query runs on. What the filters
+really bound is the size of the answer, which cannot exceed 8 MiB, so a
+deployment large enough to return more than that sees the read fail and
+raises the volume threshold.
+
+The defaults are set for the **Sessions that grew the most** ranking: ten
+mebibytes of cumulative traffic and no age filter, which is what a session
+pushing a flood reaches inside a single incident. The previous defaults of a
+gibibyte and ten minutes described a long transfer accumulating over days and
+returned nothing at all on a three-minute incident, so nothing could be
+ranked. Raise the volume threshold if the query returns too much on a large
+deployment; an age filter hides a session born with the incident, which is
+usually the one being hunted. The volume threshold accepts `0`, which stops
 the query being issued at all, or a value of at least `1000` kilobytes. Note
 that the age filter also hides a session younger than the threshold, so lower
 it when hunting a short, very fast transfer rather than a long-running one.

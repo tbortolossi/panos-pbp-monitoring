@@ -88,8 +88,8 @@ class ConfigStoreTests(unittest.TestCase):
             store = ConfigStore(Path(temporary_directory) / "config.db")
             store.initialize()
             settings = store.get_settings()
-            self.assertEqual(settings["large_session_min_kb"], "1048576")
-            self.assertEqual(settings["large_session_min_age_seconds"], "600")
+            self.assertEqual(settings["large_session_min_kb"], "10240")
+            self.assertEqual(settings["large_session_min_age_seconds"], "0")
             store.update_settings(
                 {"large_session_min_kb": "0", "large_session_min_age_seconds": "0"}
             )
@@ -98,6 +98,44 @@ class ConfigStoreTests(unittest.TestCase):
                 store.update_settings({"large_session_min_kb": "10"})
             with self.assertRaisesRegex(ValueError, "large_session_min_age_seconds"):
                 store.update_settings({"large_session_min_age_seconds": "-1"})
+
+    def test_the_old_session_table_thresholds_are_lowered_but_a_choice_is_kept(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "config.db"
+            store = ConfigStore(path)
+            store.initialize()
+            # A deployment that upgrades while still carrying the old defaults:
+            # they hid every session an incident actually grows.
+            store.update_settings(
+                {
+                    "large_session_min_kb": "1048576",
+                    "large_session_min_age_seconds": "600",
+                }
+            )
+
+            ConfigStore(path).initialize()
+
+            settings = ConfigStore(path).get_settings()
+            self.assertEqual(settings["large_session_min_kb"], "10240")
+            self.assertEqual(settings["large_session_min_age_seconds"], "0")
+
+    def test_a_configured_session_table_threshold_survives_the_upgrade(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "config.db"
+            store = ConfigStore(path)
+            store.initialize()
+            store.update_settings(
+                {
+                    "large_session_min_kb": "50000",
+                    "large_session_min_age_seconds": "120",
+                }
+            )
+
+            ConfigStore(path).initialize()
+
+            settings = ConfigStore(path).get_settings()
+            self.assertEqual(settings["large_session_min_kb"], "50000")
+            self.assertEqual(settings["large_session_min_age_seconds"], "120")
 
     def test_webhook_url_accepts_https_and_empty_but_rejects_garbage(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

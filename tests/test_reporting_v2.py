@@ -197,6 +197,43 @@ class LayeredReportTests(unittest.TestCase):
         self.assertIn("The full four-step investigation", rendered)
         self.assertLess(len(_visible(rendered)), len(rendered))
 
+    def test_the_growth_ranking_reaches_the_layered_report_too(self):
+        records = self._incident_records()
+        batches = [
+            record for record in records if record.get("elapsed_seconds") is not None
+        ]
+        self.assertGreaterEqual(len(batches), 2)
+        for index, record in enumerate(batches):
+            record.setdefault("commands", {})["large_sessions"] = {
+                "ok": True,
+                "result": "<result/>",
+            }
+            record["large_sessions"] = {
+                "status": "collected",
+                "min_kb": 10240,
+                "min_age_seconds": 0,
+                "truncated": False,
+                "sessions": [
+                    {
+                        "session_id": 8888,
+                        "start_time": "Thu Aug 27 09:59:00 2026",
+                        "total_bytes": 1_000 + index * 9_000_000,
+                        "source_ip": "198.51.100.77",
+                        "destination_ip": "203.0.113.30",
+                        "application": "ssl",
+                    }
+                ],
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            capture, _ = self._capture(directory, records)
+            layered = generate_html_report_v2(capture, directory / REPORT_V2_FILENAME)
+            rendered = layered.read_text(encoding="utf-8")
+
+        self.assertIn("Sessions that grew the most", rendered)
+        self.assertIn("<code>198.51.100.77</code>", rendered)
+
     def test_the_layered_report_shows_less_at_once_than_the_flat_one(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)

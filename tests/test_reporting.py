@@ -1711,6 +1711,86 @@ class LargeSessionSectionTests(unittest.TestCase):
         self.assertIn("predates largest-session tracking", html)
 
 
+class SessionGrowthSectionTests(unittest.TestCase):
+    """The report must name what grew, not only what PAN-OS designated."""
+
+    def _render(self, cycles: list[dict]) -> str:
+        records: list[dict] = [
+            {
+                "timestamp": "2026-08-27T10:00:00+00:00",
+                "run_id": "growth-run",
+                "event": "monitor_started",
+                "collector_version": "test",
+                "device": {"serial": "fixture", "model": "PA-fixture"},
+            }
+        ]
+        for batch, cycle in enumerate(cycles, 1):
+            record = {
+                "timestamp": f"2026-08-27T10:0{batch}:00+00:00",
+                "run_id": "growth-run",
+                "cycle": batch,
+                "elapsed_seconds": float(batch) * 10.0,
+                "percentages": {"packet_buffer_congestion": [98]},
+                "commands": {"large_sessions": {"ok": True, "result": "<result/>"}},
+            }
+            record.update(cycle)
+            records.append(record)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "growth.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            report = generate_html_report(capture, capture.with_suffix(".html"))
+            return report.read_text(encoding="utf-8")
+
+    def _batch(self, total_bytes: int) -> dict:
+        return {
+            "large_sessions": {
+                "status": "collected",
+                "min_kb": 10240,
+                "min_age_seconds": 0,
+                "truncated": False,
+                "sessions": [
+                    {
+                        "session_id": 4242,
+                        "start_time": "Thu Aug 27 09:59:00 2026",
+                        "total_bytes": total_bytes,
+                        "source_ip": "198.51.100.20",
+                        "destination_ip": "203.0.113.30",
+                        "source_port": "44321",
+                        "destination_port": "443",
+                        "application": "ssl",
+                        "from_zone": "LAN",
+                        "to_zone": "INTERNET",
+                        "ingress_interface": "ethernet1/1",
+                        "egress_interface": "ethernet1/2",
+                    }
+                ],
+            }
+        }
+
+    def test_a_grown_session_pbp_never_designated_is_named_as_such(self):
+        html = self._render([self._batch(1_000), self._batch(9_001_000)])
+
+        self.assertIn("Sessions that grew the most", html)
+        self.assertIn("<code>198.51.100.20</code>", html)
+        self.assertIn("<strong>never</strong>", html)
+        self.assertIn("top grew", html)
+
+    def test_the_section_states_the_threshold_that_bounded_it(self):
+        html = self._render([self._batch(1_000), self._batch(9_001_000)])
+
+        self.assertIn("What this ranking could not see", html)
+        self.assertIn("of cumulative traffic", html)
+
+    def test_a_capture_with_no_growth_says_so_instead_of_ranking_nothing(self):
+        html = self._render([self._batch(5_000), self._batch(5_000)])
+
+        self.assertIn("held a counter that did not move", html)
+        self.assertIn("no growth measured", html)
+
+
 class RankedEntityDescriptionTests(unittest.TestCase):
     """The table and the diagnosis describe a ranked entity identically."""
 

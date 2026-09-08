@@ -3357,14 +3357,12 @@ class LargeSessionCollectionTests(unittest.TestCase):
                 command for command in client.commands if "<min-kb>" in command
             ]
             self.assertTrue(queries)
-            self.assertEqual(
-                queries[0], large_session_command(1048576, 600)
-            )
+            self.assertEqual(queries[0], large_session_command(10240, 0))
             cycles = self._cycles(output_dir)
             summary = cycles[0]["large_sessions"]
             self.assertEqual(summary["status"], "collected")
-            self.assertEqual(summary["min_kb"], 1048576)
-            self.assertEqual(summary["min_age_seconds"], 600)
+            self.assertEqual(summary["min_kb"], 10240)
+            self.assertEqual(summary["min_age_seconds"], 0)
             self.assertEqual(
                 [session["session_id"] for session in summary["sessions"]],
                 [5258, 5259],

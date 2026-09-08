@@ -39,6 +39,7 @@ from .diagnosis import (
     hardware_generation,
     ingress_backlog_collection,
     read_failed_everywhere,
+    session_growth_ranking,
     session_totals_counted,
     congestion_recurrence,
     application_statistics_summary,
@@ -4092,6 +4093,109 @@ def _render_large_sessions(summary: dict[str, Any]) -> str:
     )
 
 
+def _growth_blind_spot(summary: dict[str, Any]) -> str:
+    """State what the ranking could not see, so it is never read as the list."""
+    notes: list[str] = []
+    min_kb = next(iter(_numbers(summary.get("min_kb"))), None)
+    age = next(iter(_numbers(summary.get("min_age_seconds"))), None)
+    if min_kb:
+        threshold = (
+            "the session table only listed sessions above "
+            f"{_format_volume(min_kb * 1000.0)} of cumulative traffic"
+        )
+        if age:
+            threshold += f" and open for more than {_human_duration(age)}"
+        notes.append(threshold)
+    elif age:
+        notes.append(
+            "the session table only listed sessions open for more than "
+            f"{_human_duration(age)}"
+        )
+    read = summary.get("read") or {}
+    failed = next(iter(_numbers(read.get("failed"))), 0.0)
+    if failed:
+        notes.append(
+            f"the table read failed in {_escape(int(failed))} of "
+            f"{_escape(int(next(iter(_numbers(read.get('batches'))), 0.0)))} batches"
+        )
+    single = next(iter(_numbers(summary.get("single_observation"))), 0.0)
+    if single:
+        notes.append(
+            f"{_escape(int(single))} session(s) were seen in a single batch, "
+            "which measures no growth"
+        )
+    reset = next(iter(_numbers(summary.get("counter_reset"))), 0.0)
+    if reset:
+        notes.append(
+            f"{_escape(int(reset))} session(s) had a counter go backwards and "
+            "are not ranked"
+        )
+    if summary.get("tracking_truncated"):
+        notes.append("more sessions were listed than the ranking follows at once")
+    if not notes:
+        return ""
+    return (
+        '<p class="muted">What this ranking could not see: '
+        + "; ".join(notes)
+        + ".</p>"
+    )
+
+
+def _render_session_growth(summary: dict[str, Any]) -> str:
+    """Rank the sessions by what they gained while the buffers were full."""
+    status = summary.get("status")
+    blind = _growth_blind_spot(summary)
+    if status == "unobserved":
+        return (
+            '<p class="muted">No session carried a cumulative byte counter this '
+            "capture could follow across two batches, so no growth could be "
+            "measured.</p>" + blind
+        )
+    if status == "no_growth":
+        return (
+            '<p class="muted">Every session followed across the incident held a '
+            "counter that did not move, so no session grew while the buffers "
+            "were full.</p>" + blind
+        )
+    sessions = summary.get("sessions") or []
+    if not sessions:
+        return '<p class="muted">No session growth was ranked.</p>' + blind
+    rows = "".join(
+        "<tr>"
+        f'<td class="number">{_escape(item.get("session_id"))}</td>'
+        f'<td><code>{_escape(item.get("source_ip") or "—")}</code>:'
+        f'{_escape(item.get("source_port") or "—")} &rarr; '
+        f'<code>{_escape(item.get("destination_ip") or "—")}</code>:'
+        f'{_escape(item.get("destination_port") or "—")}</td>'
+        f'<td>{_escape(item.get("application") or "—")}</td>'
+        f'<td>{_escape(item.get("from_zone") or "—")} &rarr; '
+        f'{_escape(item.get("to_zone") or "—")}</td>'
+        f'<td>{_escape(item.get("ingress_interface") or "—")} &rarr; '
+        f'{_escape(item.get("egress_interface") or "—")}</td>'
+        f'<td class="number">{_escape(_format_volume(item.get("growth_bytes")))}</td>'
+        f'<td>{_escape(_human_duration(next(iter(_numbers(item.get("observed_seconds"))), None)))}</td>'
+        f'<td class="number">{_escape(_format_rate(item.get("average_bits_per_second")))}</td>'
+        f'<td>{"designated" if item.get("pbp_flagged") else "<strong>never</strong>"}</td>'
+        f'<td class="number">{_escape(item.get("observations"))}</td>'
+        "</tr>"
+        for item in sessions
+    )
+    return (
+        '<p class="muted">What each session gained between the first and the '
+        "last batch that saw it, which is not its lifetime volume: a session "
+        "opened days earlier that moved nothing while the buffers filled ranks "
+        "nowhere here. A session PAN-OS never designated is the finding this "
+        "ranking exists for, because an offloaded high-volume flow writes no "
+        "traffic log while it is open and cannot appear in the offender "
+        "ranking.</p>"
+        '<div class="table-wrap"><table>'
+        "<thead><tr><th>Session</th><th>Flow</th><th>Application</th>"
+        "<th>Zones</th><th>Interfaces</th><th>Grew by</th><th>Observed for</th>"
+        "<th>Avg Mbit/s</th><th>PBP offender</th><th>Batches</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table></div>{blind}"
+    )
+
+
 #: The navigation entry of the threat-logs section, which exists only when the
 #: query at monitor stop returned something to render.
 _THREAT_LOGS_NAV_ITEM = ("pbp-threat-logs-title", "Threat logs")
@@ -4110,6 +4214,7 @@ _EVIDENCE_NAV_ITEMS: tuple[tuple[str, str], ...] = (
     ("device-title", "Device"),
     ("cpu-tracking-title", "CPU"),
     ("large-sessions-title", "Largest sessions"),
+    ("session-growth-title", "Growth"),
     ("drop-counters-title", "Drops"),
     ("session-table-title", "Session table"),
 )
@@ -4221,6 +4326,8 @@ def _evidence_sections(parts: dict[str, Any]) -> str:
     cpu_pill = parts["cpu_pill"]
     large_sessions_html = parts["large_sessions_html"]
     large_pill = parts["large_pill"]
+    session_growth_html = parts["session_growth_html"]
+    session_growth_pill = parts["session_growth_pill"]
     drop_counters_html = parts["drop_counters_html"]
     drops_pill = parts["drops_pill"]
     session_table_html = parts["session_table_html"]
@@ -4324,6 +4431,17 @@ def _evidence_sections(parts: dict[str, Any]) -> str:
                 "traffic log until it closes, so it never appears in the offender "
                 "ranking.",
                 pill=large_pill,
+                open=False,
+            ),
+            _render_section(
+                "session-growth-title",
+                "Sessions that grew the most",
+                session_growth_html,
+                intro="Which sessions actually gained volume while the buffers "
+                "were full, which is a different question from which ones "
+                "PAN-OS designated: a session the offender ranking never names "
+                "can be the one that filled them.",
+                pill=session_growth_pill,
                 open=False,
             ),
             _render_section(
@@ -4929,6 +5047,19 @@ def _build_report_parts(
         if large_session_summary.get("status") == "collected"
         else "not collected"
     )
+    session_growth_summary = session_growth_ranking([record for _, record in cycles])
+    session_growth_html = _render_session_growth(session_growth_summary)
+    top_growth = next(iter(session_growth_summary.get("sessions") or []), None)
+    growth_bytes = (
+        next(iter(_numbers(top_growth.get("growth_bytes"))), None)
+        if isinstance(top_growth, dict)
+        else None
+    )
+    session_growth_pill = (
+        f"top grew {_format_volume(growth_bytes)}"
+        if growth_bytes is not None
+        else "no growth measured"
+    )
     drops_pill = (
         f"{_format_number(drop_counter_summary['denied_total'])} denied packets"
         if drop_counter_summary.get("items")
@@ -5006,6 +5137,9 @@ def _build_report_parts(
         "ingress_pill": ingress_pill,
         "large_pill": large_pill,
         "large_sessions_html": large_sessions_html,
+        "session_growth_html": session_growth_html,
+        "session_growth_pill": session_growth_pill,
+        "session_growth": session_growth_summary,
         "metric_groups_html": metric_groups_html,
         "offender_logs_html": offender_logs_html,
         "pbp_threat_logs_html": pbp_threat_logs_html,

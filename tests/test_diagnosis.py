@@ -9,6 +9,8 @@ from pathlib import Path
 
 from pbp_monitoring.diagnosis import (
     HYPOTHESIS_COUNTERS,
+    SESSION_GROWTH_TRACK_LIMIT,
+    session_growth_ranking,
     render_diagnosis,
     SIGNAL_COUNTER_FAMILIES,
     build_diagnosis,
@@ -762,6 +764,173 @@ class IngressBacklogStepTests(unittest.TestCase):
 
         self.assertIn(("On-box auto-collection", "not read", "none"), step["facts"])
         self.assertIn("state was not read", step["verdict"])
+
+
+def _growth_cycle(elapsed, table_sessions=(), summaries=None, command=None):
+    """One batch carrying a session-table answer and the per-candidate lookups."""
+    return {
+        "elapsed_seconds": elapsed,
+        "commands": {
+            "large_sessions": command
+            if command is not None
+            else {"ok": True, "result": "<result/>"}
+        },
+        "large_sessions": {
+            "status": "collected",
+            "min_kb": 10240,
+            "min_age_seconds": 0,
+            "truncated": False,
+            "sessions": list(table_sessions),
+        },
+        "session_summaries": summaries or {},
+    }
+
+
+def _table_session(session_id, total_bytes, start_time="Mon Sep  7 21:52:04 2026"):
+    return {
+        "session_id": session_id,
+        "start_time": start_time,
+        "total_bytes": total_bytes,
+        "source_ip": "192.0.2.10",
+        "destination_ip": "198.51.100.20",
+        "source_port": 40000 + session_id,
+        "destination_port": 443,
+        "application": "ssl",
+        "ingress_interface": "ethernet1/1",
+        "egress_interface": "ethernet1/2",
+    }
+
+
+class SessionGrowthTests(unittest.TestCase):
+    """The ranking answers what a session gained, not what it ever carried."""
+
+    def test_growth_ranks_the_gain_and_not_the_lifetime_volume(self):
+        # The veteran opened long before and barely moves; the flood is young
+        # and small in absolute terms but gains far more during the incident.
+        cycles = [
+            _growth_cycle(0.0, [_table_session(1, 900), _table_session(2, 5_000_000)]),
+            _growth_cycle(
+                10.0, [_table_session(1, 8_000_900), _table_session(2, 5_000_100)]
+            ),
+        ]
+
+        ranking = session_growth_ranking(cycles)
+
+        self.assertEqual(ranking["status"], "ranked")
+        self.assertEqual(
+            [item["session_id"] for item in ranking["sessions"]], [1, 2]
+        )
+        self.assertEqual(ranking["sessions"][0]["growth_bytes"], 8_000_000)
+        self.assertEqual(ranking["sessions"][0]["observed_seconds"], 10.0)
+        self.assertEqual(
+            ranking["sessions"][0]["average_bits_per_second"], 6_400_000.0
+        )
+
+    def test_a_session_pbp_never_designated_is_ranked_and_marked(self):
+        cycles = [
+            _growth_cycle(0.0, [_table_session(7, 100)]),
+            _growth_cycle(5.0, [_table_session(7, 900_100)]),
+        ]
+        cycles[1]["pbp_offenders"] = [{"session_id": 8}]
+
+        ranking = session_growth_ranking(cycles)
+
+        self.assertEqual(ranking["sessions"][0]["session_id"], 7)
+        self.assertFalse(ranking["sessions"][0]["pbp_flagged"])
+
+    def test_a_recycled_session_index_inherits_no_volume(self):
+        cycles = [
+            _growth_cycle(0.0, [_table_session(4, 9_000_000)]),
+            _growth_cycle(
+                5.0, [_table_session(4, 200, start_time="Mon Sep  7 22:10:00 2026")]
+            ),
+        ]
+
+        ranking = session_growth_ranking(cycles)
+
+        self.assertEqual(ranking["status"], "no_growth")
+        self.assertEqual(ranking["followed"], 2)
+        self.assertEqual(ranking["single_observation"], 2)
+        self.assertEqual(ranking["sessions"], [])
+
+    def test_a_counter_that_went_backwards_is_reported_not_ranked(self):
+        cycles = [
+            _growth_cycle(0.0, [_table_session(5, 9_000_000)]),
+            _growth_cycle(5.0, [_table_session(5, 12)]),
+        ]
+
+        ranking = session_growth_ranking(cycles)
+
+        self.assertEqual(ranking["counter_reset"], 1)
+        self.assertEqual(ranking["sessions"], [])
+        self.assertEqual(ranking["status"], "no_growth")
+
+    def test_candidate_lookups_rank_a_session_below_the_table_threshold(self):
+        summaries = {
+            "1217": {
+                "session_id": 1217,
+                "available": True,
+                "start_time": "Mon Sep  7 21:52:04 2026",
+                "total_bytes_c2s": 1000,
+                "total_bytes_s2c": 60,
+                "application": "unknown-udp",
+                "ingress_interface": "ethernet1/2",
+                "c2s": {"source_ip": "192.0.2.10", "destination_port": 5203},
+            }
+        }
+        later = {
+            "1217": {**summaries["1217"], "total_bytes_c2s": 4_001_000}
+        }
+        cycles = [
+            _growth_cycle(0.0, summaries=summaries),
+            _growth_cycle(8.0, summaries=later),
+        ]
+
+        ranking = session_growth_ranking(cycles)
+
+        self.assertEqual(ranking["sessions"][0]["session_id"], 1217)
+        self.assertEqual(ranking["sessions"][0]["growth_bytes"], 4_000_000)
+        self.assertEqual(ranking["sessions"][0]["source_ip"], "192.0.2.10")
+
+    def test_a_failed_table_read_is_counted_and_never_read_as_no_growth(self):
+        cycles = [
+            _growth_cycle(0.0, command=TIMED_OUT),
+            _growth_cycle(5.0, command=TIMED_OUT),
+        ]
+        for cycle in cycles:
+            cycle["large_sessions"] = {"error": "TimeoutError: the read timed out"}
+
+        ranking = session_growth_ranking(cycles)
+
+        self.assertEqual(ranking["status"], "unobserved")
+        self.assertEqual(ranking["read"]["failed"], 2)
+        self.assertEqual(ranking["read"]["succeeded"], 0)
+
+    def test_the_ranking_follows_a_bounded_number_of_sessions(self):
+        many = [
+            _table_session(index, 1000)
+            for index in range(SESSION_GROWTH_TRACK_LIMIT + 50)
+        ]
+        cycles = [_growth_cycle(0.0, many), _growth_cycle(5.0, many)]
+
+        ranking = session_growth_ranking(cycles)
+
+        self.assertEqual(ranking["followed"], SESSION_GROWTH_TRACK_LIMIT)
+        self.assertTrue(ranking["tracking_truncated"])
+
+    def test_the_ranking_renders_only_the_requested_number_of_rows(self):
+        first = [_table_session(index, 100) for index in range(30)]
+        second = [
+            _table_session(index, 100 + index * 1000) for index in range(30)
+        ]
+        cycles = [_growth_cycle(0.0, first), _growth_cycle(5.0, second)]
+
+        ranking = session_growth_ranking(cycles, limit=3)
+
+        self.assertEqual(len(ranking["sessions"]), 3)
+        self.assertEqual(
+            [item["session_id"] for item in ranking["sessions"]], [29, 28, 27]
+        )
 
 
 class CommandOutcomeTests(unittest.TestCase):

@@ -3,6 +3,53 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.45.0] - 2026-09-08
+
+### Added
+
+- **The report ranks the sessions that grew the most during the incident.** The
+  offender ranking answers which sessions PAN-OS designated; this answers which
+  ones actually gained volume while the buffers were full, and the two are not
+  the same question. On an observed incident the heaviest grower gained 36 MB
+  in 38 seconds while the session the offender ranking put first, on 35% of the
+  buffer, gained 918 KB. Growth is the difference between the first and the
+  last cumulative byte counter observed for one session inside the incident,
+  never its lifetime volume, taken over the union of the sessions the filtered
+  table listed and the candidates looked up individually, so a session ranks
+  whether or not PBP designated it. Each row states whether PAN-OS ever
+  designated the session: a heavy grower it never named is the finding the
+  ranking exists for, because an offloaded high-volume flow writes no traffic
+  log while it is open and can appear nowhere else in the report. A session
+  seen in a single batch, and one whose counter went backwards, are reported as
+  such and never ranked as a zero; an index PAN-OS recycled is told apart by
+  its start time and inherits nothing. Every rendering states its own blind
+  spot — the threshold in force, the batches whose read failed, the sessions
+  seen once — so it is never read as an exhaustive list. The ranking is derived
+  at report time from the batches already persisted rather than collected as
+  new state, so no command was added, nothing new is persisted, and an existing
+  capture that holds the evidence is ranked after the fact. Refs #232.
+
+### Changed
+
+- **The session-table thresholds now describe an incident, not a week.** They
+  defaulted to a gibibyte of cumulative traffic and ten minutes of age, which
+  returned nothing at all in all 36 batches of a real three-minute incident:
+  the flood sessions were too young and had not yet moved a gibibyte, so
+  nothing could be ranked and no session PBP had not already designated could
+  be found. The defaults become ten mebibytes and no age filter, which is what
+  a session pushing a flood reaches inside one incident, and an age filter is
+  removed because a session born with the incident is the one being hunted.
+  The reasoning that set the old values does not hold: a packet-buffer incident
+  saturates the **dataplane** while this query runs on the **management
+  plane**, which stays available. What the threshold really bounds is the size
+  of the answer, capped at 8 MiB, so a deployment large enough to exceed it
+  sees the read fail — recorded as a failure — and raises the threshold. Both
+  settings keep their existing floor and stay configurable in the admin UI.
+- **Settings schema 7 lowers the stored thresholds, once.** A deployment still
+  carrying the untouched old defaults has them lowered on upgrade so the
+  ranking has something to rank. A threshold an operator configured is left
+  exactly as it is.
+
 ## [0.44.1] - 2026-09-08
 
 ### Fixed

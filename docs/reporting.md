@@ -674,6 +674,44 @@ table when nothing matched, when the query is disabled, or when the capture
 predates the feature. A session index PAN-OS recycled during the incident
 appears as a separate row rather than inheriting the volume of its predecessor.
 
+## Sessions that grew the most
+
+The **Sessions that grew the most** section answers a different question from
+the one above it: not which session is large, but which ones *gained* volume
+while the buffers were full. A session opened days ago carrying four gibibytes
+tops the largest-session table and may have been idle throughout the incident;
+a session born with the flood is small in absolute terms and is the cause.
+
+For every session any batch named — the filtered session table, and the
+per-candidate `show session id` lookups — the ranking keeps the first and the
+last cumulative byte counter it saw inside the incident and reports the
+difference. Each row carries the flow, the application, the zones, the
+interfaces, what the session gained, how long it was observed, the average rate
+that follows from the two, and one column that is the point of the section:
+
+- **PBP offender** — whether PAN-OS ever designated this session. A row marked
+  **never** is a session that grew heavily and that no other section of the
+  report can name, because an offloaded high-volume flow writes no traffic log
+  while it is open and is never ranked as a packet-buffer offender.
+
+The ranking is deliberately conservative about what it will call growth. A
+session seen in a single batch has no growth to report, and is not a zero. A
+counter that went backwards is a counter the firewall reset or an index it
+recycled, so it is reported as such and never ranked. A session index PAN-OS
+reused mid-incident is told apart by its start time and inherits nothing from
+the session that held the index before it.
+
+Every rendering states its own blind spot below the table: the volume threshold
+that bounded the session table, any age filter in force, the batches where the
+read failed, and how many sessions were seen only once or had their counter
+reset. The ranking is only ever what the threshold let it see, and the section
+says so rather than reading as an exhaustive list.
+
+The threshold matters more here than anywhere else. It defaults to ten
+mebibytes of cumulative traffic with no age filter, which is what a session
+pushing a flood reaches inside one incident; both are configurable in the admin
+UI, and `docs/operations.md` explains what to change on a large deployment.
+
 ## Dataplane CPU
 
 Each batch requests `show running resource-monitor second last N`, where `N` is
