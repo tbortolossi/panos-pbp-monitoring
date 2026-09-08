@@ -506,28 +506,35 @@ class SupportBundleCommandTests(unittest.TestCase):
 
 
 class AnonymizerTests(unittest.TestCase):
-    """A bundle a customer cannot send is a bundle nobody can diagnose."""
+    """A bundle a customer cannot send is a bundle nobody can diagnose.
+
+    Every identifier below is fabricated: serials and MAC addresses are
+    globally unique, so a value copied from a real device would publish that
+    device. Addresses come from the documentation ranges of RFC 5737 and MAC
+    addresses from the RFC 7042 documentation OUI. Never paste an identifier
+    read from a firewall into these fixtures.
+    """
 
     def _anonymizer(self):
         return Anonymizer(
             "a" * 64,
-            [("PA-440-paris", "fw"), ("021201122656", "serial"), ("fw", "fw")],
+            [("PA-440-paris", "fw"), ("012345678901", "serial"), ("fw", "fw")],
         )
 
     def test_addresses_serials_and_names_become_tokens(self):
         anonymizer = self._anonymizer()
         text = anonymizer.apply(
-            "PA-440-paris serial 021201122656 at 10.0.0.253 "
-            "mac 8c:36:7a:03:10:db offender 203.0.113.7 "
-            "link fe80::8e36:7aff:fe03:10db/64"
+            "PA-440-paris serial 012345678901 at 192.0.2.253 "
+            "mac 00:53:00:03:10:db offender 203.0.113.7 "
+            "link fe80::253:ff:fe03:10db/64"
         )
         for original in (
             "PA-440-paris",
-            "021201122656",
-            "10.0.0.253",
-            "8c:36:7a:03:10:db",
+            "012345678901",
+            "192.0.2.253",
+            "00:53:00:03:10:db",
             "203.0.113.7",
-            "fe80::8e36:7aff:fe03:10db",
+            "fe80::253:ff:fe03:10db",
         ):
             self.assertNotIn(original, text)
         self.assertRegex(text, r"ip-[0-9a-f]{10}")
@@ -555,28 +562,28 @@ class AnonymizerTests(unittest.TestCase):
     def test_a_registered_serial_reads_the_same_inside_and_outside_an_element(self):
         anonymizer = self._anonymizer()
         text = anonymizer.apply(
-            "log line 021201122656 and <serial>021201122656</serial>"
+            "log line 012345678901 and <serial>012345678901</serial>"
         )
-        token = anonymizer.mapping["021201122656"]
+        token = anonymizer.mapping["012345678901"]
 
         self.assertEqual(text.count(token), 2)
 
     def test_an_already_tokenized_serial_is_never_tokenized_twice(self):
         anonymizer = self._anonymizer()
-        once = anonymizer.apply("<serial>021201122656</serial>")
+        once = anonymizer.apply("<serial>012345678901</serial>")
 
         self.assertEqual(anonymizer.apply(once), once)
 
     def test_a_value_keeps_one_token_everywhere_and_across_exports(self):
-        first = self._anonymizer().apply("10.0.0.253 talks to 10.0.0.253")
-        second = self._anonymizer().apply("seen again: 10.0.0.253")
+        first = self._anonymizer().apply("192.0.2.253 talks to 192.0.2.253")
+        second = self._anonymizer().apply("seen again: 192.0.2.253")
         token = first.split()[0]
         self.assertEqual(first.count(token), 2)
         self.assertIn(token, second)
 
     def test_a_different_installation_produces_different_tokens(self):
-        mine = Anonymizer("a" * 64).apply("10.0.0.253")
-        theirs = Anonymizer("b" * 64).apply("10.0.0.253")
+        mine = Anonymizer("a" * 64).apply("192.0.2.253")
+        theirs = Anonymizer("b" * 64).apply("192.0.2.253")
         self.assertNotEqual(mine, theirs)
 
     def test_loopback_and_unspecified_addresses_stay_readable(self):
@@ -589,17 +596,17 @@ class AnonymizerTests(unittest.TestCase):
     def test_an_address_ending_a_sentence_is_still_replaced(self):
         # Shape taken from a real PAN-OS system log.
         text = self._anonymizer().apply(
-            "authenticated for user 'admin'.   From: 10.0.0.52."
+            "authenticated for user 'admin'.   From: 192.0.2.52."
         )
-        self.assertNotIn("10.0.0.52", text)
+        self.assertNotIn("192.0.2.52", text)
         self.assertTrue(text.endswith("."))
 
     def test_a_serial_inside_a_filename_is_still_replaced(self):
         # Shape taken from a real PAN-OS scheduled-export log.
         text = self._anonymizer().apply(
-            "Successfully sent: file 'PA_021201122656_dt_12.2.2_20260830.tgz'"
+            "Successfully sent: file 'PA_012345678901_dt_12.2.2_20260830.tgz'"
         )
-        self.assertNotIn("021201122656", text)
+        self.assertNotIn("012345678901", text)
         self.assertIn("12.2.2", text)
 
     def test_a_longer_dotted_number_is_not_mistaken_for_an_address(self):
@@ -628,7 +635,7 @@ class AnonymizerTests(unittest.TestCase):
                 panos_url="https://192.0.2.10",
                 api_key="key",
                 target_serial=None,
-                serials=["021201122656"],
+                serials=["012345678901"],
                 syslog_sources=["192.0.2.10"],
                 device_identity={
                     "model": "PA-440",
@@ -637,10 +644,10 @@ class AnonymizerTests(unittest.TestCase):
                 },
             )
             text = build_anonymizer(store).apply(
-                "<model>PA-440</model><serial>021201122656</serial>"
+                "<model>PA-440</model><serial>012345678901</serial>"
             )
             self.assertIn("PA-440", text)
-            self.assertNotIn("021201122656", text)
+            self.assertNotIn("012345678901", text)
 
     def test_the_mapping_translates_every_token_back(self):
         anonymizer = self._anonymizer()
