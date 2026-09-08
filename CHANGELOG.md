@@ -3,6 +3,36 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.45.1] - 2026-09-08
+
+### Fixed
+
+- **A flood that dies before session setup is no longer framed as post-session
+  drops.** On an incident whose buffers peaked at 99.84% with no session on the
+  firewall at all, the *Denied and dropped traffic* verdict claimed the drops
+  "happened after session setup or outside policy evaluation, so the offender
+  attribution table stays the primary evidence". Both halves were wrong, and
+  the table right below them said so: 76 million packets counted as
+  `flow_rcv_dot1q_tag_err` (*802.1q tag not configured*) and `flow_no_interface`
+  at a peak of 820 015 per second, both classified `parse` — the stage before a
+  session can exist. The offender attribution table could not be the primary
+  evidence either, because it was empty: PBP designated nobody, `show session
+  info` reported zero allocated sessions, and the filtered session table
+  answered `<result />`. The verdict fell into that branch whenever the policy,
+  DoS and zone-protection totals were zero, without reading which families had
+  actually moved or whether anything had been ranked. It now does both: parse
+  drops with nothing ranked are stated as discarded before a session could
+  exist, with the offender table named as empty for that reason rather than for
+  want of collection, and the counter delta named as the primary evidence;
+  parse drops beside ranked sessions split the evidence between the two; and
+  the offender table is offered as primary only when it holds entries.
+- **The verdict says how to read a drop counter.** It now asks for the peak rate
+  against the incident window rather than the running total, because a
+  parse-stage counter moves continuously on a trunk carrying VLANs the firewall
+  does not terminate: it accumulates a large total that explains no particular
+  incident, and only its rate during the incident separates the background from
+  the event. Refs #234.
+
 ## [0.45.0] - 2026-09-08
 
 ### Added
