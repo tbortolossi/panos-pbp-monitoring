@@ -3,6 +3,26 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.47.1] - 2026-09-08
+
+### Changed
+
+- **The project is now licensed under the Apache License, Version 2.0.** It was
+  distributed under a proprietary notice that reserved every right and named no
+  copyright holder, which did not match a repository anyone can read and left
+  the terms unenforceable in practice. Consultants and customers may now
+  deploy, modify and redistribute the collector, including at a customer site,
+  as long as they keep the copyright and licence notices and state the changes
+  they made. `LICENSE` carries the licence text verbatim so it is detected as
+  Apache-2.0, and the new `NOTICE` carries the attribution to redistribute with
+  it; both ship inside the image. The `org.opencontainers.image.licenses` label
+  reads `Apache-2.0`, and the package metadata declares the SPDX identifier,
+  which raises the build requirement to `setuptools>=77` for PEP 639.
+- The licence covers the software only. Captures, reports and support bundles
+  remain the property of whoever owns the firewall they were read from, and
+  `SECURITY.md` now states that the software is granted "AS IS", so running it
+  against a production firewall stays the operator's responsibility.
+
 ## [0.47.0] - 2026-09-08
 
 ### Added

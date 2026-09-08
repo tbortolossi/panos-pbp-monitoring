@@ -1,7 +1,7 @@
 FROM python:3.13-alpine AS builder
 
 WORKDIR /build
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml README.md LICENSE NOTICE ./
 COPY src ./src
 
 RUN pip install --no-cache-dir setuptools \
@@ -26,10 +26,10 @@ RUN pip install --no-cache-dir --no-index --find-links /wheels panos-pbp-monitor
     && rm -rf /wheels
 
 LABEL org.opencontainers.image.title="PAN-OS PBP Monitoring" \
-      org.opencontainers.image.version="0.47.0" \
+      org.opencontainers.image.version="0.47.1" \
       org.opencontainers.image.description="Event-driven PAN-OS packet-buffer diagnostic collector" \
       org.opencontainers.image.source="https://github.com/tbortolossi/panos-pbp-monitoring" \
-      org.opencontainers.image.licenses="LicenseRef-Proprietary"
+      org.opencontainers.image.licenses="Apache-2.0"
 
 USER 10001:10001
 

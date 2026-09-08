@@ -1,11 +1,11 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.47.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.47.1-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
-[![License](https://img.shields.io/badge/license-proprietary-red.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 **PBP Monitoring is a self-hosted, event-driven diagnostic collector for Palo
 Alto Networks firewalls under packet-buffer pressure.** It listens to PAN-OS
@@ -501,5 +501,11 @@ distributions.
 
 ## License
 
-This project is proprietary and distributed only under a separate written
-agreement with the copyright holder. See [LICENSE](LICENSE).
+Licensed under the Apache License, Version 2.0. You may use, modify and
+redistribute it, including at a customer site, provided you keep the copyright
+and licence notices and state the changes you made. See [LICENSE](LICENSE) for
+the terms and [NOTICE](NOTICE) for the attribution to carry with them.
+
+The licence covers the software. It says nothing about the evidence the
+collector produces: captures, reports and support bundles stay the property of
+whoever owns the firewall they were read from.

@@ -23,8 +23,11 @@ bundle carries no credential by construction; see
 
 ## Supported deployments
 
-Security fixes apply to versions explicitly covered by the customer's current
-support agreement. Deploy with TLS verification enabled, a dedicated
+Security fixes are published against the latest released version; older
+versions are fixed only where a support agreement covers them. The software is
+distributed under the Apache License, Version 2.0, which grants it "AS IS" and
+without warranty: running it against a production firewall stays the operator's
+responsibility. Deploy with TLS verification enabled, a dedicated
 least-privilege API administrator, network ACLs around Syslog port 514, and
 restricted access to the persistent evidence volume.
 
