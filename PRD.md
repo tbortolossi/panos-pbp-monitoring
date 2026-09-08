@@ -911,9 +911,15 @@ key must be backed up and restored together.
     the question is open. The fact line, the step's verdict and the Ingress
     section of both reports are formatted from one resolver, and a threshold
     or duration the firewall did not return is shown as an assumed PAN-OS
-    default rather than as the firewall's own value; (4) five wider
-    hypotheses — elephant session, burst of denied sessions, storm of new
-    sessions, interface errors, aggregate load — each with its own verdict.
+    default rather than as the firewall's own value; (4) eight wider
+    hypotheses — elephant session, few sessions holding the byte budget,
+    one-way feed crossing the firewall, PBP measured but never mitigated,
+    burst of denied sessions, storm of new sessions, interface errors,
+    aggregate load — each with its own verdict. The three that read a buffer
+    held by a handful of never-closing sessions are protocol-agnostic: the
+    concentration of bytes over almost no sessions is the signature, and the
+    carrier (GRE and its ERSPAN mirroring, IPSec, a tunnel PAN-OS never
+    classified) only annotates it.
     The ones reading the session table state it as unknown rather than flat
     when every `show session info` read failed: the storm hypothesis is then
     not evaluable instead of negative, and the denied-burst verdict, which the

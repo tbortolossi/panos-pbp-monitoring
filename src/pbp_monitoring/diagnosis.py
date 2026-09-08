@@ -48,6 +48,26 @@ DENIED_BURST_TOTAL_PACKETS = 5000.0
 # elephant session looks like from the session table.
 ELEPHANT_RATE_BITS_PER_SECOND = 100_000_000.0
 SESSION_TABLE_CONSTRAINT_PERCENT = 80.0
+# A session that never closes does not have to be fast to hold the buffer: it
+# has to be the only thing on the firewall carrying volume. When one App-ID
+# holds this share of every byte the firewall has forwarded since boot, the
+# byte budget belongs to it whatever its rate, and the per-batch ranking of
+# the busiest sessions never has to catch it in the act.
+CONCENTRATED_APPLICATION_BYTE_SHARE = 0.5
+# ...across this few sessions. Both halves are required: an App-ID carrying
+# half the bytes over a million sessions is a busy deployment, not a session
+# that never closes. Either an absolute handful, or a negligible share of a
+# firewall large enough that a hundred sessions is not remarkable.
+CONCENTRATED_APPLICATION_SESSIONS = 100
+CONCENTRATED_APPLICATION_SESSION_SHARE = 0.01
+# A port that receives far more than it sends is not carrying a conversation.
+# Real client-server traffic is asymmetric by a factor of a few; a mirror,
+# span or tunnel-transit feed is asymmetric by orders of magnitude.
+ONE_WAY_FEED_RATIO = 40.0
+# Below this much movement during the capture the ratio means nothing: an idle
+# port sends nothing and receives a handful of broadcasts, which is a perfect
+# infinite ratio and no finding at all.
+ONE_WAY_FEED_MINIMUM_BYTES = 100_000_000.0
 # A storm of new sessions is slowpath work too, but from traffic the policy
 # allows: many short sessions from a few sources, or a connection rate the
 # session setup path cannot absorb.
@@ -114,6 +134,32 @@ BACKUP_APPLICATIONS = frozenset(
         "rsync",
         "vmware",
         "commvault",
+    }
+)
+
+# Transports whose session is one long-lived tunnel rather than one exchange:
+# a single session there is a whole feed, so its byte total says nothing about
+# how many hosts sit behind it. ERSPAN port mirroring rides on GRE. This
+# annotates a finding; it never narrows what fires one, because the same shape
+# arrives under any App-ID - including none at all.
+TRANSIT_APPLICATIONS = frozenset(
+    {
+        "gre",
+        "ipsec",
+        "ipsec-esp",
+        "ipsec-esp-udp",
+        "ipsec-ah",
+        "gtp-u",
+        "gtpv1-u",
+        "capwap",
+        "l2tp",
+        "pptp",
+        "vxlan",
+        "geneve",
+        "ip-in-ip",
+        "ipv6-in-ipv4",
+        "openvpn",
+        "wireguard",
     }
 )
 
@@ -189,6 +235,21 @@ def _fmt(value: float | int | None) -> str:
     if float(value).is_integer():
         return str(int(value))
     return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _gb(value: float | int | None) -> str:
+    """Bytes as gigabytes, for volumes no operator reads in full digits."""
+    number = _first_number(value)
+    if number is None:
+        return "-"
+    return f"{_fmt(round(number / 1_000_000_000.0, 1))} GB"
+
+
+def _share(value: float | None) -> str:
+    """A 0-1 share as a percentage, for the concentration wording."""
+    if value is None:
+        return "-"
+    return f"{_fmt(round(value * 100, 1))}%"
 
 
 def _pct(value: float | None) -> str:
@@ -408,7 +469,10 @@ def _congestion_moment(entry: dict[str, Any]) -> datetime | None:
     return None
 
 
-def congestion_recurrence(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+def congestion_recurrence(
+    events: Sequence[dict[str, Any]],
+    activate_percent: float | None = None,
+) -> dict[str, Any]:
     """Fold the firewall's own congestion log into a recurrence histogram.
 
     The congestion line is written once a minute while the buffer is above the
@@ -417,6 +481,11 @@ def congestion_recurrence(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     hour of day and day of week is what separates a scheduled job from an
     attack: a backup window fires in the same three hours every night, and a
     flood does not.
+
+    Given the Activate threshold, it also says how severe those minutes were.
+    The peak alone cannot separate a firewall that touched the threshold once
+    from one that has been sitting above it for a month, and that difference
+    decides whether the answer is an incident response or a capacity change.
 
     No collection of its own: the histogram is derived from the single
     congestion query the monitor already runs at stop.
@@ -463,6 +532,16 @@ def congestion_recurrence(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "share": round(share, 3),
             "scheduled": share >= RECURRENCE_WINDOW_SHARE,
         }
+    # The median is taken over the logged minutes only. Those are by
+    # definition the minutes above the alert threshold, so it answers "how bad
+    # was it when it was bad", never "how loaded is this firewall".
+    ordered = sorted(percentages)
+    median_percent = ordered[len(ordered) // 2] if ordered else None
+    above_activate = (
+        sum(1 for value in ordered if value >= activate_percent)
+        if activate_percent is not None and ordered
+        else None
+    )
     return {
         "collected": bool(record),
         "ok": bool(record.get("ok")),
@@ -480,6 +559,16 @@ def congestion_recurrence(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
             else 0.0
         ),
         "peak_percent": max(percentages) if percentages else None,
+        "median_percent": median_percent,
+        # How many of the logged minutes were severe enough that PBP would
+        # have acted, and against which threshold that was measured.
+        "activate_percent": activate_percent,
+        "above_activate": above_activate,
+        "above_activate_share": (
+            round(above_activate / len(ordered), 3)
+            if above_activate is not None and ordered
+            else None
+        ),
         "peak_window": peak_window,
     }
 
@@ -556,6 +645,89 @@ def arp_table_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
 def application_statistics_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """What this firewall carries by application, cumulative since its boot."""
     return _start_state(events, "application_statistics")
+
+
+def interface_status_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """The zone, link state and speed of every interface, read once at start.
+
+    Not a ``_start_state`` read: the parser returns one entry per interface
+    rather than a summary carrying a ``parsed`` flag, so "collected" is
+    whether any interface came back at all.
+    """
+    for source in (start_event(events), latest_event(events, CONTEXT_EVENT) or {}):
+        state = source.get("interface_status")
+        if isinstance(state, dict) and state:
+            return {"collected": True, "interfaces": state}
+    return {"collected": False, "interfaces": {}}
+
+
+def concentrated_applications(summary: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Applications holding the firewall's bytes across almost no sessions.
+
+    ``show running application statistics`` counts since boot, so this
+    describes the deployment rather than the incident's minute - which is
+    exactly what a session that never closes looks like. It has been carrying
+    the volume for as long as the firewall has been up, it writes no traffic
+    log while it runs, and no per-batch ranking of the busiest sessions has to
+    catch it in the act for the concentration to be visible.
+
+    Applications PAN-OS could not identify are kept: an unclassified transport
+    holding the byte budget is the same finding, and dropping it would hide
+    the case where App-ID never resolved the tunnel at all.
+    """
+    if not isinstance(summary, dict) or not summary.get("collected"):
+        return []
+    totals = summary.get("totals")
+    if not isinstance(totals, dict):
+        return []
+    total_bytes = _first_number(totals.get("bytes")) or 0.0
+    total_packets = _first_number(totals.get("packets")) or 0.0
+    total_sessions = _first_number(totals.get("sessions")) or 0.0
+    if total_bytes <= 0:
+        return []
+    found: list[dict[str, Any]] = []
+    for row in summary.get("top_by_bytes") or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("application") or "").strip()
+        row_bytes = _first_number(row.get("bytes"))
+        row_sessions = _first_number(row.get("sessions"))
+        if not name or row_bytes is None or row_sessions is None:
+            continue
+        byte_share = row_bytes / total_bytes
+        if byte_share < CONCENTRATED_APPLICATION_BYTE_SHARE:
+            continue
+        session_share = row_sessions / total_sessions if total_sessions > 0 else None
+        if not (
+            row_sessions <= CONCENTRATED_APPLICATION_SESSIONS
+            or (
+                session_share is not None
+                and session_share <= CONCENTRATED_APPLICATION_SESSION_SHARE
+            )
+        ):
+            continue
+        row_packets = _first_number(row.get("packets"))
+        found.append(
+            {
+                "application": name,
+                "sessions": int(row_sessions),
+                "bytes": int(row_bytes),
+                "byte_share": round(byte_share, 3),
+                "packet_share": (
+                    round(row_packets / total_packets, 3)
+                    if row_packets is not None and total_packets > 0
+                    else None
+                ),
+                "session_share": (
+                    round(session_share, 5) if session_share is not None else None
+                ),
+                "transit": name.lower() in TRANSIT_APPLICATIONS,
+                "backup": name.lower() in BACKUP_APPLICATIONS,
+                "unidentified": name.lower() in _UNIDENTIFIED_APPLICATIONS,
+            }
+        )
+    found.sort(key=lambda item: -item["byte_share"])
+    return found
 
 
 def session_distribution_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -1796,11 +1968,12 @@ def _context(
         "inflight_monitoring": inflight_monitoring_summary(events),
         "arp_table": arp_table_summary(events),
         "application_statistics": application_statistics_summary(events),
+        "interface_status": interface_status_summary(events),
         "session_distribution": session_distribution_summary(events),
         "chassis_status": chassis_status_summary(events),
         "pow_performance": pow_performance_summary(events),
         "buffer_history": history_trend(events),
-        "recurrence": congestion_recurrence(events),
+        "recurrence": congestion_recurrence(events, activate),
     }
 
 
@@ -3008,6 +3181,90 @@ def _interface_error_deltas(
     ]
 
 
+_ONE_WAY_BYTE_COUNTERS = ("rx_bytes", "tx_bytes")
+
+
+def _interface_byte_deltas(cycles: Sequence[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    """Byte growth per hardware port during the capture, both directions.
+
+    The port counters are cumulative since boot, so only their movement says
+    what crossed the firewall while the buffers were full; a port sampled once
+    contributes nothing.
+    """
+    first: dict[str, dict[str, float]] = {}
+    last: dict[str, dict[str, float]] = {}
+    for record in cycles:
+        interfaces = record.get("interface_counters")
+        if not isinstance(interfaces, dict):
+            continue
+        for name, payload in interfaces.items():
+            counters = payload.get("counters") if isinstance(payload, dict) else None
+            if not isinstance(counters, dict):
+                continue
+            values = {
+                key: value
+                for key in _ONE_WAY_BYTE_COUNTERS
+                if (value := _first_number(counters.get(key))) is not None
+            }
+            if len(values) < len(_ONE_WAY_BYTE_COUNTERS):
+                continue
+            first.setdefault(str(name), values)
+            last[str(name)] = values
+    return {
+        name: {
+            key: max(0.0, last[name].get(key, 0.0) - values.get(key, 0.0))
+            for key in values
+        }
+        for name, values in first.items()
+    }
+
+
+def one_way_feeds(
+    cycles: Sequence[dict[str, Any]],
+    interface_status: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Ports whose traffic crossed in one direction and never answered.
+
+    A mirror, span or tunnel-transit feed enters one port and leaves another
+    without a return path, so both ends read as an extreme byte imbalance. The
+    session carrying it stays open for as long as the source keeps sending,
+    and its buffers are held for that whole time - the shape this collector
+    exists to name, and one no per-session rate threshold reaches.
+
+    HA links are excluded by their zone: on the peer of an Active/Active pair
+    the HA2 data link is routinely the busiest and most one-sided port on the
+    box, and it is not customer traffic.
+    """
+    statuses = (interface_status or {}).get("interfaces") or {}
+    feeds: list[dict[str, Any]] = []
+    for name, values in _interface_byte_deltas(cycles).items():
+        received = values.get("rx_bytes", 0.0)
+        sent = values.get("tx_bytes", 0.0)
+        if received + sent < ONE_WAY_FEED_MINIMUM_BYTES:
+            continue
+        status = statuses.get(name) if isinstance(statuses, dict) else None
+        zone = str((status or {}).get("zone") or "").strip()
+        if zone.lower() == "ha":
+            continue
+        inbound = received >= sent
+        high, low = (received, sent) if inbound else (sent, received)
+        ratio = high / low if low > 0 else None
+        if ratio is not None and ratio < ONE_WAY_FEED_RATIO:
+            continue
+        feeds.append(
+            {
+                "interface": name,
+                "zone": zone or None,
+                "direction": "received" if inbound else "transmitted",
+                "received_bytes": int(received),
+                "transmitted_bytes": int(sent),
+                "ratio": round(ratio, 1) if ratio is not None else None,
+            }
+        )
+    feeds.sort(key=lambda item: -max(item["received_bytes"], item["transmitted_bytes"]))
+    return feeds
+
+
 def _flood_corroborations(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Count the zone-protection or DoS flood logs received during the capture."""
     destinations: set[str] = set()
@@ -3338,6 +3595,245 @@ def _step_elsewhere(
                     if sampled or large_sessions.get("status")
                     else "Neither the per-core CPU nor the largest sessions were collected."
                 ),
+                "named": [],
+            }
+        )
+
+    # A handful of sessions holding the firewall's whole byte budget. The
+    # elephant hypothesis above reads per-session rate from the batch ranking
+    # and needs the session listed through the capture; this one reads the
+    # cumulative application table instead, so a transfer that has been
+    # running since boot is visible even when no single batch ranked it.
+    concentrated = concentrated_applications(context.get("application_statistics"))
+    application_state = context.get("application_statistics") or {}
+    if concentrated:
+        leader = concentrated[0]
+        text = (
+            "<strong>One application carries almost everything this firewall "
+            "forwards, across almost no sessions</strong>: <code>"
+            + _escape(leader["application"])
+            + "</code> holds "
+            + _share(leader["byte_share"])
+            + " of the bytes"
+            + (
+                " and " + _share(leader["packet_share"]) + " of the packets"
+                if leader["packet_share"] is not None
+                else ""
+            )
+            + f" over {_fmt(leader['sessions'])} session"
+            + ("s" if leader["sessions"] != 1 else "")
+            + ". These counters are cumulative since boot, so they describe "
+            "what the firewall has been carrying all along rather than this "
+            "minute - which is what a session that never closes looks like. "
+            "It holds buffers for as long as it lives, it writes no traffic "
+            "log while it runs, and PBP never names it as a flood because it "
+            "is one session, not many."
+        )
+        if any(entry["transit"] for entry in concentrated):
+            text += (
+                " The application is a tunnel or mirror transport: one session "
+                "there is a whole feed - ERSPAN port mirroring rides on GRE - "
+                "so its byte total says nothing about how many hosts sit "
+                "behind it. Read <code>show session all filter application "
+                "&lt;app&gt;</code> on the firewall and check whether that "
+                "session ever ages out; a feed that never ends needs a "
+                "capacity or a design answer, not a threshold."
+            )
+        if any(entry["backup"] for entry in concentrated):
+            text += (
+                " It is backup or storage traffic: the operator's own "
+                "infrastructure, where blocking the source trades an incident "
+                "for an outage. Align the schedule, QoS or the thresholds "
+                "with the job window instead."
+            )
+        if any(entry["unidentified"] for entry in concentrated):
+            text += (
+                " App-ID never resolved it, so the byte budget belongs to "
+                "traffic the firewall cannot name - the session table and a "
+                "packet capture on the ingress port are what identify it."
+            )
+        hypotheses.append(
+            {
+                "key": "concentrated_application",
+                "title": "Few sessions hold the byte budget",
+                "state": "positive",
+                "text": text,
+                "named": [
+                    f"<code>{_escape(entry['application'])}</code>: "
+                    f"{_fmt(entry['sessions'])} session"
+                    + ("s" if entry["sessions"] != 1 else "")
+                    + f" carrying {_gb(entry['bytes'])}, "
+                    + _share(entry["byte_share"])
+                    + " of everything the firewall forwarded since boot"
+                    for entry in concentrated[:_MAX_NAMED]
+                ],
+            }
+        )
+    else:
+        hypotheses.append(
+            {
+                "key": "concentrated_application",
+                "title": "Few sessions hold the byte budget",
+                "state": "negative" if application_state.get("collected") else "unavailable",
+                "text": (
+                    "No application held "
+                    + _share(CONCENTRATED_APPLICATION_BYTE_SHARE)
+                    + " or more of the firewall's bytes across "
+                    f"{CONCENTRATED_APPLICATION_SESSIONS} sessions or fewer: "
+                    "the volume is spread across the session table rather "
+                    "than held by a handful of long-lived transfers."
+                    if application_state.get("collected")
+                    else "The per-application statistics were not collected."
+                ),
+                "named": [],
+            }
+        )
+
+    # Traffic that enters and never answers. The same feed seen from the wire
+    # instead of from the session table, and the half of the evidence that
+    # survives when App-ID never classified it.
+    feeds = one_way_feeds(cycles, context.get("interface_status"))
+    interface_status_state = context.get("interface_status") or {}
+    if feeds:
+        leader = feeds[0]
+        hypotheses.append(
+            {
+                "key": "one_way_feed",
+                "title": "One-way feed crossing the firewall",
+                "state": "positive",
+                "text": (
+                    "<strong>Traffic crossed "
+                    + ("an interface" if len(feeds) == 1 else "interfaces")
+                    + " in one direction and never answered</strong>: <code>"
+                    + _escape(leader["interface"])
+                    + "</code> "
+                    + leader["direction"]
+                    + " "
+                    + _gb(
+                        leader["received_bytes"]
+                        if leader["direction"] == "received"
+                        else leader["transmitted_bytes"]
+                    )
+                    + " against "
+                    + _gb(
+                        leader["transmitted_bytes"]
+                        if leader["direction"] == "received"
+                        else leader["received_bytes"]
+                    )
+                    + " the other way during the capture"
+                    + (
+                        f" ({_fmt(leader['ratio'])}:1)"
+                        if leader["ratio"] is not None
+                        else " (nothing at all the other way)"
+                    )
+                    + ". A client-server exchange is asymmetric by a factor of "
+                    "a few; this is a mirror, span or tunnel-transit feed "
+                    "crossing the firewall, and the session carrying it stays "
+                    "open for as long as the source keeps sending. Asymmetric "
+                    "routing produces the same shape from the wire, so confirm "
+                    "which of the two it is before acting. HA links are "
+                    "excluded from this reading."
+                ),
+                "named": [
+                    f"<code>{_escape(entry['interface'])}</code>"
+                    + (f" (zone <code>{_escape(entry['zone'])}</code>)" if entry["zone"] else "")
+                    + f": {_gb(entry['received_bytes'])} in, "
+                    + f"{_gb(entry['transmitted_bytes'])} out"
+                    + (f", {_fmt(entry['ratio'])}:1" if entry["ratio"] is not None else "")
+                    for entry in feeds[:_MAX_NAMED]
+                ],
+            }
+        )
+    else:
+        sampled = bool(_interface_byte_deltas(cycles))
+        hypotheses.append(
+            {
+                "key": "one_way_feed",
+                "title": "One-way feed crossing the firewall",
+                "state": "negative" if sampled else "unavailable",
+                "text": (
+                    "Every interface that moved traffic during the capture "
+                    "carried both directions: no port received or sent "
+                    f"{_fmt(ONE_WAY_FEED_RATIO)} times what it did the other "
+                    "way."
+                    if sampled
+                    else "The interface byte counters were not sampled twice, "
+                    "so no direction could be compared."
+                )
+                + (
+                    ""
+                    if interface_status_state.get("collected")
+                    else " The interface zones were not collected, so HA links "
+                    "could not be excluded by zone."
+                ),
+                "named": [],
+            }
+        )
+
+    # PBP measuring without mitigating. Not a cause: the reason the causes
+    # above were never acted on, and the fact that makes every zero PBP
+    # counter meaningless as evidence.
+    recurrence = context.get("recurrence") or {}
+    if context.get("monitor_only"):
+        logged = recurrence.get("dated_entries") or 0
+        above = recurrence.get("above_activate")
+        activate = _first_number(recurrence.get("activate_percent"))
+        text = (
+            "<strong>Packet Buffer Protection is enabled in monitor-only "
+            "mode</strong>: it measures the buffer and writes the congestion "
+            "log, and it drops nothing. That is why every PBP counter reads "
+            "zero however full the buffer got - their being zero is evidence "
+            "about the configuration, not about the traffic."
+        )
+        if logged and above is not None and activate is not None:
+            text += (
+                f" The firewall logged {_fmt(logged)} congested minute"
+                + ("s" if logged != 1 else "")
+                + f", {_fmt(above)} of them at or above the Activate threshold "
+                f"of {_pct(activate)}"
+                + (
+                    f" (median {_pct(recurrence.get('median_percent'))})"
+                    if recurrence.get("median_percent") is not None
+                    else ""
+                )
+                + " - each one a moment PBP would have applied RED to the "
+                "offending session had monitor-only been off."
+            )
+        zone_state = context.get("zone_protection") or {}
+        if zone_state.get("collected") and not (zone_state.get("zones") or []):
+            text += (
+                " No zone carries a protection profile either, so nothing "
+                "else on this firewall would have absorbed it."
+            )
+        hypotheses.append(
+            {
+                "key": "mitigation_disabled",
+                "title": "PBP measured but never mitigated",
+                "state": "positive",
+                "text": text,
+                "named": [],
+            }
+        )
+    elif context.get("pbp_modes"):
+        hypotheses.append(
+            {
+                "key": "mitigation_disabled",
+                "title": "PBP measured but never mitigated",
+                "state": "negative",
+                "text": (
+                    "PBP is not in monitor-only mode, so its counters mean "
+                    "what they say: it would have acted."
+                ),
+                "named": [],
+            }
+        )
+    else:
+        hypotheses.append(
+            {
+                "key": "mitigation_disabled",
+                "title": "PBP measured but never mitigated",
+                "state": "unavailable",
+                "text": "The PBP mode was not read, so whether it would have mitigated is unknown.",
                 "named": [],
             }
         )
@@ -4623,6 +5119,9 @@ def _conclusion(
 #: layered report always links to the table it was read from.
 EVIDENCE_ANCHORS = {
     "elephant": "large-sessions-title",
+    "concentrated_application": "device-title",
+    "one_way_feed": "drop-counters-title",
+    "mitigation_disabled": "pressure-title",
     "denied": "drop-counters-title",
     "storm": "session-table-title",
     "interfaces": "drop-counters-title",

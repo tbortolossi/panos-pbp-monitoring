@@ -3,6 +3,57 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.47.0] - 2026-09-08
+
+### Added
+
+- **A buffer held by a handful of sessions that never close is now a finding.**
+  Two tech support files from an Active/Active PA-5430 pair showed a shape the
+  diagnosis could not name: one member logged **1791 congested minutes over 30
+  days, median 97%, 1642 of them at or above the Activate threshold**, while
+  its session table sat at **0% utilization**. The holder was visible only in
+  the cumulative application table — **two GRE sessions carrying 91% of the
+  packets and 90% of the bytes of the entire firewall** — and on the wire, as
+  ingress ports reading **35 TB in against 0.8 TB out**. The existing elephant
+  hypothesis reads a per-session rate from the per-batch ranking and needs the
+  session listed in the act, so it stayed silent throughout. Three new step-4
+  hypotheses read the evidence the collector already gathers, with no new
+  PAN-OS command and no new privilege:
+  - *Few sessions hold the byte budget* — one application holding 50% or more
+    of the bytes across 100 sessions or fewer (or under 1% of the sessions),
+    from `show running application statistics`. Deliberately protocol-agnostic:
+    the concentration is the signature, and the carrier only annotates it. GRE
+    (which carries ERSPAN port mirroring) and the other tunnel transports get a
+    sentence, backup and storage applications keep their existing guardrail, and
+    an App-ID PAN-OS never resolved gets its own — but none of them is required
+    to fire the finding.
+  - *One-way feed crossing the firewall* — a port whose bytes moved 40 times
+    further in one direction than the other during the capture, from
+    `show counter interface all`. HA links are excluded by their zone, because
+    on the peer of an Active/Active pair HA2 is routinely the most one-sided
+    port on the box; asymmetric routing produces the same shape and the verdict
+    says so rather than deciding for the operator.
+  - *PBP measured but never mitigated* — Packet Buffer Protection enabled in
+    `monitor-only` mode. It writes the congestion log and drops nothing, which
+    is why every `flow_dos_pbp_*` and `pkt_buf_protect_*` counter on both
+    members read zero at 98% buffer. Those zeros are evidence about the
+    configuration, not about the traffic, and the report now says which.
+  Refs #237.
+
+### Changed
+
+- **The congestion log says how severe its minutes were, not only how many.**
+  `congestion_recurrence` gains `median_percent`, `above_activate` and
+  `above_activate_share`, measured against the Activate threshold in force. The
+  peak alone cannot separate a firewall that touched the threshold once from
+  one that has been sitting above it for a month, and that difference decides
+  whether the answer is an incident response or a capacity change.
+- The interface zone, link state and speed read once at monitor start are now
+  carried in the diagnosis context, so a finding can exclude an HA link by what
+  it is rather than by its name.
+- The step-4 tests look a hypothesis up by key instead of by position, so
+  adding a signature no longer breaks unrelated tests.
+
 ## [0.46.0] - 2026-09-08
 
 ### Added

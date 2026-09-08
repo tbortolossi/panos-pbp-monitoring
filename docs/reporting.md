@@ -354,12 +354,31 @@ firewall for the next one — an operator gesture described in
 [docs/troubleshooting.md](troubleshooting.md), never something this collector
 does.
 
-**Step 4 — If not, where else?** Five always-answered hypotheses, each with
+**Step 4 — If not, where else?** Eight always-answered hypotheses, each with
 its own verdict:
 
 - *Elephant session* — one `flow_fastpath` core hot against the median of its
   peers, or a session above the largest-sessions threshold listed through most
   of the capture at 100 Mbit/s or more.
+- *Few sessions hold the byte budget* — one application holding 50 % or more
+  of every byte the firewall has forwarded since boot across 100 sessions or
+  fewer (or under 1 % of its sessions). Read from `show running application
+  statistics`, whose counters are cumulative, so it catches the transfer that
+  has been running since boot and that no per-batch ranking ever lists in the
+  act. A tunnel or mirror transport, a backup application, or one App-ID never
+  resolved carries an extra sentence; none of them is required to fire it.
+- *One-way feed crossing the firewall* — a port whose bytes moved 40 times
+  further in one direction than the other during the capture, from
+  `show counter interface all`. Mirror, span and tunnel-transit feeds have
+  this shape and so does asymmetric routing, which the verdict says. HA links
+  are excluded by their zone: on the peer of an Active/Active pair HA2 is
+  routinely the most one-sided port on the box.
+- *PBP measured but never mitigated* — Packet Buffer Protection enabled in
+  `monitor-only` mode. It writes the congestion log and drops nothing, so
+  every PBP counter reading zero is evidence about the configuration and not
+  about the traffic. The verdict counts the logged congested minutes and how
+  many of them sat at or above the Activate threshold, and adds whether any
+  zone carries a protection profile at all.
 - *Burst of denied sessions* — `flow_policy_deny` and DoS or zone-protection
   drops at 100 packets per second or 5,000 packets over the capture, a packet
   rate that rises while the session count stays flat, PBP tracking source

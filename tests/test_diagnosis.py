@@ -52,6 +52,19 @@ def _render(records: list[dict]) -> str:
         return generate_html_report(capture).read_text(encoding="utf-8")
 
 
+def _hypothesis(diagnosis: dict, key: str) -> dict:
+    """One step-4 hypothesis by key.
+
+    By key and not by index: the wider-evidence step grows a hypothesis
+    whenever a new signature is added, and a positional lookup makes every
+    unrelated test fail on that day.
+    """
+    for hypothesis in diagnosis["steps"][3]["hypotheses"]:
+        if hypothesis["key"] == key:
+            return hypothesis
+    raise AssertionError(f"no hypothesis {key!r} in step 4")
+
+
 def _facts(step: dict) -> list[tuple[str, str]]:
     return [(label, value) for label, value, _ in step["facts"]]
 
@@ -1067,7 +1080,7 @@ class ElsewhereStepTests(unittest.TestCase):
                            "hottest_value": 97, "median": 12}],
         )
         elsewhere = diagnosis["steps"][3]
-        elephant = elsewhere["hypotheses"][0]
+        elephant = _hypothesis(diagnosis, "elephant")
 
         self.assertEqual(elephant["state"], "positive")
         self.assertIn("dp0 core 3 peaked at 97%", elephant["text"])
@@ -1085,17 +1098,17 @@ class ElsewhereStepTests(unittest.TestCase):
                           "family_totals": {"policy": 90000}, "denied_total": 90000, "counted_batches": 5},
         )
 
-        self.assertEqual(few["steps"][3]["hypotheses"][1]["state"], "negative")
-        self.assertIn("far too few to fill a buffer pool", few["steps"][3]["hypotheses"][1]["text"])
-        self.assertEqual(many["steps"][3]["hypotheses"][1]["state"], "positive")
-        self.assertIn("refused 90000 packets before session setup", many["steps"][3]["hypotheses"][1]["text"])
+        self.assertEqual(_hypothesis(few, "denied")["state"], "negative")
+        self.assertIn("far too few to fill a buffer pool", _hypothesis(few, "denied")["text"])
+        self.assertEqual(_hypothesis(many, "denied")["state"], "positive")
+        self.assertIn("refused 90000 packets before session setup", _hypothesis(many, "denied")["text"])
 
     def test_flood_logs_corroborate_the_denied_burst(self):
         diagnosis = _diagnose(
             [_cycle(1, 62.0)],
             [{"event": "flood_corroboration", "metadata": {"destination_ip": "198.51.100.15"}}],
         )
-        burst = diagnosis["steps"][3]["hypotheses"][1]
+        burst = _hypothesis(diagnosis, "denied")
 
         self.assertEqual(burst["state"], "positive")
         self.assertIn("1 zone-protection or DoS flood log(s) corroborated the incident targeting 198.51.100.15", burst["text"])
@@ -1105,8 +1118,8 @@ class ElsewhereStepTests(unittest.TestCase):
             _cycle(1, 84.0, interface_counters={"ethernet1/1": {"counters": {"rx_missed_error": 10, "tx_error": 0}}}),
             _cycle(2, 85.0, interface_counters={"ethernet1/1": {"counters": {"rx_missed_error": 5010, "tx_error": 0}}}),
         ]
-        moved = _diagnose(cycles)["steps"][3]["hypotheses"][3]
-        still = _diagnose([cycles[0], cycles[0]])["steps"][3]["hypotheses"][3]
+        moved = _hypothesis(_diagnose(cycles), "interfaces")
+        still = _hypothesis(_diagnose([cycles[0], cycles[0]]), "interfaces")
 
         self.assertEqual(moved["state"], "positive")
         self.assertIn("<code>ethernet1/1</code>: rx_missed_error +5000", moved["named"][0])
@@ -2410,6 +2423,220 @@ _DISTRIBUTION = {
         {"dataplane": "s1dp1", "active": 12443, "dispatched": 1},
     ],
 }
+class NeverClosingSessionTests(unittest.TestCase):
+    """The shape of a buffer held by a handful of sessions that never close.
+
+    Read from two Active/Active PA-5430 tech support files where two GRE
+    sessions carried 90 % of everything the firewall forwarded while its
+    session table sat at 0 % utilization. The elephant hypothesis cannot see
+    it: that one reads a per-session rate from the batch ranking, and a
+    transfer running since boot is never ranked in the act. These read the
+    cumulative application table and the per-port byte asymmetry instead, and
+    they stay deliberately protocol-agnostic - GRE is one carrier of the
+    shape, not the shape itself.
+    """
+
+    def _applications(self, **rows: tuple[int, int]) -> dict:
+        """`{application: (sessions, bytes)}` as the parsed statistics read."""
+        total = sum(byte_count for _, byte_count in rows.values())
+        return {
+            "parsed": True,
+            "reported_application_count": len(rows),
+            "totals": {
+                "bytes": total,
+                "packets": total,
+                "sessions": sum(sessions for sessions, _ in rows.values()),
+            },
+            "top_by_bytes": [
+                {
+                    "application": name,
+                    "sessions": sessions,
+                    "bytes": byte_count,
+                    "packets": byte_count,
+                }
+                for name, (sessions, byte_count) in rows.items()
+            ],
+        }
+
+    def _diagnose_applications(self, **rows: tuple[int, int]) -> dict:
+        return _hypothesis(
+            _diagnose(
+                [_cycle(1, 97.0)],
+                [_started(application_statistics=self._applications(**rows))],
+            ),
+            "concentrated_application",
+        )
+
+    def test_a_handful_of_sessions_holding_the_bytes_is_a_finding(self):
+        finding = self._diagnose_applications(
+            gre=(2, 561_000_000_000), ssl=(6793, 1_372_000_000)
+        )
+
+        self.assertEqual(finding["state"], "positive")
+        self.assertIn("across almost no sessions", finding["text"])
+        self.assertIn("<code>gre</code>", finding["named"][0])
+        self.assertIn("2 sessions", finding["named"][0])
+
+    def test_the_same_share_spread_across_the_table_is_not_a_finding(self):
+        """Volume is not the signal; volume held by almost nothing is."""
+        finding = self._diagnose_applications(
+            ssl=(900_000, 561_000_000_000), dns_base=(50, 1_000_000)
+        )
+
+        self.assertEqual(finding["state"], "negative")
+        self.assertIn("spread across the session table", finding["text"])
+
+    def test_a_tunnel_transport_is_annotated_but_never_required(self):
+        tunnel = self._diagnose_applications(
+            gre=(2, 561_000_000_000), ssl=(6793, 1_372_000_000)
+        )
+        unnamed = self._diagnose_applications(
+            **{"unknown-udp": (3, 561_000_000_000), "ssl": (6793, 1_372_000_000)}
+        )
+
+        self.assertIn("ERSPAN port mirroring rides on GRE", tunnel["text"])
+        # The same finding fires with no App-ID at all: the signature is the
+        # concentration, and narrowing it to GRE would miss the next carrier.
+        self.assertEqual(unnamed["state"], "positive")
+        self.assertNotIn("ERSPAN", unnamed["text"])
+        self.assertIn("App-ID never resolved it", unnamed["text"])
+
+    def test_uncollected_application_statistics_claim_nothing(self):
+        finding = _hypothesis(
+            _diagnose([_cycle(1, 97.0)], [_started()]), "concentrated_application"
+        )
+
+        self.assertEqual(finding["state"], "unavailable")
+        self.assertIn("not collected", finding["text"])
+
+    def _feed_cycles(self, first: dict, second: dict) -> list[dict]:
+        return [
+            _cycle(1, 97.0, interface_counters=first),
+            _cycle(2, 97.0, interface_counters=second),
+        ]
+
+    def test_a_port_that_receives_and_never_answers_is_named(self):
+        finding = _hypothesis(
+            _diagnose(
+                self._feed_cycles(
+                    {"ethernet1/41": {"counters": {"rx_bytes": 0, "tx_bytes": 0}}},
+                    {"ethernet1/41": {"counters": {"rx_bytes": 40_000_000_000, "tx_bytes": 500_000_000}}},
+                )
+            ),
+            "one_way_feed",
+        )
+
+        self.assertEqual(finding["state"], "positive")
+        self.assertIn("in one direction and never answered", finding["text"])
+        self.assertIn("80:1", finding["text"])
+        self.assertIn("<code>ethernet1/41</code>", finding["named"][0])
+
+    def test_an_ha_link_is_never_read_as_a_one_way_feed(self):
+        """On the peer of an A/A pair HA2 is the most one-sided port there is."""
+        counters = (
+            {"ethernet1/19": {"counters": {"rx_bytes": 0, "tx_bytes": 0}}},
+            {"ethernet1/19": {"counters": {"rx_bytes": 90_000_000_000, "tx_bytes": 10_000_000}}},
+        )
+        finding = _hypothesis(
+            _diagnose(
+                self._feed_cycles(*counters),
+                [_started(interface_status={"ethernet1/19": {"name": "ethernet1/19", "zone": "ha"}})],
+            ),
+            "one_way_feed",
+        )
+
+        self.assertEqual(finding["state"], "negative")
+
+    def test_a_port_carrying_both_directions_is_not_a_feed(self):
+        finding = _hypothesis(
+            _diagnose(
+                self._feed_cycles(
+                    {"ae1": {"counters": {"rx_bytes": 0, "tx_bytes": 0}}},
+                    {"ae1": {"counters": {"rx_bytes": 40_000_000_000, "tx_bytes": 30_000_000_000}}},
+                )
+            ),
+            "one_way_feed",
+        )
+
+        self.assertEqual(finding["state"], "negative")
+
+    def test_an_idle_port_is_not_a_feed_however_lopsided(self):
+        """A port that moved nothing has a perfect ratio and no finding."""
+        finding = _hypothesis(
+            _diagnose(
+                self._feed_cycles(
+                    {"ethernet1/21": {"counters": {"rx_bytes": 0, "tx_bytes": 0}}},
+                    {"ethernet1/21": {"counters": {"rx_bytes": 14_000, "tx_bytes": 0}}},
+                )
+            ),
+            "one_way_feed",
+        )
+
+        self.assertEqual(finding["state"], "negative")
+
+    def _monitor_only_diagnosis(self, monitor_only: bool) -> dict:
+        return _diagnose(
+            [
+                _cycle(
+                    1,
+                    97.0,
+                    pbp_status={
+                        "enabled": True,
+                        "active": False,
+                        "mode": "packet_buffer",
+                        "monitor_only": monitor_only,
+                    },
+                )
+            ],
+            [
+                _started(
+                    pbp_settings={"status": "parsed", "enabled": True},
+                    zone_protection={"parsed": True, "zones": []},
+                ),
+                {
+                    "timestamp": "2026-08-30T10:30:00+00:00",
+                    "run_id": "diagnosis-run",
+                    "event": "congestion_system_logs",
+                    "ok": True,
+                    "entries": [
+                        {"time_generated": "2026/06/24 03:0%d:00" % index, "percent": percent}
+                        for index, percent in enumerate([97.0, 97.0, 96.0, 61.0, 52.0])
+                    ],
+                },
+            ],
+        )
+
+    def test_monitor_only_pbp_is_named_as_measured_but_never_mitigated(self):
+        diagnosis = self._monitor_only_diagnosis(True)
+        finding = _hypothesis(diagnosis, "mitigation_disabled")
+
+        self.assertEqual(finding["state"], "positive")
+        self.assertIn("monitor-only", finding["text"])
+        # Zero PBP counters are then evidence about the configuration.
+        self.assertIn("not about the traffic", finding["text"])
+        self.assertIn("3 of them at or above the Activate threshold", finding["text"])
+        self.assertIn("No zone carries a protection profile", finding["text"])
+
+    def test_pbp_that_would_act_is_not_reported_as_disabled(self):
+        finding = _hypothesis(self._monitor_only_diagnosis(False), "mitigation_disabled")
+
+        self.assertEqual(finding["state"], "negative")
+
+    def test_an_unread_pbp_mode_claims_nothing_about_mitigation(self):
+        finding = _hypothesis(_diagnose([_cycle(1, 97.0)]), "mitigation_disabled")
+
+        self.assertEqual(finding["state"], "unavailable")
+
+    def test_the_congestion_log_says_how_severe_its_minutes_were(self):
+        """The peak cannot separate one bad minute from a month of them."""
+        recurrence = self._monitor_only_diagnosis(True)["context"]["recurrence"]
+
+        self.assertEqual(recurrence["median_percent"], 96.0)
+        self.assertEqual(recurrence["activate_percent"], 80.0)
+        self.assertEqual(recurrence["above_activate"], 3)
+        self.assertEqual(recurrence["above_activate_share"], 0.6)
+
+
 _APPLICATIONS = {
     "parsed": True,
     "reported_application_count": 2,
