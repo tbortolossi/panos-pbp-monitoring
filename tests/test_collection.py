@@ -714,6 +714,11 @@ session tracker stage l7proc: app identified
 
         self.assertEqual(baseline["total_bytes_c2s"], 811702)
         self.assertEqual(baseline["total_bytes_s2c"], 60)
+        self.assertEqual(baseline["total_packets_c2s"], 7658)
+        self.assertEqual(baseline["total_packets_s2c"], 1)
+        # The flow totals must not be filed as the layer-7 counts, which mean
+        # something else and this release does not print.
+        self.assertNotIn("layer7_packets_c2s", baseline)
         self.assertEqual(baseline["ingress_interface"], "ethernet1/2")
         self.assertEqual(baseline["egress_interface"], "ethernet1/3")
         self.assertEqual(baseline["layer7_processing"], "completed")
@@ -725,6 +730,54 @@ session tracker stage l7proc: app identified
         self.assertEqual(rates["1217"]["status"], "calculated")
         self.assertEqual(rates["1217"]["delta_bytes_total"], 1000060)
         self.assertEqual(rates["1217"]["bits_per_second_total"], 800048.0)
+
+    def test_a_small_packet_flood_is_rated_in_packets_not_only_bits(self):
+        # 106-byte packets: the throughput reads as unremarkable while the
+        # packet rate is what exhausts the buffers.
+        def summary(octets, packets):
+            return {
+                "42": {
+                    "session_id": 42,
+                    "available": True,
+                    "start_time": "Thu Aug 27 14:00:00 2026",
+                    "total_bytes_c2s": octets,
+                    "total_bytes_s2c": 0,
+                    "total_packets_c2s": packets,
+                    "total_packets_s2c": 0,
+                }
+            }
+
+        previous_samples = {}
+        derive_session_rates(summary(0, 0), previous_samples, 10.0)
+        rates = derive_session_rates(summary(1_060_000, 10_000), previous_samples, 20.0)
+
+        rate = rates["42"]
+        self.assertEqual(rate["status"], "calculated")
+        self.assertEqual(rate["delta_packets_total"], 10_000)
+        self.assertEqual(rate["packets_per_second_total"], 1000.0)
+        self.assertEqual(rate["average_packet_bytes"], 106.0)
+        self.assertEqual(rate["bits_per_second_total"], 848000.0)
+
+    def test_a_release_without_packet_counters_still_rates_the_bits(self):
+        def summary(octets):
+            return {
+                "42": {
+                    "session_id": 42,
+                    "available": True,
+                    "start_time": "Thu Aug 27 14:00:00 2026",
+                    "total_bytes_c2s": octets,
+                    "total_bytes_s2c": 0,
+                }
+            }
+
+        previous_samples = {}
+        derive_session_rates(summary(0), previous_samples, 10.0)
+        rate = derive_session_rates(summary(4000), previous_samples, 20.0)["42"]
+
+        self.assertEqual(rate["status"], "calculated")
+        self.assertEqual(rate["bits_per_second_total"], 3200.0)
+        self.assertNotIn("packets_per_second_total", rate)
+        self.assertNotIn("average_packet_bytes", rate)
 
     def test_session_without_byte_counters_reports_them_missing(self):
         summary = extract_session_summary(

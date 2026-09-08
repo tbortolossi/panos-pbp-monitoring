@@ -705,6 +705,12 @@ difference. Each row carries the flow, the application, the zones, the
 interfaces, what the session gained, how long it was observed, the average rate
 that follows from the two, and one column that is the point of the section:
 
+- **Avg kpkt/s** — the packet rate over the same window, with the average
+  packet size under it. A packet buffer is exhausted by packets, not by
+  bytes: an observed flood of 106-byte packets held the buffers at 99.8%
+  while reading as 0.28 Mbit/s per session, a figure that looks harmless.
+  The rate is blank for a session only the filtered session table ever
+  named, because `show session all` carries no packet counter.
 - **PBP offender** — whether PAN-OS ever designated this session. A row marked
   **never** is a session that grew heavily and that no other section of the
   report can name, because an offloaded high-volume flow writes no traffic log

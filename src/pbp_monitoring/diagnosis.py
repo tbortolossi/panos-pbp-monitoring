@@ -1031,7 +1031,7 @@ def _pbp_flagged_ids(cycles: Sequence[dict[str, Any]]) -> set[int]:
 
 def _growth_observations(
     record: dict[str, Any],
-) -> Iterable[tuple[int, str | None, int, str, dict[str, Any]]]:
+) -> Iterable[tuple[int, str | None, int, int | None, str, dict[str, Any]]]:
     """Every cumulative byte counter one batch observed, whatever named it.
 
     Two reads name a session in a batch, and a session ranks whether or not
@@ -1047,7 +1047,14 @@ def _growth_observations(
         total = _growth_bytes(session.get("total_bytes"))
         if session_id is None or total is None:
             continue
-        yield int(session_id), session.get("start_time"), total, "session_table", session
+        yield (
+            int(session_id),
+            session.get("start_time"),
+            total,
+            None,
+            "session_table",
+            session,
+        )
 
     summaries = record.get("session_summaries")
     for summary in (summaries or {}).values() if isinstance(summaries, dict) else ():
@@ -1072,7 +1079,48 @@ def _growth_observations(
             "egress_interface": summary.get("egress_interface"),
             "state": flow.get("state"),
         }
-        yield int(session_id), summary.get("start_time"), c2s + s2c, "candidate", identity
+        packets_c2s = _growth_bytes(summary.get("total_packets_c2s"))
+        packets_s2c = _growth_bytes(summary.get("total_packets_s2c"))
+        packets = (
+            packets_c2s + packets_s2c
+            if packets_c2s is not None and packets_s2c is not None
+            else None
+        )
+        yield (
+            int(session_id),
+            summary.get("start_time"),
+            c2s + s2c,
+            packets,
+            "candidate",
+            identity,
+        )
+
+
+def _measure_packet_growth(item: dict[str, Any]) -> None:
+    """Add what a session gained in packets, when its counter was ever read.
+
+    A packet-buffer incident is driven by packet rate more than by bit rate, so
+    a session that gained little volume in small packets is the interesting one.
+    The session table names a session without a packet counter, so this window
+    is its own and can be shorter than the byte window, or absent entirely.
+    """
+    item["growth_packets"] = None
+    item["average_packets_per_second"] = None
+    item["average_packet_bytes"] = None
+    first = item.get("first_packets")
+    last = item.get("last_packets")
+    if item.get("packet_observations", 0) < 2 or first is None or last is None:
+        return
+    if last < first:
+        return
+    grown = last - first
+    item["growth_packets"] = grown
+    started = item.get("first_packets_elapsed")
+    ended = item.get("last_packets_elapsed")
+    if started is not None and ended is not None and ended > started:
+        item["average_packets_per_second"] = round(grown / (ended - started), 3)
+    if grown > 0 and item.get("growth_bytes") is not None:
+        item["average_packet_bytes"] = round(item["growth_bytes"] / grown, 1)
 
 
 def session_growth_ranking(
@@ -1112,9 +1160,14 @@ def session_growth_ranking(
             if table.get("truncated"):
                 truncated = True
         elapsed = _first_number(record.get("elapsed_seconds"))
-        for session_id, start_time, total, source, identity in _growth_observations(
-            record
-        ):
+        for (
+            session_id,
+            start_time,
+            total,
+            packets,
+            source,
+            identity,
+        ) in _growth_observations(record):
             key = f"{session_id}@{start_time}"
             item = tracked.get(key)
             if item is None:
@@ -1130,6 +1183,11 @@ def session_growth_ranking(
                     "last_elapsed": elapsed,
                     "observations": 0,
                     "sources": [],
+                    "first_packets": None,
+                    "last_packets": None,
+                    "first_packets_elapsed": None,
+                    "last_packets_elapsed": None,
+                    "packet_observations": 0,
                 }
                 tracked[key] = item
             item["last_bytes"] = total
@@ -1138,6 +1196,13 @@ def session_growth_ranking(
                     item["first_elapsed"] = elapsed
                 item["last_elapsed"] = elapsed
             item["observations"] += 1
+            if packets is not None:
+                if item["first_packets"] is None:
+                    item["first_packets"] = packets
+                    item["first_packets_elapsed"] = elapsed
+                item["last_packets"] = packets
+                item["last_packets_elapsed"] = elapsed
+                item["packet_observations"] += 1
             if source not in item["sources"]:
                 item["sources"].append(source)
             for field in _SESSION_GROWTH_FIELDS:
@@ -1165,6 +1230,7 @@ def session_growth_ranking(
             window = round(item["last_elapsed"] - item["first_elapsed"], 3)
         item["growth_status"] = "measured"
         item["growth_bytes"] = last - first
+        _measure_packet_growth(item)
         item["observed_seconds"] = window
         item["average_bits_per_second"] = (
             round(8.0 * item["growth_bytes"] / window, 3)

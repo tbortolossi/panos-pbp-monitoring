@@ -2314,6 +2314,12 @@ def extract_session_summary(
         "total_bytes_s2c": _int_value(
             _line_value(text, r"total byte count\s*\(s2c\)")
         ),
+        "total_packets_c2s": _int_value(
+            _line_value(text, r"total packet count\s*\(c2s\)")
+        ),
+        "total_packets_s2c": _int_value(
+            _line_value(text, r"total packet count\s*\(s2c\)")
+        ),
         "layer7_packets_c2s": _int_value(
             _line_value(text, r"layer7 packet count\s*\(c2s\)")
         ),
@@ -2363,6 +2369,12 @@ def extract_session_summary(
                 _first_descendant_text(
                     root, "total-bytes-s2c", "bytes-s2c", "s2c-octets"
                 )
+            ),
+            "total_packets_c2s": _int_value(
+                _first_descendant_text(root, "total-packets-c2s", "c2s-packets")
+            ),
+            "total_packets_s2c": _int_value(
+                _first_descendant_text(root, "total-packets-s2c", "s2c-packets")
             ),
             "layer7_packets_c2s": _int_value(
                 _first_descendant_text(root, "layer7-packets-c2s", "packets-c2s")
@@ -2417,6 +2429,44 @@ def summarize_session_details(
             session_id,
         )
     return summaries
+
+
+def _packet_rates(
+    summary: dict[str, Any],
+    previous_summary: dict[str, Any],
+    delta_bytes_total: int,
+    interval: float,
+) -> dict[str, Any]:
+    """Derive the packet rates beside the bit rates, when both samples carry them.
+
+    Returns an empty mapping rather than a zero when a release prints no packet
+    counter, or when the counters went backwards: the bit rates the caller
+    already computed stay valid on their own.
+    """
+    current_c2s = _int_value(summary.get("total_packets_c2s"))
+    current_s2c = _int_value(summary.get("total_packets_s2c"))
+    previous_c2s = _int_value(previous_summary.get("total_packets_c2s"))
+    previous_s2c = _int_value(previous_summary.get("total_packets_s2c"))
+    if None in (current_c2s, current_s2c, previous_c2s, previous_s2c):
+        return {}
+    if current_c2s < previous_c2s or current_s2c < previous_s2c:
+        return {}
+    delta_c2s = current_c2s - previous_c2s
+    delta_s2c = current_s2c - previous_s2c
+    delta_total = delta_c2s + delta_s2c
+    rates: dict[str, Any] = {
+        "delta_packets_c2s": delta_c2s,
+        "delta_packets_s2c": delta_s2c,
+        "delta_packets_total": delta_total,
+        "packets_per_second_c2s": round(delta_c2s / interval, 3),
+        "packets_per_second_s2c": round(delta_s2c / interval, 3),
+        "packets_per_second_total": round(delta_total / interval, 3),
+    }
+    # What separates a small-packet flood from a bulk transfer at the same
+    # throughput. Undefined when no packet moved, and never a division by zero.
+    if delta_total > 0:
+        rates["average_packet_bytes"] = round(delta_bytes_total / delta_total, 1)
+    return rates
 
 
 def derive_session_rates(
@@ -2479,6 +2529,16 @@ def derive_session_rates(
                         "bits_per_second_total": round(8.0 * delta_total / interval, 3),
                     }
                 )
+                # A packet-buffer incident is driven by packet rate more than
+                # by bit rate: a flood of small packets exhausts the buffers
+                # at a throughput that reads as unremarkable. The packet
+                # counters travel in the same answer, under the same guards,
+                # and are absent on a release that does not print them.
+                packets = _packet_rates(
+                    summary, previous_summary, delta_total, interval
+                )
+                if packets:
+                    result.update(packets)
 
         previous_samples[session_id_text] = {
             "sampled_at_monotonic": sampled_at_monotonic,

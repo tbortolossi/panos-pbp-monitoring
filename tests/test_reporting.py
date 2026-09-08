@@ -1868,6 +1868,89 @@ class SessionGrowthSectionTests(unittest.TestCase):
         self.assertIn("no growth measured", html)
 
 
+class PacketRateRenderingTests(unittest.TestCase):
+    """A 106-byte flood must not read as an unremarkable Mbit/s."""
+
+    def _render(self, cycles: list[dict]) -> str:
+        records: list[dict] = [
+            {
+                "timestamp": "2026-08-27T10:00:00+00:00",
+                "run_id": "pps-run",
+                "event": "monitor_started",
+                "collector_version": "test",
+                "device": {"serial": "fixture", "model": "PA-fixture"},
+            }
+        ]
+        for batch, cycle in enumerate(cycles, 1):
+            record = {
+                "timestamp": f"2026-08-27T10:0{batch}:00+00:00",
+                "run_id": "pps-run",
+                "cycle": batch,
+                "elapsed_seconds": float(batch) * 10.0,
+                "percentages": {"packet_buffer_congestion": [99]},
+                "commands": {"large_sessions": {"ok": True, "result": "<result/>"}},
+            }
+            record.update(cycle)
+            records.append(record)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            capture = Path(temporary_directory) / "pps.jsonl"
+            capture.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            return generate_html_report(
+                capture, capture.with_suffix(".html")
+            ).read_text(encoding="utf-8")
+
+    def _batch(self, octets: int, packets: int) -> dict:
+        return {
+            "candidate_entities": [
+                {
+                    "rank": 1,
+                    "entity_type": "session",
+                    "session_id": 1809,
+                    "drop_state": True,
+                    "pbp_percentage_total": 61,
+                }
+            ],
+            "session_summaries": {
+                "1809": {
+                    "session_id": 1809,
+                    "status": "parsed",
+                    "available": True,
+                    "start_time": "Thu Aug 27 09:59:00 2026",
+                    "application": "unknown-udp",
+                    "total_bytes_c2s": octets,
+                    "total_bytes_s2c": 0,
+                    "total_packets_c2s": packets,
+                    "total_packets_s2c": 0,
+                    "c2s": {"source_ip": "192.0.2.10"},
+                }
+            },
+            "session_rates": {
+                "1809": {
+                    "session_id": 1809,
+                    "status": "calculated",
+                    "bits_per_second_total": 848_000.0,
+                    "packets_per_second_total": 1000.0,
+                    "average_packet_bytes": 106.0,
+                }
+            },
+        }
+
+    def test_the_offender_table_states_the_packet_rate_and_packet_size(self):
+        html = self._render([self._batch(0, 0), self._batch(1_060_000, 10_000)])
+
+        self.assertIn("<th>Peak kpkt/s</th>", html)
+        self.assertIn("106 B/pkt", html)
+
+    def test_the_growth_ranking_states_the_packet_rate_and_packet_size(self):
+        html = self._render([self._batch(0, 0), self._batch(1_060_000, 10_000)])
+
+        self.assertIn("<th>Avg kpkt/s</th>", html)
+        self.assertIn("a packet buffer is exhausted by packets, not by bytes", html)
+
+
 class RankedEntityDescriptionTests(unittest.TestCase):
     """The table and the diagnosis describe a ranked entity identically."""
 

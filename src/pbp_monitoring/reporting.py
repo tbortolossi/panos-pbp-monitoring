@@ -1174,6 +1174,8 @@ def _aggregate_attribution(
                 "session_summary": None,
                 "peak_bits_per_second_total": None,
                 "latest_bits_per_second_total": None,
+                "peak_packets_per_second_total": None,
+                "average_packet_bytes": None,
                 "rate_status": None,
                 "ingress_detail": None,
                 "special_reason": None,
@@ -1285,6 +1287,23 @@ def _aggregate_attribution(
                         "peak_bits_per_second_total",
                         bits_per_second,
                     )
+                packets_per_second = next(
+                    iter(_numbers(rate.get("packets_per_second_total"))),
+                    None,
+                )
+                if packets_per_second is not None:
+                    update_max(
+                        item,
+                        "peak_packets_per_second_total",
+                        packets_per_second,
+                    )
+                # The size taken with the fastest packet rate: what tells a
+                # small-packet flood from a bulk transfer at the same Mbit/s.
+                packet_bytes = next(
+                    iter(_numbers(rate.get("average_packet_bytes"))), None
+                )
+                if packet_bytes is not None:
+                    item["average_packet_bytes"] = packet_bytes
 
     def sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
         strongest = max(
@@ -1399,6 +1418,18 @@ def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
             if isinstance(peak_rate, (int, float))
             else "—"
         )
+        peak_packets = item.get("peak_packets_per_second_total")
+        packet_bytes = item.get("average_packet_bytes")
+        peak_kpps = (
+            _format_number(round(float(peak_packets) / 1000.0, 2))
+            if isinstance(peak_packets, (int, float))
+            else "—"
+        )
+        if isinstance(packet_bytes, (int, float)):
+            peak_kpps += (
+                f'<br><span class="muted">{_escape(_format_number(packet_bytes))} '
+                "B/pkt</span>"
+            )
         rows.append(
             "<tr>"
             f'<td class="number">{_escape(item.get("rank"))}</td>'
@@ -1409,6 +1440,7 @@ def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
             f'<td class="number">{_escape(_format_number(item.get("pbp_samples")))}</td>'
             f'<td class="number">{_escape(_format_number(item.get("ingress_percentage")))}</td>'
             f'<td class="number">{_escape(peak_mbps)}</td>'
+            f'<td class="number">{peak_kpps}</td>'
             f'<td class="wrap"><code>{_escape(tuple_text)}</code><br><span class="muted">{_escape(context)}</span></td>'
             f"<td>{status_text}</td>"
             f'<td>{_escape(item.get("first_seen") or "—")}<br>{_escape(item.get("last_seen") or "—")}</td>'
@@ -1420,7 +1452,8 @@ def _render_attribution_table(attribution: list[dict[str, Any]]) -> str:
         "without an active session.</p>"
         '<div class="table-wrap"><table><thead><tr>'
         "<th>Rank</th><th>Entity</th><th>Evidence / context</th><th>RED drop</th>"
-        "<th>PBP %</th><th>Samples</th><th>Ingress %</th><th>Peak Mbit/s</th><th>5-tuple / application</th>"
+        "<th>PBP %</th><th>Samples</th><th>Ingress %</th><th>Peak Mbit/s</th>"
+        "<th>Peak kpkt/s</th><th>5-tuple / application</th>"
         "<th>Session</th><th>First / last seen</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
         + _hidden_rows_note(
@@ -4141,6 +4174,24 @@ def _render_large_sessions(summary: dict[str, Any]) -> str:
     )
 
 
+def _growth_packet_cell(item: dict[str, Any]) -> str:
+    """The packet rate of a grown session, with the packet size under it.
+
+    The session table names a session without a packet counter, so a row that
+    only that read ever saw shows nothing here rather than a zero.
+    """
+    rate = next(iter(_numbers(item.get("average_packets_per_second"))), None)
+    if rate is None:
+        return "—"
+    cell = _escape(_format_number(round(rate / 1000.0, 2)))
+    size = next(iter(_numbers(item.get("average_packet_bytes"))), None)
+    if size is not None:
+        cell += (
+            f'<br><span class="muted">{_escape(_format_number(size))} B/pkt</span>'
+        )
+    return cell
+
+
 def _growth_blind_spot(summary: dict[str, Any]) -> str:
     """State what the ranking could not see, so it is never read as the list."""
     notes: list[str] = []
@@ -4223,6 +4274,7 @@ def _render_session_growth(summary: dict[str, Any]) -> str:
         f'<td class="number">{_escape(_format_volume(item.get("growth_bytes")))}</td>'
         f'<td>{_escape(_human_duration(next(iter(_numbers(item.get("observed_seconds"))), None)))}</td>'
         f'<td class="number">{_escape(_format_rate(item.get("average_bits_per_second")))}</td>'
+        f'<td class="number">{_growth_packet_cell(item)}</td>'
         f'<td>{"designated" if item.get("pbp_flagged") else "<strong>never</strong>"}</td>'
         f'<td class="number">{_escape(item.get("observations"))}</td>'
         "</tr>"
@@ -4235,11 +4287,15 @@ def _render_session_growth(summary: dict[str, Any]) -> str:
         "nowhere here. A session PAN-OS never designated is the finding this "
         "ranking exists for, because an offloaded high-volume flow writes no "
         "traffic log while it is open and cannot appear in the offender "
-        "ranking.</p>"
+        "ranking. Read the packet rate beside the throughput: a packet buffer "
+        "is exhausted by packets, not by bytes, so a flood of small packets "
+        "fills it at a Mbit/s that reads as unremarkable, and the packet size "
+        "under the rate is what tells the two apart.</p>"
         '<div class="table-wrap"><table>'
         "<thead><tr><th>Session</th><th>Flow</th><th>Application</th>"
         "<th>Zones</th><th>Interfaces</th><th>Grew by</th><th>Observed for</th>"
-        "<th>Avg Mbit/s</th><th>PBP offender</th><th>Batches</th></tr></thead>"
+        "<th>Avg Mbit/s</th><th>Avg kpkt/s</th><th>PBP offender</th>"
+        "<th>Batches</th></tr></thead>"
         f"<tbody>{rows}</tbody></table></div>{blind}"
     )
 
