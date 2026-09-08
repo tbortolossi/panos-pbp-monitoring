@@ -995,6 +995,83 @@ class DropCounterTests(unittest.TestCase):
         self.assertIn('<p class="verdict verdict-collective">', html)
         self.assertIn("No packet was denied by a Security policy rule", html)
 
+    def _parse_flood_batch(self) -> dict:
+        """A batch of the flood that never reaches the session engine."""
+        return {
+            "global_counters_delta_status": "primed_interval",
+            "global_counters_delta": {
+                "counters": [
+                    self._counter(
+                        "flow_rcv_dot1q_tag_err",
+                        3_000_000,
+                        820_015,
+                        "parse",
+                        "Packets dropped: 802.1q tag not configured",
+                    ),
+                    self._counter(
+                        "flow_no_interface",
+                        3_000_000,
+                        820_015,
+                        "parse",
+                        "Packets dropped: invalid interface",
+                    ),
+                ]
+            },
+        }
+
+    def test_a_flood_with_no_session_names_the_counter_delta_as_the_evidence(self):
+        html = self._render([self._parse_flood_batch(), self._parse_flood_batch()])
+
+        self.assertIn('<p class="verdict verdict-pre-session">', html)
+        self.assertIn("before a session could exist", html)
+        self.assertIn("no session was ranked at all", html)
+        self.assertIn("counter delta below is the primary evidence", html)
+        # The empty offender table must never be offered as the evidence, and
+        # the drops must not be described as happening after session setup.
+        verdict = html.split('verdict-pre-session">')[1].split("</p>")[0]
+        self.assertNotIn("stays the primary evidence", verdict)
+        self.assertNotIn("after session setup", verdict)
+
+    def test_a_chronic_parse_counter_is_read_by_its_rate_not_its_total(self):
+        html = self._render([self._parse_flood_batch(), self._parse_flood_batch()])
+
+        self.assertIn("Read the peak rate against the incident window", html)
+
+    def test_parse_drops_beside_ranked_sessions_split_the_evidence(self):
+        ranked = {
+            "candidate_entities": [
+                {
+                    "rank": 1,
+                    "entity_type": "session",
+                    "session_id": 4242,
+                    "drop_state": True,
+                    "pbp_percentage_total": 61,
+                }
+            ],
+            "session_summaries": {
+                "4242": {
+                    "status": "parsed",
+                    "available": True,
+                    "application": "ssl",
+                    "c2s": {
+                        "source_ip": "192.0.2.10",
+                        "destination_ip": "198.51.100.20",
+                    },
+                }
+            },
+        }
+        batches = []
+        for _ in range(2):
+            batch = self._parse_flood_batch()
+            batch.update(ranked)
+            batches.append(batch)
+
+        html = self._render(batches)
+
+        self.assertIn('<p class="verdict verdict-mixed">', html)
+        self.assertIn("before a session could exist", html)
+        self.assertIn("sessions were ranked as well", html)
+
     def test_capture_without_counters_states_it_instead_of_an_empty_table(self):
         html = self._render([{"commands": {}}])
 

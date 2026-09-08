@@ -610,6 +610,22 @@ counted while a source IP is ranked without an enriched session, the report
 states that correlation explicitly. The **Denied packets** summary card carries
 the same total, adding policy deny to DoS and zone-protection drops.
 
+A flood can also die before policy is ever evaluated. Packets carrying an
+802.1q tag no subinterface terminates, or arriving on a port whose ingress
+interface cannot be resolved, are discarded at the **parse** stage: no session
+exists, PBP designates nobody, `show session info` reports zero allocated
+sessions, and the filtered session table answers empty. The verdict says so
+rather than sending the operator to an offender table that is empty for that
+very reason — when parse drops are counted and nothing was ranked, it names the
+counter delta as the primary evidence for the incident. When parse drops are
+counted beside ranked sessions, it says both carry part of the evidence.
+
+In either case the verdict adds how to read those counters: by their peak rate
+against the incident window, not by their running total. A parse-stage counter
+moves continuously on a trunk carrying VLANs the firewall does not terminate,
+so it accumulates an impressive total that explains no particular incident. The
+rate during the incident is what separates the background from the event.
+
 ## Live sessions and traffic-log evidence
 
 For exactly those sources, the collector recovers the missing flow detail from

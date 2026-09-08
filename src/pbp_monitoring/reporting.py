@@ -1918,12 +1918,59 @@ def _drop_counter_verdict(
             "Both denied and permitted traffic contributed to the observed "
             f"pressure.{pbp_text}",
         )
+    # Nothing was denied by policy, DoS or zone protection. What the drops mean
+    # then depends on the stage they were counted at and on whether anything was
+    # ranked at all, and the two used to be assumed rather than read.
+    parse_total = summary["family_totals"].get("parse", 0.0)
+    no_denial = (
+        "No packet was denied by a Security policy rule, by DoS protection, or by "
+        "zone protection during the counted batches. "
+    )
+    # A parse-stage counter can move continuously on a trunk carrying VLANs the
+    # firewall does not terminate, so its running total says nothing on its own.
+    rate_caution = (
+        " Read the peak rate against the incident window rather than the running "
+        "total: a counter that also moves outside any incident accumulates a large "
+        "total without explaining this one."
+    )
+    if parse_total > 0 and not attribution:
+        return (
+            "pre-session",
+            no_denial
+            + f"{_format_number(parse_total)} packets were discarded at the parse "
+            "stage, before a session could exist, and no session was ranked at "
+            "all. The offender attribution table is empty because the firewall "
+            "had no session to designate, not for want of collection, and no "
+            "<code>show session id</code> could have enriched anything. The "
+            "counter delta below is the primary evidence for this incident."
+            + rate_caution
+            + pbp_text,
+        )
+    if parse_total > 0:
+        return (
+            "mixed",
+            no_denial
+            + f"{_format_number(parse_total)} packets were discarded at the parse "
+            "stage, before a session could exist, and sessions were ranked as "
+            "well, so both the counter delta below and the offender attribution "
+            "table carry part of the evidence." + rate_caution + pbp_text,
+        )
+    if not attribution:
+        return (
+            "collective",
+            no_denial
+            + "The drops below happened after session setup or outside policy "
+            "evaluation, and no session was ranked at all, so the offender "
+            "attribution table is empty because the firewall had no session to "
+            "designate. The counter delta below is the evidence there is."
+            + pbp_text,
+        )
     return (
         "collective",
-        "No packet was denied by a Security policy rule, by DoS protection, or by "
-        "zone protection during the counted batches. The drops below happened "
-        "after session setup or outside policy evaluation, so the offender "
-        f"attribution table stays the primary evidence.{pbp_text}",
+        no_denial
+        + "The drops below happened after session setup or outside policy "
+        f"evaluation, so the offender attribution table stays the primary "
+        f"evidence.{pbp_text}",
     )
 
 
@@ -2352,6 +2399,7 @@ REPORT_STYLE = """    :root { color-scheme: light; --ink:#172033; --muted:#64748
     .verdict-isolated { border-left-color:var(--danger); background:#fef2f2; }
     .verdict-collective { border-left-color:#0f766e; background:#f0fdfa; }
     .verdict-mixed { border-left-color:#f59e0b; background:#fffbeb; }
+    .verdict-pre-session { border-left-color:var(--danger); background:#fef2f2; }
     code { overflow-wrap:anywhere; color:#075985; }
     .payload-label { padding:0 12px; color:#475569; }
     details.exact-response { margin:10px 12px 12px; border:1px solid var(--line); border-radius:8px; background:#fff; overflow:hidden; }
