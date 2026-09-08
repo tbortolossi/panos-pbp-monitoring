@@ -1224,12 +1224,18 @@ class MonitorTests(unittest.TestCase):
             )
             self.assertIn("dp_core_functions", records[0]["commands"])
             self.assertIn("global_counters_baseline", records[0]["commands"])
-            self.assertEqual(records[1]["firewall_clock"], "Thu Aug 27 10:00:00 UTC 2026")
+            # The once-per-incident device reads run in the background and write
+            # their own records when the firewall answers, so a batch record is
+            # not at a fixed offset: on CPython 3.13 one of them landed at index
+            # 1 and displaced the first cycle. Select the cycle, never its
+            # position.
+            first_cycle = next(record for record in records if record.get("cycle") == 1)
+            self.assertEqual(first_cycle["firewall_clock"], "Thu Aug 27 10:00:00 UTC 2026")
             self.assertEqual(
-                records[1]["global_counters_delta_status"],
+                first_cycle["global_counters_delta_status"],
                 "primed_interval",
             )
-            self.assertTrue(records[1]["recovery_sample_eligible"])
+            self.assertTrue(first_cycle["recovery_sample_eligible"])
             self.assertEqual(records[-1]["reason"], "resources_recovered")
 
     def test_stored_core_map_spares_the_firewall_an_api_call(self):
