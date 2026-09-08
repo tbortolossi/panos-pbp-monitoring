@@ -1,7 +1,7 @@
 # PAN-OS PBP Monitoring — Packet Buffer Protection incident collector
 
 [![CI](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.45.1-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.46.0-blue.svg)](https://github.com/tbortolossi/panos-pbp-monitoring/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
 [![Deployment](https://img.shields.io/badge/deployment-Docker%20Compose-2496ed.svg)](compose.yaml)
 [![Read-only](https://img.shields.io/badge/firewall%20impact-read--only-brightgreen.svg)](#safety-guarantees)
@@ -487,8 +487,9 @@ distributions.
   on` to confirm operational XML.
 - An offender session may disappear before enrichment. The original PBP or
   ingress evidence is still preserved.
-- Derived per-session throughput is a delta between cumulative byte counters,
-  not a native instantaneous PAN-OS rate.
+- Derived per-session throughput and packet rate are deltas between cumulative
+  counters, not native instantaneous PAN-OS rates. A release that prints no
+  packet counter yields the bit rate alone rather than a zero.
 - `pow performance` stays out of the five-second batch and is read once per
   incident, in the background: it is too large, and too stable inside one
   incident, to be worth a poll. The PBP `buffer-latency` reading is collected

@@ -933,6 +933,49 @@ class SessionGrowthTests(unittest.TestCase):
         )
 
 
+class SessionGrowthPacketTests(unittest.TestCase):
+    """A packet buffer is exhausted by packets, so the ranking must show them."""
+
+    def _candidate(self, octets, packets):
+        return {
+            "1809": {
+                "session_id": 1809,
+                "available": True,
+                "start_time": "Mon Sep  7 21:52:04 2026",
+                "total_bytes_c2s": octets,
+                "total_bytes_s2c": 0,
+                "total_packets_c2s": packets,
+                "total_packets_s2c": 0,
+                "application": "unknown-udp",
+                "c2s": {"source_ip": "192.0.2.10"},
+            }
+        }
+
+    def test_growth_carries_the_packet_rate_and_the_packet_size(self):
+        cycles = [
+            _growth_cycle(0.0, summaries=self._candidate(0, 0)),
+            _growth_cycle(10.0, summaries=self._candidate(1_060_000, 10_000)),
+        ]
+
+        item = session_growth_ranking(cycles)["sessions"][0]
+
+        self.assertEqual(item["growth_packets"], 10_000)
+        self.assertEqual(item["average_packets_per_second"], 1000.0)
+        self.assertEqual(item["average_packet_bytes"], 106.0)
+
+    def test_a_session_only_the_table_named_reports_no_packet_rate(self):
+        cycles = [
+            _growth_cycle(0.0, [_table_session(3, 1_000)]),
+            _growth_cycle(10.0, [_table_session(3, 9_001_000)]),
+        ]
+
+        item = session_growth_ranking(cycles)["sessions"][0]
+
+        self.assertEqual(item["growth_bytes"], 9_000_000)
+        self.assertIsNone(item["growth_packets"])
+        self.assertIsNone(item["average_packets_per_second"])
+
+
 class CommandOutcomeTests(unittest.TestCase):
     """One classification of a stored command record, shared by every reader."""
 

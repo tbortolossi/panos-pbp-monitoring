@@ -297,7 +297,13 @@ than create a concurrent one.
    collector immediately calls `show session id <id>` for priority sessions,
    including an ID explicitly supplied by the trigger, with bounded concurrency,
    fair selection, and retry delays. Repeated snapshots derive c2s, s2c, and
-   total bit rates while detecting reset counters and reused session IDs. A
+   total bit rates, and the same three packet rates with the average packet
+   size that follows, while detecting reset counters and reused session IDs.
+   The packet rate is derived because a packet buffer is exhausted by packets
+   rather than by bytes: a flood of small packets fills it at a throughput
+   that reads as unremarkable, and the packet size is what separates it from
+   a bulk transfer. A release that prints no packet counter yields the bit
+   rates alone, never a packet rate of zero. A
    source IP alone remains valid attribution evidence but does not cause a
    session command.
 7bis. Every batch also lists the largest sessions. The `min-kb` and
@@ -328,9 +334,13 @@ than create a concurrent one.
    finding this ranking exists for, since an offloaded flow writes no traffic
    log while it is open. A session seen in a single batch, and one whose
    counter went backwards, are reported as such and never ranked as a zero; a
-   recycled index inherits nothing. The ranking is bounded in the sessions it
-   follows and the rows it renders, and it states the threshold in force and
-   the batches whose read failed, so it is never read as an exhaustive list.
+   recycled index inherits nothing. Each row carries the packet rate and the
+   average packet size beside the throughput, taken from the reads that named
+   the session with a packet counter; a session only the filtered table ever
+   named carries none, because that read has no packet counter to give. The
+   ranking is bounded in the sessions it follows and the rows it renders, and
+   it states the threshold in force and the batches whose read failed, so it
+   is never read as an exhaustive list.
 8. The complete cycle, raw XML API responses, and partial errors are written to
    a JSONL file. The hardware port counters are collected on the first batch
    then every third batch, with one `show counter interface all` read: a flood

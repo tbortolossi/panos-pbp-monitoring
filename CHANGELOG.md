@@ -3,6 +3,32 @@
 All notable changes to this project are documented in this file. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.46.0] - 2026-09-08
+
+### Added
+
+- **A per-session packet rate, beside the bit rate.** A packet buffer is
+  exhausted by packets rather than by bytes, and a lab incident made the point:
+  the buffers sat at 99.84% while the ranked sessions carried **106-byte
+  packets** and read as 0.28 Mbit/s each — a figure that looks harmless and
+  explains nothing. The counters were already in the answers the collector
+  stores; PAN-OS 11.2 prints them as `<c2s-packets>` and `<s2c-packets>`, and
+  nothing read them. `extract_session_summary` now reads them into
+  `total_packets_c2s` and `total_packets_s2c`, left apart from the existing
+  `layer7_packets_*`, which count something else and would have mislabelled the
+  evidence. `derive_session_rates` derives `packets_per_second_c2s`, `_s2c` and
+  `_total` beside the bit rates, from the same bounded counter delta and under
+  the same guards, plus the `average_packet_bytes` that falls out of the two and
+  separates a small-packet flood from a bulk transfer at the same throughput. A
+  release that prints no packet counter yields the bit rates alone, never a
+  packet rate of zero, and a counter that went backwards produces none.
+- **Both rankings state the packet rate.** The offender attribution table gains
+  a *Peak kpkt/s* column with the packet size under it, and the *Sessions that
+  grew the most* ranking gains *Avg kpkt/s* on the same terms. A session only
+  the filtered session table ever named carries no packet figure, because
+  `show session all` has no packet counter to give, and the cell says so
+  instead of showing a zero. Refs #231.
+
 ## [0.45.1] - 2026-09-08
 
 ### Fixed
